@@ -1,0 +1,45 @@
+# ka dialect catalog — seed rows shipped in the binary.
+# Pricing values are PLACEHOLDERS: verify against vendor pricing before any release.
+
+[dialects."anthropic/claude-sonnet-5"]
+wire = "anthropic_messages"
+context = 200_000
+max_output = 64_000
+efforts = ["low", "medium", "high", "max"]
+input = ["text", "image"]
+cache = "control"
+ratio = 3.6
+[dialects."anthropic/claude-sonnet-5".price]
+input_per_mtok = 3.0
+output_per_mtok = 15.0
+[dialects."anthropic/claude-sonnet-5".flags]
+reasoning_field = "thinking"
+developer_role = true
+
+[dialects."openai/gpt-5.1"]
+wire = "openai_chat"
+context = 400_000
+max_output = 128_000
+efforts = ["low", "medium", "high"]
+input = ["text", "image"]
+cache = "key"
+ratio = 4.0
+[dialects."openai/gpt-5.1".price]
+input_per_mtok = 1.25
+output_per_mtok = 10.0
+[dialects."openai/gpt-5.1".flags]
+reasoning_field = "reasoning"
+developer_role = true
+requires_tool_result_name = true
+
+[dialects."ollama/qwen3-32b"]
+wire = "openai_chat"
+discovery = "ollama"
+context = 131_072
+input = ["text"]
+cache = "off"
+ratio = 3.2
+first_byte_timeout_ms = 0
+[dialects."ollama/qwen3-32b".flags]
+replay_reasoning = true
+tool_choice = "pin_or_auto"

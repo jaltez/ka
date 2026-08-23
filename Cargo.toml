@@ -1,0 +1,39 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+rust-version = "1.85"
+
+[workspace.dependencies]
+ka-protocol = { path = "crates/ka-protocol", version = "0.1.0" }
+ka-strand = { path = "crates/ka-strand", version = "0.1.0" }
+ka-dialect = { path = "crates/ka-dialect", version = "0.1.0" }
+ka-agent = { path = "crates/ka-agent", version = "0.1.0" }
+ka-term = { path = "crates/ka-term", version = "0.1.0" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.9"
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "sync", "time"] }
+clap = { version = "4", features = ["derive"] }
+crossterm = "0.29"
+schemars = "1"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+dbg_macro = "deny"
+todo = "deny"
+unimplemented = "deny"
+
+[profile.release]
+lto = "thin"
+strip = true
+panic = "abort"
+codegen-units = 1

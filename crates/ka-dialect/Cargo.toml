@@ -1,0 +1,14 @@
+[package]
+name = "ka-dialect"
+description = "ka dialect catalog: per-model wire profiles as data, plus selectors"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+toml = { workspace = true }
+
+[lints]
+workspace = true

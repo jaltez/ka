@@ -1,0 +1,13 @@
+[package]
+name = "ka-term"
+description = "ka terminal primitives: raw-mode guard and key decoding (TUI arrives Phase 3)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+crossterm = { workspace = true }
+
+[lints]
+workspace = true
