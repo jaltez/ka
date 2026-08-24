@@ -2,7 +2,7 @@
 
 A model-agnostic, very-low-footprint coding agent in Rust.
 
-**Status: Phase 5 (permissions as data & trust).** Design: [`research/ka/architecture.md`](research/ka/architecture.md) · Roadmap: [`research/ka/roadmap.md`](research/ka/roadmap.md)
+**Status: Phase 6 (conventions, extension, pathfinder).** Design: [`research/ka/architecture.md`](research/ka/architecture.md) · Roadmap: [`research/ka/roadmap.md`](research/ka/roadmap.md)
 
 ## Footprint contract (CI-enforced target)
 Single static binary ≤ 10 MB (musl, stripped) · cold start ≤ 50 ms · idle RSS ≤ 15 MB · zero steady-state network.
@@ -32,6 +32,17 @@ cargo run -p ka-cli -- run --model ollama/qwen3:32b "hi"   # live local round-tr
 ```
 
 Selectors are `vendor/model@effort` (`@` because model ids may contain colons).
+
+Conventions: AGENTS.md (root→cwd, CLAUDE.md compat) folds into every system prompt; SKILL.md skills (`.ka/skills/`, `.agents/`, `.claude/`) list name+description+path only — the model reads bodies on demand. Hooks (exit-2 block contract):
+
+```toml
+[[hooks]]
+event = "pre_tool_use"   # or post_tool_use
+tool = "bash"            # optional filter
+command = "guard.sh"     # JSON on stdin; exit 2 blocks
+```
+
+`pathfinder` delegates read-only research (read/glob/grep) to a nested voice and returns a dense summary. Custom slash commands: `.ka/commands/<name>.md` with `$ARGUMENTS`. `ka init` writes a starter AGENTS.md.
 
 Project config (`.ka/ka.toml`) is trust-gated: first use prompts (or pass `--trust`), decisions persist in `~/.local/state/ka/trust.json`. Permission rules are data, evaluated first-match-wins before mode logic:
 

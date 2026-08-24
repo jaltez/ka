@@ -83,6 +83,8 @@ enum CliCommand {
         #[arg(long = "dialects")]
         dialects: Vec<PathBuf>,
     },
+    /// Generate a starter AGENTS.md from a quick repo scan
+    Init,
     /// Inspect configuration
     Config {
         #[command(subcommand)]
@@ -270,6 +272,7 @@ async fn dispatch(cli: Cli) -> Result<ExitCode, String> {
             }
             Ok(ExitCode::SUCCESS)
         }
+        Some(CliCommand::Init) => run_init(),
         Some(CliCommand::Config { cmd }) => match cmd {
             ConfigCommand::Schema => {
                 println!(
@@ -483,6 +486,53 @@ fn project_config_trusted(cwd: &std::path::Path, force_trust: bool) -> bool {
     }
     eprintln!("ka: project config NOT trusted; skipping .ka/ka.toml (pass --trust to trust it)");
     false
+}
+
+/// Deterministic starter AGENTS.md from repo shape (no model call).
+fn run_init() -> Result<ExitCode, String> {
+    let cwd = std::env::current_dir().map_err(|e| format!("cwd: {e}"))?;
+    let target = cwd.join("AGENTS.md");
+    if target.exists() {
+        return Err("AGENTS.md already exists; refusing to overwrite".to_string());
+    }
+
+    let mut langs = Vec::new();
+    if cwd.join("Cargo.toml").exists() {
+        langs.push(("Rust", "cargo build", "cargo test"));
+    }
+    if cwd.join("package.json").exists() {
+        langs.push(("TypeScript/JavaScript", "npm install", "npm test"));
+    }
+    if cwd.join("go.mod").exists() {
+        langs.push(("Go", "go build ./...", "go test ./..."));
+    }
+    if cwd.join("pyproject.toml").is_file() || cwd.join("requirements.txt").is_file() {
+        langs.push(("Python", "pip install -e .", "pytest"));
+    }
+    let git = cwd.join(".git").exists();
+
+    let mut body =
+        String::from("# AGENTS.md\n\nGuidance for AI agents working in this repository.\n\n");
+    if let Some((lang, build, test)) = langs.first() {
+        body.push_str(&format!(
+            "## Project\n\n- Language: {lang}\n- Build: `{build}`\n- Test: `{test}`\n{}\n",
+            if git {
+                "- VCS: git (never commit directly to main)\n"
+            } else {
+                ""
+            }
+        ));
+    }
+    if langs.len() > 1 {
+        body.push_str("(Multiple build systems detected — refine this list.)\n\n");
+    }
+    body.push_str(
+        "## Conventions\n\n- Describe code style, naming, and layout rules here.\n- List commands that must pass before finishing a task.\n\n## Notes\n\n- Anything an agent should know (quirks, forbidden areas, deployment).\n",
+    );
+    std::fs::write(&target, body).map_err(|e| format!("write: {e}"))?;
+    println!("wrote {}", target.display());
+    println!("edit it to describe real conventions; ka reads it automatically");
+    Ok(ExitCode::SUCCESS)
 }
 
 fn read_stdin() -> Result<String, String> {

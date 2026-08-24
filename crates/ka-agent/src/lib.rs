@@ -3,6 +3,7 @@
 
 mod canned;
 pub mod config;
+pub mod conventions;
 mod engine;
 pub mod hands;
 mod voice;

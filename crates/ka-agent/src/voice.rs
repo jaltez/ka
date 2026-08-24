@@ -14,7 +14,9 @@ use ka_protocol::{AskId, AskQuestion, Command, ErrorClass, Event, Stop, Usage};
 use tokio::sync::mpsc;
 
 use crate::hands::bashp::{all_readonly, analyze, hardstop};
-use crate::hands::{Clearance, Hand, HandContext, Ledger, Spill, ToolOutput, registry};
+use crate::hands::{
+    Clearance, Hand, HandContext, Ledger, Spill, ToolOutput, registry_with_pathfinder,
+};
 
 /// Session-scoped mutable state the voice needs (owned by the engine).
 #[derive(Default)]
@@ -105,6 +107,11 @@ pub struct Voice {
     last_digest: Option<(String, usize)>,
     /// Configured permission rules (first-match-wins).
     rules_cfg: Vec<crate::config::Rule>,
+    /// Configured hooks.
+    hooks_cfg: Vec<crate::config::Hook>,
+    /// Pathfinder bootstrap slot shared with the hand.
+    pathfinder_slot:
+        std::sync::Arc<parking_lot::RwLock<crate::hands::pathfinder::PathfinderSource>>,
 }
 
 impl Voice {
@@ -115,10 +122,13 @@ impl Voice {
         mode: ka_protocol::Mode,
         max_steps: u32,
     ) -> Self {
+        let slot = std::sync::Arc::new(parking_lot::RwLock::new(
+            crate::hands::pathfinder::PathfinderSource::default(),
+        ));
         Self {
             catalog,
             speakers: Default::default(),
-            hands: registry(),
+            hands: registry_with_pathfinder(slot.clone()),
             hand_ctx: HandContext {
                 cwd,
                 ledger: std::sync::Arc::new(parking_lot::Mutex::new(Ledger::default())),
@@ -135,12 +145,120 @@ impl Voice {
             digest_revision: 0,
             last_digest: None,
             rules_cfg: Vec::new(),
+            hooks_cfg: Vec::new(),
+            pathfinder_slot: slot,
         }
     }
 
-    /// Set configured permission rules (engine bootstrap).
+    /// Read-only research voice (pathfinder): inspect tools only.
+    pub fn new_readonly(
+        catalog: Catalog,
+        cwd: std::path::PathBuf,
+        mode: ka_protocol::Mode,
+        max_steps: u32,
+    ) -> Self {
+        let slot = std::sync::Arc::new(parking_lot::RwLock::new(
+            crate::hands::pathfinder::PathfinderSource::default(),
+        ));
+        let hands = crate::hands::registry_with_pathfinder(slot.clone());
+        let hand_ctx = HandContext {
+            cwd,
+            ledger: std::sync::Arc::new(parking_lot::Mutex::new(Ledger::default())),
+            spill: std::sync::Arc::new(Spill::new()),
+        };
+        Self {
+            catalog,
+            speakers: Default::default(),
+            hands,
+            hand_ctx,
+            state: VoiceState::default(),
+            max_steps,
+            mode,
+            history: Vec::new(),
+            model_selector: None,
+            ratio: 4.0,
+            digest: None,
+            last_context: 0,
+            digest_revision: 0,
+            last_digest: None,
+            rules_cfg: Vec::new(),
+            hooks_cfg: Vec::new(),
+            pathfinder_slot: slot,
+        }
+    }
+
+    /// Set configured permission rules + hooks (engine bootstrap).
     pub fn set_rules(&mut self, rules: Vec<crate::config::Rule>) {
         self.rules_cfg = rules;
+    }
+
+    /// The pathfinder's bootstrap slot (engine writes catalog/model).
+    pub fn pathfinder_slot(
+        &self,
+    ) -> std::sync::Arc<parking_lot::RwLock<crate::hands::pathfinder::PathfinderSource>> {
+        self.pathfinder_slot.clone()
+    }
+
+    /// Set configured hooks (engine bootstrap).
+    pub fn set_hooks(&mut self, hooks: Vec<crate::config::Hook>) {
+        self.hooks_cfg = hooks;
+    }
+
+    /// Run matching hooks for one event. Returns Err(reason) when a
+    /// pre_tool_use hook blocked the call (exit 2, stderr as reason).
+    async fn run_hooks(
+        &self,
+        event: crate::config::HookEvent,
+        tool: &str,
+        args: &serde_json::Value,
+    ) -> Result<(), String> {
+        use tokio::io::AsyncWriteExt;
+        for hook in &self.hooks_cfg {
+            if hook.event != event {
+                continue;
+            }
+            if let Some(t) = &hook.tool {
+                if t != tool {
+                    continue;
+                }
+            }
+            let payload = serde_json::json!({"tool": tool, "arguments": args});
+            let mut child = match tokio::process::Command::new("sh")
+                .arg("-c")
+                .arg(&hook.command)
+                .current_dir(&self.hand_ctx.cwd)
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+            {
+                Ok(c) => c,
+                Err(e) => return Err(format!("hook failed to spawn: {e}")),
+            };
+            let stdin_opt = child.stdin.take();
+            if let Some(mut stdin) = stdin_opt {
+                let _ = stdin.write_all(payload.to_string().as_bytes()).await;
+            }
+            let output = match tokio::time::timeout(
+                std::time::Duration::from_secs(30),
+                child.wait_with_output(),
+            )
+            .await
+            {
+                Ok(Ok(o)) => o,
+                Ok(Err(e)) => return Err(format!("hook failed: {e}")),
+                Err(_) => return Err("hook timed out after 30s".to_string()),
+            };
+            if output.status.code() == Some(2) {
+                let reason = String::from_utf8_lossy(&output.stderr).trim().to_string();
+                return Err(if reason.is_empty() {
+                    "blocked by hook".to_string()
+                } else {
+                    reason
+                });
+            }
+        }
+        Ok(())
     }
 
     /// Load resumed history + digest (engine bootstrap).
@@ -561,10 +679,32 @@ impl Voice {
 
         // Minimal system context: identity + read-only git awareness.
         let snap = crate::hands::git::RepoSnapshot::capture(&self.hand_ctx.cwd);
-        let mut system = format!(
-            "You are ka, a precise coding agent. {}. Use the provided tools to inspect and modify the repository; prefer read before edit.",
+        let mut system = String::new();
+        // AGENTS.md hierarchy (root→cwd)
+        for agents in crate::conventions::discover_agents(&self.hand_ctx.cwd) {
+            system.push_str(&format!(
+                "\n<project-instructions src=\"{}\">\n{}\n</project-instructions>\n",
+                agents.path.display(),
+                agents.content
+            ));
+        }
+        // skills: progressive disclosure — names/descriptions/paths only
+        let skills = crate::conventions::discover_skills(&self.hand_ctx.cwd);
+        if !skills.is_empty() {
+            system.push_str("\nAvailable skills (read the SKILL.md path with the read tool before using one):\n");
+            for sk in &skills {
+                system.push_str(&format!(
+                    "- {}: {} — {}\n",
+                    sk.name,
+                    sk.description,
+                    sk.path.display()
+                ));
+            }
+        }
+        system.push_str(&format!(
+            "\nYou are ka, a precise coding agent. {}. Use the provided tools to inspect and modify the repository; prefer read before edit.",
             snap.summary()
-        );
+        ));
         if let Some(d) = &self.digest {
             system.push_str(&format!(
                 "\n\nEarlier-conversation summary (this is your memory of prior turns — treat it as accurate ground truth):\n{d}"
@@ -802,6 +942,17 @@ impl Voice {
         let Some(hand) = self.hands.iter().find(|h| h.def().name == call.tool) else {
             return ToolOutput::err(format!("unknown tool {}", call.tool));
         };
+        // pre_tool_use hooks: exit 2 blocks before any gate
+        if let Err(reason) = self
+            .run_hooks(
+                crate::config::HookEvent::PreToolUse,
+                &call.tool,
+                &call.arguments,
+            )
+            .await
+        {
+            return ToolOutput::err(format!("blocked by hook: {reason}"));
+        }
         let def = hand.def();
         let verdict = self.gate(def.clearance, call);
         match verdict {
@@ -860,6 +1011,20 @@ impl Voice {
             }
         }
         let mut output = hand.execute(&call.arguments, &self.hand_ctx).await;
+        // post_tool_use hooks: exit 2 flags the result as an error
+        if let Err(reason) = self
+            .run_hooks(
+                crate::config::HookEvent::PostToolUse,
+                &call.tool,
+                &call.arguments,
+            )
+            .await
+        {
+            output.is_error = true;
+            output
+                .content
+                .push_str(&format!("\n[post-tool hook: {reason}]"));
+        }
         // one-way secret redaction before anything reaches the model
         output.content = crate::hands::secrets::redact(&output.content);
         output

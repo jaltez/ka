@@ -262,11 +262,19 @@ async fn run(
     let mode = config.effective_mode();
     let max_steps = config.effective_max_steps();
     let rules = config.rules.clone();
+    let hooks = config.hooks.clone();
+    let pathfinder_catalog = catalog.clone();
     let mut state = EngineState::from(config);
     let (history, ids, digest) = history_from_records(strand.records());
     let mut voice = Voice::new(catalog, cwd.clone(), mode, max_steps);
     voice.load_history(history, digest);
     voice.set_rules(rules);
+    voice.set_hooks(hooks);
+    {
+        let slot = voice.pathfinder_slot();
+        slot.write().catalog = pathfinder_catalog;
+        slot.write().model = state.model.clone();
+    }
     state.record_ids = ids;
     write_waypoint(&cwd, strand.path());
     // replay resumed history so surfaces can rebuild the transcript
@@ -315,6 +323,7 @@ async fn run(
             }
             Command::SetModel { selector } => {
                 state.model = Some(selector.clone());
+                voice.pathfinder_slot().write().model = Some(selector.clone());
                 let _ = strand.append(ka_strand::Record::Change {
                     id: ka_strand::new_record_id(),
                     model: Some(selector.clone()),

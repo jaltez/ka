@@ -17,6 +17,7 @@ pub mod edit;
 pub mod git;
 pub mod glob;
 pub mod grep;
+pub mod pathfinder;
 pub mod read;
 pub mod secrets;
 pub mod write;
@@ -216,6 +217,22 @@ pub fn registry() -> Vec<Box<dyn Hand>> {
         Box::new(bash::BashHand),
         Box::new(glob::GlobHand),
         Box::new(grep::GrepHand),
+        Box::new(pathfinder::PathfinderHand::new()),
+    ]
+}
+
+/// Registry with an externally-owned pathfinder bootstrap slot (engine).
+pub fn registry_with_pathfinder(
+    slot: std::sync::Arc<parking_lot::RwLock<pathfinder::PathfinderSource>>,
+) -> Vec<Box<dyn Hand>> {
+    vec![
+        Box::new(read::ReadHand),
+        Box::new(edit::EditHand),
+        Box::new(write::WriteHand),
+        Box::new(bash::BashHand),
+        Box::new(glob::GlobHand),
+        Box::new(grep::GrepHand),
+        Box::new(pathfinder::PathfinderHand::from_slot(slot)),
     ]
 }
 

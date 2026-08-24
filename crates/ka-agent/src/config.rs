@@ -23,6 +23,30 @@ pub struct Rule {
     pub verdict: Verdict,
 }
 
+/// One hook: a shell command run around tool calls.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct Hook {
+    /// When to run.
+    pub event: HookEvent,
+    /// Only this tool (None = every tool).
+    #[serde(default)]
+    pub tool: Option<String>,
+    /// Shell command. Receives JSON on stdin (tool name + arguments);
+    /// exit 2 blocks the call (pre_tool_use) with stderr as the reason.
+    pub command: String,
+}
+
+/// Hook trigger points.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum HookEvent {
+    /// Before a tool executes; exit 2 blocks it.
+    PreToolUse,
+    /// After a tool finished; exit 2 marks the result an error.
+    PostToolUse,
+}
+
 /// Rule verdicts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
@@ -67,6 +91,9 @@ pub struct Config {
     /// Permission rules, evaluated first-match-wins before mode logic.
     #[serde(default)]
     pub rules: Vec<Rule>,
+    /// Tool-call hooks (exit-2 block contract).
+    #[serde(default)]
+    pub hooks: Vec<Hook>,
 }
 
 impl Config {
@@ -103,6 +130,9 @@ impl Config {
         }
         if !other.rules.is_empty() {
             self.rules = other.rules;
+        }
+        if !other.hooks.is_empty() {
+            self.hooks = other.hooks;
         }
     }
 
@@ -217,6 +247,20 @@ mod tests {
         assert_eq!(c.rules[1].verdict, Verdict::Deny);
         // unknown verdict rejected
         let bad = Config::parse_layer("[[rules]]\ntool = \"bash\"\nverdict = \"maybe\"\n", "user");
+        assert!(bad.is_err());
+    }
+
+    #[test]
+    fn hooks_parse() {
+        let c = Config::parse_layer(
+            "[[hooks]]\nevent = \"pre_tool_use\"\ntool = \"bash\"\ncommand = \"guard.sh\"\n",
+            "user",
+        )
+        .unwrap();
+        assert_eq!(c.hooks.len(), 1);
+        assert_eq!(c.hooks[0].event, HookEvent::PreToolUse);
+        assert_eq!(c.hooks[0].tool.as_deref(), Some("bash"));
+        let bad = Config::parse_layer("[[hooks]]\nevent = \"whenever\"\ncommand = \"x\"\n", "u");
         assert!(bad.is_err());
     }
 

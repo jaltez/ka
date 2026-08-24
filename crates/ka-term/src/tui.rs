@@ -479,10 +479,45 @@ struct Slash {
     quit: bool,
 }
 
+/// Load a custom command body from `.ka/commands/<name>.md` (project) or
+/// the user dir; `$ARGUMENTS` substituted with the rest of the line.
+fn custom_command(head: &str, rest: Option<&str>) -> Option<String> {
+    let name = head.strip_prefix('/')?;
+    let cwd = std::env::current_dir().ok()?;
+    let mut candidates = vec![
+        cwd.join(format!(".ka/commands/{name}.md")),
+        cwd.join(format!(".agents/commands/{name}.md")),
+        cwd.join(format!(".claude/commands/{name}.md")),
+    ];
+    if let Ok(home) = std::env::var("HOME") {
+        candidates
+            .push(std::path::PathBuf::from(home).join(format!(".config/ka/commands/{name}.md")));
+    }
+    for path in candidates {
+        if let Ok(body) = std::fs::read_to_string(&path) {
+            let args = rest.unwrap_or("");
+            return Some(body.replace("$ARGUMENTS", args));
+        }
+    }
+    None
+}
+
 fn slash_command(text: &str) -> Option<Slash> {
     let mut parts = text.splitn(2, ' ');
     let head = parts.next()?.trim();
     let rest = parts.next().map(str::trim).filter(|s| !s.is_empty());
+    // custom commands load from files; builtins win over files
+    if !matches!(head, "/quit" | "/exit" | "/model" | "/mode" | "/compact") {
+        if let Some(body) = custom_command(head, rest) {
+            return Some(Slash {
+                event: Some(Command::Prompt {
+                    text: body,
+                    attachments: vec![],
+                }),
+                quit: false,
+            });
+        }
+    }
     match head {
         "/quit" | "/exit" => Some(Slash {
             event: None,
@@ -690,6 +725,21 @@ mod tests {
             f.contains("qwen3.5:9b") && f.contains("guarded") && f.contains("ctx 10%"),
             "{f}"
         );
+    }
+
+    #[test]
+    fn custom_command_loads_and_substitutes() {
+        let dir = std::env::temp_dir().join(format!("ka-cmd-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let cmds = dir.join(".ka/commands");
+        std::fs::create_dir_all(&cmds).unwrap();
+        std::fs::write(cmds.join("review.md"), "Review this diff: $ARGUMENTS").unwrap();
+        let prev = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&dir).unwrap();
+        let body = custom_command("/review", Some("src/main.rs")).unwrap();
+        assert_eq!(body, "Review this diff: src/main.rs");
+        std::env::set_current_dir(prev).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
