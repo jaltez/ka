@@ -307,6 +307,14 @@ pub enum Event {
         /// Selector that was applied.
         selector: String,
     },
+    /// The full prompt cycle (turn + settling) is complete; the engine is
+    /// idle. Long-lived surfaces keep running; one-shot surfaces may exit.
+    Idle,
+    /// Informational note (pruning/digest notices, etc.).
+    Note {
+        /// Note text.
+        message: String,
+    },
     /// Engine-level error report.
     Error {
         /// Error classification.
@@ -453,6 +461,9 @@ mod tests {
         });
         roundtrip_event(Event::ModelChanged {
             selector: "openai/gpt-5.1".into(),
+        });
+        roundtrip_event(Event::Note {
+            message: "pruned ~2k tokens".into(),
         });
         roundtrip_event(Event::Error {
             class: ErrorClass::Unsupported,

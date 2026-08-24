@@ -4,7 +4,7 @@
 
 use clap::{CommandFactory, Parser, Subcommand};
 use ka_agent::config::Config;
-use ka_agent::spawn_with;
+use ka_agent::spawn_full;
 use ka_dialect::Catalog;
 use ka_protocol::{Command, Event, Stop, to_line};
 use std::path::PathBuf;
@@ -64,6 +64,9 @@ enum CliCommand {
         /// Skip local-endpoint discovery probes
         #[arg(long)]
         no_discovery: bool,
+        /// Continue the newest strand for this directory
+        #[arg(short = 'c', long)]
+        continue_latest: bool,
     },
     /// List known models (embedded catalog + local discovery)
     Models {
@@ -214,7 +217,19 @@ async fn dispatch(cli: Cli) -> Result<ExitCode, String> {
             configs,
             dialects,
             no_discovery,
-        }) => run_headless(prompt, model, mode, &configs, &dialects, !no_discovery).await,
+            continue_latest,
+        }) => {
+            run_headless(
+                prompt,
+                model,
+                mode,
+                &configs,
+                &dialects,
+                !no_discovery,
+                continue_latest,
+            )
+            .await
+        }
         Some(CliCommand::Models {
             no_discovery,
             dialects,
@@ -272,6 +287,7 @@ async fn run_headless(
     configs: &[PathBuf],
     dialects: &[PathBuf],
     with_discovery: bool,
+    continue_latest: bool,
 ) -> Result<ExitCode, String> {
     let cfg = load_config(configs, model, mode)?;
     let prompt = match prompt {
@@ -283,7 +299,12 @@ async fn run_headless(
     }
 
     let catalog = build_catalog(dialects, with_discovery).await?;
-    let mut handle = spawn_with(cfg, catalog);
+    let choice = if continue_latest {
+        ka_agent::StrandChoice::Latest
+    } else {
+        ka_agent::StrandChoice::New
+    };
+    let mut handle = spawn_full(cfg, catalog, choice);
     handle
         .commands
         .send(Command::Prompt {
@@ -310,9 +331,10 @@ async fn run_headless(
                 .await
                 .map_err(|_| "engine closed during ask")?;
         }
-        if let Event::TurnFinished { stop, .. } = &event {
-            final_stop = Some(*stop);
-            break;
+        match &event {
+            Event::TurnFinished { stop, .. } => final_stop = Some(*stop),
+            Event::Idle => break,
+            _ => {}
         }
     }
     std::io::Write::flush(&mut stdout).map_err(|e| format!("stdout: {e}"))?;

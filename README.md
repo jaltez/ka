@@ -2,7 +2,7 @@
 
 A model-agnostic, very-low-footprint coding agent in Rust.
 
-**Status: Phase 3 (strands & TUI).** Design: [`research/ka/architecture.md`](research/ka/architecture.md) · Roadmap: [`research/ka/roadmap.md`](research/ka/roadmap.md)
+**Status: Phase 4 (context survival).** Design: [`research/ka/architecture.md`](research/ka/architecture.md) · Roadmap: [`research/ka/roadmap.md`](research/ka/roadmap.md)
 
 ## Footprint contract (CI-enforced target)
 Single static binary ≤ 10 MB (musl, stripped) · cold start ≤ 50 ms · idle RSS ≤ 15 MB · zero steady-state network.

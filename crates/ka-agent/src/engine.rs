@@ -98,12 +98,21 @@ fn repo_snapshot(cwd: &std::path::Path) -> Option<ka_strand::RepoSnapshot> {
     })
 }
 
-/// Convert persisted records into neutral conversation history.
-fn history_from_records(records: &[ka_strand::Record]) -> Vec<ka_dialect::speaker::TurnMessage> {
+/// Convert persisted records into conversation history + active digest.
+/// Digest records reset the accumulated history (the summary carries it).
+fn history_from_records(
+    records: &[ka_strand::Record],
+) -> (
+    Vec<ka_dialect::speaker::TurnMessage>,
+    Vec<ka_protocol::RecordId>,
+    Option<String>,
+) {
     use ka_dialect::speaker::{ToolCall, ToolResult, TurnMessage, TurnRole};
-    records
-        .iter()
-        .filter_map(|r| match r {
+    let mut out: Vec<TurnMessage> = Vec::new();
+    let mut ids: Vec<ka_protocol::RecordId> = Vec::new();
+    let mut digest: Option<String> = None;
+    for r in records {
+        match r {
             ka_strand::Record::Message {
                 role,
                 content,
@@ -116,7 +125,10 @@ fn history_from_records(records: &[ka_strand::Record]) -> Vec<ka_dialect::speake
                     ka_strand::Role::Assistant | ka_strand::Role::System => TurnRole::Assistant,
                     ka_strand::Role::Tool => TurnRole::Tool,
                 };
-                Some(TurnMessage {
+                if let Some(id) = r.id() {
+                    ids.push(id.clone());
+                }
+                out.push(TurnMessage {
                     role: turn_role,
                     content: content.clone(),
                     calls: calls
@@ -135,11 +147,23 @@ fn history_from_records(records: &[ka_strand::Record]) -> Vec<ka_dialect::speake
                             is_error: r.is_error,
                         })
                         .collect(),
-                })
+                });
             }
-            _ => None,
-        })
-        .collect()
+            ka_strand::Record::Digest { summary, .. } => {
+                // everything before the digest is carried by its summary
+                out.clear();
+                ids.clear();
+                digest = Some(summary.clone());
+            }
+            ka_strand::Record::Boundary { .. } => {
+                out.clear();
+                ids.clear();
+                digest = None;
+            }
+            _ => {}
+        }
+    }
+    (out, ids, digest)
 }
 
 /// Convert one neutral history message into a persistable record.
@@ -183,7 +207,9 @@ struct EngineState {
     mode: Mode,
     deferrals: VecDeque<String>,
     interjections: Vec<String>,
-    history: Vec<ka_dialect::speaker::TurnMessage>,
+    /// Record ids of persisted history messages, aligned with
+    /// voice.history[..record_ids.len()] (mod digest truncation).
+    record_ids: Vec<ka_protocol::RecordId>,
 }
 
 impl From<Config> for EngineState {
@@ -195,7 +221,7 @@ impl From<Config> for EngineState {
             mode,
             deferrals: VecDeque::new(),
             interjections: Vec::new(),
-            history: Vec::new(),
+            record_ids: Vec::new(),
         }
     }
 }
@@ -236,12 +262,14 @@ async fn run(
     let mode = config.effective_mode();
     let max_steps = config.effective_max_steps();
     let mut state = EngineState::from(config);
-    state.history = history_from_records(strand.records());
+    let (history, ids, digest) = history_from_records(strand.records());
     let mut voice = Voice::new(catalog, cwd.clone(), mode, max_steps);
+    voice.load_history(history, digest);
+    state.record_ids = ids;
     write_waypoint(&cwd, strand.path());
     // replay resumed history so surfaces can rebuild the transcript
-    if !state.history.is_empty() {
-        let messages = state
+    if !voice.history.is_empty() {
+        let messages = voice
             .history
             .iter()
             .filter(|m| !m.content.trim().is_empty())
@@ -267,6 +295,7 @@ async fn run(
                     &mut strand,
                 )
                 .await;
+                settle_context(&mut voice, &mut state, &mut strand, &events).await;
                 // Settling: drain deferrals as follow-on turns.
                 while let Some(deferred) = state.deferrals.pop_front() {
                     dispatch_turn(
@@ -278,7 +307,9 @@ async fn run(
                         &mut strand,
                     )
                     .await;
+                    settle_context(&mut voice, &mut state, &mut strand, &events).await;
                 }
+                events.send(Event::Idle).await.ok();
             }
             Command::SetModel { selector } => {
                 state.model = Some(selector.clone());
@@ -307,6 +338,107 @@ async fn run(
     Ok(())
 }
 
+/// Post-turn context maintenance: prune old tool outputs, digest while
+/// the window is under pressure.
+async fn settle_context(
+    voice: &mut Voice,
+    state: &mut EngineState,
+    strand: &mut ka_strand::StrandFile,
+    events: &mpsc::Sender<Event>,
+) {
+    let window = voice.window_tokens();
+    let ratio = voice_ratio(voice);
+    let saved = voice.prune_tool_outputs(ratio);
+    if std::env::var("KA_DEBUG_SETTLE").is_ok() {
+        eprintln!(
+            "[settle] window={window} ratio={ratio} last_context={} pressure={}",
+            voice.debug_last_context(),
+            voice.context_pressure(window)
+        );
+    }
+    if saved > 0 {
+        events
+            .send(Event::Note {
+                message: format!("pruned ~{saved} tokens of old tool output"),
+            })
+            .await
+            .ok();
+    }
+    let mut digests = 0;
+    while voice.context_pressure(window) && digests < 3 {
+        digests += 1;
+        match run_digest(voice, state, strand, events, None).await {
+            DigestResult::Digested => continue,
+            DigestResult::NoModel => break,
+        }
+    }
+}
+
+async fn run_digest(
+    voice: &mut Voice,
+    state: &mut EngineState,
+    strand: &mut ka_strand::StrandFile,
+    events: &mpsc::Sender<Event>,
+    focus: Option<String>,
+) -> DigestResult {
+    let Some(model) = voice.model_selector_cloned() else {
+        events
+            .send(Event::Error {
+                class: ErrorClass::Unsupported,
+                retryable: false,
+                message: "compact needs an active model".to_string(),
+            })
+            .await
+            .ok();
+        return DigestResult::NoModel;
+    };
+    let _ = model;
+    events.send(Event::DigestStarted).await.ok();
+    let ratio = voice_ratio(voice);
+    match voice
+        .summarize(focus.as_deref(), std::time::Duration::from_secs(120))
+        .await
+    {
+        Some(summary) => {
+            let kept = voice.apply_digest(summary, ratio);
+            let _ = kept;
+            persist_delta(voice, state, strand);
+            events
+                .send(Event::Note {
+                    message: "context digested".to_string(),
+                })
+                .await
+                .ok();
+            DigestResult::Digested
+        }
+        None => {
+            // Mechanical fallback: keep the recent tail with a truncation
+            // note. Guarantees progress when the summarizer cannot fit.
+            events
+                .send(Event::Note {
+                    message: "digest summarizer unavailable; truncating to recent tail".to_string(),
+                })
+                .await
+                .ok();
+            let summary = "Earlier conversation was truncated automatically (summarizer \
+unavailable). The most recent exchange follows; re-read files you need."
+                .to_string();
+            voice.apply_digest(summary, ratio);
+            persist_delta(voice, state, strand);
+            DigestResult::Digested
+        }
+    }
+}
+
+enum DigestResult {
+    Digested,
+    NoModel,
+}
+
+fn voice_ratio(voice: &Voice) -> f64 {
+    voice.model_ratio()
+}
+
 /// Route one prompt through the live voice when a model is configured,
 /// else the canned speaker.
 async fn dispatch_turn(
@@ -317,12 +449,10 @@ async fn dispatch_turn(
     text: String,
     strand: &mut ka_strand::StrandFile,
 ) {
-    let before = state.history.len();
     if let Some(model) = state.model.clone() {
         voice
             .turn(
                 &model,
-                &mut state.history,
                 text,
                 commands,
                 events,
@@ -331,11 +461,36 @@ async fn dispatch_turn(
             )
             .await;
     } else {
-        turn_canned(commands, events, state, text).await;
+        let mut history = std::mem::take(&mut voice.history);
+        turn_canned(commands, events, state, &mut history, text).await;
+        voice.history = history;
     }
-    // persist the conversation delta
-    for msg in state.history.get(before..).unwrap_or(&[]) {
-        let _ = strand.append(record_from_message(msg));
+    persist_delta(voice, state, strand);
+}
+
+/// Persist any pending digest (as a Digest record) and the history delta.
+fn persist_delta(voice: &mut Voice, state: &mut EngineState, strand: &mut ka_strand::StrandFile) {
+    if let Some((summary, kept, _rev)) = voice.take_pending_digest() {
+        let kept_from = state
+            .record_ids
+            .get(kept)
+            .cloned()
+            .unwrap_or_else(ka_strand::new_record_id);
+        let _ = strand.append(ka_strand::Record::Digest {
+            id: ka_strand::new_record_id(),
+            summary,
+            kept_from,
+        });
+        state.record_ids = state.record_ids.get(kept..).unwrap_or(&[]).to_vec();
+    }
+    while state.record_ids.len() < voice.history.len() {
+        let record = record_from_message(&voice.history[state.record_ids.len()]);
+        let _ = strand.append(record.clone());
+        if let Some(id) = record.id() {
+            state.record_ids.push(id.clone());
+        } else {
+            break;
+        }
     }
 }
 
@@ -416,6 +571,7 @@ async fn turn_canned(
     commands: &mut mpsc::Receiver<Command>,
     events: &mpsc::Sender<Event>,
     state: &mut EngineState,
+    history: &mut Vec<ka_dialect::speaker::TurnMessage>,
     text: String,
 ) {
     let est_in = (text.len() as u64).div_ceil(4);
@@ -429,9 +585,7 @@ async fn turn_canned(
         .await
         .ok();
 
-    state
-        .history
-        .push(ka_dialect::speaker::TurnMessage::user(text.clone()));
+    history.push(ka_dialect::speaker::TurnMessage::user(text.clone()));
     let chunks = canned::reply(&text);
     let mut idx = 0;
     let mut aborted = false;
@@ -485,9 +639,7 @@ async fn turn_canned(
         .map(|c: &String| c.len() as u64)
         .sum::<u64>()
         .div_ceil(4);
-    state
-        .history
-        .push(ka_dialect::speaker::TurnMessage::assistant(chunks.concat()));
+    history.push(ka_dialect::speaker::TurnMessage::assistant(chunks.concat()));
     events
         .send(Event::TurnFinished {
             stop: Stop::Done,

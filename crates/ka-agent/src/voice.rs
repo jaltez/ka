@@ -8,7 +8,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 
 use ka_dialect::dialects::{Catalog, Wire};
 use ka_dialect::speaker::{
-    SpeakRequest, Speaker, StreamEvent, ToolCall, ToolResult, ToolSpec, TurnMessage,
+    SpeakRequest, Speaker, StreamEvent, ToolCall, ToolResult, ToolSpec, TurnMessage, TurnRole,
 };
 use ka_protocol::{AskId, AskQuestion, Command, ErrorClass, Event, Stop, Usage};
 use tokio::sync::mpsc;
@@ -27,6 +27,41 @@ pub struct VoiceState {
     pub loop_counts: HashMap<String, usize>,
 }
 
+// Context-survival knobs (Phase 4 defaults; config knobs later).
+/// Tokens of recent tool outputs protected from pruning.
+const PROTECT_WINDOW_TOKENS: u64 = 40_000;
+/// Minimum estimated savings before pruning fires.
+const MIN_PRUNE_SAVINGS: u64 = 20_000;
+/// Tokens of history the digest keeps after the summary.
+const KEEP_TAIL_TOKENS: u64 = 20_000;
+/// Digest reserve floor.
+const RESERVE_FLOOR: u64 = 16_384;
+/// Digest reserve fraction of the window (15%).
+const RESERVE_PCT: u64 = 15;
+
+const DIGEST_SYSTEM: &str = "You are a context digester. Summarize the conversation so a \
+continuing agent can pick up exactly where it left off. Preserve: the \
+task and its current state, key decisions and their reasons, file paths \
+touched (read vs modified), open threads and next steps, and any \
+user-stated constraints. Be dense; skip pleasantries. Output only the \
+summary.";
+
+/// Rough token estimate for one message under a chars-per-token ratio.
+fn message_tokens(msg: &TurnMessage, ratio: f64) -> u64 {
+    let chars = msg.content.chars().count() as u64
+        + msg
+            .calls
+            .iter()
+            .map(|c| c.arguments.to_string().chars().count() as u64 + c.tool.chars().count() as u64)
+            .sum::<u64>()
+        + msg
+            .results
+            .iter()
+            .map(|r| r.content.chars().count() as u64)
+            .sum::<u64>();
+    (chars as f64 / ratio.max(0.1)) as u64
+}
+
 /// Everything needed to speak to real models and act on the world.
 pub struct Voice {
     catalog: Catalog,
@@ -36,6 +71,20 @@ pub struct Voice {
     pub(crate) state: VoiceState,
     max_steps: u32,
     mode: ka_protocol::Mode,
+    /// Conversation history (owned by the voice; engine persists deltas).
+    pub history: Vec<TurnMessage>,
+    /// Active model selector (set per turn; needed by settle-time digests).
+    model_selector: Option<String>,
+    /// Chars-per-token ratio of the active model (estimates).
+    ratio: f64,
+    /// Active digest summary (prepended to requests, not part of history).
+    digest: Option<String>,
+    /// Last measured context consumption (tokens, from provider usage).
+    last_context: u64,
+    /// Bumped every time a digest replaces history.
+    digest_revision: u64,
+    /// (summary, kept index) of the most recent digest, for persistence.
+    last_digest: Option<(String, usize)>,
 }
 
 impl Voice {
@@ -58,12 +107,338 @@ impl Voice {
             state: VoiceState::default(),
             max_steps,
             mode,
+            history: Vec::new(),
+            model_selector: None,
+            ratio: 4.0,
+            digest: None,
+            last_context: 0,
+            digest_revision: 0,
+            last_digest: None,
         }
+    }
+
+    /// Load resumed history + digest (engine bootstrap).
+    pub fn load_history(&mut self, history: Vec<TurnMessage>, digest: Option<String>) {
+        self.history = history;
+        self.digest = digest;
+    }
+
+    /// Set the active model selector + ratio (engine forwards each turn
+    /// and before settle-time digests).
+    #[allow(dead_code)]
+    pub fn set_model_selector(&mut self, selector: &str, ratio: f64) {
+        self.model_selector = Some(selector.to_string());
+        self.ratio = if ratio > 0.0 { ratio } else { 4.0 };
+    }
+
+    /// Restore a digest from a resumed strand.
+    #[allow(dead_code)]
+    pub fn set_digest(&mut self, summary: String) {
+        self.digest = Some(summary);
+    }
+
+    /// Context-window pressure check against the active dialect.
+    pub fn context_pressure(&self, window: u64) -> bool {
+        if window == 0 {
+            return false; // unknown window: never auto-digest
+        }
+        // omp rule: reserve is the 16k floor when practical, but never
+        // more than a quarter of small windows (proportional reserve)
+        let proportional = window * RESERVE_PCT / 100;
+        let reserve = proportional.max(RESERVE_FLOOR.min(window / 4));
+        self.last_context + KEEP_TAIL_TOKENS.min(window / 4) > window.saturating_sub(reserve)
+    }
+
+    /// Blank old tool-result bodies in history beyond the protected
+    /// window. In-memory only — strands keep the full originals, so
+    /// pruning re-applies deterministically after resume.
+    pub fn prune_tool_outputs(&mut self, ratio: f64) -> u64 {
+        let sizes: Vec<u64> = self.history_sizes(ratio);
+        let total: u64 = sizes.iter().sum();
+        let mut cut = self.history.len();
+        let mut protected: u64 = 0;
+        // walk backwards protecting the recent window (all message kinds)
+        for i in (0..self.history.len()).rev() {
+            if protected >= PROTECT_WINDOW_TOKENS {
+                break;
+            }
+            protected = protected.saturating_add(sizes[i]);
+            cut = i;
+        }
+        // candidates: tool results strictly older than `cut`
+        let mut savings = 0u64;
+        let mut replacements: Vec<(usize, usize, String)> = Vec::new();
+        for (i, msg) in self.history.iter().enumerate() {
+            if i >= cut {
+                break;
+            }
+            if msg.role != TurnRole::Tool {
+                continue;
+            }
+            for (j, result) in msg.results.iter().enumerate() {
+                let tokens = (result.content.chars().count() as f64 / ratio.max(0.1)) as u64;
+                if tokens > 8 {
+                    savings += tokens;
+                    replacements.push((i, j, result.content.clone()));
+                }
+            }
+        }
+        if savings < MIN_PRUNE_SAVINGS {
+            return 0;
+        }
+        for (i, j, original) in replacements.iter().map(|(i, j, o)| (*i, *j, o.clone())) {
+            let parked = self.hand_ctx.spill.park(&original).ok();
+            let note = match parked {
+                Some(ptr) => format!("[pruned output; full text at {ptr}]"),
+                None => "[pruned output]".to_string(),
+            };
+            if let Some(result) = self.history[i].results.get_mut(j) {
+                result.content = note;
+            }
+        }
+        let _ = total;
+        savings
+    }
+
+    fn history_sizes(&self, ratio: f64) -> Vec<u64> {
+        self.history
+            .iter()
+            .map(|m| message_tokens(m, ratio))
+            .collect()
+    }
+
+    /// Bound each message so the summarizer request fits even when the
+    /// conversation dwarfs the model's real window: head+tail per content,
+    /// capped tool noise (snapcompact-style serialization, text-only).
+    fn summarizer_view(m: &TurnMessage) -> TurnMessage {
+        let cap = |s: &str| -> String {
+            const HEAD: usize = 600;
+            const TAIL: usize = 300;
+            if s.chars().count() <= HEAD + TAIL {
+                return s.to_string();
+            }
+            let head: String = s.chars().take(HEAD).collect();
+            let tail: String = s
+                .chars()
+                .rev()
+                .take(TAIL)
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect();
+            format!(
+                "{head}\n…[truncated {} chars]…\n{tail}",
+                s.chars().count() - HEAD - TAIL
+            )
+        };
+        TurnMessage {
+            role: m.role,
+            content: cap(&m.content),
+            calls: m
+                .calls
+                .iter()
+                .map(|c| {
+                    let mut cl = c.clone();
+                    cl.arguments = serde_json::Value::String(cap(&c.arguments.to_string()));
+                    cl
+                })
+                .collect(),
+            results: m
+                .results
+                .iter()
+                .map(|r| {
+                    let mut rl = r.clone();
+                    rl.content = cap(&rl.content);
+                    rl
+                })
+                .collect(),
+        }
+    }
+    /// Summarize the conversation with the active model (same-model
+    /// digest). Returns the summary text.
+    pub async fn summarize(
+        &mut self,
+        focus: Option<&str>,
+        window_deadline: std::time::Duration,
+    ) -> Option<String> {
+        let model_id = self.model_selector.clone()?;
+        let dialect = self.catalog.get(&model_id).cloned()?;
+        let token = dialect
+            .api_key_env
+            .as_deref()
+            .and_then(ka_dialect::auth::resolve_token);
+        let ratio = if dialect.ratio > 0.0 {
+            dialect.ratio as f64
+        } else {
+            4.0
+        };
+        let system = match focus {
+            Some(f) => format!("{DIGEST_SYSTEM}\n\nFocus: {f}"),
+            None => DIGEST_SYSTEM.to_string(),
+        };
+        let mut messages = Vec::new();
+        if let Some(d) = &self.digest {
+            messages.push(TurnMessage::user(format!("<context-digest>\n{d}")));
+        }
+        messages.extend(self.history.iter().map(Voice::summarizer_view));
+        // never end on an assistant message: several OpenAI-compatible
+        // servers treat it as prefill and emit nothing
+        messages.push(TurnMessage::user(
+            "Summarize the conversation above now, in at most 300 words.",
+        ));
+        let req = SpeakRequest {
+            model_id,
+            dialect: dialect.clone(),
+            effort: None,
+            system,
+            messages,
+            tools: Vec::new(),
+            token,
+            cache_key: None,
+        };
+        let speaker = self.speaker(dialect.wire);
+        let (tx, mut rx) = mpsc::channel::<StreamEvent>(256);
+        {
+            let speaker = speaker.clone();
+            tokio::spawn(async move {
+                speaker.speak(req, tx).await;
+            });
+        }
+        let mut text = String::new();
+        let mut thought = String::new();
+        let mut failure: Option<String> = None;
+        let _ = ratio;
+        let _ = tokio::time::timeout(window_deadline, async {
+            while let Some(evt) = rx.recv().await {
+                match evt {
+                    StreamEvent::Text(t) => text.push_str(&t),
+                    StreamEvent::Thought(t) => thought.push_str(&t),
+                    StreamEvent::Finished { .. } => break,
+                    StreamEvent::Failed { message, .. } => {
+                        failure = Some(message);
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+        })
+        .await;
+        // prefer the model's final text; thinking models sometimes only
+        // reason — fall back to a trimmed tail of the reasoning channel
+        // (thinking converges to conclusions at the end)
+        let mut summary = text;
+        if summary.trim().is_empty() && !thought.trim().is_empty() {
+            const HEAD: usize = 200;
+            const TAIL: usize = 1_200;
+            let chars: Vec<char> = thought.chars().collect();
+            summary = if chars.len() <= HEAD + TAIL {
+                thought
+            } else {
+                let head: String = chars[..HEAD].iter().collect();
+                let tail: String = chars[chars.len() - TAIL..].iter().collect();
+                format!("{head}\n…[thinking trimmed]…\n{tail}")
+            };
+        }
+        if std::env::var("KA_DEBUG_SETTLE").is_ok() {
+            eprintln!("[summarize] chars={} failure={:?}", summary.len(), failure);
+        }
+        (!summary.trim().is_empty()).then_some(summary)
+    }
+
+    /// Replace history with the digest summary + kept tail. Returns the
+    /// kept index into the OLD history (for Digest-record persistence).
+    pub fn apply_digest(&mut self, summary: String, ratio: f64) -> usize {
+        let sizes = self.history_sizes(ratio);
+        let total: u64 = sizes.iter().sum();
+        // clamp the tail to the window: pathological tiny windows must not
+        // keep more than they can hold
+        let window = self.window_tokens();
+        let tail_cap = if window > 0 {
+            (window / 4).max(1_000)
+        } else {
+            KEEP_TAIL_TOKENS
+        };
+        let mut budget = KEEP_TAIL_TOKENS.min(tail_cap).min(total);
+        // walk from the end, then advance the cut to the next user message
+        // so a turn is never split (also keeps tool pairs intact).
+        let mut cut = self.history.len();
+        let mut acc: u64 = 0;
+        for i in (0..self.history.len()).rev() {
+            if acc >= budget {
+                cut = i + 1;
+                break;
+            }
+            acc += sizes[i];
+            cut = i;
+        }
+        let _ = &mut budget;
+        while cut < self.history.len() && self.history[cut].role != TurnRole::User {
+            cut += 1;
+        }
+        let kept_from = cut.min(self.history.len());
+        let kept_tokens: u64 = sizes.get(kept_from..).map(|s| s.iter().sum()).unwrap_or(0);
+        self.history.drain(..kept_from);
+        self.digest = Some(summary.clone());
+        self.digest_revision += 1;
+        self.last_digest = Some((summary, kept_from));
+        // pressure reflects the real post-digest estimate: the persistent
+        // digest only — the pressure formula already adds the tail budget
+        let digest_tokens =
+            (self.digest.as_deref().map_or(0, str::len) as u64).div_ceil(ratio.max(0.1) as u64);
+        let _ = kept_tokens;
+        self.last_context = digest_tokens;
+        kept_from
+    }
+
+    /// Context window of the active model (0 = unknown).
+    pub fn window_tokens(&self) -> u64 {
+        let Some(model_id) = &self.model_selector else {
+            return 0;
+        };
+        self.catalog
+            .get(model_id)
+            .map(|d| d.context as u64)
+            .unwrap_or(0)
+    }
+
+    /// Clone of the active model selector.
+    pub fn model_selector_cloned(&self) -> Option<String> {
+        self.model_selector.clone()
+    }
+
+    /// Chars-per-token ratio of the active model.
+    pub fn model_ratio(&self) -> f64 {
+        self.ratio
+    }
+
+    /// Debug accessor for the last measured context.
+    #[doc(hidden)]
+    pub fn debug_last_context(&self) -> u64 {
+        self.last_context
+    }
+
+    /// Test hook: pretend the provider just reported this context size.
+    #[doc(hidden)]
+    #[allow(dead_code)]
+    pub fn note_context_for_tests(&mut self, tokens: u64) {
+        self.last_context = tokens;
+    }
+
+    /// Consume the pending digest outcome for persistence.
+    pub fn take_pending_digest(&mut self) -> Option<(String, usize, u64)> {
+        let (summary, kept) = self.last_digest.take()?;
+        Some((summary, kept, self.digest_revision))
     }
 
     /// Update the permission mode (engine forwards `SetMode`).
     pub fn set_mode(&mut self, mode: ka_protocol::Mode) {
         self.mode = mode;
+    }
+
+    /// Messages as sent on the wire: the conversation (the digest rides
+    /// in the system prompt as authoritative memory).
+    fn speak_messages(&self) -> Vec<TurnMessage> {
+        self.history.clone()
     }
 
     fn speaker(&mut self, wire: Wire) -> std::sync::Arc<dyn Speaker> {
@@ -100,7 +475,6 @@ impl Voice {
     pub async fn turn(
         &mut self,
         model_selector: &str,
-        history: &mut Vec<TurnMessage>,
         prompt: String,
         commands: &mut mpsc::Receiver<Command>,
         events: &mpsc::Sender<Event>,
@@ -149,17 +523,29 @@ impl Voice {
 
         // Minimal system context: identity + read-only git awareness.
         let snap = crate::hands::git::RepoSnapshot::capture(&self.hand_ctx.cwd);
-        let system = format!(
+        let mut system = format!(
             "You are ka, a precise coding agent. {}. Use the provided tools to inspect and modify the repository; prefer read before edit.",
             snap.summary()
         );
+        if let Some(d) = &self.digest {
+            system.push_str(&format!(
+                "\n\nEarlier-conversation summary (this is your memory of prior turns — treat it as accurate ground truth):\n{d}"
+            ));
+        }
 
-        history.push(TurnMessage::user(prompt));
+        self.model_selector = Some(model_selector.to_string());
+        self.ratio = if dialect.ratio > 0.0 {
+            dialect.ratio as f64
+        } else {
+            4.0
+        };
+        self.history.push(TurnMessage::user(prompt));
         self.state.loop_counts.clear();
         let mut usage_total = Usage::default();
         let mut assistant_text = String::new();
         let mut final_stop = Stop::Done;
         let mut steps = 0u32;
+        let mut overflow_retried = false;
 
         'outer: loop {
             let req = SpeakRequest {
@@ -167,7 +553,7 @@ impl Voice {
                 dialect: dialect.clone(),
                 effort: parsed.effort.clone(),
                 system: system.clone(),
-                messages: history.clone(),
+                messages: self.speak_messages(),
                 tools: self.specs(),
                 token: token.clone(),
                 cache_key: None,
@@ -237,6 +623,10 @@ impl Voice {
                                 usage_total.output += usage.output;
                                 usage_total.cache_read += usage.cache_read;
                                 usage_total.cache_write += usage.cache_write;
+                                self.last_context = usage.input
+                                    + usage.cache_read
+                                    + usage.cache_write
+                                    + usage.output;
                                 final_stop = stop;
                                 step_finished = true;
                             }
@@ -251,6 +641,18 @@ impl Voice {
             }
 
             if let Some((class, message)) = step_failed {
+                // Overflow → digest-and-retry once.
+                if class == ErrorClass::Overflow && !overflow_retried {
+                    overflow_retried = true;
+                    events.send(Event::DigestStarted).await.ok();
+                    if let Some(summary) = self
+                        .summarize(None, std::time::Duration::from_secs(120))
+                        .await
+                    {
+                        self.apply_digest(summary, self.ratio);
+                        continue 'outer;
+                    }
+                }
                 events
                     .send(Event::Error {
                         class,
@@ -267,7 +669,7 @@ impl Voice {
             }
 
             // Execute this step's calls; ordered results.
-            history.push(TurnMessage::assistant_with_calls(
+            self.history.push(TurnMessage::assistant_with_calls(
                 step_text.clone(),
                 step_calls.clone(),
             ));
@@ -318,7 +720,7 @@ impl Voice {
                     is_error: output.is_error,
                 });
             }
-            history.push(TurnMessage::tool(results));
+            self.history.push(TurnMessage::tool(results));
             steps += 1;
             if final_stop == Stop::Length {
                 break 'outer;
@@ -335,11 +737,12 @@ impl Voice {
         usage_total.cost = cost_of(&usage_total, price);
 
         if final_stop != Stop::Aborted {
-            history.push(TurnMessage::assistant(if assistant_text.is_empty() {
-                "(no text)".to_string()
-            } else {
-                assistant_text.clone()
-            }));
+            self.history
+                .push(TurnMessage::assistant(if assistant_text.is_empty() {
+                    "(no text)".to_string()
+                } else {
+                    assistant_text.clone()
+                }));
         }
         events
             .send(Event::TurnFinished {
@@ -615,7 +1018,6 @@ mod tests {
 
         let (cmd_tx, mut cmd_rx) = mpsc::channel(16);
         let (evt_tx, mut evt_rx) = mpsc::channel(256);
-        let mut history = Vec::new();
         let mut interjections = Vec::new();
         let mut deferrals = std::collections::VecDeque::new();
 
@@ -623,7 +1025,6 @@ mod tests {
             voice
                 .turn(
                     "test/m",
-                    &mut history,
                     "read the file".into(),
                     &mut cmd_rx,
                     &evt_tx,
@@ -669,6 +1070,273 @@ mod tests {
         assert!(result.content.contains("ROUNDTRIP-CONTENT"));
         assert!(!result.is_error);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn prune_blanks_old_tool_outputs_beyond_window() {
+        use ka_dialect::speaker::{ToolCall, ToolResult, TurnMessage, TurnRole};
+        let catalog = Catalog::parse(
+            "[dialects.\"test/m\"]\nwire = \"openai_chat\"\nbase_url = \"http://127.0.0.1:1\"\ncontext = 1000\nratio = 1.0\n",
+        )
+        .unwrap();
+        let dir = std::env::temp_dir();
+        let mut voice = Voice::new(catalog, dir.clone(), ka_protocol::Mode::Guarded, 5);
+        // ratio 1.0 → tokens == chars
+        let big = "x".repeat(30_000); // 30k tokens
+        voice.history.push(TurnMessage::user("start"));
+        voice.history.push(TurnMessage::assistant_with_calls(
+            "working",
+            vec![ToolCall {
+                id: "c1".into(),
+                tool: "bash".into(),
+                arguments: Default::default(),
+            }],
+        ));
+        voice.history.push(TurnMessage::tool(vec![ToolResult {
+            call_id: "c1".into(),
+            content: big.clone(),
+            is_error: false,
+        }]));
+        // recent large exchange: fills the 40k protect window so the old
+        // tool result falls outside it
+        voice
+            .history
+            .push(TurnMessage::user(format!("recent {}", "r".repeat(45_000))));
+        voice.history.push(TurnMessage::assistant("tail"));
+
+        let saved = voice.prune_tool_outputs(1.0);
+        assert!(saved >= 20_000, "savings {saved}");
+        let tool_msg = voice
+            .history
+            .iter()
+            .find(|m| m.role == TurnRole::Tool)
+            .unwrap();
+        let content = &tool_msg.results[0].content;
+        assert!(content.starts_with("[pruned output"), "{content}");
+        assert!(content.contains("spill://"), "{content}");
+        assert!(
+            voice.history[3].content.starts_with("recent"),
+            "recent messages untouched"
+        );
+        assert_eq!(voice.history[4].content, "tail");
+    }
+
+    #[test]
+    fn prune_skips_when_savings_below_threshold() {
+        let catalog = Catalog::parse(
+            "[dialects.\"test/m\"]\nwire = \"openai_chat\"\nbase_url = \"http://127.0.0.1:1\"\ncontext = 1000\n",
+        )
+        .unwrap();
+        let mut voice = Voice::new(catalog, std::env::temp_dir(), ka_protocol::Mode::Guarded, 5);
+        voice.set_model_selector("test/m", 1.0);
+        use ka_dialect::speaker::{ToolCall, ToolResult, TurnMessage};
+        voice.history.push(TurnMessage::user("q"));
+        voice.history.push(TurnMessage::assistant_with_calls(
+            "",
+            vec![ToolCall {
+                id: "c".into(),
+                tool: "read".into(),
+                arguments: Default::default(),
+            }],
+        ));
+        voice.history.push(TurnMessage::tool(vec![ToolResult {
+            call_id: "c".into(),
+            content: "tiny".to_string(),
+            is_error: false,
+        }]));
+        let saved = voice.prune_tool_outputs(1.0);
+        assert_eq!(saved, 0, "tiny outputs must not be pruned");
+        assert_eq!(voice.history[2].results[0].content, "tiny");
+    }
+
+    #[test]
+    fn apply_digest_cuts_at_user_boundary_and_keeps_tail() {
+        use ka_dialect::speaker::{ToolCall, ToolResult, TurnMessage, TurnRole};
+        let catalog = Catalog::parse(
+            "[dialects.\"test/m\"]\nwire = \"openai_chat\"\nbase_url = \"http://127.0.0.1:1\"\ncontext = 1000\n",
+        )
+        .unwrap();
+        let mut voice = Voice::new(catalog, std::env::temp_dir(), ka_protocol::Mode::Guarded, 5);
+        // ratio 1 char/token; tail budget is 20k, so the filler must not fit
+        let filler = "y".repeat(30_000);
+        voice.history.push(TurnMessage::user("old question"));
+        voice.history.push(TurnMessage::assistant("old answer"));
+        voice
+            .history
+            .push(TurnMessage::user(format!("filler {filler}")));
+        voice.history.push(TurnMessage::assistant_with_calls(
+            "let me check",
+            vec![ToolCall {
+                id: "t9".into(),
+                tool: "read".into(),
+                arguments: Default::default(),
+            }],
+        ));
+        voice.history.push(TurnMessage::tool(vec![ToolResult {
+            call_id: "t9".into(),
+            content: "file contents".into(),
+            is_error: false,
+        }]));
+        voice.history.push(TurnMessage::assistant("done with that"));
+        voice.history.push(TurnMessage::user("keep me"));
+
+        let kept = voice.apply_digest("SUMMARY".to_string(), 1.0);
+        // the cut must land on a user message boundary ("filler..." is too
+        // big to fit with everything after; "keep me" is small)
+        assert_eq!(
+            voice.history[0].role,
+            TurnRole::User,
+            "history must start at a user message"
+        );
+        assert!(
+            voice.history.iter().any(|m| m.content == "keep me"),
+            "tail preserved"
+        );
+        // tool pair intact: an assistant-with-calls message is followed by
+        // its tool message, or neither is present
+        if voice.history.iter().any(|m| m.role == TurnRole::Tool) {
+            let idx = voice
+                .history
+                .iter()
+                .position(|m| m.role == TurnRole::Tool)
+                .unwrap();
+            assert!(idx > 0, "tool message never first");
+        }
+        assert_eq!(voice.digest.as_deref(), Some("SUMMARY"));
+        assert_eq!(kept, 2, "cut index points at the filler user message");
+        assert!(voice.digest_revision >= 1);
+        assert!(voice.take_pending_digest().is_some());
+        assert!(voice.take_pending_digest().is_none(), "consumed once");
+    }
+
+    #[test]
+    fn context_pressure_uses_reserve() {
+        let catalog = Catalog::parse(
+            "[dialects.\"test/m\"]\nwire = \"openai_chat\"\nbase_url = \"http://127.0.0.1:1\"\ncontext = 100000\n",
+        )
+        .unwrap();
+        let mut voice = Voice::new(catalog, std::env::temp_dir(), ka_protocol::Mode::Guarded, 5);
+        voice.set_model_selector("test/m", 4.0);
+        assert!(
+            !voice.context_pressure(100_000),
+            "empty history, no pressure"
+        );
+        voice.note_context_for_tests(90_000);
+        // reserve = max(16384, 15%) = 16384; 90k + 20k tail > 100k - 16384
+        assert!(voice.context_pressure(100_000), "90k used + tail must trip");
+        assert!(!voice.context_pressure(0), "unknown window never trips");
+    }
+
+    /// Overflow → digest → retry, all through the fake speaker.
+    struct OverflowFakeSpeaker {
+        calls: std::sync::Arc<parking_lot::Mutex<Vec<usize>>>,
+    }
+
+    impl Speaker for OverflowFakeSpeaker {
+        fn speak<'a>(
+            &'a self,
+            req: SpeakRequest,
+            out: tokio::sync::mpsc::Sender<StreamEvent>,
+        ) -> SpeakFuture<'a> {
+            let calls = self.calls.clone();
+            Box::pin(async move {
+                let n = {
+                    let mut c = calls.lock();
+                    c.push(0);
+                    c.len()
+                };
+                let has_digest = req
+                    .messages
+                    .first()
+                    .is_some_and(|m| m.content.starts_with("<context-digest>"));
+                if req.tools.is_empty() {
+                    // summarize call
+                    out.send(StreamEvent::Text("digested state".into()))
+                        .await
+                        .ok();
+                    out.send(StreamEvent::Finished {
+                        stop: ka_protocol::Stop::Done,
+                        usage: Default::default(),
+                    })
+                    .await
+                    .ok();
+                } else if n == 1 && !has_digest {
+                    out.send(StreamEvent::Failed {
+                        class: ka_protocol::ErrorClass::Overflow,
+                        retryable: false,
+                        message: "prompt is too long".into(),
+                    })
+                    .await
+                    .ok();
+                } else {
+                    out.send(StreamEvent::Text("recovered".into())).await.ok();
+                    out.send(StreamEvent::Finished {
+                        stop: ka_protocol::Stop::Done,
+                        usage: Default::default(),
+                    })
+                    .await
+                    .ok();
+                }
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn overflow_triggers_digest_and_retry() {
+        use ka_protocol::Event;
+        use tokio::sync::mpsc;
+
+        let catalog = Catalog::parse(
+            "[dialects.\"test/m\"]\nwire = \"openai_chat\"\nbase_url = \"http://127.0.0.1:1\"\ncontext = 50000\n",
+        )
+        .unwrap();
+        let calls = std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let mut voice = Voice::new(catalog, std::env::temp_dir(), ka_protocol::Mode::Guarded, 5)
+            .with_speaker(
+                Wire::OpenaiChat,
+                std::sync::Arc::new(OverflowFakeSpeaker {
+                    calls: calls.clone(),
+                }),
+            );
+
+        let (cmd_tx, mut cmd_rx) = mpsc::channel(16);
+        let (evt_tx, mut evt_rx) = mpsc::channel(256);
+        let mut interjections = Vec::new();
+        let mut deferrals = std::collections::VecDeque::new();
+        let handle = tokio::spawn(async move {
+            voice
+                .turn(
+                    "test/m",
+                    "big prompt".into(),
+                    &mut cmd_rx,
+                    &evt_tx,
+                    &mut interjections,
+                    &mut deferrals,
+                )
+                .await;
+        });
+
+        let mut finished = false;
+        let mut digest_started = false;
+        while let Some(evt) = evt_rx.recv().await {
+            match evt {
+                Event::DigestStarted => digest_started = true,
+                Event::TurnFinished {
+                    stop: ka_protocol::Stop::Done,
+                    ..
+                } => {
+                    finished = true;
+                    break;
+                }
+                Event::TurnFinished { .. } => break,
+                _ => {}
+            }
+        }
+        drop(cmd_tx);
+        handle.await.unwrap();
+        assert!(digest_started, "overflow must trigger a digest");
+        assert!(finished, "turn must recover and finish done");
+        assert!(calls.lock().len() >= 3, "speak, summarize, retry");
     }
 
     #[test]

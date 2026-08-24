@@ -466,7 +466,10 @@ fn apply_event(
                 }
             }
         }
-        Event::DigestStarted | Event::DigestFinished { .. } => {}
+        Event::Note { message } => lines.push(Line::Note(message.clone())),
+        Event::Idle => {}
+        Event::DigestStarted => lines.push(Line::Note("⋯ digesting context…".to_string())),
+        Event::DigestFinished { .. } => {}
     }
 }
 
@@ -491,6 +494,13 @@ fn slash_command(text: &str) -> Option<Slash> {
                 event: Some(Command::SetModel {
                     selector: selector.to_string(),
                 }),
+                quit: false,
+            })
+        }
+        "/compact" => {
+            let focus = rest.map(str::to_string);
+            Some(Slash {
+                event: Some(Command::Compact { focus }),
                 quit: false,
             })
         }
