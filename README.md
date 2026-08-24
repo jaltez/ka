@@ -2,7 +2,7 @@
 
 A model-agnostic, very-low-footprint coding agent in Rust.
 
-**Status: Phase 1 (real wires).** Design: [`research/ka/architecture.md`](research/ka/architecture.md) · Roadmap: [`research/ka/roadmap.md`](research/ka/roadmap.md)
+**Status: Phase 2 (core tools + hard safety).** Design: [`research/ka/architecture.md`](research/ka/architecture.md) · Roadmap: [`research/ka/roadmap.md`](research/ka/roadmap.md)
 
 ## Footprint contract (CI-enforced target)
 Single static binary ≤ 10 MB (musl, stripped) · cold start ≤ 50 ms · idle RSS ≤ 15 MB · zero steady-state network.
@@ -24,6 +24,7 @@ cargo fmt
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 cargo run -p ka-cli -- run "hi"          # canned path, no model needed
+cargo run -p ka-cli -- run --model ollama/qwen3.5:9b 'read secret.txt with the read tool'  # live tools
 cargo run -p ka-cli -- models            # catalog + local discovery (Ollama, LM Studio)
 cargo run -p ka-cli -- run --model ollama/qwen3:32b "hi"   # live local round-trip
 ```

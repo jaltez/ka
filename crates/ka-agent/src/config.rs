@@ -31,6 +31,9 @@ pub struct Config {
     pub mode: Option<Mode>,
     /// Role mappings.
     pub roles: Roles,
+    /// Maximum tool-execution steps per prompt before forcing a text reply.
+    #[serde(default)]
+    pub max_steps: Option<u32>,
 }
 
 impl Config {
@@ -59,6 +62,14 @@ impl Config {
         if other.roles.fast.is_some() {
             self.roles.fast = other.roles.fast;
         }
+        if other.max_steps.is_some() {
+            self.max_steps = other.max_steps;
+        }
+    }
+
+    /// Effective step cap (default 20).
+    pub fn effective_max_steps(&self) -> u32 {
+        self.max_steps.unwrap_or(20)
     }
 
     /// The effective permission mode (guarded unless explicitly freed).

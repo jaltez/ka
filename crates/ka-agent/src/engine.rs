@@ -81,8 +81,11 @@ async fn run(
     config: Config,
     catalog: ka_dialect::Catalog,
 ) -> Result<(), DynError> {
+    let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    let mode = config.effective_mode();
+    let max_steps = config.effective_max_steps();
     let mut state = EngineState::from(config);
-    let mut voice = Voice::new(catalog);
+    let mut voice = Voice::new(catalog, cwd, mode, max_steps);
     while let Some(cmd) = commands.recv().await {
         match cmd {
             Command::Prompt { text, .. } => {
@@ -91,6 +94,15 @@ async fn run(
                 while let Some(deferred) = state.deferrals.pop_front() {
                     dispatch_turn(&mut commands, &events, &mut state, &mut voice, deferred).await;
                 }
+            }
+            Command::SetModel { selector } => {
+                state.model = Some(selector.clone());
+                events.send(Event::ModelChanged { selector }).await?;
+            }
+            Command::SetMode { mode } => {
+                state.mode = mode;
+                voice.set_mode(mode);
+                events.send(Event::ModeChanged { mode }).await?;
             }
             other => side_command(&events, &mut state, other).await?,
         }
@@ -134,14 +146,9 @@ async fn side_command(
         Command::Interject { text } => state.interjections.push(text),
         Command::Defer { text } => state.deferrals.push_back(text),
         Command::Abort => {}
-        Command::SetModel { selector } => {
-            state.model = Some(selector.clone());
-            events.send(Event::ModelChanged { selector }).await?;
-        }
         Command::SetEffort { level } => state.effort = Some(level),
-        Command::SetMode { mode } => {
-            state.mode = mode;
-            events.send(Event::ModeChanged { mode }).await?;
+        Command::SetModel { .. } | Command::SetMode { .. } => {
+            unreachable!("handled by caller with voice access")
         }
         Command::AlwaysAllow { .. }
         | Command::Answer { .. }

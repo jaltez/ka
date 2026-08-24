@@ -15,7 +15,8 @@ pub mod wire_openai;
 pub use dialects::{Catalog, Dialect, Discovery, Selector, SelectorError, Wire, parse_selector};
 pub use discovery::{FoundModel, discover_lmstudio, discover_ollama, discover_openai_compatible};
 pub use speaker::{
-    SpeakFuture, SpeakRequest, Speaker, StreamEvent, ToolCall, TurnMessage, TurnRole,
+    SpeakFuture, SpeakRequest, Speaker, StreamEvent, ToolCall, ToolResult, ToolSpec, TurnMessage,
+    TurnRole,
 };
 pub use wire_anthropic::AnthropicMessages;
 pub use wire_openai::OpenaiChat;

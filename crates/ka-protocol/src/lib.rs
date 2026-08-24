@@ -248,6 +248,19 @@ pub enum Event {
         /// Whether the call succeeded.
         ok: bool,
     },
+    /// A tool call produced output (capped excerpt for surfaces).
+    CallOutput {
+        /// Tool name.
+        tool: String,
+        /// Call identifier.
+        id: String,
+        /// Capped output excerpt (full output may live in a spill file).
+        excerpt: String,
+        /// Whether the output represents an error result.
+        is_error: bool,
+        /// Spill pointer when the full output was parked on disk.
+        spill: Option<String>,
+    },
     /// The engine needs user input.
     Ask {
         /// Ask identifier.

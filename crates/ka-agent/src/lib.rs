@@ -4,6 +4,7 @@
 mod canned;
 pub mod config;
 mod engine;
+pub mod hands;
 mod voice;
 
 pub use config::{Config, ConfigError};

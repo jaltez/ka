@@ -264,6 +264,17 @@ async fn run_headless(
         let line = to_line(&event).map_err(|e| format!("serialize event: {e}"))?;
         std::io::Write::write_all(&mut stdout, line.as_bytes())
             .map_err(|e| format!("stdout: {e}"))?;
+        // headless policy: permission asks auto-deny (last option = deny)
+        if let Event::Ask { id, .. } = &event {
+            handle
+                .commands
+                .send(Command::Answer {
+                    question: id.clone(),
+                    choice: 2,
+                })
+                .await
+                .map_err(|_| "engine closed during ask")?;
+        }
         if let Event::TurnFinished { stop, .. } = &event {
             final_stop = Some(*stop);
             break;

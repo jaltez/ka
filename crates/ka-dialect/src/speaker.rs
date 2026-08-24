@@ -12,13 +12,82 @@ use tokio::sync::mpsc;
 
 use crate::dialects::Dialect;
 
-/// Conversation message in ka's neutral shape.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Conversation message in ka's neutral shape. Assistant messages may carry
+/// tool calls; a following `Tool` message carries their results.
+#[derive(Debug, Clone, PartialEq)]
 pub struct TurnMessage {
     /// Who spoke.
     pub role: TurnRole,
-    /// What they said (plain text; tool blocks arrive in Phase 2).
+    /// What they said (plain text; tool blocks are carried separately).
     pub content: String,
+    /// Tool calls issued with this assistant message.
+    pub calls: Vec<ToolCall>,
+    /// Tool results carried by a `Tool`-role message.
+    pub results: Vec<ToolResult>,
+}
+
+impl TurnMessage {
+    /// A plain user message.
+    pub fn user(content: impl Into<String>) -> Self {
+        Self {
+            role: TurnRole::User,
+            content: content.into(),
+            calls: Vec::new(),
+            results: Vec::new(),
+        }
+    }
+
+    /// A plain assistant message.
+    pub fn assistant(content: impl Into<String>) -> Self {
+        Self {
+            role: TurnRole::Assistant,
+            content: content.into(),
+            calls: Vec::new(),
+            results: Vec::new(),
+        }
+    }
+
+    /// An assistant message with tool calls.
+    pub fn assistant_with_calls(content: impl Into<String>, calls: Vec<ToolCall>) -> Self {
+        Self {
+            role: TurnRole::Assistant,
+            content: content.into(),
+            calls,
+            results: Vec::new(),
+        }
+    }
+
+    /// A tool-results message.
+    pub fn tool(results: Vec<ToolResult>) -> Self {
+        Self {
+            role: TurnRole::Tool,
+            content: String::new(),
+            calls: Vec::new(),
+            results,
+        }
+    }
+}
+
+/// One executed tool result.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ToolResult {
+    /// The call this answers.
+    pub call_id: String,
+    /// Output text.
+    pub content: String,
+    /// Whether the tool reported an error.
+    pub is_error: bool,
+}
+
+/// Model-facing tool definition.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ToolSpec {
+    /// Tool name.
+    pub name: String,
+    /// Description for the model.
+    pub description: String,
+    /// JSON schema for the arguments object.
+    pub parameters: serde_json::Value,
 }
 
 /// Neutral roles.
@@ -28,6 +97,8 @@ pub enum TurnRole {
     User,
     /// Model output.
     Assistant,
+    /// Tool results.
+    Tool,
 }
 
 /// A complete, parsed tool call (arguments accumulated dialect-side).
@@ -52,8 +123,10 @@ pub struct SpeakRequest {
     pub effort: Option<String>,
     /// System prompt (placement is wire-specific).
     pub system: String,
-    /// Conversation so far (user/assistant).
+    /// Conversation so far (user/assistant/tool).
     pub messages: Vec<TurnMessage>,
+    /// Tools offered to the model this request.
+    pub tools: Vec<ToolSpec>,
     /// Bearer/API token, if the endpoint needs one.
     pub token: Option<String>,
     /// Cache key for providers that take one.

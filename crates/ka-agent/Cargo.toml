@@ -14,6 +14,12 @@ serde_json = { workspace = true }
 toml = { workspace = true }
 tokio = { workspace = true }
 schemars = { workspace = true }
+ignore = { workspace = true }
+regex = { workspace = true }
+parking_lot = { workspace = true }
+
+[dev-dependencies]
+parking_lot = { workspace = true }
 
 [lints]
 workspace = true

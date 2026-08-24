@@ -82,18 +82,70 @@ async fn speak_openai(
         "stream": true,
         "stream_options": { "include_usage": true },
     });
-    if !req.messages.is_empty() {
-        let mut messages = Vec::new();
-        if !req.system.is_empty() {
-            messages.push(json!({"role": "system", "content": req.system}));
+    if !req.tools.is_empty() {
+        let tools: Vec<Value> = req
+            .tools
+            .iter()
+            .map(|t| {
+                json!({
+                    "type": "function",
+                    "function": {
+                        "name": t.name,
+                        "description": t.description,
+                        "parameters": t.parameters,
+                    }
+                })
+            })
+            .collect();
+        body["tools"] = Value::Array(tools);
+    }
+    let mut messages = Vec::new();
+    if !req.system.is_empty() {
+        messages.push(json!({"role": "system", "content": req.system}));
+    }
+    for m in &req.messages {
+        match m.role {
+            crate::speaker::TurnRole::User => {
+                messages.push(json!({"role": "user", "content": m.content}));
+            }
+            crate::speaker::TurnRole::Assistant if !m.calls.is_empty() => {
+                let calls: Vec<Value> = m
+                    .calls
+                    .iter()
+                    .map(|c| {
+                        json!({
+                            "id": c.id,
+                            "type": "function",
+                            "function": {
+                                "name": c.tool,
+                                "arguments": serde_json::to_string(&c.arguments).unwrap_or_default(),
+                            }
+                        })
+                    })
+                    .collect();
+                let content = if m.content.is_empty() {
+                    Value::Null
+                } else {
+                    json!(m.content)
+                };
+                messages
+                    .push(json!({"role": "assistant", "content": content, "tool_calls": calls}));
+            }
+            crate::speaker::TurnRole::Assistant => {
+                messages.push(json!({"role": "assistant", "content": m.content}));
+            }
+            crate::speaker::TurnRole::Tool => {
+                for r in &m.results {
+                    messages.push(json!({
+                        "role": "tool",
+                        "tool_call_id": r.call_id,
+                        "content": r.content,
+                    }));
+                }
+            }
         }
-        for m in &req.messages {
-            let role = match m.role {
-                crate::speaker::TurnRole::User => "user",
-                crate::speaker::TurnRole::Assistant => "assistant",
-            };
-            messages.push(json!({"role": role, "content": m.content}));
-        }
+    }
+    if !messages.is_empty() {
         body["messages"] = Value::Array(messages);
     }
     let max_field = dialect

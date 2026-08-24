@@ -95,15 +95,62 @@ async fn speak_anthropic(
             body["system"] = json!(req.system);
         }
     }
-    if !req.messages.is_empty() {
-        let mut messages = Vec::new();
-        for m in &req.messages {
-            let role = match m.role {
-                crate::speaker::TurnRole::User => "user",
-                crate::speaker::TurnRole::Assistant => "assistant",
-            };
-            messages.push(json!({"role": role, "content": m.content}));
+    if !req.tools.is_empty() {
+        let tools: Vec<Value> = req
+            .tools
+            .iter()
+            .map(|t| {
+                json!({
+                    "name": t.name,
+                    "description": t.description,
+                    "input_schema": t.parameters,
+                })
+            })
+            .collect();
+        body["tools"] = Value::Array(tools);
+    }
+    let mut messages = Vec::new();
+    for m in &req.messages {
+        match m.role {
+            crate::speaker::TurnRole::User => {
+                messages.push(json!({"role": "user", "content": m.content}));
+            }
+            crate::speaker::TurnRole::Assistant if !m.calls.is_empty() || !m.results.is_empty() => {
+                let mut blocks = Vec::new();
+                if !m.content.is_empty() {
+                    blocks.push(json!({"type": "text", "text": m.content}));
+                }
+                for c in &m.calls {
+                    blocks.push(json!({
+                        "type": "tool_use",
+                        "id": c.id,
+                        "name": c.tool,
+                        "input": c.arguments,
+                    }));
+                }
+                messages.push(json!({"role": "assistant", "content": blocks}));
+            }
+            crate::speaker::TurnRole::Assistant => {
+                messages.push(json!({"role": "assistant", "content": m.content}));
+            }
+            crate::speaker::TurnRole::Tool => {
+                let blocks: Vec<Value> = m
+                    .results
+                    .iter()
+                    .map(|r| {
+                        json!({
+                            "type": "tool_result",
+                            "tool_use_id": r.call_id,
+                            "content": r.content,
+                            "is_error": r.is_error,
+                        })
+                    })
+                    .collect();
+                messages.push(json!({"role": "user", "content": blocks}));
+            }
         }
+    }
+    if !messages.is_empty() {
         body["messages"] = Value::Array(messages);
     }
     if let Some(effort) = req.effort.as_deref() {

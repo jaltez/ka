@@ -166,7 +166,10 @@ fn request(dialect: Dialect, system: &str) -> SpeakRequest {
         messages: vec![TurnMessage {
             role: TurnRole::User,
             content: "hi".to_string(),
+            calls: Vec::new(),
+            results: Vec::new(),
         }],
+        tools: Vec::new(),
         token: Some("k-test-token".to_string()),
         cache_key: None,
     }
