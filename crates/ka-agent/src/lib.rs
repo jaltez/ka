@@ -1,9 +1,10 @@
 //! ka engine crate: the turn machine and layered configuration. No I/O
-//! beyond the queues; surfaces and wires live elsewhere.
+//! beyond the queues; surfaces live elsewhere, wires live in ka-dialect.
 
 mod canned;
 pub mod config;
 mod engine;
+mod voice;
 
 pub use config::{Config, ConfigError};
-pub use engine::{EngineHandle, spawn};
+pub use engine::{EngineHandle, spawn, spawn_with};

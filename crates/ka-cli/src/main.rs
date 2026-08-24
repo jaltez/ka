@@ -1,12 +1,14 @@
-//! The `ka` binary. Phase 0 surface: `ka run` (headless NDJSON event stream)
-//! and `ka config {schema,print}`. The TUI arrives in Phase 3.
-
-use std::path::PathBuf;
-use std::process::ExitCode;
+//! The `ka` binary. Phase 1 surface: `ka run` (headless NDJSON against real
+//! models), `ka models` (catalog + local discovery), `ka config
+// {schema,print}`. The TUI arrives in Phase 3.
 
 use clap::{CommandFactory, Parser, Subcommand};
-use ka_agent::config::{Config, ConfigError};
+use ka_agent::config::Config;
+use ka_agent::spawn_with;
+use ka_dialect::Catalog;
 use ka_protocol::{Command, Event, Stop, to_line};
+use std::path::PathBuf;
+use std::process::ExitCode;
 
 #[derive(Parser)]
 #[command(
@@ -34,6 +36,21 @@ enum CliCommand {
         /// Extra strict-TOML config layer (repeatable, highest file wins)
         #[arg(long = "config")]
         configs: Vec<PathBuf>,
+        /// Extra dialect catalog overlay (strict TOML, repeatable)
+        #[arg(long = "dialects")]
+        dialects: Vec<PathBuf>,
+        /// Skip local-endpoint discovery probes
+        #[arg(long)]
+        no_discovery: bool,
+    },
+    /// List known models (embedded catalog + local discovery)
+    Models {
+        /// Skip local discovery probes
+        #[arg(long)]
+        no_discovery: bool,
+        /// Extra dialect catalog overlay (strict TOML, repeatable)
+        #[arg(long = "dialects")]
+        dialects: Vec<PathBuf>,
     },
     /// Inspect configuration
     Config {
@@ -72,6 +89,87 @@ fn main() -> ExitCode {
     }
 }
 
+/// Defaults < user < project < extra files < env < flags, every layer strict.
+fn load_config(
+    configs: &[PathBuf],
+    flag_model: Option<String>,
+    flag_mode: Option<String>,
+) -> Result<Config, String> {
+    let mut cfg = Config::default();
+
+    let user = std::env::var("HOME")
+        .ok()
+        .map(|h| PathBuf::from(h).join(".config/ka/ka.toml"));
+    let project = PathBuf::from(".ka/ka.toml");
+
+    for path in user
+        .iter()
+        .chain(std::iter::once(&project))
+        .chain(configs.iter())
+    {
+        match std::fs::read_to_string(path) {
+            Ok(text) => {
+                let layer = Config::parse_layer(&text, &path.display().to_string())
+                    .map_err(|e| e.to_string())?;
+                cfg.overlay(layer);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(format!("{}: {e}", path.display())),
+        }
+    }
+
+    if let Ok(model) = std::env::var("KA_MODEL") {
+        if !model.is_empty() {
+            cfg.model = Some(model);
+        }
+    }
+    if let Ok(mode) = std::env::var("KA_MODE") {
+        if !mode.is_empty() {
+            cfg.mode = Some(parse_mode(&mode)?);
+        }
+    }
+    if let Some(model) = flag_model {
+        cfg.model = Some(model);
+    }
+    if let Some(mode) = flag_mode {
+        cfg.mode = Some(parse_mode(&mode)?);
+    }
+    Ok(cfg)
+}
+
+fn parse_mode(s: &str) -> Result<ka_protocol::Mode, String> {
+    match s {
+        "guarded" => Ok(ka_protocol::Mode::Guarded),
+        "free" => Ok(ka_protocol::Mode::Free),
+        other => Err(format!("unknown mode {other:?} (expected guarded|free)")),
+    }
+}
+
+fn wire_str(w: ka_dialect::Wire) -> String {
+    match w {
+        ka_dialect::Wire::OpenaiChat => "openai_chat".to_string(),
+        ka_dialect::Wire::AnthropicMessages => "anthropic_messages".to_string(),
+    }
+}
+
+fn load_catalog(overlays: &[PathBuf]) -> Result<Catalog, String> {
+    let mut catalog = Catalog::embedded();
+    for path in overlays {
+        let text = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
+        let over = Catalog::parse(&text).map_err(|e| format!("{}: {e}", path.display()))?;
+        catalog.overlay(over);
+    }
+    Ok(catalog)
+}
+
+async fn build_catalog(overlays: &[PathBuf], with_discovery: bool) -> Result<Catalog, String> {
+    let mut catalog = load_catalog(overlays)?;
+    if with_discovery {
+        ka_dialect::discovery::overlay_discovered(&mut catalog).await;
+    }
+    Ok(catalog)
+}
+
 async fn dispatch(cli: Cli) -> Result<ExitCode, String> {
     match cli.command {
         Some(CliCommand::Run {
@@ -79,7 +177,34 @@ async fn dispatch(cli: Cli) -> Result<ExitCode, String> {
             model,
             mode,
             configs,
-        }) => run_headless(prompt, model, mode, &configs).await,
+            dialects,
+            no_discovery,
+        }) => run_headless(prompt, model, mode, &configs, &dialects, !no_discovery).await,
+        Some(CliCommand::Models {
+            no_discovery,
+            dialects,
+        }) => {
+            let mut catalog = load_catalog(&dialects)?;
+            if !no_discovery {
+                ka_dialect::discovery::overlay_discovered(&mut catalog).await;
+            }
+            let header = format!(
+                "{:<34} {:<20} {:>9} {:>7}  {}",
+                "model", "wire", "context", "$in/M", "auth"
+            );
+            println!("{header}");
+            for (id, d) in &catalog.dialects {
+                println!(
+                    "{:<34} {:<20} {:>9} {:>7}  {}",
+                    id,
+                    wire_str(d.wire),
+                    d.context,
+                    d.price.input_per_mtok,
+                    d.api_key_env.as_deref().unwrap_or("-")
+                );
+            }
+            Ok(ExitCode::SUCCESS)
+        }
         Some(CliCommand::Config { cmd }) => match cmd {
             ConfigCommand::Schema => {
                 println!(
@@ -110,6 +235,8 @@ async fn run_headless(
     model: Option<String>,
     mode: Option<String>,
     configs: &[PathBuf],
+    dialects: &[PathBuf],
+    with_discovery: bool,
 ) -> Result<ExitCode, String> {
     let cfg = load_config(configs, model, mode)?;
     let prompt = match prompt {
@@ -120,7 +247,8 @@ async fn run_headless(
         return Err("empty prompt".to_string());
     }
 
-    let mut handle = ka_agent::spawn(cfg);
+    let catalog = build_catalog(dialects, with_discovery).await?;
+    let mut handle = spawn_with(cfg, catalog);
     handle
         .commands
         .send(Command::Prompt {
@@ -156,64 +284,4 @@ fn read_stdin() -> Result<String, String> {
         .read_to_string(&mut buf)
         .map_err(|e| format!("stdin: {e}"))?;
     Ok(buf)
-}
-
-/// Defaults < user < project < extra files < env < flags, every layer strict.
-fn load_config(
-    configs: &[PathBuf],
-    flag_model: Option<String>,
-    flag_mode: Option<String>,
-) -> Result<Config, String> {
-    let mut cfg = Config::default();
-
-    let user = std::env::var("HOME")
-        .ok()
-        .map(|h| PathBuf::from(h).join(".config/ka/ka.toml"));
-    let project = PathBuf::from(".ka/ka.toml");
-
-    for path in user
-        .iter()
-        .chain(std::iter::once(&project))
-        .chain(configs.iter())
-    {
-        match std::fs::read_to_string(path) {
-            Ok(text) => {
-                let layer = Config::parse_layer(&text, &path.display().to_string())
-                    .map_err(fmt_config_err)?;
-                cfg.overlay(layer);
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(e) => return Err(format!("{}: {e}", path.display())),
-        }
-    }
-
-    if let Ok(model) = std::env::var("KA_MODEL") {
-        if !model.is_empty() {
-            cfg.model = Some(model);
-        }
-    }
-    if let Ok(mode) = std::env::var("KA_MODE") {
-        if !mode.is_empty() {
-            cfg.mode = Some(parse_mode(&mode)?);
-        }
-    }
-    if let Some(model) = flag_model {
-        cfg.model = Some(model);
-    }
-    if let Some(mode) = flag_mode {
-        cfg.mode = Some(parse_mode(&mode)?);
-    }
-    Ok(cfg)
-}
-
-fn parse_mode(s: &str) -> Result<ka_protocol::Mode, String> {
-    match s {
-        "guarded" => Ok(ka_protocol::Mode::Guarded),
-        "free" => Ok(ka_protocol::Mode::Free),
-        other => Err(format!("unknown mode {other:?} (expected guarded|free)")),
-    }
-}
-
-fn fmt_config_err(e: ConfigError) -> String {
-    e.to_string()
 }

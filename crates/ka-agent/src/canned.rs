@@ -1,13 +1,13 @@
-//! Phase-0 canned speaker. Produces the deterministic reply chunks the exit
-//! criterion streams through the real queues. Phase 1 replaces this module
-//! with the ka-dialect wires (anthropic-messages, openai-chat).
+//! The canned speaker: deterministic reply chunks for the keyless path
+//! (`ka run` with no model configured). Also the Phase-0 exit-criterion
+//! fixture — real wires live in ka-dialect.
 
 /// Build the canned reply for a prompt, as streamed text chunks.
 pub fn reply(prompt: &str) -> Vec<String> {
     vec![
-        "(ka phase 0) ".to_string(),
+        "(ka, no model configured) ".to_string(),
         format!("heard: {prompt} — "),
-        "canned reply; real wires land in phase 1.".to_string(),
+        "set a model with --model or KA_MODEL to speak for real.".to_string(),
     ]
 }
 

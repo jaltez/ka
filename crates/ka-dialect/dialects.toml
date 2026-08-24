@@ -3,6 +3,8 @@
 
 [dialects."anthropic/claude-sonnet-5"]
 wire = "anthropic_messages"
+base_url = "https://api.anthropic.com"
+api_key_env = "ANTHROPIC_API_KEY"
 context = 200_000
 max_output = 64_000
 efforts = ["low", "medium", "high", "max"]
@@ -15,9 +17,16 @@ output_per_mtok = 15.0
 [dialects."anthropic/claude-sonnet-5".flags]
 reasoning_field = "thinking"
 developer_role = true
+[dialects."anthropic/claude-sonnet-5".effort_budgets]
+low = 2048
+medium = 8192
+high = 16_384
+max = 32_768
 
 [dialects."openai/gpt-5.1"]
 wire = "openai_chat"
+base_url = "https://api.openai.com/v1"
+api_key_env = "OPENAI_API_KEY"
 context = 400_000
 max_output = 128_000
 efforts = ["low", "medium", "high"]
@@ -31,9 +40,11 @@ output_per_mtok = 10.0
 reasoning_field = "reasoning"
 developer_role = true
 requires_tool_result_name = true
+max_tokens_field = "max_completion_tokens"
 
 [dialects."ollama/qwen3-32b"]
 wire = "openai_chat"
+base_url = "http://127.0.0.1:11434/v1"
 discovery = "ollama"
 context = 131_072
 input = ["text"]

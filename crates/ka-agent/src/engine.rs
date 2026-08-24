@@ -1,10 +1,10 @@
 //! The engine: a turn machine over two queues. Surfaces send [`Command`]s
 //! and consume [`Event`]s; the engine owns all sequencing.
 //!
-//! Turn shape (Phase 0, canned speaker): `Receiving → Speaking → Settling`.
-//! Speaking streams paced chunks while listening for interjections and
-//! aborts via `select!` — this is the same seam Phase 1's real Speaker
-//! streams and Phase 2's tool execution plug into.
+//! Two turn paths: the **canned** speaker (no model configured — keeps
+//! `ka run` working keyless) and the **live voice** (real wires via
+//! ka-dialect). Both honor interjections, deferrals, and aborts through the
+//! same `select!` seam.
 
 use std::collections::VecDeque;
 use std::time::Duration;
@@ -14,6 +14,7 @@ use tokio::sync::mpsc;
 
 use crate::canned;
 use crate::config::Config;
+use crate::voice::Voice;
 
 /// Handle returned by [`spawn`]: the surface's two queue ends.
 pub struct EngineHandle {
@@ -23,13 +24,19 @@ pub struct EngineHandle {
     pub events: mpsc::Receiver<Event>,
 }
 
-/// Spawn the engine on the current tokio runtime. Must be called inside a
-/// runtime (the CLI provides one).
+/// Spawn the engine with the embedded catalog. Must be called inside a
+/// tokio runtime (the CLI provides one).
 pub fn spawn(config: Config) -> EngineHandle {
+    spawn_with(config, ka_dialect::Catalog::embedded())
+}
+
+/// Spawn the engine over an explicit catalog (embedded + overlays +
+/// discovery, assembled by the caller).
+pub fn spawn_with(config: Config, catalog: ka_dialect::Catalog) -> EngineHandle {
     let (cmd_tx, cmd_rx) = mpsc::channel(64);
     let (evt_tx, evt_rx) = mpsc::channel(256);
     tokio::spawn(async move {
-        if let Err(e) = run(cmd_rx, evt_tx, config).await {
+        if let Err(e) = run(cmd_rx, evt_tx, config, catalog).await {
             // The events channel is gone or the engine hit an unrecoverable
             // state; surface-level diagnostics only.
             eprintln!("ka engine ended: {e}");
@@ -49,6 +56,7 @@ struct EngineState {
     mode: Mode,
     deferrals: VecDeque<String>,
     interjections: Vec<String>,
+    history: Vec<ka_dialect::speaker::TurnMessage>,
 }
 
 impl From<Config> for EngineState {
@@ -60,6 +68,7 @@ impl From<Config> for EngineState {
             mode,
             deferrals: VecDeque::new(),
             interjections: Vec::new(),
+            history: Vec::new(),
         }
     }
 }
@@ -70,21 +79,49 @@ async fn run(
     mut commands: mpsc::Receiver<Command>,
     events: mpsc::Sender<Event>,
     config: Config,
+    catalog: ka_dialect::Catalog,
 ) -> Result<(), DynError> {
     let mut state = EngineState::from(config);
+    let mut voice = Voice::new(catalog);
     while let Some(cmd) = commands.recv().await {
         match cmd {
             Command::Prompt { text, .. } => {
-                turn(&mut commands, &events, &mut state, text).await?;
+                dispatch_turn(&mut commands, &events, &mut state, &mut voice, text).await;
                 // Settling: drain deferrals as follow-on turns.
                 while let Some(deferred) = state.deferrals.pop_front() {
-                    turn(&mut commands, &events, &mut state, deferred).await?;
+                    dispatch_turn(&mut commands, &events, &mut state, &mut voice, deferred).await;
                 }
             }
             other => side_command(&events, &mut state, other).await?,
         }
     }
     Ok(())
+}
+
+/// Route one prompt through the live voice when a model is configured,
+/// else the canned speaker.
+async fn dispatch_turn(
+    commands: &mut mpsc::Receiver<Command>,
+    events: &mpsc::Sender<Event>,
+    state: &mut EngineState,
+    voice: &mut Voice,
+    text: String,
+) {
+    if let Some(model) = state.model.clone() {
+        voice
+            .turn(
+                &model,
+                &mut state.history,
+                text,
+                commands,
+                events,
+                &mut state.interjections,
+                &mut state.deferrals,
+            )
+            .await;
+    } else {
+        turn_canned(commands, events, state, text).await;
+    }
 }
 
 /// Handle a command that arrives outside a turn.
@@ -114,7 +151,7 @@ async fn side_command(
                 .send(Event::Error {
                     class: ErrorClass::Unsupported,
                     retryable: false,
-                    message: "command not wired in phase 0".to_string(),
+                    message: "command not wired in phase 1".to_string(),
                 })
                 .await?;
         }
@@ -123,14 +160,14 @@ async fn side_command(
     Ok(())
 }
 
-/// One turn: stream the canned reply, honoring interjections and aborts that
-/// arrive mid-stream.
-async fn turn(
+/// One canned turn: stream paced chunks, honoring aborts that arrive
+/// mid-stream. Used when no model is configured.
+async fn turn_canned(
     commands: &mut mpsc::Receiver<Command>,
     events: &mpsc::Sender<Event>,
     state: &mut EngineState,
     text: String,
-) -> Result<(), DynError> {
+) {
     let est_in = (text.len() as u64).div_ceil(4);
     events
         .send(Event::TurnStarted {
@@ -139,7 +176,8 @@ async fn turn(
                 window: 0,
             },
         })
-        .await?;
+        .await
+        .ok();
 
     let chunks = canned::reply(&text);
     let mut idx = 0;
@@ -151,19 +189,24 @@ async fn turn(
                 match maybe {
                     None => {
                         // Surface went away; finish quietly.
-                        return Ok(());
+                        return;
                     }
                     Some(Command::Abort) => {
                         aborted = true;
                         break;
                     }
-                    Some(other) => side_command(events, state, other).await?,
+                    Some(other) => {
+                        if let Err(e) = side_command(events, state, other).await {
+                            eprintln!("ka engine: {e}");
+                        }
+                    }
                 }
             }
             () = tokio::time::sleep(Duration::from_millis(20)) => {
                 events
                     .send(Event::Delta { kind: DeltaKind::Text(chunks[idx].clone()) })
-                    .await?;
+                    .await
+                    .ok();
                 idx += 1;
             }
         }
@@ -175,8 +218,9 @@ async fn turn(
                 stop: Stop::Aborted,
                 usage: Usage::default(),
             })
-            .await?;
-        return Ok(());
+            .await
+            .ok();
+        return;
     }
 
     // Settling: unhandled interjections become deferrals so they are not lost.
@@ -185,7 +229,7 @@ async fn turn(
     }
     let est_out: u64 = chunks
         .iter()
-        .map(|c| c.len() as u64)
+        .map(|c: &String| c.len() as u64)
         .sum::<u64>()
         .div_ceil(4);
     events
@@ -197,8 +241,8 @@ async fn turn(
                 ..Usage::default()
             },
         })
-        .await?;
-    Ok(())
+        .await
+        .ok();
 }
 
 #[cfg(test)]
@@ -209,8 +253,8 @@ mod tests {
     use std::time::Duration;
     use tokio::sync::mpsc;
 
-    use super::spawn;
     use crate::config::Config;
+    use crate::engine::spawn;
 
     async fn drain_until_finished(events: &mut mpsc::Receiver<Event>) -> Vec<Event> {
         let mut seen = Vec::new();
