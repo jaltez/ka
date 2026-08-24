@@ -66,6 +66,21 @@ Dialect overlays add any OpenAI-compatible provider: `ka run --dialects my.toml 
 
 Clearances read/write/exec · guarded/free modes with session always-allow · bash decomposition (compound splitting, wrapper stripping, redirection-as-write) · **unbypassable hardstops** (root rm, fork bombs, fetch-and-execute, device writes — ask even in free; headless denies) · read ledger (edits refuse unread or changed files) · one-way secret redaction in every tool result · plan mode read-only except `.ka/plans/`.
 
+## Development (cargo xtask)
+
+Repo automation follows the [cargo-xtask](https://github.com/matklad/cargo-xtask) convention — `cargo xtask <task>`:
+
+```sh
+cargo xtask install   # stable: cargo install --locked → ~/.cargo/bin/ka
+cargo xtask link      # dev: builds release + symlinks kad → repo target/release/ka
+cargo xtask dev -- models          # rebuild + run dev binary with args
+cargo xtask ci        # fmt --check + clippy -D warnings + tests (the CI gate)
+cargo xtask size      # binary size vs the 10 MB contract
+cargo xtask unlink    # remove the kad symlink
+```
+
+Stable owns the name `ka`; dev is always `kad`. Isolate dev sessions with `KA_DATA_DIR=/tmp/ka-dev kad …` (shares config/rules/hooks, separates strands).
+
 ## Crates
 
 `ka-protocol` (Command/Event wire contract) · `ka-agent` (engine: turn machine, 7 tools, gate, digests, strands) · `ka-dialect` (catalog + 2 wires + discovery) · `ka-strand` (append-only JSONL sessions) · `ka-term` (ratatui TUI) · `ka-cli` (the binary).
