@@ -218,10 +218,25 @@ pub enum Command {
     },
 }
 
+/// A replayed historical message (emitted on resume so surfaces can
+/// reconstruct the transcript).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct ReplayedMessage {
+    /// `user` or `assistant`.
+    pub role: String,
+    /// Message text.
+    pub content: String,
+}
+
 /// Engine → surface events.
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Event {
+    /// Resumed history replay (emitted once at startup when resuming).
+    Replay {
+        /// Prior messages, oldest first.
+        messages: Vec<ReplayedMessage>,
+    },
     /// A turn began.
     TurnStarted {
         /// Context consumption snapshot.
@@ -379,6 +394,12 @@ mod tests {
 
     #[test]
     fn events_roundtrip() {
+        roundtrip_event(Event::Replay {
+            messages: vec![ReplayedMessage {
+                role: "user".into(),
+                content: "before the crash".into(),
+            }],
+        });
         roundtrip_event(Event::TurnStarted {
             context: ContextMeter {
                 used: 12,

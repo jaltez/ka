@@ -19,6 +19,28 @@ use std::process::ExitCode;
 struct Cli {
     #[command(subcommand)]
     command: Option<CliCommand>,
+
+    /// Continue the newest strand (with the terminal's waypoint preferred)
+    #[arg(short = 'c', long)]
+    continue_latest: bool,
+    /// Open a specific strand file
+    #[arg(long)]
+    session: Option<std::path::PathBuf>,
+    /// Model selector override (vendor/model@effort)
+    #[arg(long)]
+    model: Option<String>,
+    /// Permission mode override (guarded|free)
+    #[arg(long)]
+    mode: Option<String>,
+    /// Extra strict-TOML config layer (repeatable)
+    #[arg(long = "config")]
+    configs: Vec<std::path::PathBuf>,
+    /// Extra dialect catalog overlay (strict TOML, repeatable)
+    #[arg(long = "dialects")]
+    dialects: Vec<std::path::PathBuf>,
+    /// Skip local-endpoint discovery probes
+    #[arg(long)]
+    no_discovery: bool,
 }
 
 #[derive(Subcommand, Clone)]
@@ -171,6 +193,19 @@ async fn build_catalog(overlays: &[PathBuf], with_discovery: bool) -> Result<Cat
 }
 
 async fn dispatch(cli: Cli) -> Result<ExitCode, String> {
+    if cli.command.is_none() {
+        return run_tui(cli).await;
+    }
+    let cli = Cli {
+        command: cli.command,
+        continue_latest: cli.continue_latest,
+        session: cli.session,
+        model: cli.model,
+        mode: cli.mode,
+        configs: cli.configs,
+        dialects: cli.dialects,
+        no_discovery: cli.no_discovery,
+    };
     match cli.command {
         Some(CliCommand::Run {
             prompt,
@@ -285,6 +320,63 @@ async fn run_headless(
         Some(Stop::Aborted) => Ok(ExitCode::from(2)),
         Some(Stop::Error) => Ok(ExitCode::from(1)),
         _ => Ok(ExitCode::SUCCESS),
+    }
+}
+
+/// The interactive surface: picker (unless -c/--session) then the TUI.
+async fn run_tui(cli: Cli) -> Result<ExitCode, String> {
+    let cwd = std::env::current_dir().map_err(|e| format!("cwd: {e}"))?;
+    let choice = if let Some(path) = cli.session.clone() {
+        ka_agent::StrandChoice::Path(path)
+    } else if cli.continue_latest {
+        // waypoint first, else newest
+        match ka_agent::read_waypoint() {
+            Some((way_cwd, path)) if way_cwd == cwd && path.exists() => {
+                ka_agent::StrandChoice::Path(path)
+            }
+            _ => ka_agent::StrandChoice::Latest,
+        }
+    } else {
+        pick_strand(&cwd)?
+    };
+
+    let cfg = load_config(&cli.configs, cli.model.clone(), cli.mode.clone())?;
+    let catalog = build_catalog(&cli.dialects, !cli.no_discovery).await?;
+    let model_label = cfg.model.clone().unwrap_or_else(|| "(canned)".to_string());
+    let handle = ka_agent::spawn_full(cfg, catalog, choice);
+    let ka_agent::EngineHandle { commands, events } = handle;
+    let exit = ka_term::tui::run(commands, events, &model_label)
+        .await
+        .map_err(|e| format!("tui: {e}"))?;
+    match exit {
+        ka_term::tui::Exit::Quit | ka_term::tui::Exit::EngineEnded => Ok(ExitCode::SUCCESS),
+    }
+}
+
+/// Text session picker: newest strands for this cwd + new-session default.
+fn pick_strand(cwd: &std::path::Path) -> Result<ka_agent::StrandChoice, String> {
+    use std::io::Write;
+
+    let strands = ka_strand::list(cwd).map_err(|e| format!("listing strands: {e}"))?;
+    if strands.is_empty() {
+        return Ok(ka_agent::StrandChoice::New);
+    }
+    println!("recent strands for {}:", cwd.display());
+    println!("  0) new session");
+    for (i, s) in strands.iter().take(9).enumerate() {
+        println!("  {}) [{}] {} ({} msgs)", i + 1, s.ts, s.title, s.messages);
+    }
+    print!("choice [0]: ");
+    std::io::stdout().flush().map_err(|e| e.to_string())?;
+    let mut line = String::new();
+    std::io::stdin()
+        .read_line(&mut line)
+        .map_err(|e| format!("stdin: {e}"))?;
+    let n: usize = line.trim().parse().unwrap_or(0);
+    if n == 0 || n > strands.len() {
+        Ok(ka_agent::StrandChoice::New)
+    } else {
+        Ok(ka_agent::StrandChoice::Path(strands[n - 1].path.clone()))
     }
 }
 

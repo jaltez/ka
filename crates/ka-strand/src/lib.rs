@@ -1,11 +1,14 @@
 //! Strand store: one session = one append-only JSONL file ("strand"), a tree
 //! of [`Record`]s with a single live tip. Branching ("offshoot") is a tip
-//! move; splitting copies a prefix into a new file. This module freezes the
-//! record taxonomy in Phase 0; persistence wiring lands in Phase 3.
+//! move; splitting copies a prefix into a new file. Phase 3 adds the
+//! session-file management used by the engine: ids, settings replay,
+//! listing, and dangling-turn synthesis.
 
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use ka_protocol::{Effort, Mode, RecordId, StrandId};
 use serde::{Deserialize, Serialize};
@@ -33,6 +36,28 @@ pub enum Role {
     System,
 }
 
+/// A tool call persisted with an assistant message.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct StoredCall {
+    /// Provider call id.
+    pub id: String,
+    /// Tool name.
+    pub tool: String,
+    /// Parsed arguments.
+    pub arguments: serde_json::Value,
+}
+
+/// A tool result persisted with a tool-role message.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct StoredResult {
+    /// The call this answers.
+    pub call_id: String,
+    /// Output text.
+    pub content: String,
+    /// Whether the tool reported an error.
+    pub is_error: bool,
+}
+
 /// One line of a strand file.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "record", rename_all = "snake_case")]
@@ -50,7 +75,7 @@ pub enum Record {
         /// Repo state at creation, if inside a work tree.
         repo: Option<RepoSnapshot>,
     },
-    /// A conversation message.
+    /// A conversation message (with tool calls/results when present).
     Message {
         /// Record identifier.
         id: RecordId,
@@ -58,6 +83,12 @@ pub enum Record {
         role: Role,
         /// Message content.
         content: String,
+        /// Tool calls issued with this assistant message.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        calls: Vec<StoredCall>,
+        /// Tool results carried by a tool-role message.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        results: Vec<StoredResult>,
     },
     /// A settings change (model / effort / mode).
     Change {
@@ -109,7 +140,241 @@ impl Record {
     }
 }
 
-/// Append-only writer for a strand file.
+static RECORD_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// Generate a fresh, roughly-sortable record id.
+pub fn new_record_id() -> RecordId {
+    let millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    let n = RECORD_COUNTER.fetch_add(1, Ordering::Relaxed);
+    RecordId(format!("r{millis:x}-{n:x}"))
+}
+
+/// Generate a fresh strand id.
+pub fn new_strand_id() -> StrandId {
+    let millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    let n = RECORD_COUNTER.fetch_add(1, Ordering::Relaxed);
+    StrandId(format!("s{millis:x}-{n:x}"))
+}
+
+thread_local! {
+    static DATA_DIR_OVERRIDE: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Override the data root for this thread (engine tests).
+#[doc(hidden)]
+pub fn set_data_dir_for_tests(dir: PathBuf) {
+    DATA_DIR_OVERRIDE.with(|d| *d.borrow_mut() = Some(dir));
+}
+
+/// Data root: `KA_DATA_DIR` (tests) > `XDG_DATA_HOME/ka` > `~/.local/share/ka`.
+pub fn data_dir() -> PathBuf {
+    if let Some(dir) = DATA_DIR_OVERRIDE.with(|d| d.borrow().clone()) {
+        return dir;
+    }
+    if let Ok(dir) = std::env::var("KA_DATA_DIR") {
+        return PathBuf::from(dir);
+    }
+    let base = std::env::var("XDG_DATA_HOME")
+        .map(PathBuf::from)
+        .or_else(|_| std::env::var("HOME").map(|h| PathBuf::from(h).join(".local/share")))
+        .unwrap_or_else(|_| std::env::temp_dir());
+    base.join("ka")
+}
+
+fn encode_cwd(cwd: &Path) -> String {
+    let s = cwd.to_string_lossy().replace('/', "-");
+    format!("-{s}")
+}
+
+/// The strand directory for a working directory.
+pub fn strand_dir(cwd: &Path) -> PathBuf {
+    data_dir().join("strands").join(encode_cwd(cwd))
+}
+
+/// A strand under management: path, records, live settings.
+#[derive(Debug)]
+pub struct StrandFile {
+    path: PathBuf,
+    records: Vec<Record>,
+    settings: Settings,
+}
+
+/// Replayed session settings.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Settings {
+    /// Last-set model selector.
+    pub model: Option<String>,
+    /// Last-set effort.
+    pub effort: Option<Effort>,
+    /// Last-set permission mode.
+    pub mode: Option<Mode>,
+    /// True when the file ended on a dangling (user-tail) turn.
+    pub dangling: bool,
+}
+
+impl StrandFile {
+    /// Create a new strand for `cwd` (writes the header immediately).
+    pub fn create(cwd: &Path, repo: Option<RepoSnapshot>) -> std::io::Result<Self> {
+        let dir = strand_dir(cwd);
+        std::fs::create_dir_all(&dir)?;
+        let id = new_strand_id();
+        let ts = now_rfc3339();
+        let path = dir.join(format!("{}_{}.jsonl", ts.replace(':', ""), id.0));
+        let header = Record::Header {
+            id: id.clone(),
+            ts,
+            cwd: cwd.to_string_lossy().into_owned(),
+            version: 1,
+            repo,
+        };
+        let mut writer = StrandWriter::open(&path)?;
+        writer.append(&header)?;
+        Ok(Self {
+            path,
+            records: vec![header],
+            settings: Settings::default(),
+        })
+    }
+
+    /// Open an existing strand, replaying settings and detecting dangling
+    /// turns. Missing file is an error (use listing to pick paths).
+    pub fn open(path: &Path) -> std::io::Result<Self> {
+        let records = read(path)?;
+        if records.is_empty() || !matches!(records[0], Record::Header { .. }) {
+            return Err(std::io::Error::other(
+                "not a strand file (missing header record)",
+            ));
+        }
+        let mut settings = Settings::default();
+        for record in &records {
+            if let Record::Change {
+                model,
+                effort,
+                mode,
+                ..
+            } = record
+            {
+                if model.is_some() {
+                    settings.model = model.clone();
+                }
+                if effort.is_some() {
+                    settings.effort = *effort;
+                }
+                if mode.is_some() {
+                    settings.mode = *mode;
+                }
+            }
+        }
+        settings.dangling = matches!(
+            records.last(),
+            Some(Record::Message {
+                role: Role::User,
+                ..
+            })
+        );
+        Ok(Self {
+            path: path.to_path_buf(),
+            records,
+            settings,
+        })
+    }
+
+    /// Synthesize an aborted marker for a dangling turn, if present.
+    pub fn synthesize_aborted(&mut self) -> std::io::Result<bool> {
+        if !self.settings.dangling {
+            return Ok(false);
+        }
+        let record = Record::Message {
+            id: new_record_id(),
+            role: Role::Assistant,
+            content: "(turn interrupted)".to_string(),
+            calls: Vec::new(),
+            results: Vec::new(),
+        };
+        self.append(record)?;
+        self.settings.dangling = false;
+        Ok(true)
+    }
+
+    /// Append a record (writes through to disk).
+    pub fn append(&mut self, record: Record) -> std::io::Result<()> {
+        if let Record::Change {
+            model,
+            effort,
+            mode,
+            ..
+        } = &record
+        {
+            if model.is_some() {
+                self.settings.model = model.clone();
+            }
+            if effort.is_some() {
+                self.settings.effort = *effort;
+            }
+            if mode.is_some() {
+                self.settings.mode = *mode;
+            }
+        }
+        if matches!(
+            record,
+            Record::Message {
+                role: Role::User,
+                ..
+            }
+        ) {
+            self.settings.dangling = true;
+        } else if matches!(record, Record::Message { .. }) {
+            self.settings.dangling = false;
+        }
+        let mut writer = StrandWriter::open(&self.path)?;
+        writer.append(&record)?;
+        self.records.push(record);
+        Ok(())
+    }
+
+    /// The strand's file path.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// All records in order.
+    pub fn records(&self) -> &[Record] {
+        &self.records
+    }
+
+    /// Replayed settings.
+    pub fn settings(&self) -> &Settings {
+        &self.settings
+    }
+
+    /// Take the settings (for engine bootstrap).
+    pub fn into_settings(self) -> Settings {
+        self.settings
+    }
+
+    /// Records appended after `since` (index into records).
+    pub fn records_since(&self, since: usize) -> &[Record] {
+        self.records.get(since..).unwrap_or(&[])
+    }
+
+    /// Current record count.
+    pub fn len(&self) -> usize {
+        self.records.len()
+    }
+
+    /// Whether the strand holds only its header.
+    pub fn is_empty(&self) -> bool {
+        self.records.len() <= 1
+    }
+}
+
+/// One line of the writer. Kept separate so raw appending stays cheap.
 pub struct StrandWriter {
     file: File,
 }
@@ -129,6 +394,103 @@ impl StrandWriter {
         self.file.write_all(line.as_bytes())?;
         self.file.flush()
     }
+}
+
+/// Summary of a strand for pickers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StrandSummary {
+    /// File path.
+    pub path: PathBuf,
+    /// Strand id.
+    pub id: String,
+    /// Creation timestamp.
+    pub ts: String,
+    /// First user message (truncated) or "(empty)".
+    pub title: String,
+    /// Message count.
+    pub messages: usize,
+}
+
+/// List strands for a working directory, newest first.
+pub fn list(cwd: &Path) -> std::io::Result<Vec<StrandSummary>> {
+    let dir = strand_dir(cwd);
+    let mut summaries = Vec::new();
+    let entries = match std::fs::read_dir(&dir) {
+        Ok(e) => e,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(summaries),
+        Err(e) => return Err(e),
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().is_none_or(|e| e != "jsonl") {
+            continue;
+        }
+        let Ok(records) = read(&path) else {
+            continue;
+        };
+        let Some(Record::Header { id, ts, .. }) = records.first() else {
+            continue;
+        };
+        let title = records
+            .iter()
+            .find_map(|r| match r {
+                Record::Message {
+                    role: Role::User,
+                    content,
+                    ..
+                } => Some(content.clone()),
+                _ => None,
+            })
+            .map(|c| {
+                let first = c.lines().next().unwrap_or("").to_string();
+                let truncated: String = first.chars().take(60).collect();
+                truncated
+            })
+            .filter(|c| !c.is_empty())
+            .unwrap_or_else(|| "(empty)".to_string());
+        let messages = records
+            .iter()
+            .filter(|r| matches!(r, Record::Message { .. }))
+            .count();
+        summaries.push(StrandSummary {
+            path,
+            id: id.0.clone(),
+            ts: ts.clone(),
+            title,
+            messages,
+        });
+    }
+    // ids embed millisecond timestamps (s{millis:x}), so they sort newer
+    // first even when RFC 3339 timestamps tie at second granularity.
+    summaries.sort_by(|a, b| b.id.cmp(&a.id));
+    Ok(summaries)
+}
+
+/// Most recent strand for a working directory.
+pub fn latest(cwd: &Path) -> std::io::Result<Option<StrandSummary>> {
+    Ok(list(cwd)?.into_iter().next())
+}
+
+fn now_rfc3339() -> String {
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    // days→date civil algorithm (Howard Hinnant) compressed
+    let days = secs / 86_400;
+    let rem = secs % 86_400;
+    let (h, m, s) = (rem / 3600, (rem % 3600) / 60, rem % 60);
+    let z = days as i64 + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let mth = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if mth <= 2 { y + 1 } else { y };
+    format!("{y:04}-{mth:02}-{d:02}T{h:02}:{m:02}:{s:02}Z")
 }
 
 /// Read every record from a strand file. Malformed lines fail with the
@@ -161,100 +523,138 @@ pub fn read(path: &Path) -> std::io::Result<Vec<Record>> {
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-    use std::path::PathBuf;
-
     use super::*;
 
-    fn temp_strand(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("ka-strand-{}-{}", std::process::id(), name));
+    fn temp_data(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("ka-strand3-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        dir.join("strand.jsonl")
+        DATA_DIR_OVERRIDE.with(|d| *d.borrow_mut() = Some(dir.clone()));
+        dir
     }
 
     #[test]
-    fn roundtrip_through_file() {
-        let path = temp_strand("roundtrip");
-        let records = vec![
-            Record::Header {
-                id: StrandId("s1".into()),
-                ts: "2026-08-23T00:00:00Z".into(),
-                cwd: "/tmp/proj".into(),
-                version: 1,
-                repo: Some(RepoSnapshot {
-                    branch: "main".into(),
-                    dirty: vec!["src/x.rs".into()],
-                }),
-            },
-            Record::Message {
-                id: RecordId("r1".into()),
+    fn strandfile_roundtrip_with_tools_and_settings() {
+        let data = temp_data("roundtrip");
+        let cwd = PathBuf::from("/tmp/proj");
+        let mut strand = StrandFile::create(
+            &cwd,
+            Some(RepoSnapshot {
+                branch: "main".into(),
+                dirty: vec!["x".into()],
+            }),
+        )
+        .unwrap();
+        strand
+            .append(Record::Message {
+                id: new_record_id(),
                 role: Role::User,
-                content: "hi".into(),
-            },
-            Record::Message {
-                id: RecordId("r2".into()),
+                content: "go".into(),
+                calls: Vec::new(),
+                results: Vec::new(),
+            })
+            .unwrap();
+        strand
+            .append(Record::Message {
+                id: new_record_id(),
                 role: Role::Assistant,
-                content: "hello".into(),
-            },
-            Record::Change {
-                id: RecordId("r3".into()),
-                model: Some("openai/gpt-5.1:high".into()),
+                content: "working".into(),
+                calls: vec![StoredCall {
+                    id: "c1".into(),
+                    tool: "read".into(),
+                    arguments: serde_json::json!({"path": "x"}),
+                }],
+                results: Vec::new(),
+            })
+            .unwrap();
+        strand
+            .append(Record::Message {
+                id: new_record_id(),
+                role: Role::Tool,
+                content: String::new(),
+                calls: Vec::new(),
+                results: vec![StoredResult {
+                    call_id: "c1".into(),
+                    content: "file body".into(),
+                    is_error: false,
+                }],
+            })
+            .unwrap();
+        strand
+            .append(Record::Change {
+                id: new_record_id(),
+                model: Some("openai/gpt-5.1@high".into()),
                 effort: Some(Effort::High),
                 mode: Some(Mode::Free),
-            },
-            Record::Digest {
-                id: RecordId("r4".into()),
-                summary: "so far: greetings".into(),
-                kept_from: RecordId("r3".into()),
-            },
-            Record::Boundary {
-                id: RecordId("r5".into()),
-            },
-            Record::Custom {
-                id: RecordId("r6".into()),
-                ns: "x.example.state".into(),
-                data: serde_json::json!({"n": 1}),
-            },
-        ];
-        {
-            let mut w = StrandWriter::open(&path).unwrap();
-            for r in &records {
-                w.append(r).unwrap();
-            }
+            })
+            .unwrap();
+
+        let reopened = StrandFile::open(strand.path()).unwrap();
+        assert_eq!(reopened.records().len(), 5);
+        let settings = reopened.settings();
+        assert_eq!(settings.model.as_deref(), Some("openai/gpt-5.1@high"));
+        assert_eq!(settings.mode, Some(Mode::Free));
+        assert!(!settings.dangling);
+        let _ = std::fs::remove_dir_all(&data);
+    }
+
+    #[test]
+    fn dangling_turn_detected_and_synthesized() {
+        let data = temp_data("dangling");
+        let cwd = PathBuf::from("/tmp/proj2");
+        let mut strand = StrandFile::create(&cwd, None).unwrap();
+        strand
+            .append(Record::Message {
+                id: new_record_id(),
+                role: Role::User,
+                content: "hello?".into(),
+                calls: Vec::new(),
+                results: Vec::new(),
+            })
+            .unwrap();
+        assert!(StrandFile::open(strand.path()).unwrap().settings().dangling);
+
+        let mut resumed = StrandFile::open(strand.path()).unwrap();
+        assert!(resumed.synthesize_aborted().unwrap());
+        let clean = StrandFile::open(strand.path()).unwrap();
+        assert!(!clean.settings().dangling);
+        match clean.records().last() {
+            Some(Record::Message { content, .. }) => assert_eq!(content, "(turn interrupted)"),
+            other => panic!("expected synthesized message, got {other:?}"),
         }
-        let back = read(&path).unwrap();
-        assert_eq!(records, back);
-        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir_all(&data);
     }
 
     #[test]
-    fn missing_file_is_empty() {
-        let path = temp_strand("missing").join("nope.jsonl");
-        assert!(read(&path).unwrap().is_empty());
+    fn listing_newest_first_with_titles() {
+        let data = temp_data("listing");
+        let cwd = PathBuf::from("/tmp/proj3");
+        for prompt in ["first session query", "second session query"] {
+            let mut strand = StrandFile::create(&cwd, None).unwrap();
+            strand
+                .append(Record::Message {
+                    id: new_record_id(),
+                    role: Role::User,
+                    content: prompt.into(),
+                    calls: Vec::new(),
+                    results: Vec::new(),
+                })
+                .unwrap();
+        }
+        let listed = list(&cwd).unwrap();
+        assert_eq!(listed.len(), 2);
+        assert!(listed[0].title.contains("second"), "{}", listed[0].title);
+        assert!(listed[0].messages >= 1);
+        assert!(latest(&cwd).unwrap().is_some());
+        let _ = std::fs::remove_dir_all(&data);
     }
 
     #[test]
-    fn malformed_line_reports_number() {
-        let path = temp_strand("malformed");
-        let valid_header = r#"{"record":"header","id":"s1","ts":"t","cwd":"/","version":1}"#;
-        std::fs::write(&path, format!("{valid_header}\ngarbage\n")).unwrap();
-        let err = read(&path).unwrap_err().to_string();
-        assert!(err.contains(":2:"), "got: {err}");
-        let _ = std::fs::remove_file(&path);
-    }
-
-    #[test]
-    fn record_id_accessor() {
-        let r = Record::Boundary {
-            id: RecordId("b".into()),
-        };
-        assert_eq!(r.id(), Some(&RecordId("b".into())));
-        let h = Record::Header {
-            id: StrandId("s".into()),
-            ts: "t".into(),
-            cwd: "/".into(),
-            version: 1,
-            repo: None,
-        };
-        assert_eq!(h.id(), None);
+    fn ids_are_fresh_and_sortableish() {
+        let a = new_record_id();
+        let b = new_record_id();
+        assert_ne!(a, b);
+        assert!(a.0.starts_with('r'));
+        assert!(new_strand_id().0.starts_with('s'));
     }
 }

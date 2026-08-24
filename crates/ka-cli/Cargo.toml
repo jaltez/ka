@@ -13,6 +13,8 @@ path = "src/main.rs"
 [dependencies]
 ka-agent = { workspace = true }
 ka-dialect = { workspace = true }
+ka-strand = { workspace = true }
+ka-term = { workspace = true }
 ka-protocol = { workspace = true }
 toml = { workspace = true }
 clap = { workspace = true }

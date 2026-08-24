@@ -6,6 +6,8 @@ use std::io;
 
 use crossterm::event::{Event as TermEvent, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
+pub mod tui;
+
 /// A decoded keypress, surface-agnostic.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Key {

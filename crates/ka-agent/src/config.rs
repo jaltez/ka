@@ -34,6 +34,9 @@ pub struct Config {
     /// Maximum tool-execution steps per prompt before forcing a text reply.
     #[serde(default)]
     pub max_steps: Option<u32>,
+    /// Working directory override (default: process cwd).
+    #[serde(default)]
+    pub cwd: Option<String>,
 }
 
 impl Config {
@@ -64,6 +67,9 @@ impl Config {
         }
         if other.max_steps.is_some() {
             self.max_steps = other.max_steps;
+        }
+        if other.cwd.is_some() {
+            self.cwd = other.cwd;
         }
     }
 
