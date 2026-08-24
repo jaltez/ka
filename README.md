@@ -2,7 +2,7 @@
 
 A model-agnostic, very-low-footprint coding agent in Rust.
 
-**Status: Phase 4 (context survival).** Design: [`research/ka/architecture.md`](research/ka/architecture.md) · Roadmap: [`research/ka/roadmap.md`](research/ka/roadmap.md)
+**Status: Phase 5 (permissions as data & trust).** Design: [`research/ka/architecture.md`](research/ka/architecture.md) · Roadmap: [`research/ka/roadmap.md`](research/ka/roadmap.md)
 
 ## Footprint contract (CI-enforced target)
 Single static binary ≤ 10 MB (musl, stripped) · cold start ≤ 50 ms · idle RSS ≤ 15 MB · zero steady-state network.
@@ -32,5 +32,14 @@ cargo run -p ka-cli -- run --model ollama/qwen3:32b "hi"   # live local round-tr
 ```
 
 Selectors are `vendor/model@effort` (`@` because model ids may contain colons).
+
+Project config (`.ka/ka.toml`) is trust-gated: first use prompts (or pass `--trust`), decisions persist in `~/.local/state/ka/trust.json`. Permission rules are data, evaluated first-match-wins before mode logic:
+
+```toml
+[[rules]]
+tool = "bash"
+pattern = "cargo *"   # glob on the primary argument
+verdict = "allow"     # allow | ask | deny
+```
 
 Publishing note: `ka` is taken on crates.io; all crates publish under the free `ka-*` names, binary stays `ka`.

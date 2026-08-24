@@ -261,10 +261,12 @@ async fn run(
     }
     let mode = config.effective_mode();
     let max_steps = config.effective_max_steps();
+    let rules = config.rules.clone();
     let mut state = EngineState::from(config);
     let (history, ids, digest) = history_from_records(strand.records());
     let mut voice = Voice::new(catalog, cwd.clone(), mode, max_steps);
     voice.load_history(history, digest);
+    voice.set_rules(rules);
     state.record_ids = ids;
     write_waypoint(&cwd, strand.path());
     // replay resumed history so surfaces can rebuild the transcript

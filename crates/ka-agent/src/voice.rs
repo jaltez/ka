@@ -46,6 +46,24 @@ touched (read vs modified), open threads and next steps, and any \
 user-stated constraints. Be dense; skip pleasantries. Output only the \
 summary.";
 
+/// Simple glob match: `*` spans anything, `?` one char, everything else
+/// literal. No path semantics — patterns match raw strings.
+pub fn glob_match(pattern: &str, text: &str) -> bool {
+    fn inner(p: &[char], t: &[char]) -> bool {
+        match (p.first(), t.first()) {
+            (None, None) => true,
+            (None, Some(_)) => false,
+            (Some('*'), _) => (0..=t.len()).any(|skip| inner(&p[1..], &t[skip..])),
+            (Some('?'), Some(_)) => inner(&p[1..], &t[1..]),
+            (Some(pc), Some(tc)) if pc == tc => inner(&p[1..], &t[1..]),
+            _ => false,
+        }
+    }
+    let p: Vec<char> = pattern.chars().collect();
+    let t: Vec<char> = text.chars().collect();
+    inner(&p, &t)
+}
+
 /// Rough token estimate for one message under a chars-per-token ratio.
 fn message_tokens(msg: &TurnMessage, ratio: f64) -> u64 {
     let chars = msg.content.chars().count() as u64
@@ -85,6 +103,8 @@ pub struct Voice {
     digest_revision: u64,
     /// (summary, kept index) of the most recent digest, for persistence.
     last_digest: Option<(String, usize)>,
+    /// Configured permission rules (first-match-wins).
+    rules_cfg: Vec<crate::config::Rule>,
 }
 
 impl Voice {
@@ -114,7 +134,13 @@ impl Voice {
             last_context: 0,
             digest_revision: 0,
             last_digest: None,
+            rules_cfg: Vec::new(),
         }
+    }
+
+    /// Set configured permission rules (engine bootstrap).
+    pub fn set_rules(&mut self, rules: Vec<crate::config::Rule>) {
+        self.rules_cfg = rules;
     }
 
     /// Load resumed history + digest (engine bootstrap).
@@ -388,6 +414,18 @@ impl Voice {
         let _ = kept_tokens;
         self.last_context = digest_tokens;
         kept_from
+    }
+
+    /// First matching configured rule's verdict for this call.
+    fn match_rule(&self, call: &ToolCall) -> Option<crate::config::Verdict> {
+        self.rules_cfg
+            .iter()
+            .find(|r| r.tool == call.tool)
+            .filter(|r| match &r.pattern {
+                None => true,
+                Some(pat) => glob_match(pat, &call.primary_arg()),
+            })
+            .map(|r| r.verdict)
     }
 
     /// Context window of the active model (0 = unknown).
@@ -768,6 +806,7 @@ impl Voice {
         let verdict = self.gate(def.clearance, call);
         match verdict {
             Gate::Allow => {}
+            Gate::Deny { reason } => return ToolOutput::err(reason),
             Gate::Ask { question } => {
                 self.state.ask_counter += 1;
                 let ask_id = AskId(format!("ask-{}", self.state.ask_counter));
@@ -820,10 +859,29 @@ impl Voice {
                 }
             }
         }
-        hand.execute(&call.arguments, &self.hand_ctx).await
+        let mut output = hand.execute(&call.arguments, &self.hand_ctx).await;
+        // one-way secret redaction before anything reaches the model
+        output.content = crate::hands::secrets::redact(&output.content);
+        output
     }
 
     fn gate(&self, clearance: Clearance, call: &ToolCall) -> Gate {
+        // configured rules: first match wins, before mode logic
+        if let Some(verdict) = self.match_rule(call) {
+            return match verdict {
+                crate::config::Verdict::Allow => Gate::Allow,
+                crate::config::Verdict::Ask => Gate::Ask {
+                    question: format!(
+                        "rule requires confirmation for {} `{}`",
+                        call.tool,
+                        call.primary_arg()
+                    ),
+                },
+                crate::config::Verdict::Deny => Gate::Deny {
+                    reason: format!("denied by rule for {}", call.tool),
+                },
+            };
+        }
         if self.state.rules.contains(&format!("tool:{}", call.tool)) {
             return Gate::Allow;
         }
@@ -878,6 +936,7 @@ impl Voice {
 enum Gate {
     Allow,
     Ask { question: String },
+    Deny { reason: String },
 }
 
 fn truncate_excerpt(text: &str) -> String {
@@ -925,7 +984,7 @@ mod tests {
     };
     use ka_protocol::Usage;
 
-    use super::{Voice, cost_of};
+    use super::{Voice, cost_of, glob_match};
 
     #[test]
     fn cost_of_computes_from_price() {
@@ -1337,6 +1396,97 @@ mod tests {
         assert!(digest_started, "overflow must trigger a digest");
         assert!(finished, "turn must recover and finish done");
         assert!(calls.lock().len() >= 3, "speak, summarize, retry");
+    }
+
+    #[test]
+    fn glob_match_basics() {
+        assert!(glob_match("cargo *", "cargo build --release"));
+        assert!(glob_match("cargo build", "cargo build"));
+        assert!(!glob_match("cargo build", "cargo test"));
+        assert!(glob_match("git push *", "git push origin main"));
+        assert!(!glob_match("git push *", "git status"));
+        assert!(glob_match("rm *build*", "rm -rf ./build-dir"));
+        assert!(glob_match("*", "anything at all"));
+        assert!(glob_match("read?file", "read-file"));
+    }
+
+    struct RuleFakeSpeaker;
+
+    impl Speaker for RuleFakeSpeaker {
+        fn speak<'a>(
+            &'a self,
+            _req: SpeakRequest,
+            out: tokio::sync::mpsc::Sender<StreamEvent>,
+        ) -> SpeakFuture<'a> {
+            Box::pin(async move {
+                out.send(StreamEvent::Call(ToolCall {
+                    id: "c1".into(),
+                    tool: "bash".into(),
+                    arguments: serde_json::json!({"command": "cargo build"}),
+                }))
+                .await
+                .ok();
+                out.send(StreamEvent::Finished {
+                    stop: ka_protocol::Stop::Done,
+                    usage: Default::default(),
+                })
+                .await
+                .ok();
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn rules_deny_in_free_mode() {
+        use ka_protocol::Event;
+        use tokio::sync::mpsc;
+
+        let catalog = Catalog::parse(
+            "[dialects.\"test/m\"]\nwire = \"openai_chat\"\nbase_url = \"http://127.0.0.1:1\"\ncontext = 1000\n",
+        )
+        .unwrap();
+        let mut voice = Voice::new(catalog, std::env::temp_dir(), ka_protocol::Mode::Free, 5)
+            .with_speaker(Wire::OpenaiChat, std::sync::Arc::new(RuleFakeSpeaker));
+        voice.set_rules(vec![crate::config::Rule {
+            tool: "bash".into(),
+            pattern: Some("cargo *".into()),
+            verdict: crate::config::Verdict::Deny,
+        }]);
+
+        let (cmd_tx, mut cmd_rx) = mpsc::channel(16);
+        let (evt_tx, mut evt_rx) = mpsc::channel(256);
+        let mut interjections = Vec::new();
+        let mut deferrals = std::collections::VecDeque::new();
+        let handle = tokio::spawn(async move {
+            voice
+                .turn(
+                    "test/m",
+                    "build it".into(),
+                    &mut cmd_rx,
+                    &evt_tx,
+                    &mut interjections,
+                    &mut deferrals,
+                )
+                .await;
+        });
+
+        let mut denied_output = false;
+        while let Some(evt) = evt_rx.recv().await {
+            if let Event::CallOutput {
+                excerpt, is_error, ..
+            } = &evt
+            {
+                assert!(is_error, "denied call must be an error result");
+                assert!(excerpt.contains("denied by rule"), "{excerpt}");
+                denied_output = true;
+            }
+            if matches!(evt, Event::TurnFinished { .. }) {
+                break;
+            }
+        }
+        drop(cmd_tx);
+        handle.await.unwrap();
+        assert!(denied_output, "rule denial must surface as tool error");
     }
 
     #[test]

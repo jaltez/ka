@@ -18,6 +18,7 @@ pub mod git;
 pub mod glob;
 pub mod grep;
 pub mod read;
+pub mod secrets;
 pub mod write;
 
 /// Execution clearance tiers.

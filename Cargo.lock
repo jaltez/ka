@@ -876,6 +876,7 @@ dependencies = [
  "ka-protocol",
  "ka-strand",
  "ka-term",
+ "serde_json",
  "tokio",
  "toml",
 ]

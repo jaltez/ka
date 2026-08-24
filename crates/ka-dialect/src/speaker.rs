@@ -112,6 +112,19 @@ pub struct ToolCall {
     pub arguments: Value,
 }
 
+impl ToolCall {
+    /// The call's primary string argument (what rules match against):
+    /// bash→command, file tools→path, search tools→pattern.
+    pub fn primary_arg(&self) -> String {
+        for key in ["command", "path", "pattern"] {
+            if let Some(v) = self.arguments.get(key).and_then(Value::as_str) {
+                return v.to_string();
+            }
+        }
+        self.arguments.to_string()
+    }
+}
+
 /// Everything a Speaker needs for one request.
 #[derive(Debug, Clone)]
 pub struct SpeakRequest {

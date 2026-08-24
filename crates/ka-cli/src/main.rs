@@ -41,6 +41,9 @@ struct Cli {
     /// Skip local-endpoint discovery probes
     #[arg(long)]
     no_discovery: bool,
+    /// Trust this directory's .ka/ka.toml (stores the decision)
+    #[arg(long)]
+    trust: bool,
 }
 
 #[derive(Subcommand, Clone)]
@@ -67,6 +70,9 @@ enum CliCommand {
         /// Continue the newest strand for this directory
         #[arg(short = 'c', long)]
         continue_latest: bool,
+        /// Trust this directory's .ka/ka.toml (stores the decision)
+        #[arg(long)]
+        trust: bool,
     },
     /// List known models (embedded catalog + local discovery)
     Models {
@@ -114,24 +120,25 @@ fn main() -> ExitCode {
     }
 }
 
-/// Defaults < user < project < extra files < env < flags, every layer strict.
+/// Defaults < user < project (if trusted) < extra files < env < flags.
 fn load_config(
     configs: &[PathBuf],
     flag_model: Option<String>,
     flag_mode: Option<String>,
+    trust_project: bool,
 ) -> Result<Config, String> {
     let mut cfg = Config::default();
 
     let user = std::env::var("HOME")
         .ok()
         .map(|h| PathBuf::from(h).join(".config/ka/ka.toml"));
-    let project = PathBuf::from(".ka/ka.toml");
+    let project = if trust_project {
+        Some(PathBuf::from(".ka/ka.toml"))
+    } else {
+        None
+    };
 
-    for path in user
-        .iter()
-        .chain(std::iter::once(&project))
-        .chain(configs.iter())
-    {
+    for path in user.iter().chain(project.iter()).chain(configs.iter()) {
         match std::fs::read_to_string(path) {
             Ok(text) => {
                 let layer = Config::parse_layer(&text, &path.display().to_string())
@@ -168,6 +175,11 @@ fn parse_mode(s: &str) -> Result<ka_protocol::Mode, String> {
         "free" => Ok(ka_protocol::Mode::Free),
         other => Err(format!("unknown mode {other:?} (expected guarded|free)")),
     }
+}
+
+fn trust_for_cwd(force: bool) -> bool {
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    project_config_trusted(&cwd, force)
 }
 
 fn wire_str(w: ka_dialect::Wire) -> String {
@@ -208,6 +220,7 @@ async fn dispatch(cli: Cli) -> Result<ExitCode, String> {
         configs: cli.configs,
         dialects: cli.dialects,
         no_discovery: cli.no_discovery,
+        trust: cli.trust,
     };
     match cli.command {
         Some(CliCommand::Run {
@@ -218,6 +231,7 @@ async fn dispatch(cli: Cli) -> Result<ExitCode, String> {
             dialects,
             no_discovery,
             continue_latest,
+            trust,
         }) => {
             run_headless(
                 prompt,
@@ -227,6 +241,7 @@ async fn dispatch(cli: Cli) -> Result<ExitCode, String> {
                 &dialects,
                 !no_discovery,
                 continue_latest,
+                trust,
             )
             .await
         }
@@ -264,7 +279,8 @@ async fn dispatch(cli: Cli) -> Result<ExitCode, String> {
                 Ok(ExitCode::SUCCESS)
             }
             ConfigCommand::Print { configs } => {
-                let cfg = load_config(&configs, None, None)?;
+                let trust = trust_for_cwd(false);
+                let cfg = load_config(&configs, None, None, trust)?;
                 let text =
                     toml::to_string_pretty(&cfg).map_err(|e| format!("serialize config: {e}"))?;
                 print!("{text}");
@@ -280,6 +296,7 @@ async fn dispatch(cli: Cli) -> Result<ExitCode, String> {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_headless(
     prompt: Option<String>,
     model: Option<String>,
@@ -288,8 +305,10 @@ async fn run_headless(
     dialects: &[PathBuf],
     with_discovery: bool,
     continue_latest: bool,
+    force_trust: bool,
 ) -> Result<ExitCode, String> {
-    let cfg = load_config(configs, model, mode)?;
+    let trust = trust_for_cwd(force_trust);
+    let cfg = load_config(configs, model, mode, trust)?;
     let prompt = match prompt {
         Some(p) => p,
         None => read_stdin()?,
@@ -362,7 +381,8 @@ async fn run_tui(cli: Cli) -> Result<ExitCode, String> {
         pick_strand(&cwd)?
     };
 
-    let cfg = load_config(&cli.configs, cli.model.clone(), cli.mode.clone())?;
+    let trust = trust_for_cwd(cli.trust);
+    let cfg = load_config(&cli.configs, cli.model.clone(), cli.mode.clone(), trust)?;
     let catalog = build_catalog(&cli.dialects, !cli.no_discovery).await?;
     let model_label = cfg.model.clone().unwrap_or_else(|| "(canned)".to_string());
     let handle = ka_agent::spawn_full(cfg, catalog, choice);
@@ -400,6 +420,69 @@ fn pick_strand(cwd: &std::path::Path) -> Result<ka_agent::StrandChoice, String> 
     } else {
         Ok(ka_agent::StrandChoice::Path(strands[n - 1].path.clone()))
     }
+}
+
+/// Trust store: directories whose `.ka/` local config ka will load.
+fn trust_path() -> PathBuf {
+    std::env::var("XDG_STATE_HOME")
+        .map(PathBuf::from)
+        .or_else(|_| std::env::var("HOME").map(|h| PathBuf::from(h).join(".local/state")))
+        .unwrap_or_else(|_| std::env::temp_dir())
+        .join("ka/trust.json")
+}
+
+fn load_trust() -> Vec<PathBuf> {
+    std::fs::read_to_string(trust_path())
+        .ok()
+        .and_then(|t| serde_json::from_str(&t).ok())
+        .unwrap_or_default()
+}
+
+fn save_trust(dirs: &[PathBuf]) {
+    let path = trust_path();
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Ok(json) = serde_json::to_string_pretty(dirs) {
+        let _ = std::fs::write(path, json);
+    }
+}
+
+/// Whether the project config layer for `cwd` may load. Prompts on a TTY
+/// (first sighting), skips with a warning otherwise. `--trust` forces.
+fn project_config_trusted(cwd: &std::path::Path, force_trust: bool) -> bool {
+    let project = cwd.join(".ka/ka.toml");
+    if !project.exists() {
+        return true; // nothing to gate
+    }
+    let canonical = std::fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
+    let mut trusted = load_trust();
+    if trusted.contains(&canonical) {
+        return true;
+    }
+    if force_trust {
+        trusted.push(canonical);
+        save_trust(&trusted);
+        return true;
+    }
+    // prompt only when interactive
+    if std::io::IsTerminal::is_terminal(&std::io::stdin()) {
+        eprintln!(
+            "ka: this directory has a .ka/ka.toml project config.\n     {}\n   Trust it (loads its rules/model settings)? [y/N]",
+            canonical.display()
+        );
+        let mut line = String::new();
+        if std::io::stdin().read_line(&mut line).is_ok() {
+            let ans = line.trim().to_lowercase();
+            if ans == "y" || ans == "yes" {
+                trusted.push(canonical);
+                save_trust(&trusted);
+                return true;
+            }
+        }
+    }
+    eprintln!("ka: project config NOT trusted; skipping .ka/ka.toml (pass --trust to trust it)");
+    false
 }
 
 fn read_stdin() -> Result<String, String> {
