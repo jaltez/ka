@@ -2,7 +2,7 @@
 
 A model-agnostic, very-low-footprint coding agent in Rust.
 
-**Status: Phase 6 (conventions, extension, pathfinder).** Design: [`research/ka/architecture.md`](research/ka/architecture.md) · Roadmap: [`research/ka/roadmap.md`](research/ka/roadmap.md)
+**Status: Phase 7 partial (plan mode, rewind).** Design: [`research/ka/architecture.md`](research/ka/architecture.md) · Roadmap: [`research/ka/roadmap.md`](research/ka/roadmap.md)
 
 ## Footprint contract (CI-enforced target)
 Single static binary ≤ 10 MB (musl, stripped) · cold start ≤ 50 ms · idle RSS ≤ 15 MB · zero steady-state network.
@@ -41,6 +41,8 @@ event = "pre_tool_use"   # or post_tool_use
 tool = "bash"            # optional filter
 command = "guard.sh"     # JSON on stdin; exit 2 blocks
 ```
+
+**Plan mode** (`--mode plan` or TUI `/plan`): read-only except `.ka/plans/` (enforced at the gate); `/build` switches back and starts implementation from the plan file. **Rewind**: `/rewind N` drops the last N exchanges (persisted as a `rewind` record; resume reconstructs the truncated history).
 
 `pathfinder` delegates read-only research (read/glob/grep) to a nested voice and returns a dense summary. Custom slash commands: `.ka/commands/<name>.md` with `$ARGUMENTS`. `ka init` writes a starter AGENTS.md.
 

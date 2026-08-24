@@ -546,6 +546,26 @@ impl Voice {
             .map(|r| r.verdict)
     }
 
+    /// Truncate history so it ends just before the Nth-last user
+    /// message. Returns the kept index (into the pre-truncation history)
+    /// or None when there aren't that many user turns.
+    pub fn rewind(&mut self, turns: u32) -> Option<usize> {
+        if turns == 0 {
+            return None;
+        }
+        let mut seen = 0u32;
+        for idx in (0..self.history.len()).rev() {
+            if self.history[idx].role == TurnRole::User {
+                seen += 1;
+                if seen == turns {
+                    self.history.truncate(idx);
+                    return Some(idx);
+                }
+            }
+        }
+        None
+    }
+
     /// Context window of the active model (0 = unknown).
     pub fn window_tokens(&self) -> u64 {
         let Some(model_id) = &self.model_selector else {
@@ -705,6 +725,13 @@ impl Voice {
             "\nYou are ka, a precise coding agent. {}. Use the provided tools to inspect and modify the repository; prefer read before edit.",
             snap.summary()
         ));
+        if self.mode == ka_protocol::Mode::Plan {
+            system.push_str(
+                "\n\nPLAN MODE: research the task with read/glob/grep/pathfinder, then write a \
+concrete numbered plan to .ka/plans/plan.md (the only writable path). Do not \
+attempt implementation — the user will review and switch to build mode.",
+            );
+        }
         if let Some(d) = &self.digest {
             system.push_str(&format!(
                 "\n\nEarlier-conversation summary (this is your memory of prior turns — treat it as accurate ground truth):\n{d}"
@@ -1057,6 +1084,23 @@ impl Voice {
                 ka_protocol::Mode::Guarded => Gate::Ask {
                     question: format!("allow {} to modify files?", call.tool),
                 },
+                ka_protocol::Mode::Plan => {
+                    // research mode: only the plans directory is writable
+                    let arg = call.primary_arg();
+                    let plans_ok = arg.starts_with(".ka/plans/")
+                        || arg.starts_with("./.ka/plans/")
+                        || arg.contains("/.ka/plans/");
+                    if plans_ok {
+                        Gate::Allow
+                    } else {
+                        Gate::Deny {
+                            reason: format!(
+                                "plan mode is read-only except .ka/plans/ (got {arg:?}); \
+use /build to switch to implementation"
+                            ),
+                        }
+                    }
+                }
             },
             Clearance::Exec => {
                 let command = call
@@ -1089,6 +1133,9 @@ impl Voice {
                 }
                 match self.mode {
                     ka_protocol::Mode::Free => Gate::Allow,
+                    ka_protocol::Mode::Plan => Gate::Ask {
+                        question: format!("plan mode: run `{command}`? (build with /build)"),
+                    },
                     ka_protocol::Mode::Guarded => Gate::Ask {
                         question: format!("run `{command}`?"),
                     },
@@ -1652,6 +1699,107 @@ mod tests {
         drop(cmd_tx);
         handle.await.unwrap();
         assert!(denied_output, "rule denial must surface as tool error");
+    }
+
+    #[tokio::test]
+    async fn plan_mode_denies_writes_outside_plans_dir() {
+        use ka_protocol::Event;
+        use tokio::sync::mpsc;
+
+        let catalog = Catalog::parse(
+            "[dialects.\"test/m\"]\nwire = \"openai_chat\"\nbase_url = \"http://127.0.0.1:1\"\ncontext = 1000\n",
+        )
+        .unwrap();
+        // speaker asks to write OUTSIDE the plans dir
+        struct WriteOutside;
+        impl Speaker for WriteOutside {
+            fn speak<'a>(
+                &'a self,
+                _req: SpeakRequest,
+                out: tokio::sync::mpsc::Sender<StreamEvent>,
+            ) -> SpeakFuture<'a> {
+                Box::pin(async move {
+                    out.send(StreamEvent::Call(ToolCall {
+                        id: "w1".into(),
+                        tool: "write".into(),
+                        arguments: serde_json::json!({"path": "src/main.rs", "content": "x"}),
+                    }))
+                    .await
+                    .ok();
+                    out.send(StreamEvent::Finished {
+                        stop: ka_protocol::Stop::Done,
+                        usage: Default::default(),
+                    })
+                    .await
+                    .ok();
+                })
+            }
+        }
+        let mut voice = Voice::new(catalog, std::env::temp_dir(), ka_protocol::Mode::Plan, 5)
+            .with_speaker(Wire::OpenaiChat, std::sync::Arc::new(WriteOutside));
+
+        let (cmd_tx, mut cmd_rx) = mpsc::channel(16);
+        let (evt_tx, mut evt_rx) = mpsc::channel(256);
+        let handle = tokio::spawn(async move {
+            let mut i = Vec::new();
+            let mut d = std::collections::VecDeque::new();
+            voice
+                .turn(
+                    "test/m",
+                    "do it".into(),
+                    &mut cmd_rx,
+                    &evt_tx,
+                    &mut i,
+                    &mut d,
+                )
+                .await;
+        });
+        let mut blocked = false;
+        while let Some(evt) = evt_rx.recv().await {
+            if let Event::CallOutput {
+                excerpt, is_error, ..
+            } = &evt
+            {
+                if excerpt.contains("plan mode is read-only") && *is_error {
+                    blocked = true;
+                }
+            }
+            if matches!(evt, Event::TurnFinished { .. }) {
+                break;
+            }
+        }
+        drop(cmd_tx);
+        handle.await.unwrap();
+        assert!(
+            blocked,
+            "write outside .ka/plans must be denied in plan mode"
+        );
+    }
+
+    #[test]
+    fn rewind_truncates_before_nth_last_user_message() {
+        use ka_dialect::speaker::TurnMessage;
+        let catalog = Catalog::parse(
+            "[dialects.\"test/m\"]\nwire = \"openai_chat\"\nbase_url = \"http://127.0.0.1:1\"\ncontext = 1000\n",
+        )
+        .unwrap();
+        let mut voice = Voice::new(catalog, std::env::temp_dir(), ka_protocol::Mode::Guarded, 5);
+        for (u, a) in [("q1", "a1"), ("q2", "a2"), ("q3", "a3")] {
+            voice.history.push(TurnMessage::user(u));
+            voice.history.push(TurnMessage::assistant(a));
+        }
+        let kept = voice.rewind(1).unwrap();
+        assert_eq!(kept, 4);
+        let contents: Vec<&str> = voice.history.iter().map(|m| m.content.as_str()).collect();
+        assert_eq!(
+            contents,
+            vec!["q1", "a1", "q2", "a2"],
+            "last exchange dropped"
+        );
+        let kept = voice.rewind(2).unwrap();
+        assert_eq!(kept, 0);
+        assert!(voice.history.is_empty());
+        assert!(voice.rewind(1).is_none(), "nothing left to rewind");
     }
 
     #[test]

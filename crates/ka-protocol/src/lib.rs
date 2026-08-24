@@ -66,6 +66,8 @@ pub enum Mode {
     Guarded,
     /// Auto-approve everything except hardstops.
     Free,
+    /// Research mode: read-only except the plans directory.
+    Plan,
 }
 
 /// Why a turn finished.
@@ -208,6 +210,11 @@ pub enum Command {
     Compact {
         /// Optional focus instructions for the summary.
         focus: Option<String>,
+    },
+    /// Rewind the conversation to before the Nth-last user message.
+    Rewind {
+        /// How many user turns back (1 = erase the last exchange).
+        turns: u32,
     },
     /// Answer an outstanding ask.
     Answer {

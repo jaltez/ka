@@ -175,7 +175,10 @@ fn parse_mode(s: &str) -> Result<ka_protocol::Mode, String> {
     match s {
         "guarded" => Ok(ka_protocol::Mode::Guarded),
         "free" => Ok(ka_protocol::Mode::Free),
-        other => Err(format!("unknown mode {other:?} (expected guarded|free)")),
+        "plan" => Ok(ka_protocol::Mode::Plan),
+        other => Err(format!(
+            "unknown mode {other:?} (expected guarded|free|plan)"
+        )),
     }
 }
 

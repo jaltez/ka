@@ -160,6 +160,15 @@ fn history_from_records(
                 ids.clear();
                 digest = None;
             }
+            ka_strand::Record::Rewind { kept_from, .. } => {
+                // drop messages after the kept point (the tail of the log
+                // is the abandoned branch)
+                if let Some(pos) = ids.iter().position(|i| i == kept_from) {
+                    let keep_msgs = pos + 1;
+                    out.truncate(keep_msgs);
+                    ids.truncate(keep_msgs);
+                }
+            }
             _ => {}
         }
     }
@@ -343,7 +352,7 @@ async fn run(
                 });
                 events.send(Event::ModeChanged { mode }).await?;
             }
-            other => side_command(&events, &mut state, other).await?,
+            other => side_command(&events, &mut state, &mut voice, &mut strand, other).await?,
         }
     }
     Ok(())
@@ -549,6 +558,8 @@ fn tty_key() -> Option<String> {
 async fn side_command(
     events: &mpsc::Sender<Event>,
     state: &mut EngineState,
+    voice: &mut Voice,
+    strand: &mut ka_strand::StrandFile,
     cmd: Command,
 ) -> Result<(), DynError> {
     match cmd {
@@ -559,15 +570,52 @@ async fn side_command(
         Command::SetModel { .. } | Command::SetMode { .. } => {
             unreachable!("handled by caller with voice access")
         }
-        Command::AlwaysAllow { .. }
-        | Command::Answer { .. }
-        | Command::Resume { .. }
-        | Command::Compact { .. } => {
+        Command::Compact { focus } => {
+            run_digest(voice, state, strand, events, focus).await;
+            events.send(Event::Idle).await.ok();
+        }
+        Command::Rewind { turns } => {
+            match voice.rewind(turns) {
+                Some(kept) => {
+                    // kept = index of the dropped user message; keep
+                    // everything strictly before it
+                    let keep_idx = kept.saturating_sub(1);
+                    let kept_from = state
+                        .record_ids
+                        .get(keep_idx)
+                        .cloned()
+                        .unwrap_or_else(ka_strand::new_record_id);
+                    let _ = strand.append(ka_strand::Record::Rewind {
+                        id: ka_strand::new_record_id(),
+                        kept_from,
+                    });
+                    state.record_ids.truncate(keep_idx + 1);
+                    events
+                        .send(Event::Note {
+                            message: format!("rewound {turns} turn(s)"),
+                        })
+                        .await
+                        .ok();
+                }
+                None => {
+                    events
+                        .send(Event::Error {
+                            class: ErrorClass::Protocol,
+                            retryable: false,
+                            message: format!("cannot rewind {turns} turn(s): not enough history"),
+                        })
+                        .await
+                        .ok();
+                }
+            }
+            events.send(Event::Idle).await.ok();
+        }
+        Command::AlwaysAllow { .. } | Command::Answer { .. } | Command::Resume { .. } => {
             events
                 .send(Event::Error {
                     class: ErrorClass::Unsupported,
                     retryable: false,
-                    message: "command not wired in phase 1".to_string(),
+                    message: "command not wired".to_string(),
                 })
                 .await?;
         }
@@ -614,8 +662,12 @@ async fn turn_canned(
                         break;
                     }
                     Some(other) => {
-                        if let Err(e) = side_command(events, state, other).await {
-                            eprintln!("ka engine: {e}");
+                        // canned path: only queue-side effects are safe here
+                        match other {
+                            Command::Interject { text } => state.interjections.push(text),
+                            Command::Defer { text } => state.deferrals.push_back(text),
+                            Command::Abort => {}
+                            _ => {}
                         }
                     }
                 }
@@ -861,6 +913,68 @@ mod tests {
             })
             .collect();
         assert_eq!(users, vec!["hello there", "second question"]);
+        let _ = std::fs::remove_dir_all(&data);
+    }
+
+    #[tokio::test]
+    async fn rewind_persists_and_resume_truncates() {
+        use crate::engine::{StrandChoice, spawn_full};
+        use ka_protocol::Command;
+
+        let data = std::env::temp_dir().join(format!("ka-eng-rewind-{}", std::process::id()));
+        let work = data.join("work");
+        let _ = std::fs::remove_dir_all(&data);
+        std::fs::create_dir_all(&work).unwrap();
+        ka_strand::set_data_dir_for_tests(data.clone());
+
+        let cfg = Config {
+            cwd: Some(work.display().to_string()),
+            ..Default::default()
+        };
+        let mut h = spawn_full(
+            cfg.clone(),
+            ka_dialect::Catalog::embedded(),
+            StrandChoice::New,
+        );
+        for prompt in ["first question", "second question"] {
+            h.commands
+                .send(Command::Prompt {
+                    text: prompt.into(),
+                    attachments: vec![],
+                })
+                .await
+                .unwrap();
+            while let Some(evt) = h.events.recv().await {
+                if matches!(evt, Event::Idle) {
+                    break;
+                }
+            }
+        }
+        // rewind one turn
+        h.commands.send(Command::Rewind { turns: 1 }).await.unwrap();
+        while let Some(evt) = h.events.recv().await {
+            if matches!(evt, Event::Idle) {
+                break;
+            }
+        }
+        drop(h);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // resume: history must end after the FIRST exchange only
+        let mut h2 = spawn_full(cfg, ka_dialect::Catalog::embedded(), StrandChoice::Latest);
+        let mut replayed = Vec::new();
+        while let Some(evt) = h2.events.recv().await {
+            if let Event::Replay { messages } = evt {
+                replayed = messages.into_iter().map(|m| m.content).collect();
+                break;
+            }
+        }
+        drop(h2);
+        assert_eq!(
+            replayed,
+            vec!["first question".to_string(), "(ka, no model configured) heard: first question — set a model with --model or KA_MODEL to speak for real.".to_string()],
+            "rewound session replays only the kept exchange: {replayed:?}"
+        );
         let _ = std::fs::remove_dir_all(&data);
     }
 

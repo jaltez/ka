@@ -115,6 +115,13 @@ pub enum Record {
         /// Record identifier.
         id: RecordId,
     },
+    /// Conversation rewind: history is truncated after `kept_from`.
+    Rewind {
+        /// Record identifier.
+        id: RecordId,
+        /// Last kept message record; everything after it is discarded.
+        kept_from: RecordId,
+    },
     /// Extension-owned opaque record (namespaced; engine reserves `x.ka.*`).
     Custom {
         /// Record identifier.
@@ -135,6 +142,7 @@ impl Record {
             | Record::Change { id, .. }
             | Record::Digest { id, .. }
             | Record::Boundary { id, .. }
+            | Record::Rewind { id, .. }
             | Record::Custom { id, .. } => Some(id),
         }
     }

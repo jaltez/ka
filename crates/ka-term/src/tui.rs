@@ -306,6 +306,13 @@ async fn app(
                                 if let Some(evt) = cmd.event {
                                     let _ = commands.send(evt).await;
                                 }
+                                if let Some(follow) = cmd.followup {
+                                    lines.push(Line::Note("(mode set; starting)".into()));
+                                    busy = true;
+                                    let _ = commands
+                                        .send(Command::Prompt { text: follow, attachments: vec![] })
+                                        .await;
+                                }
                                 if cmd.quit {
                                     exit = Some(Exit::Quit);
                                 }
@@ -452,6 +459,7 @@ fn apply_event(
             meters.mode = match mode {
                 ka_protocol::Mode::Guarded => "guarded".to_string(),
                 ka_protocol::Mode::Free => "free".to_string(),
+                ka_protocol::Mode::Plan => "plan".to_string(),
             };
         }
         Event::Error { message, .. } => {
@@ -477,6 +485,7 @@ fn apply_event(
 struct Slash {
     event: Option<Command>,
     quit: bool,
+    followup: Option<String>,
 }
 
 /// Load a custom command body from `.ka/commands/<name>.md` (project) or
@@ -515,6 +524,7 @@ fn slash_command(text: &str) -> Option<Slash> {
                     attachments: vec![],
                 }),
                 quit: false,
+                followup: None,
             });
         }
     }
@@ -522,6 +532,7 @@ fn slash_command(text: &str) -> Option<Slash> {
         "/quit" | "/exit" => Some(Slash {
             event: None,
             quit: true,
+            followup: None,
         }),
         "/model" => {
             let selector = rest?;
@@ -530,6 +541,39 @@ fn slash_command(text: &str) -> Option<Slash> {
                     selector: selector.to_string(),
                 }),
                 quit: false,
+                followup: None,
+            })
+        }
+        "/plan" => {
+            let task = rest.map(str::to_string).unwrap_or_default();
+            Some(Slash {
+                event: Some(Command::SetMode {
+                    mode: ka_protocol::Mode::Plan,
+                }),
+                quit: false,
+                followup: Some(format!(
+                    "Plan this task. Research the codebase with read/glob/grep/pathfinder, \\
+then write a concrete numbered implementation plan to .ka/plans/plan.md. Task: {task}"
+                )),
+            })
+        }
+        "/build" => Some(Slash {
+            event: Some(Command::SetMode {
+                mode: ka_protocol::Mode::Guarded,
+            }),
+            quit: false,
+            followup: Some(
+                "Switching to build mode. Read .ka/plans/plan.md and implement it step by \\
+step now; verify each step."
+                    .to_string(),
+            ),
+        }),
+        "/rewind" => {
+            let turns: u32 = rest.and_then(|r| r.trim().parse().ok()).unwrap_or(1);
+            Some(Slash {
+                event: Some(Command::Rewind { turns }),
+                quit: false,
+                followup: None,
             })
         }
         "/compact" => {
@@ -537,16 +581,19 @@ fn slash_command(text: &str) -> Option<Slash> {
             Some(Slash {
                 event: Some(Command::Compact { focus }),
                 quit: false,
+                followup: None,
             })
         }
         "/mode" => {
             let mode = match rest? {
                 "free" => ka_protocol::Mode::Free,
+                "plan" => ka_protocol::Mode::Plan,
                 _ => ka_protocol::Mode::Guarded,
             };
             Some(Slash {
                 event: Some(Command::SetMode { mode }),
                 quit: false,
+                followup: None,
             })
         }
         _ => None,
