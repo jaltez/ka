@@ -16,7 +16,7 @@ ka -c                                 # continue this terminal's last session
 ka run "summarize the build error"    # headless NDJSON
 ```
 
-Keys: `Enter` send / interject mid-turn · `+text` defer until turn ends · `Esc`/`Ctrl-C` abort · `↑/↓` history · slash commands below.
+Keys: `Enter` send / interject mid-turn · `+text` defer until turn ends · `Esc`/`Ctrl-C` abort · `↑/↓` history · `/` + `Tab` autocomplete slash commands. The transcript renders markdown (headers, lists, `code`, fenced blocks with syntax coloring) with role blocks: blue for you, amber for tool calls, dark gray for streamed thinking. NO_COLOR is honored.
 
 ## Commands
 

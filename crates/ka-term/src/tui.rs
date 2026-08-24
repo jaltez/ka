@@ -232,6 +232,7 @@ async fn app(
     let mut current_thought = String::new();
     let mut current_tool = String::new();
     let mut exit = None;
+    let mut slash_popup: Option<SlashPopup> = None;
     let mut term_events = crossterm::event::EventStream::new();
 
     while exit.is_none() {
@@ -240,6 +241,11 @@ async fn app(
         let ask = pending.clone();
         let input_snapshot = input.text.clone();
         let cursor = input.cursor;
+        let live = if busy_now {
+            Some((current_thought.clone(), current_assistant.clone()))
+        } else {
+            None
+        };
         terminal.draw(|frame| {
             render(
                 frame,
@@ -249,6 +255,8 @@ async fn app(
                 &footer,
                 busy_now,
                 ask.as_ref(),
+                live.as_ref(),
+                slash_popup.as_ref(),
             );
         })?;
 
@@ -332,14 +340,41 @@ async fn app(
                             busy = true;
                             let _ = commands.send(cmd).await;
                         }
+                        (KeyCode::Tab, _) => {
+                            if let Some(popup) = slash_popup.as_mut() {
+                                if let Some((name, _)) = popup.items.get(popup.selected).cloned() {
+                                    input.text = format!("{name} ");
+                                    input.cursor = input.text.chars().count();
+                                    slash_popup = update_suggestions(&input.text);
+                                }
+                            }
+                        }
+                        (KeyCode::Up, _) if slash_popup.is_some() => {
+                            if let Some(popup) = slash_popup.as_mut() {
+                                popup.selected = popup.selected.saturating_sub(1);
+                            }
+                        }
+                        (KeyCode::Down, _) if slash_popup.is_some() => {
+                            if let Some(popup) = slash_popup.as_mut() {
+                                if popup.selected + 1 < popup.items.len() {
+                                    popup.selected += 1;
+                                }
+                            }
+                        }
                         (KeyCode::Up, _) if !busy => input.history_prev(),
                         (KeyCode::Down, _) if !busy => input.history_next(),
                         (KeyCode::Left, _) => input.left(),
                         (KeyCode::Right, _) => input.right(),
                         (KeyCode::Home, _) => input.home(),
                         (KeyCode::End, _) => input.end(),
-                        (KeyCode::Backspace, _) => input.backspace(),
-                        (KeyCode::Char(c), _) => input.insert(c),
+                        (KeyCode::Backspace, _) => {
+                            input.backspace();
+                            slash_popup = update_suggestions(&input.text);
+                        }
+                        (KeyCode::Char(c), _) => {
+                            input.insert(c);
+                            slash_popup = update_suggestions(&input.text);
+                        }
                         _ => {}
                     }
                 }
@@ -481,6 +516,86 @@ fn apply_event(
     }
 }
 
+/// Slash-command autocomplete state.
+#[derive(Debug, Clone)]
+pub struct SlashPopup {
+    /// (command, description) items filtered by the current prefix.
+    pub items: Vec<(String, String)>,
+    /// Selected item index.
+    pub selected: usize,
+}
+
+/// All available slash commands: builtins + custom files.
+pub fn available_slash_commands() -> Vec<(String, String)> {
+    let mut cmds = vec![
+        (
+            "/model".to_string(),
+            "switch model: vendor/model@effort".to_string(),
+        ),
+        (
+            "/mode".to_string(),
+            "set mode: guarded | free | plan".to_string(),
+        ),
+        (
+            "/plan".to_string(),
+            "research the task, write .ka/plans/plan.md".to_string(),
+        ),
+        ("/build".to_string(), "implement the plan file".to_string()),
+        (
+            "/rewind".to_string(),
+            "drop the last N exchanges".to_string(),
+        ),
+        ("/compact".to_string(), "digest the context now".to_string()),
+        ("/quit".to_string(), "exit".to_string()),
+    ];
+    if let Ok(cwd) = std::env::current_dir() {
+        let home = std::env::var("HOME").ok();
+        let mut roots = vec![
+            cwd.join(".ka/commands"),
+            cwd.join(".agents/commands"),
+            cwd.join(".claude/commands"),
+        ];
+        if let Some(h) = home {
+            roots.push(std::path::PathBuf::from(h).join(".config/ka/commands"));
+        }
+        for root in roots {
+            let Ok(entries) = std::fs::read_dir(&root) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.extension().is_none_or(|e| e != "md") {
+                    continue;
+                }
+                let name = format!(
+                    "/{}",
+                    path.file_stem().unwrap_or_default().to_string_lossy()
+                );
+                if !cmds.iter().any(|(n, _)| *n == name) {
+                    cmds.push((name, "(custom)".to_string()));
+                }
+            }
+        }
+    }
+    cmds
+}
+
+/// Recompute the suggestion popup from the raw input.
+pub fn update_suggestions(input: &str) -> Option<SlashPopup> {
+    if !input.starts_with('/') || input.contains(' ') {
+        return None;
+    }
+    let items: Vec<(String, String)> = available_slash_commands()
+        .into_iter()
+        .filter(|(name, _)| name.starts_with(input))
+        .collect();
+    if items.is_empty() {
+        None
+    } else {
+        Some(SlashPopup { items, selected: 0 })
+    }
+}
+
 /// A parsed slash command.
 struct Slash {
     event: Option<Command>,
@@ -600,6 +715,7 @@ step now; verify each step."
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn render(
     frame: &mut ratatui::Frame,
     lines: &[Line],
@@ -608,43 +724,67 @@ fn render(
     footer: &str,
     busy: bool,
     ask: Option<&PendingAsk>,
+    live: Option<&(String, String)>,
+    popup: Option<&SlashPopup>,
 ) {
     use ratatui::layout::Constraint::{Length, Min};
     use ratatui::style::{Color, Modifier, Style};
     use ratatui::text::{Line as TuiLine, Span};
-    use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
+    use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 
     let chunks =
         ratatui::layout::Layout::vertical([Min(3), Length(3), Length(1)]).split(frame.area());
+    let width = chunks[0].width;
 
-    // transcript
+    // ── transcript ────────────────────────────────────────────────
     let mut render_lines: Vec<TuiLine> = Vec::new();
     for line in lines {
-        let (style, prefix) = match line {
-            Line::User(_) => (Style::default().fg(Color::Blue), "you"),
-            Line::Assistant(_) => (Style::default().fg(Color::White), "ka"),
-            Line::Thought(_) => (Style::default().fg(Color::DarkGray), "…"),
-            Line::Tool(_) => (Style::default().fg(Color::Yellow), "⚙"),
-            Line::Note(_) => (Style::default().fg(Color::Red), "!"),
-        };
-        if let Line::Assistant(text) = line {
-            for (i, seg) in text.split('\n').enumerate() {
-                let prefix = if i == 0 {
-                    format!("{prefix} │ ")
-                } else {
-                    "    │ ".to_string()
-                };
-                render_lines.push(TuiLine::styled(format!("{prefix}{seg}"), style));
+        match line {
+            Line::User(text) => {
+                push_block(&mut render_lines, text, width, BlockStyle::User);
             }
-        } else {
-            let text = match line {
-                Line::User(t) | Line::Thought(t) | Line::Tool(t) | Line::Note(t) => t,
-                Line::Assistant(_) => unreachable!(),
-            };
-            render_lines.push(TuiLine::styled(format!("{prefix} │ {text}"), style));
+            Line::Assistant(text) => {
+                render_lines.extend(crate::markdown::render(text));
+                render_lines.push(TuiLine::default());
+            }
+            Line::Thought(text) => {
+                push_block(&mut render_lines, text, width, BlockStyle::Thought);
+            }
+            Line::Tool(text) => {
+                push_block(&mut render_lines, text, width, BlockStyle::Tool);
+            }
+            Line::Note(text) => {
+                push_block(&mut render_lines, text, width, BlockStyle::Note);
+            }
         }
     }
-    // tail-scroll: show only what fits (approximate with wrapping)
+
+    // ── live streaming region (text + thinking while busy) ────────
+    if let Some((thought, text)) = live {
+        if !thought.trim().is_empty() {
+            let tail: Vec<&str> = thought
+                .lines()
+                .rev()
+                .take(5)
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect();
+            for l in tail {
+                render_lines.push(TuiLine::styled(
+                    format!("⋯ {l}"),
+                    Style::default()
+                        .fg(Color::DarkGray)
+                        .add_modifier(Modifier::ITALIC),
+                ));
+            }
+        }
+        if !text.trim().is_empty() {
+            render_lines.extend(crate::markdown::render(text));
+        }
+    }
+
+    // tail-scroll: keep only what fits (approximate with wrapping)
     let visible = chunks[0].height.saturating_sub(1) as usize;
     if render_lines.len() > visible {
         let start = render_lines.len() - visible;
@@ -655,7 +795,7 @@ fn render(
         .wrap(Wrap { trim: false });
     frame.render_widget(transcript, chunks[0]);
 
-    // input
+    // ── input ─────────────────────────────────────────────────────
     let title = if busy {
         "input (enter=interject, +=defer, esc=abort)"
     } else {
@@ -665,12 +805,11 @@ fn render(
         .block(Block::default().borders(Borders::ALL).title(title))
         .wrap(Wrap { trim: false });
     frame.render_widget(input_widget, chunks[1]);
-    // cursor position
     let area = chunks[1];
     let col = (cursor as u16).min(area.width.saturating_sub(2));
     frame.set_cursor_position((area.x + 1 + col, area.y + 1));
 
-    // footer
+    // ── footer ────────────────────────────────────────────────────
     let status = if busy { " ⋆ working" } else { "" };
     let footer_line = TuiLine::from(vec![
         Span::styled(footer.to_string(), Style::default().fg(Color::Gray)),
@@ -681,11 +820,47 @@ fn render(
     ]);
     frame.render_widget(Paragraph::new(footer_line), chunks[2]);
 
-    // ask modal
+    // ── slash autocomplete popup (above input) ────────────────────
+    if let Some(popup) = popup {
+        // border(2) + up to 7 items + 1 hint row
+        let rows = popup.items.len().min(7) as u16 + 3;
+        let rect = ratatui::layout::Rect {
+            x: chunks[1].x,
+            y: chunks[1].y.saturating_sub(rows),
+            width: (chunks[1].width).min(56),
+            height: rows,
+        };
+        frame.render_widget(Clear, rect);
+        let mut text = Vec::new();
+        for (i, (name, desc)) in popup.items.iter().take(7).enumerate() {
+            let marker = if i == popup.selected { "▶ " } else { "  " };
+            let style = if i == popup.selected {
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::Gray)
+            };
+            let desc_trim: String = desc.chars().take(32).collect();
+            text.push(TuiLine::styled(
+                format!("{marker}{name:<12} {desc_trim}"),
+                style,
+            ));
+        }
+        text.push(TuiLine::styled(
+            "tab complete · ↑↓ select",
+            Style::default().fg(Color::DarkGray),
+        ));
+        let widget = Paragraph::new(text)
+            .block(Block::default().borders(Borders::ALL).title("commands"))
+            .wrap(Wrap { trim: false });
+        frame.render_widget(widget, rect);
+    }
+
+    // ── ask modal ─────────────────────────────────────────────────
     if let Some(ask) = ask {
         let rect = centered(40, 8, frame.area());
-        let clear = ratatui::widgets::Clear;
-        frame.render_widget(clear, rect);
+        frame.render_widget(Clear, rect);
         let mut text = vec![TuiLine::styled(
             ask.question.clone(),
             Style::default()
@@ -697,7 +872,7 @@ fn render(
             let style = if i == ask.selected {
                 Style::default().fg(Color::Cyan)
             } else {
-                Style::default()
+                Style::default().fg(Color::Gray)
             };
             text.push(TuiLine::styled(format!("{marker}{opt}"), style));
         }
@@ -705,11 +880,79 @@ fn render(
             "↑↓ select · enter confirm · esc deny",
             Style::default().fg(Color::DarkGray),
         ));
-        let popup = Paragraph::new(text)
+        let widget = Paragraph::new(text)
             .block(Block::default().borders(Borders::ALL).title("permission"))
             .wrap(Wrap { trim: true });
-        frame.render_widget(popup, rect);
+        frame.render_widget(widget, rect);
     }
+}
+
+/// Background-block styles for transcript roles.
+enum BlockStyle {
+    /// Blue block, "you ❯" prefix.
+    User,
+    /// Dark gray block, "⋯" prefix (thinking).
+    Thought,
+    /// Amber block, "⚙" prefix (tools).
+    Tool,
+    /// Red-tinted block, "!" prefix (notes/errors).
+    Note,
+}
+
+fn push_block(
+    out: &mut Vec<ratatui::text::Line<'static>>,
+    text: &str,
+    width: u16,
+    kind: BlockStyle,
+) {
+    use ratatui::style::{Color, Modifier, Style};
+    use ratatui::text::Line as TuiLine;
+
+    let (prefix, style) = match kind {
+        BlockStyle::User => (
+            "❯ ",
+            Style::default()
+                .fg(Color::LightBlue)
+                .bg(Color::Rgb(22, 30, 48)),
+        ),
+        BlockStyle::Thought => (
+            "⋯ ",
+            Style::default()
+                .fg(Color::DarkGray)
+                .bg(Color::Rgb(18, 18, 22))
+                .add_modifier(Modifier::ITALIC),
+        ),
+        BlockStyle::Tool => (
+            "⚙ ",
+            Style::default()
+                .fg(Color::LightYellow)
+                .bg(Color::Rgb(38, 34, 20)),
+        ),
+        BlockStyle::Note => (
+            "! ",
+            Style::default().fg(Color::Red).bg(Color::Rgb(40, 20, 20)),
+        ),
+    };
+    let inner = width.saturating_sub(2) as usize;
+    for raw in text.lines() {
+        // wrap long lines at the block width (char boundary)
+        let mut start = 0;
+        let chars: Vec<char> = raw.chars().collect();
+        loop {
+            let end = (start + inner.saturating_sub(2)).min(chars.len());
+            let mut segment: String = chars[start..end].iter().collect();
+            let first = start == 0;
+            let lead = if first { prefix } else { "  " };
+            let pad = inner.saturating_sub(segment.chars().count() + lead.chars().count());
+            segment.push_str(&" ".repeat(pad));
+            out.push(TuiLine::styled(format!("{lead}{segment}"), style));
+            if end >= chars.len() {
+                break;
+            }
+            start = end;
+        }
+    }
+    out.push(TuiLine::default()); // spacing after each block
 }
 
 fn centered(width: u16, height: u16, area: ratatui::layout::Rect) -> ratatui::layout::Rect {
