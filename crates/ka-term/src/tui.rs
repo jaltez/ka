@@ -913,37 +913,39 @@ fn push_block(
             "❯ ",
             Style::default()
                 .fg(Color::LightBlue)
-                .bg(Color::Rgb(22, 30, 48)),
+                .bg(Color::Rgb(30, 54, 96)),
         ),
         BlockStyle::Thought => (
             "⋯ ",
             Style::default()
-                .fg(Color::DarkGray)
-                .bg(Color::Rgb(18, 18, 22))
+                .fg(Color::Gray)
+                .bg(Color::Rgb(38, 38, 46))
                 .add_modifier(Modifier::ITALIC),
         ),
         BlockStyle::Tool => (
             "⚙ ",
             Style::default()
                 .fg(Color::LightYellow)
-                .bg(Color::Rgb(38, 34, 20)),
+                .bg(Color::Rgb(72, 60, 24)),
         ),
         BlockStyle::Note => (
             "! ",
-            Style::default().fg(Color::Red).bg(Color::Rgb(40, 20, 20)),
+            Style::default().fg(Color::Red).bg(Color::Rgb(76, 28, 28)),
         ),
     };
-    let inner = width.saturating_sub(2) as usize;
+    // blocks span the full transcript width, edge to edge
+    let usable = width as usize;
     for raw in text.lines() {
         // wrap long lines at the block width (char boundary)
         let mut start = 0;
         let chars: Vec<char> = raw.chars().collect();
         loop {
-            let end = (start + inner.saturating_sub(2)).min(chars.len());
-            let mut segment: String = chars[start..end].iter().collect();
             let first = start == 0;
             let lead = if first { prefix } else { "  " };
-            let pad = inner.saturating_sub(segment.chars().count() + lead.chars().count());
+            let room = usable.saturating_sub(lead.chars().count());
+            let end = (start + room).min(chars.len());
+            let mut segment: String = chars[start..end].iter().collect();
+            let pad = usable.saturating_sub(segment.chars().count() + lead.chars().count());
             segment.push_str(&" ".repeat(pad));
             out.push(TuiLine::styled(format!("{lead}{segment}"), style));
             if end >= chars.len() {
@@ -1015,6 +1017,57 @@ mod tests {
             f.contains("qwen3.5:9b") && f.contains("guarded") && f.contains("ctx 10%"),
             "{f}"
         );
+    }
+
+    #[test]
+    fn blocks_span_full_width() {
+        use super::{BlockStyle, push_block};
+        use ratatui::text::Line as TuiLine;
+
+        for kind in [
+            BlockStyle::User,
+            BlockStyle::Thought,
+            BlockStyle::Tool,
+            BlockStyle::Note,
+        ] {
+            let mut out: Vec<TuiLine> = Vec::new();
+            push_block(&mut out, "short text", 40, kind_label(&kind));
+            let content = out[0].clone();
+            let width: usize = content
+                .spans
+                .iter()
+                .map(|s| s.content.chars().count())
+                .sum();
+            assert_eq!(
+                width,
+                40,
+                "{:?} block must span exactly the width",
+                kind_dbg(&kind)
+            );
+            // long text wraps and every wrapped row also spans the width
+            let mut out2: Vec<TuiLine> = Vec::new();
+            push_block(&mut out2, &"word ".repeat(30), 40, kind_label(&kind));
+            for (i, line) in out2.iter().take(4).enumerate() {
+                let w: usize = line.spans.iter().map(|s| s.content.chars().count()).sum();
+                assert_eq!(w, 40, "row {i} of wrapped block must span the width");
+            }
+        }
+        fn kind_label(k: &BlockStyle) -> BlockStyle {
+            match k {
+                BlockStyle::User => BlockStyle::User,
+                BlockStyle::Thought => BlockStyle::Thought,
+                BlockStyle::Tool => BlockStyle::Tool,
+                BlockStyle::Note => BlockStyle::Note,
+            }
+        }
+        fn kind_dbg(k: &BlockStyle) -> &'static str {
+            match k {
+                BlockStyle::User => "User",
+                BlockStyle::Thought => "Thought",
+                BlockStyle::Tool => "Tool",
+                BlockStyle::Note => "Note",
+            }
+        }
     }
 
     #[test]
