@@ -83,6 +83,18 @@ enum CliCommand {
         #[arg(long = "dialects")]
         dialects: Vec<PathBuf>,
     },
+    /// Rewind the newest strand N user turns (default 1)
+    Rewind {
+        /// Turns to rewind
+        #[arg(default_value_t = 1)]
+        turns: u32,
+    },
+    /// Export the newest strand as readable markdown
+    Export {
+        /// Output path (default: stdout)
+        #[arg(short, long)]
+        out: Option<PathBuf>,
+    },
     /// Generate a starter AGENTS.md from a quick repo scan
     Init,
     /// Inspect configuration
@@ -276,6 +288,8 @@ async fn dispatch(cli: Cli) -> Result<ExitCode, String> {
             Ok(ExitCode::SUCCESS)
         }
         Some(CliCommand::Init) => run_init(),
+        Some(CliCommand::Rewind { turns }) => run_rewind(turns).await,
+        Some(CliCommand::Export { out }) => run_export(out),
         Some(CliCommand::Config { cmd }) => match cmd {
             ConfigCommand::Schema => {
                 println!(
@@ -325,7 +339,13 @@ async fn run_headless(
 
     let catalog = build_catalog(dialects, with_discovery).await?;
     let choice = if continue_latest {
-        ka_agent::StrandChoice::Latest
+        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        match ka_agent::read_waypoint() {
+            Some((way_cwd, path)) if way_cwd == cwd && path.exists() => {
+                ka_agent::StrandChoice::Path(path)
+            }
+            _ => ka_agent::StrandChoice::Latest,
+        }
     } else {
         ka_agent::StrandChoice::New
     };
@@ -535,6 +555,88 @@ fn run_init() -> Result<ExitCode, String> {
     std::fs::write(&target, body).map_err(|e| format!("write: {e}"))?;
     println!("wrote {}", target.display());
     println!("edit it to describe real conventions; ka reads it automatically");
+    Ok(ExitCode::SUCCESS)
+}
+
+/// Headless rewind: attach to the latest strand and drop N turns.
+async fn run_rewind(turns: u32) -> Result<ExitCode, String> {
+    let cwd = std::env::current_dir().map_err(|e| format!("cwd: {e}"))?;
+    let latest = ka_strand::latest(&cwd)
+        .map_err(|e| format!("listing strands: {e}"))?
+        .ok_or_else(|| "no strands for this directory".to_string())?;
+    println!("rewinding {} turn(s) in {}", turns, latest.path.display());
+
+    let choice = match ka_agent::read_waypoint() {
+        Some((way_cwd, path)) if way_cwd == cwd && path.exists() => {
+            ka_agent::StrandChoice::Path(path)
+        }
+        _ => ka_agent::StrandChoice::Path(latest.path.clone()),
+    };
+    let cfg = load_config(&[], None, None, true)?;
+    let catalog = build_catalog(&[], true).await?;
+    let mut handle = ka_agent::spawn_full(cfg, catalog, choice);
+    handle
+        .commands
+        .send(ka_protocol::Command::Rewind { turns })
+        .await
+        .map_err(|_| "engine closed")?;
+    while let Some(evt) = handle.events.recv().await {
+        match evt {
+            ka_protocol::Event::Note { message } => println!("  {message}"),
+            ka_protocol::Event::Error { message, .. } => {
+                eprintln!("ka: {message}");
+                return Ok(ExitCode::FAILURE);
+            }
+            ka_protocol::Event::Idle => break,
+            _ => {}
+        }
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+/// Export the latest (or waypoint) strand as markdown.
+fn run_export(out: Option<PathBuf>) -> Result<ExitCode, String> {
+    let cwd = std::env::current_dir().map_err(|e| format!("cwd: {e}"))?;
+    let target = match ka_agent::read_waypoint() {
+        Some((way_cwd, path)) if way_cwd == cwd && path.exists() => path,
+        _ => {
+            ka_strand::latest(&cwd)
+                .map_err(|e| format!("listing strands: {e}"))?
+                .ok_or_else(|| "no strands for this directory".to_string())?
+                .path
+        }
+    };
+    let records = ka_strand::read(&target).map_err(|e| format!("{}: {e}", target.display()))?;
+    let mut md = String::from("# ka session\n\n");
+    for r in &records {
+        match r {
+            ka_strand::Record::Header { id, ts, .. } => {
+                md.push_str(&format!("> strand `{}` at {}\n\n", id.0, ts));
+            }
+            ka_strand::Record::Message { role, content, .. } => {
+                let who = match role {
+                    ka_strand::Role::User => "**you**",
+                    ka_strand::Role::Tool => "*tool*",
+                    _ => "**ka**",
+                };
+                if !content.trim().is_empty() {
+                    md.push_str(&format!("### {who}\n\n{}\n\n", content.trim()));
+                }
+            }
+            ka_strand::Record::Digest { summary, .. } => {
+                md.push_str(&format!("### *digest*\n\n> {}\n\n", summary.trim()));
+            }
+            ka_strand::Record::Rewind { .. } => md.push_str("### *rewound*\n\n"),
+            _ => {}
+        }
+    }
+    match out {
+        Some(path) => {
+            std::fs::write(&path, &md).map_err(|e| format!("{}: {e}", path.display()))?;
+            println!("wrote {}", path.display());
+        }
+        None => print!("{md}"),
+    }
     Ok(ExitCode::SUCCESS)
 }
 

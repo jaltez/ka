@@ -2,57 +2,74 @@
 
 A model-agnostic, very-low-footprint coding agent in Rust.
 
-**Status: Phase 7 partial (plan mode, rewind).** Design: [`research/ka/architecture.md`](research/ka/architecture.md) · Roadmap: [`research/ka/roadmap.md`](research/ka/roadmap.md)
+**Status: core complete (Phases 0–7 partial).** Design: [`research/ka/architecture.md`](research/ka/architecture.md) · Roadmap: [`research/ka/roadmap.md`](research/ka/roadmap.md) · Survey of 17 agents that informed it: [`research/`](research/README.md)
 
-## Footprint contract (CI-enforced target)
-Single static binary ≤ 10 MB (musl, stripped) · cold start ≤ 50 ms · idle RSS ≤ 15 MB · zero steady-state network.
+## Quickstart
+
+```sh
+cargo build --release -p ka-cli
+alias ka=target/release/ka            # or: cargo install --path crates/ka-cli
+
+cd your-project
+ka --model ollama/qwen3.5:9b          # TUI: session picker, then chat
+ka -c                                 # continue this terminal's last session
+ka run "summarize the build error"    # headless NDJSON
+```
+
+Keys: `Enter` send / interject mid-turn · `+text` defer until turn ends · `Esc`/`Ctrl-C` abort · `↑/↓` history · slash commands below.
+
+## Commands
+
+| Surface | What it does |
+|---|---|
+| `ka` | TUI (picker → session) |
+| `ka -c` / `ka --session <path>` | continue newest / specific strand (waypoint-aware per terminal) |
+| `ka run [-c] [--model M] [--mode guarded\|free\|plan] [--trust] [--dialects f] "prompt"` | one headless turn, NDJSON events on stdout, exit 0/1/2 |
+| `ka models [--no-discovery]` | catalog + local Ollama/LM Studio probes |
+| `ka rewind [N]` | drop the last N exchanges of the newest strand |
+| `ka export [-o out.md]` | strand as readable markdown |
+| `ka init` | starter AGENTS.md from repo shape |
+| `ka config {schema,print}` | resolved config / JSON schema |
+
+TUI slash commands: `/model <sel>` `/mode <guarded|free|plan>` `/plan <task>` `/build` `/rewind [N]` `/compact [focus]` `/quit` plus custom `/name` from `.ka/commands/*.md` (`$ARGUMENTS` substituted).
+
+## Selectors & models
+
+`vendor/model@effort` — e.g. `anthropic/claude-sonnet-5@high`, `ollama/qwen3.5:9b` (`@` because model ids may contain colons). Two wires built in (anthropic-messages, openai-chat — the latter covers every OpenAI-compatible endpoint incl. Ollama/vLLM/LM Studio/gateways); local endpoints auto-discovered.
+
+## Config
+
+Strict TOML, layered: defaults → `~/.config/ka/ka.toml` → `.ka/ka.toml` (trust-gated: first use prompts or `--trust`; stored in `~/.local/state/ka/trust.json`) → env (`KA_MODEL`, `KA_MODE`) → flags. Unknown keys are hard errors with line numbers.
+
+```toml
+model = "ollama/qwen3.5:9b"
+mode = "guarded"            # guarded | free | plan
+
+[[rules]]                   # first match wins, before mode logic
+tool = "bash"
+pattern = "cargo *"         # glob on the call's primary argument
+verdict = "allow"           # allow | ask | deny
+
+[[hooks]]                   # exit-2 block contract
+event = "pre_tool_use"      # or post_tool_use
+tool = "write"              # optional filter
+command = "guard.sh"        # {tool, arguments} JSON on stdin
+```
+
+Dialect overlays add any OpenAI-compatible provider: `ka run --dialects my.toml --model myhost/model "hi"`.
+
+## Conventions ka reads automatically
+
+`AGENTS.md` (root→cwd, `CLAUDE.md` compat) · `SKILL.md` skills in `.ka/` `.agents/` `.claude/` (name+description listed; body read on demand) · hooks · commands. `pathfinder` delegates read-only research to a nested voice and returns a dense summary.
+
+## Safety
+
+Clearances read/write/exec · guarded/free modes with session always-allow · bash decomposition (compound splitting, wrapper stripping, redirection-as-write) · **unbypassable hardstops** (root rm, fork bombs, fetch-and-execute, device writes — ask even in free; headless denies) · read ledger (edits refuse unread or changed files) · one-way secret redaction in every tool result · plan mode read-only except `.ka/plans/`.
 
 ## Crates
-| Crate | Role |
-|---|---|
-| `ka-protocol` | `Command`/`Event` wire contract (NDJSON-serializable) |
-| `ka-agent` | engine: turn machine, queues, layered strict-TOML config |
-| `ka-dialect` | dialect catalog + **wires**: openai-chat & anthropic-messages Speakers, SSE client, retry/classify, JSON repair, token ladder, local discovery |
-| `ka-agent` engine | live voice path (real models) + canned fallback; cost from usage |
-| `ka-strand` | append-only JSONL session records |
-| `ka-term` | terminal primitives (raw-mode guard, key decoding); TUI in Phase 3 |
-| `ka-cli` | the `ka` binary |
 
-## Develop
-```sh
-cargo fmt
-cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace
-cargo run -p ka-cli -- run "hi"          # canned path, no model needed (persists a strand)
-cargo run -p ka-cli                       # TUI: session picker, meters, ask dialogs
-cargo run -p ka-cli -- -c                 # continue the newest strand (waypoint-aware)
-cargo run -p ka-cli -- run --model ollama/qwen3.5:9b 'read secret.txt with the read tool'  # live tools
-cargo run -p ka-cli -- models            # catalog + local discovery (Ollama, LM Studio)
-cargo run -p ka-cli -- run --model ollama/qwen3:32b "hi"   # live local round-trip
-```
+`ka-protocol` (Command/Event wire contract) · `ka-agent` (engine: turn machine, 7 tools, gate, digests, strands) · `ka-dialect` (catalog + 2 wires + discovery) · `ka-strand` (append-only JSONL sessions) · `ka-term` (ratatui TUI) · `ka-cli` (the binary).
 
-Selectors are `vendor/model@effort` (`@` because model ids may contain colons).
+## Footprint contract
 
-Conventions: AGENTS.md (root→cwd, CLAUDE.md compat) folds into every system prompt; SKILL.md skills (`.ka/skills/`, `.agents/`, `.claude/`) list name+description+path only — the model reads bodies on demand. Hooks (exit-2 block contract):
-
-```toml
-[[hooks]]
-event = "pre_tool_use"   # or post_tool_use
-tool = "bash"            # optional filter
-command = "guard.sh"     # JSON on stdin; exit 2 blocks
-```
-
-**Plan mode** (`--mode plan` or TUI `/plan`): read-only except `.ka/plans/` (enforced at the gate); `/build` switches back and starts implementation from the plan file. **Rewind**: `/rewind N` drops the last N exchanges (persisted as a `rewind` record; resume reconstructs the truncated history).
-
-`pathfinder` delegates read-only research (read/glob/grep) to a nested voice and returns a dense summary. Custom slash commands: `.ka/commands/<name>.md` with `$ARGUMENTS`. `ka init` writes a starter AGENTS.md.
-
-Project config (`.ka/ka.toml`) is trust-gated: first use prompts (or pass `--trust`), decisions persist in `~/.local/state/ka/trust.json`. Permission rules are data, evaluated first-match-wins before mode logic:
-
-```toml
-[[rules]]
-tool = "bash"
-pattern = "cargo *"   # glob on the primary argument
-verdict = "allow"     # allow | ask | deny
-```
-
-Publishing note: `ka` is taken on crates.io; all crates publish under the free `ka-*` names, binary stays `ka`.
+Single binary ≤ 10 MB (currently **6.35 MB**) · cold start ≤ 50 ms · idle RSS ≤ 15 MB · zero steady-state network. 113 tests, `clippy -D warnings` clean, musl CI build.
