@@ -216,6 +216,21 @@ pub enum Command {
         /// How many user turns back (1 = erase the last exchange).
         turns: u32,
     },
+    /// Switch the engine to another strand ("new" = fresh session, else a
+    /// strand id / id prefix / existing file path).
+    SwitchStrand {
+        /// Target session reference.
+        id: String,
+    },
+    /// Persist settings to the user config layer (~/.config/ka/ka.toml).
+    SaveSettings {
+        /// Default model selector.
+        model: Option<String>,
+        /// Default reasoning effort.
+        effort: Option<Effort>,
+        /// Default permission mode.
+        mode: Option<Mode>,
+    },
     /// Answer an outstanding ask.
     Answer {
         /// Which ask is being answered.
@@ -239,10 +254,17 @@ pub struct ReplayedMessage {
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Event {
-    /// Resumed history replay (emitted once at startup when resuming).
+    /// Resumed history replay (emitted at startup and on session switch;
+    /// surfaces rebuild the transcript from it).
     Replay {
         /// Prior messages, oldest first.
         messages: Vec<ReplayedMessage>,
+    },
+    /// The active session (strand) changed or was announced. Surfaces use
+    /// it to label the session and the /session picker.
+    SessionInfo {
+        /// Active strand id.
+        id: String,
     },
     /// A turn began.
     TurnStarted {

@@ -147,6 +147,20 @@ pub enum Line {
     Note(String),
 }
 
+/// A provider row for the settings panel (built by the CLI from the
+/// ka-dialect registry; ka-term stays dialect-free).
+#[derive(Debug, Clone)]
+pub struct ProviderInfo {
+    /// Vendor prefix.
+    pub name: String,
+    /// Env var holding the API key (empty = keyless).
+    pub env_var: String,
+    /// Endpoint base URL.
+    pub base_url: String,
+    /// Whether the env var is set in this process.
+    pub key_set: bool,
+}
+
 /// Footer state shown under the editor.
 #[derive(Debug, Clone, Default)]
 pub struct Meters {
@@ -154,6 +168,8 @@ pub struct Meters {
     pub model: String,
     /// Permission mode.
     pub mode: String,
+    /// Active session (strand) id.
+    pub session: String,
     /// Context usage / window.
     pub context: (u64, u64),
     /// Turn cost.
@@ -180,7 +196,13 @@ impl Meters {
             .cache_hit
             .map(|h| format!(" cache {:.0}%", h * 100.0))
             .unwrap_or_default();
-        format!("{} · {} · {}{}{}", self.model, self.mode, ctx, cost, cache)
+        let tag = short_session(&self.session)
+            .map(|t| format!(" · #{t}"))
+            .unwrap_or_default();
+        format!(
+            "{} · {} · {}{}{}{}",
+            self.model, self.mode, ctx, cost, cache, tag
+        )
     }
 }
 
@@ -197,14 +219,140 @@ pub struct PendingAsk {
     pub selected: usize,
 }
 
+/// Short human tag for a strand id: the first 8 chars of its random tail.
+pub fn short_session(id: &str) -> Option<&str> {
+    id.split_once('-')
+        .map(|(_, tail)| &tail[..tail.len().min(8)])
+}
+
+/// Session picker (/session, /resume): newest strands + a fresh-session
+/// row, filtered by the typed substring.
+#[derive(Debug, Clone)]
+pub struct SessionPicker {
+    /// Newest-first sessions for the cwd.
+    pub sessions: Vec<ka_strand::StrandSummary>,
+    /// Selected row (0 = new session).
+    pub selected: usize,
+    /// Typed filter (matches title or id).
+    pub filter: String,
+}
+
+impl SessionPicker {
+    /// Rows after filtering: (label, detail). Row 0 is always new-session.
+    pub fn rows(&self) -> Vec<(String, String)> {
+        let mut rows = vec![("(new session)".to_string(), "start fresh".to_string())];
+        let f = self.filter.to_lowercase();
+        for s in &self.sessions {
+            if !f.is_empty()
+                && !s.title.to_lowercase().contains(&f)
+                && !s.id.to_lowercase().contains(&f)
+            {
+                continue;
+            }
+            let tag = short_session(&s.id).unwrap_or("?");
+            rows.push((
+                format!("#{tag}  {}", s.title),
+                format!("{} msgs · {}", s.messages, s.ts),
+            ));
+        }
+        rows
+    }
+
+    /// The session id the selected row switches to (None = new session).
+    pub fn pick(&self) -> Option<String> {
+        let rows = self.rows();
+        if self.selected == 0 {
+            return None;
+        }
+        let visible: Vec<&ka_strand::StrandSummary> = self
+            .sessions
+            .iter()
+            .filter(|s| {
+                let f = self.filter.to_lowercase();
+                f.is_empty()
+                    || s.title.to_lowercase().contains(&f)
+                    || s.id.to_lowercase().contains(&f)
+            })
+            .collect();
+        // selected counts only session rows after row 0
+        let idx = self.selected.saturating_sub(1);
+        let _ = rows;
+        visible.get(idx).map(|s| s.id.clone())
+    }
+}
+
+/// Settings panel (/settings): live engine options + provider registry.
+#[derive(Debug, Clone)]
+pub struct SettingsPanel {
+    /// Model selector (editable).
+    pub model: String,
+    /// Permission mode.
+    pub mode: ka_protocol::Mode,
+    /// Effort (None = provider default).
+    pub effort: Option<ka_protocol::Effort>,
+    /// Selected row index.
+    pub selected: usize,
+    /// Inline edit buffer while editing the model.
+    pub edit: Option<String>,
+    /// Providers injected by the CLI.
+    pub providers: Vec<ProviderInfo>,
+    /// User config path (informational).
+    pub config_path: String,
+}
+
+impl SettingsPanel {
+    /// The editable row count (model, mode, effort).
+    pub const ROWS: usize = 3;
+
+    /// Cycle mode guarded → free → plan → guarded.
+    pub fn cycle_mode(&mut self) -> ka_protocol::Mode {
+        self.mode = match self.mode {
+            ka_protocol::Mode::Guarded => ka_protocol::Mode::Free,
+            ka_protocol::Mode::Free => ka_protocol::Mode::Plan,
+            ka_protocol::Mode::Plan => ka_protocol::Mode::Guarded,
+        };
+        self.mode
+    }
+
+    /// Cycle effort none → low → medium → high → none.
+    pub fn cycle_effort(&mut self) -> ka_protocol::Effort {
+        use ka_protocol::Effort;
+        self.effort = match self.effort {
+            None | Some(Effort::Off) => Some(Effort::Low),
+            Some(Effort::Low) => Some(Effort::Medium),
+            Some(Effort::Medium) => Some(Effort::High),
+            Some(Effort::High) => Some(Effort::Max),
+            Some(Effort::Max) => None,
+        };
+        self.effort.unwrap_or(Effort::Medium)
+    }
+}
+
+/// Which modal is open (drawn above everything).
+#[derive(Debug, Clone)]
+pub enum Modal {
+    /// Session picker.
+    Session(SessionPicker),
+    /// Settings panel.
+    Settings(SettingsPanel),
+}
+
 /// Run the TUI over an engine handle. Blocks until exit.
 pub async fn run(
     mut commands: mpsc::Sender<Command>,
     mut events: mpsc::Receiver<Event>,
     initial_model: &str,
+    providers: Vec<ProviderInfo>,
 ) -> std::io::Result<Exit> {
     let mut terminal = ratatui::init();
-    let result = app(&mut terminal, &mut commands, &mut events, initial_model).await;
+    let result = app(
+        &mut terminal,
+        &mut commands,
+        &mut events,
+        initial_model,
+        providers,
+    )
+    .await;
     ratatui::restore();
     result
 }
@@ -214,6 +362,7 @@ async fn app(
     commands: &mut mpsc::Sender<Command>,
     events: &mut mpsc::Receiver<Event>,
     initial_model: &str,
+    providers: Vec<ProviderInfo>,
 ) -> std::io::Result<Exit> {
     use crossterm::event::{Event as TermEvent, KeyCode, KeyModifiers};
 
@@ -233,6 +382,8 @@ async fn app(
     let mut current_tool = String::new();
     let mut exit = None;
     let mut slash_popup: Option<SlashPopup> = None;
+    let mut modal: Option<Modal> = None;
+    let providers_ref = providers;
     let mut term_events = crossterm::event::EventStream::new();
 
     while exit.is_none() {
@@ -257,6 +408,7 @@ async fn app(
                 ask.as_ref(),
                 live.as_ref(),
                 slash_popup.as_ref(),
+                modal.as_ref(),
             );
         })?;
 
@@ -293,6 +445,107 @@ async fn app(
                         }
                         continue;
                     }
+                    // Modal (session picker / settings) captures input next
+                    if let Some(open) = modal.as_mut() {
+                        match open {
+                            Modal::Session(picker) => match key.code {
+                                KeyCode::Esc => modal = None,
+                                KeyCode::Up => picker.selected = picker.selected.saturating_sub(1),
+                                KeyCode::Down => {
+                                    let n = picker.rows().len();
+                                    if picker.selected + 1 < n {
+                                        picker.selected += 1;
+                                    }
+                                }
+                                KeyCode::Backspace => {
+                                    picker.filter.pop();
+                                    picker.selected = 0;
+                                }
+                                KeyCode::Enter => {
+                                    let id = picker.pick();
+                                    let target = id.unwrap_or_else(|| "new".to_string());
+                                    let _ = commands
+                                        .send(Command::SwitchStrand { id: target })
+                                        .await;
+                                    modal = None;
+                                    busy = true;
+                                }
+                                KeyCode::Char(c) => picker.filter.push(c),
+                                _ => {}
+                            },
+                            Modal::Settings(panel) => {
+                                let editing = panel.edit.is_some();
+                                match key.code {
+                                    KeyCode::Esc => {
+                                        if editing {
+                                            panel.edit = None;
+                                        } else {
+                                            modal = None;
+                                        }
+                                    }
+                                    KeyCode::Up if !editing => {
+                                        panel.selected = panel.selected.saturating_sub(1)
+                                    }
+                                    KeyCode::Down if !editing => {
+                                        if panel.selected + 1 < SettingsPanel::ROWS {
+                                            panel.selected += 1;
+                                        }
+                                    }
+                                    KeyCode::Backspace if editing => {
+                                        if let Some(edit) = panel.edit.as_mut() {
+                                            edit.pop();
+                                        }
+                                    }
+                                    KeyCode::Char(c) if editing => {
+                                        if let Some(edit) = panel.edit.as_mut() {
+                                            edit.push(c);
+                                        }
+                                    }
+                                    KeyCode::Enter => match panel.selected {
+                                        0 => {
+                                            if editing {
+                                                let value =
+                                                    panel.edit.clone().unwrap_or_default();
+                                                if !value.trim().is_empty() {
+                                                    panel.model = value.trim().to_string();
+                                                    let _ = commands
+                                                        .send(Command::SetModel {
+                                                            selector: panel.model.clone(),
+                                                        })
+                                                        .await;
+                                                }
+                                                panel.edit = None;
+                                            } else {
+                                                panel.edit = Some(panel.model.clone());
+                                            }
+                                        }
+                                        1 => {
+                                            let mode = panel.cycle_mode();
+                                            let _ =
+                                                commands.send(Command::SetMode { mode }).await;
+                                        }
+                                        _ => {
+                                            let level = panel.cycle_effort();
+                                            let _ = commands
+                                                .send(Command::SetEffort { level })
+                                                .await;
+                                        }
+                                    },
+                                    KeyCode::Char('s') if !editing => {
+                                        let _ = commands
+                                            .send(Command::SaveSettings {
+                                                model: Some(panel.model.clone()),
+                                                effort: panel.effort,
+                                                mode: Some(panel.mode),
+                                            })
+                                            .await;
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
+                        continue;
+                    }
                     match (key.code, key.modifiers) {
                         (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
                             if busy {
@@ -311,8 +564,41 @@ async fn app(
                             }
                             if let Some(cmd) = slash_command(&text) {
                                 lines.push(Line::User(text));
+                                if let Some(kind) = cmd.modal {
+                                    modal = Some(match kind {
+                                        ModalKind::Session => {
+                                            let sessions = std::env::current_dir()
+                                                .ok()
+                                                .and_then(|cwd| ka_strand::list(&cwd).ok())
+                                                .unwrap_or_default();
+                                            Modal::Session(SessionPicker {
+                                                sessions,
+                                                selected: 0,
+                                                filter: String::new(),
+                                            })
+                                        }
+                                        ModalKind::Settings => Modal::Settings(SettingsPanel {
+                                            model: meters.model.clone(),
+                                            mode: match meters.mode.as_str() {
+                                                "free" => ka_protocol::Mode::Free,
+                                                "plan" => ka_protocol::Mode::Plan,
+                                                _ => ka_protocol::Mode::Guarded,
+                                            },
+                                            effort: None,
+                                            selected: 0,
+                                            edit: None,
+                                            providers: providers_ref.clone(),
+                                            config_path: ka_config_path(),
+                                        }),
+                                    });
+                                }
                                 if let Some(evt) = cmd.event {
+                                    let is_switch =
+                                        matches!(evt, Command::SwitchStrand { .. });
                                     let _ = commands.send(evt).await;
+                                    if is_switch {
+                                        busy = true;
+                                    }
                                 }
                                 if let Some(follow) = cmd.followup {
                                     lines.push(Line::Note("(mode set; starting)".into()));
@@ -490,6 +776,7 @@ fn apply_event(
             let _ = pending_turn_cost;
         }
         Event::ModelChanged { selector } => meters.model = selector.clone(),
+        Event::SessionInfo { id } => meters.session = id.clone(),
         Event::ModeChanged { mode } => {
             meters.mode = match mode {
                 ka_protocol::Mode::Guarded => "guarded".to_string(),
@@ -501,6 +788,15 @@ fn apply_event(
             lines.push(Line::Note(format!("! {message}")));
         }
         Event::Replay { messages } => {
+            // a replay is the full transcript of the active session:
+            // rebuild from scratch (startup on a fresh Vec, session switch
+            // replaces the previous conversation)
+            lines.clear();
+            meters.cost = 0.0;
+            meters.context = (0, 0);
+            current_assistant.clear();
+            current_thought.clear();
+            current_tool.clear();
             for m in messages {
                 if m.role == "user" {
                     lines.push(Line::User(m.content.clone()));
@@ -546,6 +842,16 @@ pub fn available_slash_commands() -> Vec<(String, String)> {
             "drop the last N exchanges".to_string(),
         ),
         ("/compact".to_string(), "digest the context now".to_string()),
+        (
+            "/session".to_string(),
+            "pick a session to resume".to_string(),
+        ),
+        ("/resume".to_string(), "alias for /session".to_string()),
+        ("/new".to_string(), "start a fresh session".to_string()),
+        (
+            "/settings".to_string(),
+            "settings & provider status".to_string(),
+        ),
         ("/quit".to_string(), "exit".to_string()),
     ];
     if let Ok(cwd) = std::env::current_dir() {
@@ -596,11 +902,34 @@ pub fn update_suggestions(input: &str) -> Option<SlashPopup> {
     }
 }
 
+/// The user config path shown in the settings panel (mirrors
+/// ka-agent's `config::user_config_path`).
+fn ka_config_path() -> String {
+    std::env::var("XDG_CONFIG_HOME")
+        .map(std::path::PathBuf::from)
+        .or_else(|_| std::env::var("HOME").map(|h| std::path::PathBuf::from(h).join(".config")))
+        .unwrap_or_else(|_| std::path::PathBuf::from("."))
+        .join("ka/ka.toml")
+        .display()
+        .to_string()
+}
+
 /// A parsed slash command.
 struct Slash {
     event: Option<Command>,
     quit: bool,
     followup: Option<String>,
+    /// Modal to open instead of sending an event.
+    modal: Option<ModalKind>,
+}
+
+/// Modal a slash command opens.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModalKind {
+    /// Session picker.
+    Session,
+    /// Settings panel.
+    Settings,
 }
 
 /// Load a custom command body from `.ka/commands/<name>.md` (project) or
@@ -631,7 +960,18 @@ fn slash_command(text: &str) -> Option<Slash> {
     let head = parts.next()?.trim();
     let rest = parts.next().map(str::trim).filter(|s| !s.is_empty());
     // custom commands load from files; builtins win over files
-    if !matches!(head, "/quit" | "/exit" | "/model" | "/mode" | "/compact") {
+    if !matches!(
+        head,
+        "/quit"
+            | "/exit"
+            | "/model"
+            | "/mode"
+            | "/compact"
+            | "/session"
+            | "/resume"
+            | "/new"
+            | "/settings"
+    ) {
         if let Some(body) = custom_command(head, rest) {
             return Some(Slash {
                 event: Some(Command::Prompt {
@@ -640,6 +980,7 @@ fn slash_command(text: &str) -> Option<Slash> {
                 }),
                 quit: false,
                 followup: None,
+                modal: None,
             });
         }
     }
@@ -648,6 +989,7 @@ fn slash_command(text: &str) -> Option<Slash> {
             event: None,
             quit: true,
             followup: None,
+            modal: None,
         }),
         "/model" => {
             let selector = rest?;
@@ -657,6 +999,7 @@ fn slash_command(text: &str) -> Option<Slash> {
                 }),
                 quit: false,
                 followup: None,
+                modal: None,
             })
         }
         "/plan" => {
@@ -666,10 +1009,15 @@ fn slash_command(text: &str) -> Option<Slash> {
                     mode: ka_protocol::Mode::Plan,
                 }),
                 quit: false,
-                followup: Some(format!(
+                followup: None,
+                modal: None,
+            })
+            .map(|mut sl| {
+                sl.followup = Some(format!(
                     "Plan this task. Research the codebase with read/glob/grep/pathfinder, \\
 then write a concrete numbered implementation plan to .ka/plans/plan.md. Task: {task}"
-                )),
+                ));
+                sl
             })
         }
         "/build" => Some(Slash {
@@ -677,6 +1025,7 @@ then write a concrete numbered implementation plan to .ka/plans/plan.md. Task: {
                 mode: ka_protocol::Mode::Guarded,
             }),
             quit: false,
+            modal: None,
             followup: Some(
                 "Switching to build mode. Read .ka/plans/plan.md and implement it step by \\
 step now; verify each step."
@@ -689,6 +1038,7 @@ step now; verify each step."
                 event: Some(Command::Rewind { turns }),
                 quit: false,
                 followup: None,
+                modal: None,
             })
         }
         "/compact" => {
@@ -697,8 +1047,29 @@ step now; verify each step."
                 event: Some(Command::Compact { focus }),
                 quit: false,
                 followup: None,
+                modal: None,
             })
         }
+        "/session" | "/resume" => Some(Slash {
+            event: None,
+            quit: false,
+            followup: None,
+            modal: Some(ModalKind::Session),
+        }),
+        "/new" => Some(Slash {
+            event: Some(Command::SwitchStrand {
+                id: "new".to_string(),
+            }),
+            quit: false,
+            followup: None,
+            modal: None,
+        }),
+        "/settings" => Some(Slash {
+            event: None,
+            quit: false,
+            followup: None,
+            modal: Some(ModalKind::Settings),
+        }),
         "/mode" => {
             let mode = match rest? {
                 "free" => ka_protocol::Mode::Free,
@@ -709,6 +1080,7 @@ step now; verify each step."
                 event: Some(Command::SetMode { mode }),
                 quit: false,
                 followup: None,
+                modal: None,
             })
         }
         _ => None,
@@ -726,6 +1098,7 @@ fn render(
     ask: Option<&PendingAsk>,
     live: Option<&(String, String)>,
     popup: Option<&SlashPopup>,
+    modal: Option<&Modal>,
 ) {
     use ratatui::layout::Constraint::{Length, Min};
     use ratatui::style::{Color, Modifier, Style};
@@ -885,6 +1258,120 @@ fn render(
             .wrap(Wrap { trim: true });
         frame.render_widget(widget, rect);
     }
+
+    // ── modals (session picker / settings) ────────────────────────
+    if let Some(open) = modal {
+        match open {
+            Modal::Session(picker) => {
+                let rows = picker.rows();
+                let height = (rows.len() as u16 + 4).min(20);
+                let width = 68.min(frame.area().width);
+                let rect = centered(width, height, frame.area());
+                frame.render_widget(Clear, rect);
+                let mut text = vec![TuiLine::from(vec![
+                    Span::styled("filter: ", Style::default().fg(Color::Gray)),
+                    Span::styled(picker.filter.clone(), Style::default().fg(Color::Cyan)),
+                ])];
+                for (i, (label, detail)) in rows.iter().take((height as usize) - 4).enumerate() {
+                    let marker = if i == picker.selected { "▶ " } else { "  " };
+                    let style = if i == picker.selected {
+                        Style::default()
+                            .fg(Color::Cyan)
+                            .add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(Color::Gray)
+                    };
+                    text.push(TuiLine::styled(
+                        format!("{marker}{label}  —  {detail}"),
+                        style,
+                    ));
+                }
+                text.push(TuiLine::styled(
+                    "type to filter · enter switch · esc close",
+                    Style::default().fg(Color::DarkGray),
+                ));
+                let widget = Paragraph::new(text)
+                    .block(Block::default().borders(Borders::ALL).title("sessions"))
+                    .wrap(Wrap { trim: false });
+                frame.render_widget(widget, rect);
+            }
+            Modal::Settings(panel) => {
+                let height = (SettingsPanel::ROWS + panel.providers.len() + 6) as u16;
+                let height = height.min(frame.area().height.saturating_sub(2));
+                let width = 72.min(frame.area().width);
+                let rect = centered(width, height, frame.area());
+                frame.render_widget(Clear, rect);
+                let sel = Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD);
+                let dim = Style::default().fg(Color::Gray);
+                let marker =
+                    |i: usize| -> &'static str { if i == panel.selected { "▶ " } else { "  " } };
+                let mode_str = match panel.mode {
+                    ka_protocol::Mode::Guarded => "guarded",
+                    ka_protocol::Mode::Free => "free",
+                    ka_protocol::Mode::Plan => "plan",
+                };
+                let effort_str = panel
+                    .effort
+                    .as_ref()
+                    .map(|e| format!("{e:?}").to_lowercase())
+                    .unwrap_or_else(|| "(default)".to_string());
+                let model_shown = panel.edit.clone().unwrap_or_else(|| panel.model.clone());
+                let mut text = vec![
+                    TuiLine::styled(
+                        format!("{}model    {}", marker(0), model_shown),
+                        if panel.selected == 0 { sel } else { dim },
+                    ),
+                    TuiLine::styled(
+                        format!("{}mode     {}", marker(1), mode_str),
+                        if panel.selected == 1 { sel } else { dim },
+                    ),
+                    TuiLine::styled(
+                        format!("{}effort   {}", marker(2), effort_str),
+                        if panel.selected == 2 { sel } else { dim },
+                    ),
+                    TuiLine::styled(
+                        format!("config: {}", panel.config_path),
+                        Style::default().fg(Color::DarkGray),
+                    ),
+                    TuiLine::styled("providers:", Style::default().fg(Color::Gray)),
+                ];
+                for p in &panel.providers {
+                    let key = if p.env_var.is_empty() {
+                        "(keyless)".to_string()
+                    } else if p.key_set {
+                        format!("{} ✓", p.env_var)
+                    } else {
+                        format!("{} ✗", p.env_var)
+                    };
+                    text.push(TuiLine::from(vec![
+                        Span::styled(format!("  {:<12}", p.name), dim),
+                        Span::styled(
+                            key,
+                            if p.key_set || p.env_var.is_empty() {
+                                Style::default().fg(Color::Green)
+                            } else {
+                                Style::default().fg(Color::Red)
+                            },
+                        ),
+                        Span::styled(
+                            format!("  {}", p.base_url),
+                            Style::default().fg(Color::DarkGray),
+                        ),
+                    ]));
+                }
+                text.push(TuiLine::styled(
+                    "enter edit/cycle · s save to config · esc close",
+                    Style::default().fg(Color::DarkGray),
+                ));
+                let widget = Paragraph::new(text)
+                    .block(Block::default().borders(Borders::ALL).title("settings"))
+                    .wrap(Wrap { trim: false });
+                frame.render_widget(widget, rect);
+            }
+        }
+    }
 }
 
 /// Background-block styles for transcript roles.
@@ -975,6 +1462,98 @@ mod tests {
     use super::*;
 
     #[test]
+    fn short_session_takes_tail() {
+        assert_eq!(short_session("s19a4f2e1b0-3f9c2a81d4b7"), Some("3f9c2a81"));
+        assert_eq!(short_session("no-tail"), Some("tail"));
+        assert_eq!(short_session(""), None);
+    }
+
+    #[test]
+    fn session_picker_filters_and_picks() {
+        let picker = SessionPicker {
+            sessions: vec![ka_strand::StrandSummary {
+                path: std::path::PathBuf::from("/tmp/a.jsonl"),
+                id: "s1-aaaa11112222".to_string(),
+                ts: "2026-01-01T00:00:00Z".to_string(),
+                title: "fix the parser".to_string(),
+                messages: 4,
+            }],
+            selected: 1,
+            filter: "parser".to_string(),
+        };
+        let rows = picker.rows();
+        assert_eq!(rows.len(), 2, "new-session row + the match");
+        assert!(rows[1].0.contains("fix the parser"));
+        assert_eq!(picker.pick().as_deref(), Some("s1-aaaa11112222"));
+
+        let mut miss = picker.clone();
+        miss.filter = "nomatch".to_string();
+        assert_eq!(miss.rows().len(), 1);
+        assert_eq!(miss.pick(), None, "only the new-session row remains");
+
+        let mut fresh = picker.clone();
+        fresh.selected = 0;
+        assert_eq!(fresh.pick(), None, "row 0 = new session");
+    }
+
+    #[test]
+    fn settings_effort_cycles_all_variants() {
+        use ka_protocol::Effort;
+        let mut panel = SettingsPanel {
+            model: "x/y".to_string(),
+            mode: ka_protocol::Mode::Guarded,
+            effort: None,
+            selected: 0,
+            edit: None,
+            providers: vec![],
+            config_path: String::new(),
+        };
+        let seq = [
+            Some(Effort::Low),
+            Some(Effort::Medium),
+            Some(Effort::High),
+            Some(Effort::Max),
+            None,
+        ];
+        for expected in seq {
+            panel.cycle_effort();
+            assert_eq!(panel.effort, expected);
+        }
+    }
+
+    #[test]
+    fn slash_commands_include_session_and_settings() {
+        let names: Vec<String> = available_slash_commands()
+            .into_iter()
+            .map(|(n, _)| n)
+            .collect();
+        for want in ["/session", "/resume", "/new", "/settings"] {
+            assert!(names.contains(&want.to_string()), "missing {want}");
+        }
+        assert!(matches!(
+            slash_command("/new"),
+            Some(Slash {
+                event: Some(Command::SwitchStrand { id }),
+                ..
+            }) if id == "new"
+        ));
+        assert!(matches!(
+            slash_command("/settings"),
+            Some(Slash {
+                modal: Some(ModalKind::Settings),
+                ..
+            })
+        ));
+        assert!(matches!(
+            slash_command("/resume"),
+            Some(Slash {
+                modal: Some(ModalKind::Session),
+                ..
+            })
+        ));
+    }
+
+    #[test]
     fn input_buffer_edits_and_history() {
         let mut b = InputBuffer::default();
         for c in "héllo".chars() {
@@ -1006,6 +1585,7 @@ mod tests {
     #[test]
     fn meters_footer_shows_fields() {
         let m = Meters {
+            session: String::new(),
             model: "ollama/qwen3.5:9b".into(),
             mode: "guarded".into(),
             context: (10_000, 100_000),

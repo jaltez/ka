@@ -153,6 +153,54 @@ impl Config {
     }
 }
 
+/// The user config layer path (`~/.config/ka/ka.toml`, XDG-aware).
+pub fn user_config_path() -> std::path::PathBuf {
+    std::env::var("XDG_CONFIG_HOME")
+        .map(std::path::PathBuf::from)
+        .or_else(|_| std::env::var("HOME").map(|h| std::path::PathBuf::from(h).join(".config")))
+        .unwrap_or_else(|_| std::path::PathBuf::from("."))
+        .join("ka/ka.toml")
+}
+
+/// Persist default settings to the user layer, preserving unrelated keys
+/// (rules, hooks, roles) from an existing file. Returns the path written.
+pub fn save_user_settings(
+    model: Option<&str>,
+    effort: Option<Effort>,
+    mode: Option<Mode>,
+) -> Result<std::path::PathBuf, String> {
+    save_settings_to(&user_config_path(), model, effort, mode)
+}
+
+/// [`save_user_settings`] against an explicit path (tests, layers).
+pub fn save_settings_to(
+    path: &std::path::Path,
+    model: Option<&str>,
+    effort: Option<Effort>,
+    mode: Option<Mode>,
+) -> Result<std::path::PathBuf, String> {
+    let mut layer = std::fs::read_to_string(path)
+        .ok()
+        .and_then(|text| Config::parse_layer(&text, "user").ok())
+        .unwrap_or_default();
+    if model.is_some() {
+        layer.model = model.map(str::to_string);
+    }
+    if effort.is_some() {
+        layer.effort = effort;
+    }
+    if mode.is_some() {
+        layer.mode = mode;
+    }
+    let mut text = String::from("# ka user config — written by /settings\n\n");
+    text.push_str(&toml::to_string_pretty(&layer).map_err(|e| e.to_string())?);
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).map_err(|e| format!("mkdir {}: {e}", dir.display()))?;
+    }
+    std::fs::write(path, text).map_err(|e| format!("write {}: {e}", path.display()))?;
+    Ok(path.to_path_buf())
+}
+
 /// Configuration failure.
 #[derive(Debug)]
 pub enum ConfigError {
@@ -185,6 +233,29 @@ impl std::error::Error for ConfigError {}
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    #[test]
+    fn save_settings_preserves_unrelated_keys() {
+        let dir = std::env::temp_dir().join(format!("ka-cfg-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("ka.toml");
+        std::fs::write(&path, "model = \"old/model\"\nmax_steps = 7\n").unwrap();
+        save_settings_to(
+            &path,
+            Some("groq/llama-3.3-70b"),
+            Some(Effort::High),
+            Some(Mode::Free),
+        )
+        .unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        let layer = Config::parse_layer(&text, "saved").unwrap();
+        assert_eq!(layer.model.as_deref(), Some("groq/llama-3.3-70b"));
+        assert_eq!(layer.effort, Some(Effort::High));
+        assert_eq!(layer.mode, Some(Mode::Free));
+        assert_eq!(layer.max_steps, Some(7), "unrelated keys preserved");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     use super::*;
 

@@ -7,6 +7,7 @@ pub mod client;
 pub mod dialects;
 pub mod discovery;
 pub mod json_repair;
+pub mod providers;
 pub mod speaker;
 mod sse;
 pub mod wire_anthropic;

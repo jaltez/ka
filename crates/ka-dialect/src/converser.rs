@@ -60,16 +60,20 @@ impl Converser {
         parse_selector(s).map_err(|e| ConverserError::BadSelector(e.to_string()))
     }
 
-    /// Resolve a selector to its dialect row.
+    /// Resolve a selector to its dialect row, falling back to a synthetic
+    /// row from the provider registry when the catalog has no seed.
     pub fn dialect_for(&self, selector: &str) -> Result<Dialect, ConverserError> {
         let sel = self.selector(selector)?;
         self.catalog
             .get(&sel.model_id())
             .cloned()
+            .or_else(|| {
+                crate::providers::find(&sel.vendor)
+                    .map(|p| crate::providers::synthetic_dialect(p, &sel.model))
+            })
             .ok_or_else(|| ConverserError::UnknownModel(sel.model_id()))
     }
 
-    /// Build a Speaker for a selector.
     pub fn speaker_for(&self, selector: &str) -> Result<Box<dyn Speaker>, ConverserError> {
         let sel = self.selector(selector)?;
         let id = sel.model_id();
@@ -77,6 +81,10 @@ impl Converser {
             .catalog
             .get(&id)
             .cloned()
+            .or_else(|| {
+                crate::providers::find(&sel.vendor)
+                    .map(|p| crate::providers::synthetic_dialect(p, &sel.model))
+            })
             .ok_or_else(|| ConverserError::UnknownModel(id.clone()))?;
         // the model id the wire sends is everything after the vendor prefix
         let wire_model = sel.model.clone();
@@ -159,6 +167,24 @@ mod tests {
 
     fn converser() -> Converser {
         Converser::new(Catalog::embedded(), EnvLookup::empty())
+    }
+
+    #[test]
+    fn unseeded_provider_model_resolves_via_registry() {
+        let d = converser().dialect_for("groq/llama-3.3-70b-versatile").unwrap();
+        assert_eq!(d.base_url.as_deref(), Some("https://api.groq.com/openai/v1"));
+        assert_eq!(d.api_key_env.as_deref(), Some("GROQ_API_KEY"));
+    }
+
+    #[test]
+    fn unknown_vendor_still_errors() {
+        assert!(converser().dialect_for("nosuch/model-x").is_err());
+    }
+
+    #[test]
+    fn seeded_row_wins_over_registry() {
+        let d = converser().dialect_for("ollama/qwen3-32b").unwrap();
+        assert_eq!(d.context, 131_072);
     }
 
     #[test]

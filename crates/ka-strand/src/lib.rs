@@ -160,14 +160,24 @@ pub fn new_record_id() -> RecordId {
     RecordId(format!("r{millis:x}-{n:x}"))
 }
 
-/// Generate a fresh strand id.
+/// Generate a fresh strand id: `s{millis:x}-{seq:02x}{rand:010x}` — the
+/// millis head keeps listing order stable across seconds, the per-process
+/// sequence orders bursts inside one millisecond, and the 40 random bits
+/// make ids referenceable by prefix (`ka --session 806890f4`).
 pub fn new_strand_id() -> StrandId {
+    static NONCE: AtomicU64 = AtomicU64::new(0);
     let millis = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0);
-    let n = RECORD_COUNTER.fetch_add(1, Ordering::Relaxed);
-    StrandId(format!("s{millis:x}-{n:x}"))
+    let n = NONCE.fetch_add(1, Ordering::Relaxed);
+    // RandomState seeds differ per process (and per call); mixing in the
+    // counter keeps same-process ids distinct too.
+    use std::hash::{BuildHasher, Hasher as _};
+    let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();
+    hasher.write_u64(millis.rotate_left(32) ^ n);
+    let rand40 = hasher.finish() & 0xFF_FFFF_FFFF;
+    StrandId(format!("s{millis:x}-{n:02x}{rand40:010x}"))
 }
 
 thread_local! {
@@ -479,6 +489,65 @@ pub fn latest(cwd: &Path) -> std::io::Result<Option<StrandSummary>> {
     Ok(list(cwd)?.into_iter().next())
 }
 
+/// Outcome of resolving a user-supplied session reference.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IdMatch {
+    /// No strand matched.
+    None,
+    /// Exactly one strand matched the prefix.
+    Unique(StrandSummary),
+    /// Several matched; the user must be more specific.
+    Ambiguous(Vec<StrandSummary>),
+}
+
+/// Resolve a session reference: full id, id prefix, or an existing file
+/// path. Ids embed their creation millis, so any prefix of the random
+/// tail (or the whole id) works.
+pub fn resolve_id(cwd: &Path, needle: &str) -> std::io::Result<IdMatch> {
+    let needle = needle.trim();
+    if needle.is_empty() {
+        return Ok(IdMatch::None);
+    }
+    let path = Path::new(needle);
+    if path.exists() {
+        return Ok(IdMatch::Unique(StrandSummary {
+            path: path.to_path_buf(),
+            id: needle.to_string(),
+            ts: String::new(),
+            title: String::new(),
+            messages: 0,
+        }));
+    }
+    let mut matches: Vec<StrandSummary> = strands_filter(cwd, needle)?;
+    match matches.len() {
+        0 => Ok(IdMatch::None),
+        1 => Ok(IdMatch::Unique(matches.swap_remove(0))),
+        _ => Ok(IdMatch::Ambiguous(matches)),
+    }
+}
+
+fn strands_filter(cwd: &Path, needle: &str) -> std::io::Result<Vec<StrandSummary>> {
+    Ok(list(cwd)?
+        .into_iter()
+        .filter(|s| {
+            s.id.starts_with(needle)
+                || s.id
+                    .split_once('-')
+                    .is_some_and(|(_, tail)| tail.starts_with(needle))
+        })
+        .collect())
+}
+
+impl IdMatch {
+    /// The matched summary (None/Ambiguous → None).
+    pub fn into_summary(self) -> Option<StrandSummary> {
+        match self {
+            IdMatch::Unique(s) => Some(s),
+            _ => None,
+        }
+    }
+}
+
 fn now_rfc3339() -> String {
     let secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -654,6 +723,74 @@ mod tests {
         assert!(listed[0].title.contains("second"), "{}", listed[0].title);
         assert!(listed[0].messages >= 1);
         assert!(latest(&cwd).unwrap().is_some());
+        let _ = std::fs::remove_dir_all(&data);
+    }
+
+    #[test]
+    fn strand_ids_are_long_hashed_and_distinct() {
+        let a = new_strand_id().0;
+        let b = new_strand_id().0;
+        assert_ne!(a, b);
+        assert!(a.starts_with('s'));
+        // s{millis:x}-{12 hex}
+        let (head, tail) = a.split_once('-').unwrap();
+        assert!(head.starts_with('s') && head.len() > 1, "{a}");
+        assert_eq!(tail.len(), 12, "random tail is 12 hex chars: {a}");
+        assert!(tail.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn resolve_id_matches_full_prefix_and_tail() {
+        let data = temp_data("resolve");
+        let cwd = PathBuf::from("/tmp/proj-resolve");
+        let mut strands = Vec::new();
+        for prompt in ["alpha session", "beta session"] {
+            let mut s = StrandFile::create(&cwd, None).unwrap();
+            s.append(Record::Message {
+                id: new_record_id(),
+                role: Role::User,
+                content: prompt.into(),
+                calls: Vec::new(),
+                results: Vec::new(),
+            })
+            .unwrap();
+            strands.push(s);
+        }
+        let listed = list(&cwd).unwrap();
+        let target = &listed[1]; // oldest = "alpha"
+        // full id
+        match resolve_id(&cwd, &target.id).unwrap() {
+            IdMatch::Unique(s) => assert_eq!(s.id, target.id),
+            other => panic!("full id must resolve uniquely: {other:?}"),
+        }
+        // leading prefix (millis heads collide for same-ms sessions, so
+        // include the tail start to pin one session)
+        let head: String = target.id.chars().take(6).collect();
+        match resolve_id(&cwd, &head).unwrap() {
+            IdMatch::Ambiguous(cands) => assert_eq!(cands.len(), 2),
+            other => panic!("same-millis head should be ambiguous: {other:?}"),
+        }
+        let (head_part, tail_part) = target.id.split_once('-').unwrap();
+        let pinned = format!("{head_part}-{tail_part}");
+        match resolve_id(&cwd, &pinned).unwrap() {
+            IdMatch::Unique(s) => assert_eq!(s.id, target.id),
+            other => panic!("full id must resolve: {other:?}"),
+        }
+        // random-tail prefix
+        let tail = target.id.split_once('-').unwrap().1;
+        let tail4: String = tail.chars().take(4).collect();
+        match resolve_id(&cwd, &tail4).unwrap() {
+            IdMatch::Unique(s) => assert_eq!(s.id, target.id),
+            other => panic!("tail prefix must resolve: {other:?}"),
+        }
+        // garbage
+        assert!(matches!(
+            resolve_id(&cwd, "zz-nothing").unwrap(),
+            IdMatch::None
+        ));
+        // empty
+        assert!(matches!(resolve_id(&cwd, "  ").unwrap(), IdMatch::None));
+        drop(strands);
         let _ = std::fs::remove_dir_all(&data);
     }
 

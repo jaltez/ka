@@ -23,9 +23,9 @@ struct Cli {
     /// Continue the newest strand (with the terminal's waypoint preferred)
     #[arg(short = 'c', long)]
     continue_latest: bool,
-    /// Open a specific strand file
-    #[arg(long)]
-    session: Option<std::path::PathBuf>,
+    /// Resume a session by id (prefix ok) or strand file path
+    #[arg(long, value_name = "ID")]
+    session: Option<String>,
     /// Model selector override (vendor/model@effort)
     #[arg(long)]
     model: Option<String>,
@@ -95,6 +95,10 @@ enum CliCommand {
         #[arg(short, long)]
         out: Option<PathBuf>,
     },
+    /// List sessions for this directory (ids for `ka --session`)
+    Sessions,
+    /// List known providers with API-key env status
+    Providers,
     /// Generate a starter AGENTS.md from a quick repo scan
     Init,
     /// Inspect configuration
@@ -287,6 +291,8 @@ async fn dispatch(cli: Cli) -> Result<ExitCode, String> {
             }
             Ok(ExitCode::SUCCESS)
         }
+        Some(CliCommand::Sessions) => run_sessions(),
+        Some(CliCommand::Providers) => run_providers(),
         Some(CliCommand::Init) => run_init(),
         Some(CliCommand::Rewind { turns }) => run_rewind(turns).await,
         Some(CliCommand::Export { out }) => run_export(out),
@@ -393,8 +399,8 @@ async fn run_headless(
 /// The interactive surface: picker (unless -c/--session) then the TUI.
 async fn run_tui(cli: Cli) -> Result<ExitCode, String> {
     let cwd = std::env::current_dir().map_err(|e| format!("cwd: {e}"))?;
-    let choice = if let Some(path) = cli.session.clone() {
-        ka_agent::StrandChoice::Path(path)
+    let choice = if let Some(id) = cli.session.clone() {
+        resolve_session(&cwd, &id)?
     } else if cli.continue_latest {
         // waypoint first, else newest
         match ka_agent::read_waypoint() {
@@ -404,16 +410,26 @@ async fn run_tui(cli: Cli) -> Result<ExitCode, String> {
             _ => ka_agent::StrandChoice::Latest,
         }
     } else {
-        pick_strand(&cwd)?
+        // default: a fresh chat; /session inside the TUI lists the rest
+        ka_agent::StrandChoice::New
     };
 
     let trust = trust_for_cwd(cli.trust);
     let cfg = load_config(&cli.configs, cli.model.clone(), cli.mode.clone(), trust)?;
     let catalog = build_catalog(&cli.dialects, !cli.no_discovery).await?;
     let model_label = cfg.model.clone().unwrap_or_else(|| "(canned)".to_string());
+    let providers: Vec<ka_term::tui::ProviderInfo> = ka_dialect::providers::PROVIDERS
+        .iter()
+        .map(|p| ka_term::tui::ProviderInfo {
+            name: p.name.to_string(),
+            env_var: p.key_env.unwrap_or("").to_string(),
+            base_url: p.base_url.to_string(),
+            key_set: p.key_env.is_some_and(|k| std::env::var(k).is_ok()),
+        })
+        .collect();
     let handle = ka_agent::spawn_full(cfg, catalog, choice);
     let ka_agent::EngineHandle { commands, events } = handle;
-    let exit = ka_term::tui::run(commands, events, &model_label)
+    let exit = ka_term::tui::run(commands, events, &model_label, providers)
         .await
         .map_err(|e| format!("tui: {e}"))?;
     match exit {
@@ -421,31 +437,63 @@ async fn run_tui(cli: Cli) -> Result<ExitCode, String> {
     }
 }
 
-/// Text session picker: newest strands for this cwd + new-session default.
-fn pick_strand(cwd: &std::path::Path) -> Result<ka_agent::StrandChoice, String> {
-    use std::io::Write;
+/// Resolve a `--session` reference (id, id prefix, or file path).
+fn resolve_session(cwd: &std::path::Path, id: &str) -> Result<ka_agent::StrandChoice, String> {
+    match ka_strand::resolve_id(cwd, id).map_err(|e| format!("session lookup: {e}"))? {
+        ka_strand::IdMatch::Unique(summary) => Ok(ka_agent::StrandChoice::Path(summary.path)),
+        ka_strand::IdMatch::None => Err(format!("no session matches '{id}'")),
+        ka_strand::IdMatch::Ambiguous(candidates) => {
+            let ids: Vec<String> = candidates.iter().map(|c| c.id.clone()).collect();
+            Err(format!(
+                "session id '{id}' is ambiguous: {}",
+                ids.join(", ")
+            ))
+        }
+    }
+}
 
-    let strands = ka_strand::list(cwd).map_err(|e| format!("listing strands: {e}"))?;
+/// `ka sessions`: list strands for this cwd with resolvable ids.
+fn run_sessions() -> Result<ExitCode, String> {
+    let cwd = std::env::current_dir().map_err(|e| format!("cwd: {e}"))?;
+    let strands = ka_strand::list(&cwd).map_err(|e| format!("listing sessions: {e}"))?;
     if strands.is_empty() {
-        return Ok(ka_agent::StrandChoice::New);
+        println!("no sessions yet for {}", cwd.display());
+        return Ok(ExitCode::SUCCESS);
     }
-    println!("recent strands for {}:", cwd.display());
-    println!("  0) new session");
-    for (i, s) in strands.iter().take(9).enumerate() {
-        println!("  {}) [{}] {} ({} msgs)", i + 1, s.ts, s.title, s.messages);
+    println!(
+        "{:<26} {:>5}  {first_message:<}",
+        "session id",
+        "msgs",
+        first_message = "first message"
+    );
+    for s in strands.iter().take(30) {
+        println!("{:<26} {:>5}  {}", s.id, s.messages, s.title);
     }
-    print!("choice [0]: ");
-    std::io::stdout().flush().map_err(|e| e.to_string())?;
-    let mut line = String::new();
-    std::io::stdin()
-        .read_line(&mut line)
-        .map_err(|e| format!("stdin: {e}"))?;
-    let n: usize = line.trim().parse().unwrap_or(0);
-    if n == 0 || n > strands.len() {
-        Ok(ka_agent::StrandChoice::New)
-    } else {
-        Ok(ka_agent::StrandChoice::Path(strands[n - 1].path.clone()))
+    Ok(ExitCode::SUCCESS)
+}
+
+fn run_providers() -> Result<ExitCode, String> {
+    let header = format!(
+        "{:<12} {:<22} {:<8} {}",
+        "provider", "api key env", "key", "endpoint"
+    );
+    println!("{header}");
+    for p in ka_dialect::providers::PROVIDERS {
+        let env = p.key_env.unwrap_or("-");
+        let set = p
+            .key_env
+            .map(|k| {
+                if std::env::var(k).is_ok() {
+                    "yes"
+                } else {
+                    "no"
+                }
+            })
+            .unwrap_or("n/a");
+        println!("{:<12} {:<22} {:<8} {}", p.name, env, set, p.base_url);
     }
+    println!("\nany provider/<model> selector works against these vendors, catalog row or not");
+    Ok(ExitCode::SUCCESS)
 }
 
 /// Trust store: directories whose `.ka/` local config ka will load.
@@ -477,15 +525,12 @@ fn save_trust(dirs: &[PathBuf]) {
 /// Whether the project config layer for `cwd` may load. Prompts on a TTY
 /// (first sighting), skips with a warning otherwise. `--trust` forces.
 fn project_config_trusted(cwd: &std::path::Path, force_trust: bool) -> bool {
-    let project = cwd.join(".ka/ka.toml");
-    if !project.exists() {
-        return true; // nothing to gate
+    // nothing to trust — and no prompt — without a project config
+    if !cwd.join(".ka/ka.toml").is_file() {
+        return false;
     }
     let canonical = std::fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
     let mut trusted = load_trust();
-    if trusted.contains(&canonical) {
-        return true;
-    }
     if force_trust {
         trusted.push(canonical);
         save_trust(&trusted);

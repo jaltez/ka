@@ -250,58 +250,21 @@ async fn run(
         .map(std::path::PathBuf::from)
         .or_else(|| std::env::current_dir().ok())
         .unwrap_or_else(|| std::path::PathBuf::from("."));
-    let mut strand = resolve_strand(&strand_choice, &cwd)
-        .map_err(|e| -> DynError { format!("strand: {e}").into() })?;
-    // interrupted-turn synthesis
-    let _ = strand.synthesize_aborted();
-    // session settings win over config defaults
-    let mut config = config;
-    {
-        let settings = strand.settings().clone();
-        if settings.model.is_some() {
-            config.model = settings.model.clone();
-        }
-        if settings.effort.is_some() {
-            config.effort = settings.effort;
-        }
-        if settings.mode.is_some() {
-            config.mode = settings.mode;
-        }
-    }
     let mode = config.effective_mode();
     let max_steps = config.effective_max_steps();
     let rules = config.rules.clone();
     let hooks = config.hooks.clone();
     let pathfinder_catalog = catalog.clone();
     let mut state = EngineState::from(config);
-    let (history, ids, digest) = history_from_records(strand.records());
     let mut voice = Voice::new(catalog, cwd.clone(), mode, max_steps);
-    voice.load_history(history, digest);
     voice.set_rules(rules);
     voice.set_hooks(hooks);
     {
         let slot = voice.pathfinder_slot();
         slot.write().catalog = pathfinder_catalog;
-        slot.write().model = state.model.clone();
     }
-    state.record_ids = ids;
-    write_waypoint(&cwd, strand.path());
-    // replay resumed history so surfaces can rebuild the transcript
-    if !voice.history.is_empty() {
-        let messages = voice
-            .history
-            .iter()
-            .filter(|m| !m.content.trim().is_empty())
-            .map(|m| ka_protocol::ReplayedMessage {
-                role: match m.role {
-                    ka_dialect::speaker::TurnRole::User => "user".to_string(),
-                    _ => "assistant".to_string(),
-                },
-                content: m.content.clone(),
-            })
-            .collect();
-        events.send(Event::Replay { messages }).await.ok();
-    }
+    let mut strand = attach_strand(&events, &mut state, &mut voice, &cwd, &strand_choice).await?;
+
     while let Some(cmd) = commands.recv().await {
         match cmd {
             Command::Prompt { text, .. } => {
@@ -352,10 +315,150 @@ async fn run(
                 });
                 events.send(Event::ModeChanged { mode }).await?;
             }
+            Command::SwitchStrand { id } => {
+                let choice = if id.trim() == "new" {
+                    StrandChoice::New
+                } else {
+                    match ka_strand::resolve_id(&cwd, &id) {
+                        Ok(ka_strand::IdMatch::Unique(summary)) => StrandChoice::Path(summary.path),
+                        Ok(ka_strand::IdMatch::Ambiguous(candidates)) => {
+                            let ids: Vec<String> =
+                                candidates.iter().map(|c| c.id.clone()).collect();
+                            events
+                                .send(Event::Error {
+                                    class: ErrorClass::Unsupported,
+                                    retryable: false,
+                                    message: format!(
+                                        "session id '{}' is ambiguous: {}",
+                                        id,
+                                        ids.join(", ")
+                                    ),
+                                })
+                                .await
+                                .ok();
+                            events.send(Event::Idle).await.ok();
+                            continue;
+                        }
+                        other => {
+                            let message = match other {
+                                Ok(ka_strand::IdMatch::None) => {
+                                    format!("no session matches '{id}'")
+                                }
+                                Err(e) => format!("session lookup failed: {e}"),
+                                _ => unreachable!(),
+                            };
+                            events
+                                .send(Event::Error {
+                                    class: ErrorClass::Unsupported,
+                                    retryable: false,
+                                    message,
+                                })
+                                .await
+                                .ok();
+                            events.send(Event::Idle).await.ok();
+                            continue;
+                        }
+                    }
+                };
+                match attach_strand(&events, &mut state, &mut voice, &cwd, &choice).await {
+                    Ok(fresh) => {
+                        strand = fresh;
+                        events
+                            .send(Event::Note {
+                                message: format!("switched to session {}", strand_id(&strand)),
+                            })
+                            .await
+                            .ok();
+                    }
+                    Err(e) => {
+                        events
+                            .send(Event::Error {
+                                class: ErrorClass::Protocol,
+                                retryable: false,
+                                message: format!("session switch failed: {e}"),
+                            })
+                            .await
+                            .ok();
+                    }
+                }
+                events.send(Event::Idle).await.ok();
+            }
             other => side_command(&events, &mut state, &mut voice, &mut strand, other).await?,
         }
     }
     Ok(())
+}
+/// Attach to a strand (startup or mid-session switch): open/create it,
+/// replay its settings over the live state, load history into the voice,
+/// mark the waypoint, and announce the session to surfaces.
+async fn attach_strand(
+    events: &mpsc::Sender<Event>,
+    state: &mut EngineState,
+    voice: &mut Voice,
+    cwd: &std::path::Path,
+    choice: &StrandChoice,
+) -> Result<ka_strand::StrandFile, DynError> {
+    let mut strand =
+        resolve_strand(choice, cwd).map_err(|e| -> DynError { format!("strand: {e}").into() })?;
+    // interrupted-turn synthesis
+    let _ = strand.synthesize_aborted();
+    // session settings win over whatever the engine was running with
+    let settings = strand.settings().clone();
+    if settings.model.is_some() {
+        state.model = settings.model.clone();
+    }
+    if settings.effort.is_some() {
+        state.effort = settings.effort;
+    }
+    if settings.mode.is_some() {
+        state.mode = settings.mode.unwrap_or_default();
+        voice.set_mode(state.mode);
+    }
+    voice.pathfinder_slot().write().model = state.model.clone();
+    let (history, ids, digest) = history_from_records(strand.records());
+    voice.load_history(history, digest);
+    state.record_ids = ids;
+    write_waypoint(cwd, strand.path());
+    let id = strand
+        .records()
+        .first()
+        .and_then(|r| match r {
+            ka_strand::Record::Header { id, .. } => Some(id.0.clone()),
+            _ => None,
+        })
+        .unwrap_or_default();
+    events.send(Event::SessionInfo { id }).await.ok();
+    if let Some(selector) = &state.model {
+        events
+            .send(Event::ModelChanged {
+                selector: selector.clone(),
+            })
+            .await
+            .ok();
+    }
+    if settings.mode.is_some() {
+        events
+            .send(Event::ModeChanged { mode: state.mode })
+            .await
+            .ok();
+    }
+    // replay resumed history so surfaces can rebuild the transcript
+    if !voice.history.is_empty() {
+        let messages = voice
+            .history
+            .iter()
+            .filter(|m| !m.content.trim().is_empty())
+            .map(|m| ka_protocol::ReplayedMessage {
+                role: match m.role {
+                    ka_dialect::speaker::TurnRole::User => "user".to_string(),
+                    _ => "assistant".to_string(),
+                },
+                content: m.content.clone(),
+            })
+            .collect();
+        events.send(Event::Replay { messages }).await.ok();
+    }
+    Ok(strand)
 }
 
 /// Post-turn context maintenance: prune old tool outputs, digest while
@@ -514,6 +617,18 @@ fn persist_delta(voice: &mut Voice, state: &mut EngineState, strand: &mut ka_str
     }
 }
 
+/// The strand's own id from its header record.
+fn strand_id(strand: &ka_strand::StrandFile) -> String {
+    strand
+        .records()
+        .first()
+        .and_then(|r| match r {
+            ka_strand::Record::Header { id, .. } => Some(id.0.clone()),
+            _ => None,
+        })
+        .unwrap_or_default()
+}
+
 /// Waypoint: tiny per-terminal pointer so `ka -c` continues the right
 /// strand per pane. Best-effort.
 fn write_waypoint(cwd: &std::path::Path, strand_path: &std::path::Path) {
@@ -610,6 +725,33 @@ async fn side_command(
             }
             events.send(Event::Idle).await.ok();
         }
+        Command::SaveSettings {
+            model,
+            effort,
+            mode,
+        } => {
+            match crate::config::save_user_settings(model.as_deref(), effort, mode) {
+                Ok(path) => {
+                    events
+                        .send(Event::Note {
+                            message: format!("saved settings to {}", path.display()),
+                        })
+                        .await
+                        .ok();
+                }
+                Err(e) => {
+                    events
+                        .send(Event::Error {
+                            class: ErrorClass::Protocol,
+                            retryable: false,
+                            message: format!("saving settings failed: {e}"),
+                        })
+                        .await
+                        .ok();
+                }
+            }
+            events.send(Event::Idle).await.ok();
+        }
         Command::AlwaysAllow { .. } | Command::Answer { .. } | Command::Resume { .. } => {
             events
                 .send(Event::Error {
@@ -619,7 +761,9 @@ async fn side_command(
                 })
                 .await?;
         }
-        Command::Prompt { .. } => unreachable!("prompt handled by caller"),
+        Command::Prompt { .. } | Command::SwitchStrand { .. } => {
+            unreachable!("handled by caller")
+        }
     }
     Ok(())
 }
@@ -979,6 +1123,99 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn switch_strand_replays_target_history() {
+        let data = std::env::temp_dir().join(format!("ka-test-switch-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&data);
+        std::fs::create_dir_all(&data).unwrap();
+        ka_strand::set_data_dir_for_tests(data.clone());
+        let cwd = data.join("repo");
+        std::fs::create_dir_all(&cwd).unwrap();
+
+        let mut handle = spawn(Config {
+            cwd: Some(cwd.clone().to_string_lossy().into()),
+            ..Default::default()
+        });
+        handle
+            .commands
+            .send(Command::Prompt {
+                text: "first session question".into(),
+                attachments: vec![],
+            })
+            .await
+            .unwrap();
+        // drain to idle
+        loop {
+            let evt = tokio::time::timeout(Duration::from_millis(2_000), handle.events.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            if matches!(evt, Event::Idle) {
+                break;
+            }
+        }
+        let sessions = ka_strand::list(&cwd).unwrap();
+        let first_id = sessions[0].id.clone();
+
+        // switch to a fresh session
+        handle
+            .commands
+            .send(Command::SwitchStrand { id: "new".into() })
+            .await
+            .unwrap();
+        let mut saw_new_session = false;
+        let mut saw_replay_empty = true;
+        loop {
+            let evt = tokio::time::timeout(Duration::from_millis(2_000), handle.events.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            match evt {
+                Event::SessionInfo { id } if id != first_id => saw_new_session = true,
+                Event::Replay { messages } => saw_replay_empty = messages.is_empty(),
+                Event::Note { .. } => {}
+                Event::Idle => break,
+                _ => {}
+            }
+        }
+        assert!(saw_new_session, "switch announced a new session id");
+        assert!(saw_replay_empty, "fresh session replays no history");
+
+        // switch back to the first session by id prefix
+        let tail: String = first_id.split('-').nth(1).unwrap_or(&first_id).to_string();
+        handle
+            .commands
+            .send(Command::SwitchStrand { id: tail })
+            .await
+            .unwrap();
+        let mut back_id = String::new();
+        let mut replayed_first = false;
+        loop {
+            let evt = tokio::time::timeout(Duration::from_millis(2_000), handle.events.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            match evt {
+                Event::SessionInfo { id } => back_id = id,
+                Event::Replay { messages } => {
+                    replayed_first = messages
+                        .iter()
+                        .any(|m| m.content.contains("first session question"));
+                }
+                Event::Note { .. } => {}
+                Event::Idle => break,
+                _ => {}
+            }
+        }
+        assert_eq!(
+            back_id, first_id,
+            "returned to the first session by tail prefix"
+        );
+        assert!(replayed_first, "history of the target session was replayed");
+        drop(handle);
+        let _ = std::fs::remove_dir_all(&data);
+    }
+
+    #[tokio::test]
     async fn unsupported_commands_report_errors() {
         let mut handle = spawn(Config::default());
         handle
@@ -986,10 +1223,19 @@ mod tests {
             .send(Command::Compact { focus: None })
             .await
             .unwrap();
-        let evt = tokio::time::timeout(Duration::from_millis(500), handle.events.recv())
-            .await
-            .unwrap()
-            .unwrap();
+        let evt = loop {
+            let evt = tokio::time::timeout(Duration::from_millis(500), handle.events.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            match evt {
+                Event::SessionInfo { .. }
+                | Event::ModelChanged { .. }
+                | Event::ModeChanged { .. }
+                | Event::Replay { .. } => continue,
+                other => break other,
+            }
+        };
         assert!(matches!(
             evt,
             Event::Error {

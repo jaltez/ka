@@ -11,19 +11,22 @@ cargo build --release -p ka-cli
 alias ka=target/release/ka            # or: cargo install --path crates/ka-cli
 
 cd your-project
-ka --model ollama/qwen3.5:9b          # TUI: session picker, then chat
+ka --model ollama/qwen3.5:9b          # TUI: fresh chat
 ka -c                                 # continue this terminal's last session
+ka --session 3f9c2a81                 # resume a session by id prefix
+ka sessions                           # list session ids for this directory
+ka providers                          # provider registry + API-key env status
 ka run "summarize the build error"    # headless NDJSON
 ```
 
-Keys: `Enter` send / interject mid-turn · `+text` defer until turn ends · `Esc`/`Ctrl-C` abort · `↑/↓` history · `/` + `Tab` autocomplete slash commands. The transcript renders markdown (headers, lists, `code`, fenced blocks with syntax coloring) with role blocks: blue for you, amber for tool calls, dark gray for streamed thinking. NO_COLOR is honored.
+Keys: `Enter` send / interject mid-turn · `+text` defer until turn ends · `Esc`/`Ctrl-C` abort · `↑/↓` history · `/` + `Tab` autocomplete slash commands. `/session` (alias `/resume`) opens an in-app session picker with type-to-filter; `/new` starts a fresh session; `/settings` edits model/mode/effort (persist with `s`) and shows every provider's API-key env status. The transcript renders markdown (headers, lists, `code`, fenced blocks with syntax coloring) with role blocks: blue for you, amber for tool calls, dark gray for streamed thinking. NO_COLOR is honored.
 
 ## Commands
 
 | Surface | What it does |
 |---|---|
-| `ka` | TUI (picker → session) |
-| `ka -c` / `ka --session <path>` | continue newest / specific strand (waypoint-aware per terminal) |
+| `ka` | TUI, fresh session |
+| `ka -c` / `ka --session <id>` | continue newest (waypoint-aware per terminal) / resume by id prefix |
 | `ka run [-c] [--model M] [--mode guarded\|free\|plan] [--trust] [--dialects f] "prompt"` | one headless turn, NDJSON events on stdout, exit 0/1/2 |
 | `ka models [--no-discovery]` | catalog + local Ollama/LM Studio probes |
 | `ka rewind [N]` | drop the last N exchanges of the newest strand |
@@ -78,6 +81,8 @@ cargo xtask ci        # fmt --check + clippy -D warnings + tests (the CI gate)
 cargo xtask size      # binary size vs the 10 MB contract
 cargo xtask unlink    # remove the kad symlink
 ```
+
+**Provider registry**: `openai anthropic google mistral groq cerebras deepseek qwen moonshot xai zhipu nvidia openrouter together fireworks ollama lmstudio llamacpp vllm` — any `vendor/model` selector works against these (no catalog row needed; context/pricing unknown until seeded).
 
 Stable owns the name `ka`; dev is always `kad`. Isolate dev sessions with `KA_DATA_DIR=/tmp/ka-dev kad …` (shares config/rules/hooks, separates strands).
 
