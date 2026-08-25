@@ -84,6 +84,8 @@ cargo xtask size      # binary size vs the 10 MB contract
 cargo xtask unlink    # remove the kad symlink
 ```
 
+**Three wires**: `anthropic_messages`, `openai_chat` (plus every OpenAI-compatible endpoint), and `openai_responses` — the Responses API for reasoning models (o-series seeded: `openai/o3`, `openai/o4-mini`) with item-based history (`function_call`/`function_call_output`), flat tool definitions, `reasoning.effort`, and streamed reasoning summaries (visible as thinking).
+
 **MCP client** (stdio, no new dependencies): configure `[[mcp]]` tables (name/command/args/env) and every server tool appears as a `<name>.<tool>` hand at exec-tier clearance — the gate, rules, and snapshots treat them like any external execution. `ka mcp` probes servers and lists tools. Handshake/tools-list/tools-call only; server noise is ignored; failures are per-server notes.
 
 **File snapshots / undo**: `edit` and `write` park the target's current bytes under the data dir before every mutation (a failed snapshot refuses the change) and journal it per session — `/undo` (or `ka undo`) restores the most recent one, creation-undos delete. `/help` lists commands and keys; `ka --version` carries the git hash.
@@ -96,7 +98,7 @@ Stable owns the name `ka`; dev is always `kad`. Isolate dev sessions with `KA_DA
 
 ## Crates
 
-`ka-protocol` (Command/Event wire contract) · `ka-agent` (engine: turn machine, 7 tools, gate, digests, strands) · `ka-dialect` (catalog + 2 wires + discovery) · `ka-strand` (append-only JSONL sessions) · `ka-term` (ratatui TUI) · `ka-cli` (the binary).
+`ka-protocol` (Command/Event wire contract) · `ka-agent` (engine: turn machine, tools + MCP hands, gate, digests, strands) · `ka-dialect` (catalog + 3 wires + discovery) · `ka-strand` (append-only JSONL sessions) · `ka-term` (ratatui TUI) · `ka-cli` (the binary).
 
 ## Footprint contract
 

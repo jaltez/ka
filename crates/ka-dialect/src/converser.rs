@@ -105,6 +105,12 @@ impl Converser {
                     policy: self.policy,
                 }))
             }
+            Wire::OpenaiResponses => {
+                // key presence is validated now; the wire reads the token
+                // from SpeakRequest at speak time
+                let _ = self.resolve_key(&dialect, &id)?;
+                Ok(Box::new(crate::wire_responses::OpenaiResponses::new()))
+            }
             Wire::OpenaiChat => {
                 let api_key = self.resolve_key(&dialect, &id)?;
                 Ok(Box::new(OpenaiChat {

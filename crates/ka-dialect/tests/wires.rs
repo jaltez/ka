@@ -10,6 +10,7 @@ use std::sync::Arc;
 
 use ka_dialect::dialects::{Catalog, Dialect};
 use ka_dialect::speaker::{SpeakRequest, Speaker, StreamEvent, TurnMessage, TurnRole};
+use ka_dialect::wire_responses::OpenaiResponses;
 use ka_dialect::{AnthropicMessages, OpenaiChat};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -140,13 +141,21 @@ fn request_complete(buf: &[u8]) -> bool {
     let Some(pos) = s.find("\r\n\r\n") else {
         return false;
     };
-    let cl = s
-        .to_ascii_lowercase()
+    let lower = s.to_ascii_lowercase();
+    if let Some(cl) = lower
         .lines()
         .find_map(|l| l.strip_prefix("content-length:"))
         .and_then(|v| v.trim().parse::<usize>().ok())
-        .unwrap_or(0);
-    buf.len() >= pos + 4 + cl
+    {
+        return buf.len() >= pos + 4 + cl;
+    }
+    // chunked: wait for the terminating zero chunk (or any body at all
+    // if the sender never terminates — bounded by the read loop's EOF)
+    if lower.lines().any(|l| l.starts_with("transfer-encoding:")) {
+        return s.ends_with("0\r\n\r\n");
+    }
+    // no body intent (GET) or headers only: complete
+    true
 }
 
 fn dialect_for(wire: &str, addr: std::net::SocketAddr, extra: &str) -> Dialect {
@@ -355,6 +364,157 @@ async fn anthropic_length_stop_maps_to_length() {
         events.last(),
         Some(StreamEvent::Finished {
             stop: ka_protocol::Stop::Length,
+            ..
+        })
+    ));
+}
+
+// ---------------------------------------------------------------- responses
+
+const RESPONSES_BASIC: &str = r#"
+data: {"type":"response.created","response":{"id":"resp_1"}}
+
+data: {"type":"response.output_item.added","item":{"type":"message","id":"msg_1"}}
+
+data: {"type":"response.output_text.delta","delta":"Hel"}
+
+data: {"type":"response.output_text.delta","delta":"lo ka"}
+
+data: {"type":"response.completed","response":{"status":"completed","usage":{"input_tokens":12,"output_tokens":3,"input_tokens_details":{"cached_tokens":4}}}}
+
+"#;
+
+const RESPONSES_REASONING_AND_TOOL: &str = r#"
+data: {"type":"response.output_item.added","item":{"type":"reasoning","id":"rs_1"}}
+
+data: {"type":"response.reasoning_summary_text.delta","delta":"pondering"}
+
+data: {"type":"response.output_item.added","item":{"type":"function_call","id":"fc_1","call_id":"call_9","name":"read","arguments":""}}
+
+data: {"type":"response.function_call_arguments.delta","item_id":"fc_1","delta":"{\"pa"}
+
+data: {"type":"response.function_call_arguments.delta","item_id":"fc_1","delta":"th\": \"src/x.rs\"}"}
+
+data: {"type":"response.output_item.done","item":{"type":"function_call","id":"fc_1","call_id":"call_9","name":"read","arguments":"{\"path\": \"src/x.rs\"}"}}
+
+data: {"type":"response.completed","response":{"status":"completed","usage":{"input_tokens":40,"output_tokens":18}}}
+
+"#;
+
+const RESPONSES_INCOMPLETE: &str = r#"
+data: {"type":"response.output_text.delta","delta":"partial"}
+
+data: {"type":"response.incomplete","response":{"status":"incomplete","usage":{"input_tokens":5,"output_tokens":7}}}
+
+"#;
+
+const RESPONSES_FAILED: &str = r#"
+data: {"type":"response.failed","response":{"error":{"code":"server_error","message":"model overloaded"}}}
+
+"#;
+
+#[tokio::test]
+async fn responses_basic_text_and_usage() {
+    let (addr, captured) = serve_sse(RESPONSES_BASIC).await;
+    let dialect = dialect_for("openai_responses", addr, "");
+    let events = collect(&OpenaiResponses::new(), request(dialect, "be brief")).await;
+
+    assert_eq!(
+        events,
+        vec![
+            StreamEvent::Text("Hel".into()),
+            StreamEvent::Text("lo ka".into()),
+            StreamEvent::Finished {
+                stop: ka_protocol::Stop::Done,
+                // input excludes the cached 4 (billed separately)
+                usage: ka_protocol::Usage {
+                    input: 8,
+                    output: 3,
+                    cache_read: 4,
+                    cache_write: 0,
+                    cost: 0.0,
+                },
+            },
+        ]
+    );
+
+    let raw = captured.lock().clone().unwrap();
+    assert!(
+        raw.contains("authorization: Bearer k-test-token"),
+        "auth header missing:\n{raw}"
+    );
+    assert!(raw.contains("/v1/responses"), "endpoint:\n{raw}");
+    assert!(
+        raw.contains("\"instructions\":\"be brief\""),
+        "system prompt rides instructions:\n{raw}"
+    );
+    assert!(raw.contains("\"store\":false"), "{raw}");
+    // serde_json serializes keys alphabetically: assert per-item, not order
+    assert!(raw.contains("\"input\":["), "input array:\n{raw}");
+    assert!(raw.contains("\"type\":\"message\""), "{raw}");
+    assert!(raw.contains("\"role\":\"user\""), "{raw}");
+    assert!(raw.contains("\"content\":\"hi\""), "{raw}");
+}
+
+#[tokio::test]
+async fn responses_reasoning_streams_and_tool_accumulates() {
+    let (addr, captured) = serve_sse(RESPONSES_REASONING_AND_TOOL).await;
+    let dialect = dialect_for("openai_responses", addr, "");
+    let mut req = request(dialect, "");
+    req.effort = Some("medium".to_string());
+    let events = collect(&OpenaiResponses::new(), req).await;
+
+    let thought: String = events
+        .iter()
+        .filter_map(|e| match e {
+            StreamEvent::Thought(t) => Some(t.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(thought, "pondering");
+
+    let call = events.iter().find_map(|e| match e {
+        StreamEvent::Call(c) => Some(c.clone()),
+        _ => None,
+    });
+    let call = call.expect("expected a tool call");
+    assert_eq!(call.id, "call_9");
+    assert_eq!(call.tool, "read");
+    assert_eq!(
+        call.arguments.get("path").and_then(|v| v.as_str()),
+        Some("src/x.rs")
+    );
+
+    let raw = captured.lock().clone().unwrap();
+    assert!(
+        raw.contains("\"reasoning\":{\"effort\":\"medium\"}"),
+        "effort rides reasoning.effort:\n{raw}"
+    );
+}
+
+#[tokio::test]
+async fn responses_incomplete_maps_to_length() {
+    let (addr, _cap) = serve_sse(RESPONSES_INCOMPLETE).await;
+    let dialect = dialect_for("openai_responses", addr, "");
+    let events = collect(&OpenaiResponses::new(), request(dialect, "")).await;
+    assert!(matches!(
+        events.last(),
+        Some(StreamEvent::Finished {
+            stop: ka_protocol::Stop::Length,
+            ..
+        })
+    ));
+}
+
+#[tokio::test]
+async fn responses_failed_event_is_an_error() {
+    let (addr, _cap) = serve_sse(RESPONSES_FAILED).await;
+    let dialect = dialect_for("openai_responses", addr, "");
+    let events = collect(&OpenaiResponses::new(), request(dialect, "")).await;
+    assert!(matches!(
+        events.last(),
+        Some(StreamEvent::Failed {
+            class: ka_protocol::ErrorClass::Protocol,
             ..
         })
     ));

@@ -211,6 +211,7 @@ fn trust_for_cwd(force: bool) -> bool {
 fn wire_str(w: ka_dialect::Wire) -> String {
     match w {
         ka_dialect::Wire::OpenaiChat => "openai_chat".to_string(),
+        ka_dialect::Wire::OpenaiResponses => "openai_responses".to_string(),
         ka_dialect::Wire::AnthropicMessages => "anthropic_messages".to_string(),
     }
 }

@@ -56,3 +56,27 @@ first_byte_timeout_ms = 0
 [dialects."ollama/qwen3-32b".flags]
 replay_reasoning = true
 tool_choice = "pin_or_auto"
+
+[dialects."openai/o4-mini"]
+wire = "openai_responses"
+base_url = "https://api.openai.com/v1"
+api_key_env = "OPENAI_API_KEY"
+context = 200_000
+max_output = 100_000
+efforts = ["low", "medium", "high"]
+input = ["text", "image"]
+cache = "off"
+ratio = 4.0
+priced = false
+
+[dialects."openai/o3"]
+wire = "openai_responses"
+base_url = "https://api.openai.com/v1"
+api_key_env = "OPENAI_API_KEY"
+context = 200_000
+max_output = 100_000
+efforts = ["low", "medium", "high"]
+input = ["text", "image"]
+cache = "off"
+ratio = 4.0
+priced = false

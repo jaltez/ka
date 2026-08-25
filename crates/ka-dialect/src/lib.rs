@@ -12,6 +12,7 @@ pub mod speaker;
 mod sse;
 pub mod wire_anthropic;
 pub mod wire_openai;
+pub mod wire_responses;
 
 pub use dialects::{Catalog, Dialect, Discovery, Selector, SelectorError, Wire, parse_selector};
 pub use discovery::{FoundModel, discover_lmstudio, discover_ollama, discover_openai_compatible};
@@ -26,6 +27,9 @@ pub use wire_openai::OpenaiChat;
 pub fn speaker_for(wire: dialects::Wire) -> std::sync::Arc<dyn Speaker> {
     match wire {
         dialects::Wire::OpenaiChat => std::sync::Arc::new(OpenaiChat::new()),
+        dialects::Wire::OpenaiResponses => {
+            std::sync::Arc::new(crate::wire_responses::OpenaiResponses::new())
+        }
         dialects::Wire::AnthropicMessages => std::sync::Arc::new(AnthropicMessages::new()),
     }
 }

@@ -15,6 +15,8 @@ pub const EMBEDDED: &str = include_str!("../dialects.toml");
 pub enum Wire {
     /// Anthropic Messages API.
     AnthropicMessages,
+    /// OpenAI Responses API (reasoning models, item-based history).
+    OpenaiResponses,
     /// OpenAI Chat Completions (and every compatible endpoint).
     OpenaiChat,
 }
