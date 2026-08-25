@@ -13,7 +13,7 @@ pub struct WriteHand;
 impl Hand for WriteHand {
     fn def(&self) -> HandDef {
         HandDef {
-            name: "write",
+            name: "write".to_string(),
             description: "Create or overwrite a file with the given content. Overwriting an \
                 existing file requires it to have been read first. A shebang first line makes \
                 the file executable. Parent directories are created."

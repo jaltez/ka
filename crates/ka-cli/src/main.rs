@@ -102,6 +102,8 @@ enum CliCommand {
     Sessions,
     /// Restore the latest snapshot of the newest session here
     Undo,
+    /// Probe configured MCP servers and list their tools
+    Mcp,
     /// List known providers with API-key env status
     Providers,
     /// Generate a starter AGENTS.md from a quick repo scan
@@ -152,9 +154,7 @@ fn load_config(
 ) -> Result<Config, String> {
     let mut cfg = Config::default();
 
-    let user = std::env::var("HOME")
-        .ok()
-        .map(|h| PathBuf::from(h).join(".config/ka/ka.toml"));
+    let user = Some(ka_agent::config::user_config_path());
     let project = if trust_project {
         Some(PathBuf::from(".ka/ka.toml"))
     } else {
@@ -302,6 +302,7 @@ async fn dispatch(cli: Cli) -> Result<ExitCode, String> {
         }
         Some(CliCommand::Sessions) => run_sessions(),
         Some(CliCommand::Undo) => run_undo(),
+        Some(CliCommand::Mcp) => run_mcp().await,
         Some(CliCommand::Providers) => run_providers(),
         Some(CliCommand::Init) => run_init(),
         Some(CliCommand::Rewind { turns }) => run_rewind(turns).await,
@@ -520,6 +521,43 @@ fn run_undo() -> Result<ExitCode, String> {
         }
         Err(e) => Err(format!("undo failed: {e}")),
     }
+}
+
+/// `ka mcp`: spawn each configured server, list tools, exit.
+async fn run_mcp() -> Result<ExitCode, String> {
+    let trust = trust_for_cwd(false);
+    let cfg = load_config(&[], None, None, trust)?;
+    if cfg.mcp.is_empty() {
+        println!("no [[mcp]] servers configured (~/.config/ka/ka.toml or .ka/ka.toml)");
+        return Ok(ExitCode::SUCCESS);
+    }
+    for server in &cfg.mcp {
+        println!(
+            "{:<16} {} {}",
+            server.name,
+            server.command,
+            server.args.join(" ")
+        );
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            ka_agent::mcp::McpClient::spawn_connect(server),
+        )
+        .await
+        {
+            Ok(Ok((_client, tools))) => {
+                for t in &tools {
+                    let desc: String = t.description.chars().take(60).collect();
+                    println!("  {:<34} {}", t.name, desc);
+                }
+                if tools.is_empty() {
+                    println!("  (no tools)");
+                }
+            }
+            Ok(Err(e)) => println!("  ✗ {e}"),
+            Err(_) => println!("  ✗ connect timed out"),
+        }
+    }
+    Ok(ExitCode::SUCCESS)
 }
 
 fn run_providers() -> Result<ExitCode, String> {

@@ -153,6 +153,11 @@ impl Voice {
         }
     }
 
+    /// Register an extra tool (MCP hands arrive after async discovery).
+    pub fn push_hand(&mut self, hand: Box<dyn Hand>) {
+        self.hands.push(hand);
+    }
+
     /// Share the snapshot journal (engine-side undo + strand tracking).
     pub fn snapshot_sink(
         &self,

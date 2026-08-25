@@ -94,6 +94,9 @@ pub struct Config {
     /// Tool-call hooks (exit-2 block contract).
     #[serde(default)]
     pub hooks: Vec<Hook>,
+    /// MCP servers (stdio): tools appear as `<name>.<tool>` hands.
+    #[serde(default)]
+    pub mcp: Vec<crate::mcp::McpServerConfig>,
 }
 
 impl Config {
@@ -133,6 +136,9 @@ impl Config {
         }
         if !other.hooks.is_empty() {
             self.hooks = other.hooks;
+        }
+        if !other.mcp.is_empty() {
+            self.mcp = other.mcp;
         }
     }
 

@@ -57,7 +57,7 @@ exact file paths, line references, and direct answers. No preamble.";
 impl Hand for PathfinderHand {
     fn def(&self) -> HandDef {
         HandDef {
-            name: "pathfinder",
+            name: "pathfinder".to_string(),
             description: "Delegate a read-only research question to a subagent that \
                 explores the repository and returns a dense summary. Use for broad \
                 searches ('where is X handled?') to keep this context clean."

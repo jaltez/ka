@@ -261,6 +261,7 @@ async fn run(
         .map(std::path::PathBuf::from)
         .or_else(|| std::env::current_dir().ok())
         .unwrap_or_else(|| std::path::PathBuf::from("."));
+    let mcp_servers = config.mcp.clone();
     let mode = config.effective_mode();
     let max_steps = config.effective_max_steps();
     let rules = config.rules.clone();
@@ -282,6 +283,64 @@ async fn run(
         voice,
         strand,
     };
+    // MCP servers: spawn, handshake, list; each tool becomes a hand at
+    // exec-tier clearance. Failures are per-server notes, never fatal.
+    for cfg in &mcp_servers {
+        let connected = tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            crate::mcp::McpClient::spawn_connect(cfg),
+        )
+        .await;
+        match connected {
+            Ok(Ok((client, tools))) if !tools.is_empty() => {
+                let shared = std::sync::Arc::new(tokio::sync::Mutex::new(client));
+                let names: Vec<String> = tools.iter().map(|t| t.name.clone()).collect();
+                for tool in tools {
+                    ctx.voice
+                        .push_hand(Box::new(crate::mcp::McpHand::new(tool, shared.clone())));
+                }
+                ctx.events
+                    .send(Event::Note {
+                        message: format!(
+                            "mcp {}: {} tool(s): {}",
+                            cfg.name,
+                            names.len(),
+                            names.join(", ")
+                        ),
+                    })
+                    .await
+                    .ok();
+            }
+            Ok(Ok((_client, _empty))) => {
+                ctx.events
+                    .send(Event::Note {
+                        message: format!("mcp {}: connected but advertises no tools", cfg.name),
+                    })
+                    .await
+                    .ok();
+            }
+            Ok(Err(e)) => {
+                ctx.events
+                    .send(Event::Error {
+                        class: ErrorClass::Protocol,
+                        retryable: false,
+                        message: format!("mcp {}: {e}", cfg.name),
+                    })
+                    .await
+                    .ok();
+            }
+            Err(_) => {
+                ctx.events
+                    .send(Event::Error {
+                        class: ErrorClass::Protocol,
+                        retryable: false,
+                        message: format!("mcp {}: connect timed out", cfg.name),
+                    })
+                    .await
+                    .ok();
+            }
+        }
+    }
 
     while let Some(cmd) = commands.recv().await {
         handle_command(cmd, &mut commands, &mut ctx).await?;

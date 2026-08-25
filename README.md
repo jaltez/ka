@@ -16,6 +16,7 @@ ka -c                                 # continue this terminal's last session
 ka --session 3f9c2a81                 # resume a session by id prefix
 ka sessions                           # list session ids for this directory
 ka export --session 3f9c2a81           # export a specific session as markdown
+ka mcp                                 # probe [[mcp]] servers, list tools
 ka providers                          # provider registry + API-key env status
 ka run "summarize the build error"    # headless NDJSON
 ```
@@ -82,6 +83,8 @@ cargo xtask ci        # fmt --check + clippy -D warnings + tests (the CI gate)
 cargo xtask size      # binary size vs the 10 MB contract
 cargo xtask unlink    # remove the kad symlink
 ```
+
+**MCP client** (stdio, no new dependencies): configure `[[mcp]]` tables (name/command/args/env) and every server tool appears as a `<name>.<tool>` hand at exec-tier clearance — the gate, rules, and snapshots treat them like any external execution. `ka mcp` probes servers and lists tools. Handshake/tools-list/tools-call only; server noise is ignored; failures are per-server notes.
 
 **File snapshots / undo**: `edit` and `write` park the target's current bytes under the data dir before every mutation (a failed snapshot refuses the change) and journal it per session — `/undo` (or `ka undo`) restores the most recent one, creation-undos delete. `/help` lists commands and keys; `ka --version` carries the git hash.
 

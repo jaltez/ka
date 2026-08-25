@@ -69,7 +69,7 @@ impl ToolOutput {
 #[derive(Debug, Clone)]
 pub struct HandDef {
     /// Tool name as the model sees it.
-    pub name: &'static str,
+    pub name: String,
     /// One-paragraph description for the model.
     pub description: String,
     /// JSON schema for the arguments object.

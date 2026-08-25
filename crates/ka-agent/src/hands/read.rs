@@ -19,7 +19,7 @@ pub struct ReadHand;
 impl Hand for ReadHand {
     fn def(&self) -> HandDef {
         HandDef {
-            name: "read",
+            name: "read".to_string(),
             description: "Read a file. Returns numbered lines. Use offset/limit for ranges. \
                 Directories return a shallow listing."
                 .to_string(),

@@ -28,7 +28,7 @@ pub struct BashHand;
 impl Hand for BashHand {
     fn def(&self) -> HandDef {
         HandDef {
-            name: "bash",
+            name: "bash".to_string(),
             description: "Run a shell command and return combined output. Output is capped \
                 (tail kept, full output parked in a spill file). timeout_ms default 120000, \
                 max 3600000."

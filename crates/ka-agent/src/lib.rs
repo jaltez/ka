@@ -6,6 +6,7 @@ pub mod config;
 pub mod conventions;
 mod engine;
 pub mod hands;
+pub mod mcp;
 mod voice;
 
 pub use config::{Config, ConfigError};

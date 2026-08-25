@@ -13,7 +13,7 @@ pub struct EditHand;
 impl Hand for EditHand {
     fn def(&self) -> HandDef {
         HandDef {
-            name: "edit",
+            name: "edit".to_string(),
             description: "Edit a file by exact string replacement. `old` must match exactly \
                 once unless replace_all is true. The file must have been read first and must \
                 not have changed since."

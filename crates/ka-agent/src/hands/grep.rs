@@ -23,7 +23,7 @@ pub struct GrepHand;
 impl Hand for GrepHand {
     fn def(&self) -> HandDef {
         HandDef {
-            name: "grep",
+            name: "grep".to_string(),
             description: "Search file contents with a regular expression (Rust regex syntax: \
                 no lookaround/backreferences). Returns `path:line:text`, capped. Supports an \
                 optional glob filter on file names."

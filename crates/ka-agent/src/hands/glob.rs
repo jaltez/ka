@@ -16,7 +16,7 @@ pub struct GlobHand;
 impl Hand for GlobHand {
     fn def(&self) -> HandDef {
         HandDef {
-            name: "glob",
+            name: "glob".to_string(),
             description: "Find files by glob pattern (e.g. `src/**/*.rs`), respecting \
                 .gitignore. Results capped at 200, sorted newest-first."
                 .to_string(),
