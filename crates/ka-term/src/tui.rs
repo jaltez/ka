@@ -497,6 +497,19 @@ pub struct ModelPicker {
     pub filter: String,
 }
 
+/// One picker row for a model. Must stay on a single line under the
+/// modal's inner width (68 - 2 borders = 66) or Paragraph wraps and the
+/// tail models clip off the picker — the exact bug that hid installed
+/// ollama models behind two-line rows.
+fn model_row(marker: &str, m: &ModelInfo, ctx: &str, key: &str) -> String {
+    let id: String = m.id.chars().take(40).collect();
+    let wire = m
+        .wire
+        .trim_end_matches("_messages")
+        .trim_end_matches("_chat");
+    format!("{marker}{id:<40} {ctx:>5} {wire:<9}{key}")
+}
+
 impl ModelPicker {
     /// Rows after filtering.
     pub fn rows(&self) -> Vec<&ModelInfo> {
@@ -1555,7 +1568,7 @@ fn render(
             Modal::Model(picker) => {
                 let rows = picker.rows();
                 let height = (rows.len() as u16 + 4).min(18);
-                let width = 64.min(frame.area().width);
+                let width = 68.min(frame.area().width);
                 let rect = centered(width, height, frame.area());
                 frame.render_widget(Clear, rect);
                 let mut text = vec![TuiLine::from(vec![
@@ -1584,10 +1597,7 @@ fn render(
                     } else {
                         " ✗".to_string()
                     };
-                    text.push(TuiLine::styled(
-                        format!("{marker}{:<44} {:>6} {:<10}{}", m.id, ctx, m.wire, key),
-                        style,
-                    ));
+                    text.push(TuiLine::styled(model_row(marker, m, &ctx, &key), style));
                 }
                 if rows.is_empty() {
                     if picker.filter.trim().is_empty() {
@@ -1603,7 +1613,11 @@ fn render(
                     }
                 }
                 text.push(TuiLine::styled(
-                    "type to filter · enter switch · esc close",
+                    if rows.len() > cap {
+                        "more rows — type to filter · enter switch · esc close"
+                    } else {
+                        "type to filter · enter switch · esc close"
+                    },
                     Style::default().fg(Color::DarkGray),
                 ));
                 let widget = Paragraph::new(text)
@@ -1847,6 +1861,25 @@ mod tests {
         second.filter = "claude".to_string();
         second.selected = 0;
         assert_eq!(second.pick().as_deref(), Some("anthropic/claude-sonnet-5"));
+    }
+
+    #[test]
+    fn model_rows_stay_single_line() {
+        let long = model(
+            "ollama/some-extremely-long-model-name:with-tag-and-more",
+            1_000_000,
+        );
+        let row = model_row("▶ ", &long, "1000k", " ✗");
+        assert!(
+            row.chars().count() <= 66,
+            "row too wide: {} {}",
+            row.chars().count(),
+            row
+        );
+        let short = model("ollama/qwen3.5:9b", 262_144);
+        let row = model_row("  ", &short, "262k", "");
+        assert!(row.contains("qwen3.5:9b"));
+        assert!(row.contains("openai"), "wire abbreviated: {row}");
     }
 
     #[test]
