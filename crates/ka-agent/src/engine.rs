@@ -546,7 +546,9 @@ async fn attach_strand(
     let (history, ids, digest) = history_from_records(strand.records());
     voice.load_history(history, digest);
     state.record_ids = ids;
-    write_waypoint(cwd, strand.path());
+    if let Some(path) = strand.path() {
+        write_waypoint(cwd, path);
+    }
     let id = strand
         .records()
         .first()

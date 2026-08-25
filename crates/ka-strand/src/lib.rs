@@ -215,10 +215,14 @@ pub fn strand_dir(cwd: &Path) -> PathBuf {
     data_dir().join("strands").join(encode_cwd(cwd))
 }
 
-/// A strand under management: path, records, live settings.
+/// A strand under management: path (None until first append for fresh
+/// strands — opening the TUI no longer litters empty session files),
+/// records, live settings.
 #[derive(Debug)]
 pub struct StrandFile {
-    path: PathBuf,
+    path: Option<PathBuf>,
+    /// Working directory, kept for lazy materialization.
+    cwd: PathBuf,
     records: Vec<Record>,
     settings: Settings,
 }
@@ -237,27 +241,52 @@ pub struct Settings {
 }
 
 impl StrandFile {
-    /// Create a new strand for `cwd` (writes the header immediately).
+    /// Create a fresh strand for `cwd`. The file is materialized on the
+    /// first append — a session that never gets a message leaves nothing
+    /// on disk.
     pub fn create(cwd: &Path, repo: Option<RepoSnapshot>) -> std::io::Result<Self> {
-        let dir = strand_dir(cwd);
-        std::fs::create_dir_all(&dir)?;
         let id = new_strand_id();
-        let ts = now_rfc3339();
-        let path = dir.join(format!("{}_{}.jsonl", ts.replace(':', ""), id.0));
         let header = Record::Header {
             id: id.clone(),
-            ts,
+            ts: now_rfc3339(),
             cwd: cwd.to_string_lossy().into_owned(),
             version: 1,
             repo,
         };
-        let mut writer = StrandWriter::open(&path)?;
-        writer.append(&header)?;
         Ok(Self {
-            path,
+            path: None,
+            cwd: cwd.to_path_buf(),
             records: vec![header],
             settings: Settings::default(),
         })
+    }
+
+    /// Materialize the strand file on first use: directory + header.
+    fn materialize(&mut self) -> std::io::Result<PathBuf> {
+        if let Some(path) = &self.path {
+            return Ok(path.clone());
+        }
+        let dir = strand_dir(&self.cwd);
+        std::fs::create_dir_all(&dir)?;
+        let header = self
+            .records
+            .first()
+            .and_then(|r| match r {
+                Record::Header { id, ts, .. } => {
+                    Some(format!("{}_{}.jsonl", ts.replace(':', ""), id.0))
+                }
+                _ => None,
+            })
+            .ok_or_else(|| std::io::Error::other("strand missing header"))?;
+        let path = dir.join(header);
+        let mut writer = StrandWriter::open(&path)?;
+        let first = self
+            .records
+            .first()
+            .ok_or_else(|| std::io::Error::other("strand missing header"))?;
+        writer.append(first)?;
+        self.path = Some(path.clone());
+        Ok(path)
     }
 
     /// Open an existing strand, replaying settings and detecting dangling
@@ -297,7 +326,8 @@ impl StrandFile {
             })
         );
         Ok(Self {
-            path: path.to_path_buf(),
+            path: Some(path.to_path_buf()),
+            cwd: path.parent().map(|p| p.to_path_buf()).unwrap_or_default(),
             records,
             settings,
         })
@@ -350,15 +380,16 @@ impl StrandFile {
         } else if matches!(record, Record::Message { .. }) {
             self.settings.dangling = false;
         }
-        let mut writer = StrandWriter::open(&self.path)?;
+        let path = self.materialize()?;
+        let mut writer = StrandWriter::open(&path)?;
         writer.append(&record)?;
         self.records.push(record);
         Ok(())
     }
 
-    /// The strand's file path.
-    pub fn path(&self) -> &Path {
-        &self.path
+    /// The strand's file path (None until the first append).
+    pub fn path(&self) -> Option<&Path> {
+        self.path.as_deref()
     }
 
     /// All records in order.
@@ -429,8 +460,18 @@ pub struct StrandSummary {
     pub messages: usize,
 }
 
-/// List strands for a working directory, newest first.
+/// List strands for a working directory, newest first. Scans cheaply:
+/// full parse for the header line only, a `"record":"message"` prefix
+/// test for counting, and one partial probe for the title — no
+/// per-record deserialization of calls/results.
 pub fn list(cwd: &Path) -> std::io::Result<Vec<StrandSummary>> {
+    /// Just the fields a summary needs off a message line.
+    #[derive(serde::Deserialize)]
+    struct TitleProbe {
+        role: Option<Role>,
+        content: Option<String>,
+    }
+
     let dir = strand_dir(cwd);
     let mut summaries = Vec::new();
     let entries = match std::fs::read_dir(&dir) {
@@ -443,33 +484,45 @@ pub fn list(cwd: &Path) -> std::io::Result<Vec<StrandSummary>> {
         if path.extension().is_none_or(|e| e != "jsonl") {
             continue;
         }
-        let Ok(records) = read(&path) else {
+        let file = match File::open(&path) {
+            Ok(f) => f,
+            Err(_) => continue,
+        };
+        let mut lines = BufReader::new(file).lines();
+        let Some(Ok(first)) = lines.next() else {
             continue;
         };
-        let Some(Record::Header { id, ts, .. }) = records.first() else {
+        let Ok(Record::Header { id, ts, .. }) = serde_json::from_str(&first) else {
             continue;
         };
-        let title = records
-            .iter()
-            .find_map(|r| match r {
-                Record::Message {
-                    role: Role::User,
-                    content,
-                    ..
-                } => Some(content.clone()),
-                _ => None,
-            })
-            .map(|c| {
-                let first = c.lines().next().unwrap_or("").to_string();
-                let truncated: String = first.chars().take(60).collect();
-                truncated
-            })
-            .filter(|c| !c.is_empty())
-            .unwrap_or_else(|| "(empty)".to_string());
-        let messages = records
-            .iter()
-            .filter(|r| matches!(r, Record::Message { .. }))
-            .count();
+        let mut title = String::new();
+        let mut messages = 0usize;
+        for line in lines.map_while(Result::ok) {
+            if line.starts_with("{\"record\":\"message\"") {
+                messages += 1;
+                if title.is_empty() {
+                    if let Ok(probe) = serde_json::from_str::<TitleProbe>(&line) {
+                        if probe.role == Some(Role::User) {
+                            if let Some(content) = probe.content {
+                                let first_line = content
+                                    .lines()
+                                    .next()
+                                    .unwrap_or("")
+                                    .chars()
+                                    .take(60)
+                                    .collect::<String>();
+                                if !first_line.is_empty() {
+                                    title = first_line;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if title.is_empty() {
+            title = "(empty)".to_string();
+        }
         summaries.push(StrandSummary {
             path,
             id: id.0.clone(),
@@ -666,7 +719,7 @@ mod tests {
             })
             .unwrap();
 
-        let reopened = StrandFile::open(strand.path()).unwrap();
+        let reopened = StrandFile::open(strand.path().unwrap()).unwrap();
         assert_eq!(reopened.records().len(), 5);
         let settings = reopened.settings();
         assert_eq!(settings.model.as_deref(), Some("openai/gpt-5.1@high"));
@@ -689,11 +742,16 @@ mod tests {
                 results: Vec::new(),
             })
             .unwrap();
-        assert!(StrandFile::open(strand.path()).unwrap().settings().dangling);
+        assert!(
+            StrandFile::open(strand.path().unwrap())
+                .unwrap()
+                .settings()
+                .dangling
+        );
 
-        let mut resumed = StrandFile::open(strand.path()).unwrap();
+        let mut resumed = StrandFile::open(strand.path().unwrap()).unwrap();
         assert!(resumed.synthesize_aborted().unwrap());
-        let clean = StrandFile::open(strand.path()).unwrap();
+        let clean = StrandFile::open(strand.path().unwrap()).unwrap();
         assert!(!clean.settings().dangling);
         match clean.records().last() {
             Some(Record::Message { content, .. }) => assert_eq!(content, "(turn interrupted)"),
@@ -723,6 +781,71 @@ mod tests {
         assert!(listed[0].title.contains("second"), "{}", listed[0].title);
         assert!(listed[0].messages >= 1);
         assert!(latest(&cwd).unwrap().is_some());
+        let _ = std::fs::remove_dir_all(&data);
+    }
+
+    #[test]
+    fn fresh_strand_materializes_on_first_append() {
+        let data = temp_data("lazy");
+        let cwd = PathBuf::from("/tmp/proj-lazy");
+        let mut strand = StrandFile::create(&cwd, None).unwrap();
+        assert!(strand.path().is_none(), "no file before the first message");
+        strand
+            .append(Record::Message {
+                id: new_record_id(),
+                role: Role::User,
+                content: "first message".into(),
+                calls: Vec::new(),
+                results: Vec::new(),
+            })
+            .unwrap();
+        let path = strand.path().expect("materialized").to_path_buf();
+        assert!(path.exists());
+        let records = read(&path).unwrap();
+        assert!(matches!(records[0], Record::Header { .. }));
+        assert_eq!(records.len(), 2, "header + first message");
+        let _ = std::fs::remove_dir_all(&data);
+    }
+
+    #[test]
+    fn listing_survives_a_corrupted_tail() {
+        let data = temp_data("corrupt");
+        let cwd = PathBuf::from("/tmp/proj-corrupt");
+        let mut strand = StrandFile::create(&cwd, None).unwrap();
+        strand
+            .append(Record::Message {
+                id: new_record_id(),
+                role: Role::User,
+                content: "survives corruption".into(),
+                calls: Vec::new(),
+                results: Vec::new(),
+            })
+            .unwrap();
+        let path = strand.path().unwrap().to_path_buf();
+        // append garbage mid-file (simulates a torn write)
+        let mut writer = StrandWriter::open(&path).unwrap();
+        writer
+            .append(&Record::Message {
+                id: new_record_id(),
+                role: Role::Assistant,
+                content: "fine".into(),
+                calls: Vec::new(),
+                results: Vec::new(),
+            })
+            .unwrap();
+        drop(writer);
+        {
+            use std::io::Write;
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap();
+            f.write_all(b"{not json at all\n").unwrap();
+        }
+        let listed = list(&cwd).unwrap();
+        assert_eq!(listed.len(), 1, "corrupted tail must not hide the strand");
+        assert!(listed[0].title.contains("survives corruption"));
+        assert!(listed[0].messages >= 2);
         let _ = std::fs::remove_dir_all(&data);
     }
 

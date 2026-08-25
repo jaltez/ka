@@ -89,11 +89,14 @@ enum CliCommand {
         #[arg(default_value_t = 1)]
         turns: u32,
     },
-    /// Export the newest strand as readable markdown
+    /// Export a strand as readable markdown
     Export {
         /// Output path (default: stdout)
         #[arg(short, long)]
         out: Option<PathBuf>,
+        /// Session to export (id prefix; default: newest for this cwd)
+        #[arg(long, value_name = "ID")]
+        session: Option<String>,
     },
     /// List sessions for this directory (ids for `ka --session`)
     Sessions,
@@ -295,7 +298,7 @@ async fn dispatch(cli: Cli) -> Result<ExitCode, String> {
         Some(CliCommand::Providers) => run_providers(),
         Some(CliCommand::Init) => run_init(),
         Some(CliCommand::Rewind { turns }) => run_rewind(turns).await,
-        Some(CliCommand::Export { out }) => run_export(out),
+        Some(CliCommand::Export { out, session }) => run_export(out, session),
         Some(CliCommand::Config { cmd }) => match cmd {
             ConfigCommand::Schema => {
                 println!(
@@ -651,16 +654,22 @@ async fn run_rewind(turns: u32) -> Result<ExitCode, String> {
 }
 
 /// Export the latest (or waypoint) strand as markdown.
-fn run_export(out: Option<PathBuf>) -> Result<ExitCode, String> {
+fn run_export(out: Option<PathBuf>, session: Option<String>) -> Result<ExitCode, String> {
     let cwd = std::env::current_dir().map_err(|e| format!("cwd: {e}"))?;
-    let target = match ka_agent::read_waypoint() {
-        Some((way_cwd, path)) if way_cwd == cwd && path.exists() => path,
-        _ => {
-            ka_strand::latest(&cwd)
-                .map_err(|e| format!("listing strands: {e}"))?
-                .ok_or_else(|| "no strands for this directory".to_string())?
-                .path
-        }
+    let target = match session {
+        Some(id) => match resolve_session(&cwd, &id)? {
+            ka_agent::StrandChoice::Path(path) => path,
+            _ => unreachable!("resolve_session returns a path"),
+        },
+        None => match ka_agent::read_waypoint() {
+            Some((way_cwd, path)) if way_cwd == cwd && path.exists() => path,
+            _ => {
+                ka_strand::latest(&cwd)
+                    .map_err(|e| format!("listing strands: {e}"))?
+                    .ok_or_else(|| "no strands for this directory".to_string())?
+                    .path
+            }
+        },
     };
     let records = ka_strand::read(&target).map_err(|e| format!("{}: {e}", target.display()))?;
     let mut md = String::from("# ka session\n\n");

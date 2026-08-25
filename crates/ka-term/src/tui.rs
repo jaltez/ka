@@ -368,6 +368,8 @@ pub struct SessionPicker {
     pub selected: usize,
     /// Typed filter (matches title or id).
     pub filter: String,
+    /// The active session id (tagged in the list).
+    pub current: Option<String>,
 }
 
 impl SessionPicker {
@@ -383,8 +385,13 @@ impl SessionPicker {
                 continue;
             }
             let tag = short_session(&s.id).unwrap_or("?");
+            let here = if self.current.as_ref() == Some(&s.id) {
+                " · current"
+            } else {
+                ""
+            };
             rows.push((
-                format!("#{tag}  {}", s.title),
+                format!("#{tag}  {}{here}", s.title),
                 format!("{} msgs · {}", s.messages, s.ts),
             ));
         }
@@ -806,6 +813,8 @@ async fn app(
                                                 sessions,
                                                 selected: 0,
                                                 filter: String::new(),
+                                                current: (!meters.session.is_empty())
+                                                    .then(|| meters.session.clone()),
                                             })
                                         }
                                         ModalKind::Model => Modal::Model(ModelPicker {
@@ -1926,8 +1935,37 @@ mod tests {
     }
 
     #[test]
+    fn session_picker_marks_the_current_session() {
+        let picker = SessionPicker {
+            current: Some("s1-bbbb22221111".to_string()),
+            sessions: vec![
+                ka_strand::StrandSummary {
+                    path: std::path::PathBuf::from("/tmp/a.jsonl"),
+                    id: "s1-aaaa11112222".to_string(),
+                    ts: "2026-01-02T00:00:00Z".to_string(),
+                    title: "older session".to_string(),
+                    messages: 2,
+                },
+                ka_strand::StrandSummary {
+                    path: std::path::PathBuf::from("/tmp/b.jsonl"),
+                    id: "s1-bbbb22221111".to_string(),
+                    ts: "2026-01-01T00:00:00Z".to_string(),
+                    title: "active session".to_string(),
+                    messages: 5,
+                },
+            ],
+            selected: 0,
+            filter: String::new(),
+        };
+        let rows = picker.rows();
+        assert!(rows[1].0.contains("older session") && !rows[1].0.contains("current"));
+        assert!(rows[2].0.contains("active session") && rows[2].0.contains("· current"));
+    }
+
+    #[test]
     fn session_picker_filters_and_picks() {
         let picker = SessionPicker {
+            current: None,
             sessions: vec![ka_strand::StrandSummary {
                 path: std::path::PathBuf::from("/tmp/a.jsonl"),
                 id: "s1-aaaa11112222".to_string(),

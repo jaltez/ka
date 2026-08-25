@@ -15,6 +15,7 @@ ka --model ollama/qwen3.5:9b          # TUI: fresh chat
 ka -c                                 # continue this terminal's last session
 ka --session 3f9c2a81                 # resume a session by id prefix
 ka sessions                           # list session ids for this directory
+ka export --session 3f9c2a81           # export a specific session as markdown
 ka providers                          # provider registry + API-key env status
 ka run "summarize the build error"    # headless NDJSON
 ```
