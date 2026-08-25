@@ -142,6 +142,9 @@ mod tests {
             cwd: dir.to_path_buf(),
             ledger: Arc::new(Mutex::new(Ledger::default())),
             spill: Arc::new(Spill::new()),
+            snapshots: Arc::new(parking_lot::Mutex::new(
+                crate::hands::snapshots::Snapshots::inert(),
+            )),
         }
     }
 

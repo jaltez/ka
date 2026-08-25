@@ -540,6 +540,8 @@ pub enum Modal {
     Settings(SettingsPanel),
     /// Model picker.
     Model(ModelPicker),
+    /// Help overlay.
+    Help,
 }
 
 /// Run the TUI over an engine handle. Blocks until exit.
@@ -689,6 +691,11 @@ async fn app(
                                 KeyCode::Char(c) => picker.filter.push(c),
                                 _ => {}
                             },
+                            Modal::Help => {
+                                if key.code == KeyCode::Esc || key.code == KeyCode::Enter {
+                                    modal = None;
+                                }
+                            }
                             Modal::Model(picker) => match key.code {
                                 KeyCode::Esc => modal = None,
                                 KeyCode::Up => picker.selected = picker.selected.saturating_sub(1),
@@ -830,6 +837,7 @@ async fn app(
                                                     .then(|| meters.session.clone()),
                                             })
                                         }
+                                        ModalKind::Help => Modal::Help,
                                         ModalKind::Model => Modal::Model(ModelPicker {
                                             models: models_ref.clone(),
                                             selected: 0,
@@ -1123,6 +1131,11 @@ pub fn available_slash_commands() -> Vec<(String, String)> {
         ("/resume".to_string(), "alias for /session".to_string()),
         ("/new".to_string(), "start a fresh session".to_string()),
         (
+            "/undo".to_string(),
+            "restore the last edited/written file".to_string(),
+        ),
+        ("/help".to_string(), "commands and key bindings".to_string()),
+        (
             "/settings".to_string(),
             "settings & provider status".to_string(),
         ),
@@ -1206,6 +1219,8 @@ pub enum ModalKind {
     Settings,
     /// Model picker.
     Model,
+    /// Help overlay.
+    Help,
 }
 
 /// Load a custom command body from `.ka/commands/<name>.md` (project) or
@@ -1341,6 +1356,18 @@ step now; verify each step."
             quit: false,
             followup: None,
             modal: None,
+        }),
+        "/undo" => Some(Slash {
+            event: Some(Command::UndoFile),
+            quit: false,
+            followup: None,
+            modal: None,
+        }),
+        "/help" => Some(Slash {
+            event: None,
+            quit: false,
+            followup: None,
+            modal: Some(ModalKind::Help),
         }),
         "/settings" => Some(Slash {
             event: None,
@@ -1562,6 +1589,42 @@ fn render(
                 ));
                 let widget = Paragraph::new(text)
                     .block(Block::default().borders(Borders::ALL).title("sessions"))
+                    .wrap(Wrap { trim: false });
+                frame.render_widget(widget, rect);
+            }
+            Modal::Help => {
+                let height = 22u16.min(frame.area().height.saturating_sub(2));
+                let width = 66.min(frame.area().width);
+                let rect = centered(width, height, frame.area());
+                frame.render_widget(Clear, rect);
+                let keys = vec![
+                    ("Enter", "send · interject mid-turn"),
+                    ("+text", "defer until this turn ends"),
+                    ("Esc / Ctrl-C", "abort turn · close overlays · unpin scroll"),
+                    ("PgUp / PgDn", "scroll the transcript"),
+                    ("↑ ↓", "history · navigate pickers"),
+                    ("Tab", "complete slash command"),
+                ];
+                let mut text = Vec::new();
+                for (k, v) in keys {
+                    text.push(TuiLine::from(vec![
+                        Span::styled(format!("{k:<12} "), Style::default().fg(Color::Cyan)),
+                        Span::styled(v.to_string(), Style::default().fg(Color::Gray)),
+                    ]));
+                }
+                text.push(TuiLine::default());
+                text.push(TuiLine::styled(
+                    "commands:",
+                    Style::default().fg(Color::Gray),
+                ));
+                for (name, desc) in available_slash_commands() {
+                    text.push(TuiLine::from(vec![
+                        Span::styled(format!("{name:<12} "), Style::default().fg(Color::Cyan)),
+                        Span::styled(desc, Style::default().fg(Color::Gray)),
+                    ]));
+                }
+                let widget = Paragraph::new(text)
+                    .block(Block::default().borders(Borders::ALL).title("help"))
                     .wrap(Wrap { trim: false });
                 frame.render_widget(widget, rect);
             }

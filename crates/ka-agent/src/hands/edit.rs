@@ -82,6 +82,13 @@ impl Hand for EditHand {
             } else {
                 text.replacen(old, new, 1)
             };
+            // safety net first: a failed snapshot refuses the edit
+            if let Err(e) = ctx.snapshots.lock().snapshot(&path) {
+                return ToolOutput::err(format!(
+                    "edit {}: snapshot before edit failed ({e}); refusing to mutate",
+                    path.display()
+                ));
+            }
             if let Err(e) = std::fs::write(&path, &updated) {
                 return ToolOutput::err(format!("edit {}: {e}", path.display()));
             }
@@ -122,6 +129,9 @@ mod tests {
             cwd: dir.to_path_buf(),
             ledger: Arc::new(Mutex::new(Ledger::default())),
             spill: Arc::new(Spill::new()),
+            snapshots: Arc::new(parking_lot::Mutex::new(
+                crate::hands::snapshots::Snapshots::inert(),
+            )),
         }
     }
 

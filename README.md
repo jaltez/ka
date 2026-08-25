@@ -83,6 +83,8 @@ cargo xtask size      # binary size vs the 10 MB contract
 cargo xtask unlink    # remove the kad symlink
 ```
 
+**File snapshots / undo**: `edit` and `write` park the target's current bytes under the data dir before every mutation (a failed snapshot refuses the change) and journal it per session — `/undo` (or `ka undo`) restores the most recent one, creation-undos delete. `/help` lists commands and keys; `ka --version` carries the git hash.
+
 **Pricing honesty**: seeded dialect prices are placeholders and are flagged `priced = false` — surfaces (footer, `ka models`) never display costs from unverified rows. Flip the flag when real numbers land.
 
 **Provider registry**: `openai anthropic google mistral groq cerebras deepseek qwen moonshot xai zhipu nvidia openrouter together fireworks ollama lmstudio llamacpp vllm` — any `vendor/model` selector works against these (no catalog row needed; context/pricing unknown until seeded).

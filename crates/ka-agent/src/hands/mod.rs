@@ -20,6 +20,7 @@ pub mod grep;
 pub mod pathfinder;
 pub mod read;
 pub mod secrets;
+pub mod snapshots;
 pub mod write;
 
 /// Execution clearance tiers.
@@ -102,6 +103,8 @@ pub struct HandContext {
     pub ledger: std::sync::Arc<parking_lot::Mutex<Ledger>>,
     /// Shared spill store.
     pub spill: std::sync::Arc<Spill>,
+    /// Shared pre-mutation snapshot journal (inert for readonly voices).
+    pub snapshots: std::sync::Arc<parking_lot::Mutex<snapshots::Snapshots>>,
 }
 
 /// The read ledger: files the model has read, with their stamps. Edits

@@ -186,6 +186,8 @@ pub enum Command {
         /// Target session reference.
         id: String,
     },
+    /// Restore the latest pre-mutation snapshot of this session.
+    UndoFile,
     /// Persist settings to the user config layer (~/.config/ka/ka.toml).
     SaveSettings {
         /// Default model selector.

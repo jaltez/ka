@@ -474,6 +474,47 @@ async fn handle_command(
             }
             ctx.events.send(Event::Idle).await.ok();
         }
+        Command::UndoFile => {
+            let sink = ctx.voice.snapshot_sink();
+            let outcome = sink.lock().undo();
+            match outcome {
+                Ok(Some(entry)) => {
+                    let what = if entry.existed {
+                        format!("restored {}", entry.path.display())
+                    } else {
+                        format!(
+                            "removed {} (was created this session)",
+                            entry.path.display()
+                        )
+                    };
+                    ctx.events
+                        .send(Event::Note {
+                            message: format!("↩ {what}"),
+                        })
+                        .await
+                        .ok();
+                }
+                Ok(None) => {
+                    ctx.events
+                        .send(Event::Note {
+                            message: "↩ nothing to undo in this session".to_string(),
+                        })
+                        .await
+                        .ok();
+                }
+                Err(e) => {
+                    ctx.events
+                        .send(Event::Error {
+                            class: ErrorClass::Protocol,
+                            retryable: false,
+                            message: format!("undo failed: {e}"),
+                        })
+                        .await
+                        .ok();
+                }
+            }
+            ctx.events.send(Event::Idle).await.ok();
+        }
         Command::SaveSettings {
             model,
             effort,
@@ -557,7 +598,12 @@ async fn attach_strand(
             _ => None,
         })
         .unwrap_or_default();
-    events.send(Event::SessionInfo { id }).await.ok();
+    events
+        .send(Event::SessionInfo { id: id.clone() })
+        .await
+        .ok();
+    // the snapshot journal follows the active strand (undo is session-scoped)
+    voice.snapshot_sink().lock().set_strand(id);
     if let Some(selector) = &state.model {
         events
             .send(Event::ModelChanged {

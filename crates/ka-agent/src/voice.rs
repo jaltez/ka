@@ -130,9 +130,12 @@ impl Voice {
             speakers: Default::default(),
             hands: registry_with_pathfinder(slot.clone()),
             hand_ctx: HandContext {
-                cwd,
+                cwd: cwd.clone(),
                 ledger: std::sync::Arc::new(parking_lot::Mutex::new(Ledger::default())),
                 spill: std::sync::Arc::new(Spill::new()),
+                snapshots: std::sync::Arc::new(parking_lot::Mutex::new(
+                    crate::hands::snapshots::Snapshots::open(&cwd),
+                )),
             },
             state: VoiceState::default(),
             max_steps,
@@ -150,6 +153,13 @@ impl Voice {
         }
     }
 
+    /// Share the snapshot journal (engine-side undo + strand tracking).
+    pub fn snapshot_sink(
+        &self,
+    ) -> std::sync::Arc<parking_lot::Mutex<crate::hands::snapshots::Snapshots>> {
+        self.hand_ctx.snapshots.clone()
+    }
+
     /// Read-only research voice (pathfinder): inspect tools only.
     pub fn new_readonly(
         catalog: Catalog,
@@ -165,6 +175,9 @@ impl Voice {
             cwd,
             ledger: std::sync::Arc::new(parking_lot::Mutex::new(Ledger::default())),
             spill: std::sync::Arc::new(Spill::new()),
+            snapshots: std::sync::Arc::new(parking_lot::Mutex::new(
+                crate::hands::snapshots::Snapshots::inert(),
+            )),
         };
         Self {
             catalog,

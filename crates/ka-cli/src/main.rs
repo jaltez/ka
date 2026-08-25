@@ -13,7 +13,7 @@ use std::process::ExitCode;
 #[derive(Parser)]
 #[command(
     name = "ka",
-    version,
+    version = env!("KA_VERSION"),
     about = "ka — model-agnostic, low-footprint coding agent"
 )]
 struct Cli {
@@ -100,6 +100,8 @@ enum CliCommand {
     },
     /// List sessions for this directory (ids for `ka --session`)
     Sessions,
+    /// Restore the latest snapshot of the newest session here
+    Undo,
     /// List known providers with API-key env status
     Providers,
     /// Generate a starter AGENTS.md from a quick repo scan
@@ -299,6 +301,7 @@ async fn dispatch(cli: Cli) -> Result<ExitCode, String> {
             Ok(ExitCode::SUCCESS)
         }
         Some(CliCommand::Sessions) => run_sessions(),
+        Some(CliCommand::Undo) => run_undo(),
         Some(CliCommand::Providers) => run_providers(),
         Some(CliCommand::Init) => run_init(),
         Some(CliCommand::Rewind { turns }) => run_rewind(turns).await,
@@ -488,6 +491,35 @@ fn run_sessions() -> Result<ExitCode, String> {
         println!("{:<26} {:>5}  {}", s.id, s.messages, s.title);
     }
     Ok(ExitCode::SUCCESS)
+}
+
+/// `ka undo`: restore the newest session's latest snapshot (headless).
+fn run_undo() -> Result<ExitCode, String> {
+    let cwd = std::env::current_dir().map_err(|e| format!("cwd: {e}"))?;
+    let latest = ka_strand::latest(&cwd)
+        .map_err(|e| format!("listing sessions: {e}"))?
+        .ok_or_else(|| "no sessions for this directory".to_string())?;
+    let mut snaps = ka_agent::hands::snapshots::Snapshots::open(&cwd);
+    snaps.set_strand(latest.id.clone());
+    match snaps.undo() {
+        Ok(Some(entry)) => {
+            let what = if entry.existed {
+                format!("restored {}", entry.path.display())
+            } else {
+                format!(
+                    "removed {} (was created that session)",
+                    entry.path.display()
+                )
+            };
+            println!("↩ {what}");
+            Ok(ExitCode::SUCCESS)
+        }
+        Ok(None) => {
+            eprintln!("↩ nothing to undo in session {}", latest.id);
+            Ok(ExitCode::SUCCESS)
+        }
+        Err(e) => Err(format!("undo failed: {e}")),
+    }
 }
 
 fn run_providers() -> Result<ExitCode, String> {

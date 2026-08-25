@@ -57,6 +57,13 @@ impl Hand for WriteHand {
                     }
                 }
             }
+            // safety net first: a failed snapshot refuses the write
+            if let Err(e) = ctx.snapshots.lock().snapshot(&path) {
+                return ToolOutput::err(format!(
+                    "write {}: snapshot before write failed ({e}); refusing to mutate",
+                    path.display()
+                ));
+            }
             if let Err(e) = std::fs::write(&path, content) {
                 return ToolOutput::err(format!("write {}: {e}", path.display()));
             }
@@ -102,6 +109,9 @@ mod tests {
             cwd: dir.to_path_buf(),
             ledger: Arc::new(Mutex::new(Ledger::default())),
             spill: Arc::new(Spill::new()),
+            snapshots: Arc::new(parking_lot::Mutex::new(
+                crate::hands::snapshots::Snapshots::inert(),
+            )),
         }
     }
 
