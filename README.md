@@ -19,7 +19,7 @@ ka providers                          # provider registry + API-key env status
 ka run "summarize the build error"    # headless NDJSON
 ```
 
-Keys: `Enter` send / interject mid-turn · `+text` defer until turn ends · `Esc`/`Ctrl-C` abort · `↑/↓` history · `/` + `Tab` autocomplete slash commands. `/session` (alias `/resume`) opens an in-app session picker with type-to-filter; `/new` starts a fresh session; `/settings` edits model/mode/effort (persist with `s`) and shows every provider's API-key env status. The transcript renders markdown (headers, lists, `code`, fenced blocks with syntax coloring) with role blocks: blue for you, amber for tool calls, dark gray for streamed thinking. NO_COLOR is honored.
+Keys: `Enter` send / interject mid-turn · `+text` defer until turn ends · `Esc`/`Ctrl-C` abort · `↑/↓` history · `PgUp`/`PgDn` scroll the transcript (title shows `↑N above`; `Esc` re-pins to the tail). Rendered rows are cached per entry — streaming redraws only the live region. `/session` (alias `/resume`) opens an in-app session picker with type-to-filter; `/new` starts a fresh session; `/settings` edits model/mode/effort (persist with `s`) and shows every provider's API-key env status. The transcript renders markdown (headers, lists, `code`, fenced blocks with syntax coloring) with role blocks: blue for you, amber for tool calls, dark gray for streamed thinking. NO_COLOR is honored.
 
 ## Commands
 

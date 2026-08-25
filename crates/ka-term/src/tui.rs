@@ -161,6 +161,139 @@ pub struct ProviderInfo {
     pub key_set: bool,
 }
 
+/// Transcript with a render cache. Entries are immutable once pushed, so
+/// each is rendered (role blocks + markdown) exactly once per terminal
+/// width; resizing rebuilds. Without the cache every frame re-parsed the
+/// whole transcript — O(transcript) work per streaming delta.
+#[derive(Debug, Default)]
+pub struct Transcript {
+    lines: Vec<Line>,
+    rendered: Vec<Vec<ratatui::text::Line<'static>>>,
+    width: u16,
+    /// Render passes issued (cache-audit in tests).
+    renders: usize,
+}
+
+impl Transcript {
+    /// Append an entry; renders it at the current width.
+    pub fn push(&mut self, line: Line) {
+        let w = self.width;
+        self.rendered.push(render_line(&line, w));
+        self.lines.push(line);
+        self.renders += 1;
+    }
+
+    /// Adopt a new terminal width, rebuilding the cache if it changed.
+    pub fn set_width(&mut self, width: u16) {
+        if width != self.width {
+            self.width = width;
+            self.rebuild();
+        }
+    }
+
+    fn rebuild(&mut self) {
+        let w = self.width;
+        self.rendered = self.lines.iter().map(|l| render_line(l, w)).collect();
+        self.renders += self.lines.len();
+    }
+
+    /// Drop everything (session switch).
+    pub fn clear(&mut self) {
+        self.lines.clear();
+        self.rendered.clear();
+    }
+
+    /// The source entries, in order.
+    pub fn entries(&self) -> &[Line] {
+        &self.lines
+    }
+
+    /// Cached rendered row count.
+    pub fn total_rows(&self) -> usize {
+        self.rendered.iter().map(Vec::len).sum()
+    }
+
+    /// One rendered row by absolute index.
+    pub fn row(&self, i: usize) -> Option<&ratatui::text::Line<'static>> {
+        let mut i = i;
+        for entry in &self.rendered {
+            if i < entry.len() {
+                return entry.get(i);
+            }
+            i -= entry.len();
+        }
+        None
+    }
+
+    /// Render passes issued so far (tests).
+    pub fn render_passes(&self) -> usize {
+        self.renders
+    }
+}
+
+/// Render one transcript entry into styled rows at `width`.
+fn render_line(line: &Line, width: u16) -> Vec<ratatui::text::Line<'static>> {
+    use ratatui::text::Line as TuiLine;
+    let mut out: Vec<TuiLine> = Vec::new();
+    match line {
+        Line::User(text) => push_block(&mut out, text, width, BlockStyle::User),
+        Line::Assistant(text) => {
+            out.extend(crate::markdown::render(text));
+            out.push(TuiLine::default());
+        }
+        Line::Thought(text) => push_block(&mut out, text, width, BlockStyle::Thought),
+        Line::Tool(text) => push_block(&mut out, text, width, BlockStyle::Tool),
+        Line::Note(text) => push_block(&mut out, text, width, BlockStyle::Note),
+    }
+    out
+}
+
+/// Viewport window over `total` rendered rows for `visible` rows given the
+/// scroll anchor (None = pinned to tail). Returns `(start_row, pinned)`;
+/// an anchor at or past the tail re-pins.
+fn window_range(total: usize, visible: usize, scroll: Option<usize>) -> (usize, bool) {
+    if visible == 0 || total <= visible {
+        return (0, true);
+    }
+    let max_start = total - visible;
+    match scroll {
+        None => (max_start, true),
+        Some(anchor) => {
+            let anchor = anchor.min(max_start);
+            (anchor, anchor >= max_start)
+        }
+    }
+}
+
+/// Scroll one page up from the current anchor (pinned counts from the
+/// tail). Keeps a two-row overlap for reading continuity.
+fn page_up(scroll: &mut Option<usize>, total: usize, visible: usize) {
+    if visible == 0 || total <= visible {
+        *scroll = None;
+        return;
+    }
+    let max_anchor = total - visible;
+    let step = visible.saturating_sub(2).max(1);
+    let cur = scroll.unwrap_or(max_anchor);
+    *scroll = Some(cur.saturating_sub(step).min(max_anchor));
+}
+
+/// Scroll one page down; reaching the tail re-pins (None).
+fn page_down(scroll: &mut Option<usize>, total: usize, visible: usize) {
+    let Some(anchor) = *scroll else { return };
+    if visible == 0 {
+        *scroll = None;
+        return;
+    }
+    let max_anchor = total.saturating_sub(visible);
+    let step = visible.saturating_sub(2).max(1);
+    *scroll = if anchor + step >= max_anchor {
+        None
+    } else {
+        Some(anchor + step)
+    };
+}
+
 /// Footer state shown under the editor.
 #[derive(Debug, Clone, Default)]
 pub struct Meters {
@@ -366,7 +499,9 @@ async fn app(
 ) -> std::io::Result<Exit> {
     use crossterm::event::{Event as TermEvent, KeyCode, KeyModifiers};
 
-    let mut lines: Vec<Line> = Vec::new();
+    let mut transcript = Transcript::default();
+    let mut scroll: Option<usize> = None;
+    let mut view_rows: usize = 0;
     let mut input = InputBuffer::default();
     let mut meters = Meters {
         model: initial_model.to_string(),
@@ -397,10 +532,15 @@ async fn app(
         } else {
             None
         };
+        if let Ok(size) = terminal.size() {
+            transcript.set_width(size.width);
+            view_rows = size.height.saturating_sub(5) as usize;
+        }
         terminal.draw(|frame| {
             render(
                 frame,
-                &lines,
+                &transcript,
+                scroll,
                 &input_snapshot,
                 cursor,
                 &footer,
@@ -557,13 +697,14 @@ async fn app(
                         (KeyCode::Esc, _) if busy => {
                             let _ = commands.send(Command::Abort).await;
                         }
+                        (KeyCode::Esc, _) if scroll.is_some() => scroll = None,
                         (KeyCode::Enter, _) => {
                             let text = input.take();
                             if text.trim().is_empty() {
                                 continue;
                             }
                             if let Some(cmd) = slash_command(&text) {
-                                lines.push(Line::User(text));
+                                transcript.push(Line::User(text));
                                 if let Some(kind) = cmd.modal {
                                     modal = Some(match kind {
                                         ModalKind::Session => {
@@ -601,7 +742,7 @@ async fn app(
                                     }
                                 }
                                 if let Some(follow) = cmd.followup {
-                                    lines.push(Line::Note("(mode set; starting)".into()));
+                                    transcript.push(Line::Note("(mode set; starting)".into()));
                                     busy = true;
                                     let _ = commands
                                         .send(Command::Prompt { text: follow, attachments: vec![] })
@@ -612,7 +753,7 @@ async fn app(
                                 }
                                 continue;
                             }
-                            lines.push(Line::User(text.clone()));
+                            transcript.push(Line::User(text.clone()));
                             let cmd = if busy {
                                 // '+'-prefix defers; Enter interjects
                                 if let Some(deferred) = text.strip_prefix('+') {
@@ -625,6 +766,12 @@ async fn app(
                             };
                             busy = true;
                             let _ = commands.send(cmd).await;
+                        }
+                        (KeyCode::PageUp, _) => {
+                            page_up(&mut scroll, transcript.total_rows(), view_rows);
+                        }
+                        (KeyCode::PageDown, _) => {
+                            page_down(&mut scroll, transcript.total_rows(), view_rows);
                         }
                         (KeyCode::Tab, _) => {
                             if let Some(popup) = slash_popup.as_mut() {
@@ -669,9 +816,10 @@ async fn app(
                 match maybe_evt {
                     None => { exit = Some(Exit::EngineEnded); }
                     Some(evt) => {
+                        let replayed = matches!(evt, Event::Replay { .. });
                         apply_event(
                             &evt,
-                            &mut lines,
+                            &mut transcript,
                             &mut busy,
                             &mut meters,
                             &mut pending,
@@ -681,6 +829,9 @@ async fn app(
                             &mut current_thought,
                             &mut current_tool,
                         );
+                        if replayed {
+                            scroll = None;
+                        }
                                     }
                 }
             }
@@ -692,7 +843,7 @@ async fn app(
 #[allow(clippy::too_many_arguments)]
 fn apply_event(
     evt: &Event,
-    lines: &mut Vec<Line>,
+    transcript: &mut Transcript,
     busy: &mut bool,
     meters: &mut Meters,
     pending: &mut Option<PendingAsk>,
@@ -716,14 +867,14 @@ fn apply_event(
             ka_protocol::DeltaKind::Thought(t) => current_thought.push_str(t),
             ka_protocol::DeltaKind::Call { tool, .. } => {
                 if !current_tool.is_empty() {
-                    lines.push(Line::Tool(std::mem::take(current_tool)));
+                    transcript.push(Line::Tool(std::mem::take(current_tool)));
                 }
                 *current_tool = format!("→ {tool}");
             }
         },
         Event::CallStarted { tool, .. } => {
             if !current_tool.is_empty() {
-                lines.push(Line::Tool(std::mem::take(current_tool)));
+                transcript.push(Line::Tool(std::mem::take(current_tool)));
             }
             *current_tool = format!("→ {tool}");
         }
@@ -740,7 +891,7 @@ fn apply_event(
         }
         Event::CallFinished { .. } => {
             if !current_tool.is_empty() {
-                lines.push(Line::Tool(std::mem::take(current_tool)));
+                transcript.push(Line::Tool(std::mem::take(current_tool)));
             }
         }
         Event::Ask { id, questions } => {
@@ -755,13 +906,13 @@ fn apply_event(
         }
         Event::TurnFinished { stop: _, usage } => {
             if !current_thought.trim().is_empty() {
-                lines.push(Line::Thought(std::mem::take(current_thought)));
+                transcript.push(Line::Thought(std::mem::take(current_thought)));
             }
             if !current_assistant.trim().is_empty() {
-                lines.push(Line::Assistant(std::mem::take(current_assistant)));
+                transcript.push(Line::Assistant(std::mem::take(current_assistant)));
             }
             if !current_tool.is_empty() {
-                lines.push(Line::Tool(std::mem::take(current_tool)));
+                transcript.push(Line::Tool(std::mem::take(current_tool)));
             }
             *busy = false;
             meters.cost += usage.cost;
@@ -785,13 +936,13 @@ fn apply_event(
             };
         }
         Event::Error { message, .. } => {
-            lines.push(Line::Note(format!("! {message}")));
+            transcript.push(Line::Note(format!("! {message}")));
         }
         Event::Replay { messages } => {
             // a replay is the full transcript of the active session:
-            // rebuild from scratch (startup on a fresh Vec, session switch
-            // replaces the previous conversation)
-            lines.clear();
+            // rebuild from scratch (startup on a fresh Transcript, session
+            // switch replaces the previous conversation)
+            transcript.clear();
             meters.cost = 0.0;
             meters.context = (0, 0);
             current_assistant.clear();
@@ -799,15 +950,15 @@ fn apply_event(
             current_tool.clear();
             for m in messages {
                 if m.role == "user" {
-                    lines.push(Line::User(m.content.clone()));
+                    transcript.push(Line::User(m.content.clone()));
                 } else {
-                    lines.push(Line::Assistant(m.content.clone()));
+                    transcript.push(Line::Assistant(m.content.clone()));
                 }
             }
         }
-        Event::Note { message } => lines.push(Line::Note(message.clone())),
+        Event::Note { message } => transcript.push(Line::Note(message.clone())),
         Event::Idle => {}
-        Event::DigestStarted => lines.push(Line::Note("⋯ digesting context…".to_string())),
+        Event::DigestStarted => transcript.push(Line::Note("⋯ digesting context…".to_string())),
         Event::DigestFinished { .. } => {}
     }
 }
@@ -1090,7 +1241,8 @@ step now; verify each step."
 #[allow(clippy::too_many_arguments)]
 fn render(
     frame: &mut ratatui::Frame,
-    lines: &[Line],
+    transcript: &Transcript,
+    scroll: Option<usize>,
     input: &str,
     cursor: usize,
     footer: &str,
@@ -1107,32 +1259,9 @@ fn render(
 
     let chunks =
         ratatui::layout::Layout::vertical([Min(3), Length(3), Length(1)]).split(frame.area());
-    let width = chunks[0].width;
 
-    // ── transcript ────────────────────────────────────────────────
-    let mut render_lines: Vec<TuiLine> = Vec::new();
-    for line in lines {
-        match line {
-            Line::User(text) => {
-                push_block(&mut render_lines, text, width, BlockStyle::User);
-            }
-            Line::Assistant(text) => {
-                render_lines.extend(crate::markdown::render(text));
-                render_lines.push(TuiLine::default());
-            }
-            Line::Thought(text) => {
-                push_block(&mut render_lines, text, width, BlockStyle::Thought);
-            }
-            Line::Tool(text) => {
-                push_block(&mut render_lines, text, width, BlockStyle::Tool);
-            }
-            Line::Note(text) => {
-                push_block(&mut render_lines, text, width, BlockStyle::Note);
-            }
-        }
-    }
-
-    // ── live streaming region (text + thinking while busy) ────────
+    // ── transcript: cached rows + live region under a scroll window ──
+    let mut live_rows: Vec<TuiLine> = Vec::new();
     if let Some((thought, text)) = live {
         if !thought.trim().is_empty() {
             let tail: Vec<&str> = thought
@@ -1144,7 +1273,7 @@ fn render(
                 .rev()
                 .collect();
             for l in tail {
-                render_lines.push(TuiLine::styled(
+                live_rows.push(TuiLine::styled(
                     format!("⋯ {l}"),
                     Style::default()
                         .fg(Color::DarkGray)
@@ -1153,20 +1282,34 @@ fn render(
             }
         }
         if !text.trim().is_empty() {
-            render_lines.extend(crate::markdown::render(text));
+            live_rows.extend(crate::markdown::render(text));
         }
     }
 
-    // tail-scroll: keep only what fits (approximate with wrapping)
+    let cached = transcript.total_rows();
+    let total = cached + live_rows.len();
     let visible = chunks[0].height.saturating_sub(1) as usize;
-    if render_lines.len() > visible {
-        let start = render_lines.len() - visible;
-        render_lines.drain(..start);
+    let (start, pinned) = window_range(total, visible, scroll);
+    let end = (start + visible).min(total);
+    let mut window: Vec<TuiLine> = Vec::with_capacity(end - start);
+    for i in start..end {
+        if i < cached {
+            if let Some(row) = transcript.row(i) {
+                window.push(row.clone());
+            }
+        } else if let Some(row) = live_rows.get(i - cached) {
+            window.push(row.clone());
+        }
     }
-    let transcript = Paragraph::new(render_lines)
-        .block(Block::default().borders(Borders::TOP).title("ka"))
+    let title = if pinned {
+        "ka".to_string()
+    } else {
+        format!("ka · ↑{} above (pgdn/esc)", start)
+    };
+    let widget = Paragraph::new(window)
+        .block(Block::default().borders(Borders::TOP).title(title))
         .wrap(Wrap { trim: false });
-    frame.render_widget(transcript, chunks[0]);
+    frame.render_widget(widget, chunks[0]);
 
     // ── input ─────────────────────────────────────────────────────
     let title = if busy {
@@ -1447,7 +1590,9 @@ fn push_block(
         loop {
             let first = start == 0;
             let lead = if first { prefix } else { "  " };
-            let room = usable.saturating_sub(lead.chars().count());
+            // max(1) guarantees forward progress even at degenerate
+            // widths (0/1 columns) where the lead alone overflows
+            let room = usable.saturating_sub(lead.chars().count()).max(1);
             let end = (start + room).min(chars.len());
             let mut segment: String = chars[start..end].iter().collect();
             let pad = usable.saturating_sub(segment.chars().count() + lead.chars().count());
@@ -1478,6 +1623,65 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use super::*;
+
+    #[test]
+    fn pushes_at_degenerate_width_terminate() {
+        let mut t = Transcript::default(); // width 0 until first draw
+        t.push(Line::User("some longer text".into()));
+        t.push(Line::Note("x".repeat(50)));
+        assert!(t.total_rows() >= 2);
+    }
+
+    #[test]
+    fn transcript_renders_once_per_entry_and_resizes() {
+        let mut t = Transcript::default();
+        t.set_width(40);
+        t.push(Line::User("hello".into()));
+        t.push(Line::Note("note".into()));
+        t.push(Line::Tool("→ read".into()));
+        assert_eq!(t.render_passes(), 3, "one pass per pushed entry");
+        t.set_width(40); // same width: no rebuild
+        assert_eq!(t.render_passes(), 3, "same width must not re-render");
+        t.set_width(72); // resize: one pass per entry again
+        assert_eq!(t.render_passes(), 6, "resize rebuilds the cache");
+        assert!(t.total_rows() > 0);
+        assert!(t.row(0).is_some());
+        assert!(t.row(t.total_rows()).is_none());
+        t.clear();
+        assert_eq!(t.total_rows(), 0);
+    }
+
+    #[test]
+    fn window_range_pins_and_clamps() {
+        // everything fits: always pinned from 0
+        assert_eq!(window_range(10, 20, None), (0, true));
+        assert_eq!(window_range(10, 20, Some(5)), (0, true));
+        // pinned tail
+        assert_eq!(window_range(100, 20, None), (80, true));
+        // anchored mid-history
+        assert_eq!(window_range(100, 20, Some(30)), (30, false));
+        // anchor past the tail re-pins
+        assert_eq!(window_range(100, 20, Some(95)), (80, true));
+        // zero visible
+        assert_eq!(window_range(100, 0, Some(10)), (0, true));
+    }
+
+    #[test]
+    fn paging_roundtrip_repins_at_tail() {
+        let mut scroll = None;
+        page_up(&mut scroll, 100, 20);
+        assert_eq!(scroll, Some(80 - 18), "pinned PgUp lands a page up");
+        page_up(&mut scroll, 100, 20);
+        assert_eq!(scroll, Some(80 - 36));
+        page_down(&mut scroll, 100, 20);
+        assert_eq!(scroll, Some(80 - 18));
+        page_down(&mut scroll, 100, 20);
+        assert_eq!(scroll, None, "reaching the tail re-pins");
+        // small transcript: PgUp is a no-op
+        let mut small = None;
+        page_up(&mut small, 5, 20);
+        assert_eq!(small, None);
+    }
 
     #[test]
     fn short_session_takes_tail() {
@@ -1702,7 +1906,7 @@ mod tests {
 
     #[test]
     fn apply_event_collects_tool_and_text_lines() {
-        let mut lines = Vec::new();
+        let mut lines = Transcript::default();
         let mut busy = true;
         let mut meters = Meters::default();
         let mut pending = None;
@@ -1795,6 +1999,7 @@ mod tests {
 
         assert!(!busy);
         let texts: Vec<&str> = lines
+            .entries()
             .iter()
             .filter_map(|l| match l {
                 Line::Assistant(t) | Line::Tool(t) => Some(t.as_str()),
