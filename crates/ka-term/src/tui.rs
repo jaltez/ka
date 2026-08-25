@@ -1317,12 +1317,24 @@ fn render(
                     .as_ref()
                     .map(|e| format!("{e:?}").to_lowercase())
                     .unwrap_or_else(|| "(default)".to_string());
-                let model_shown = panel.edit.clone().unwrap_or_else(|| panel.model.clone());
+                let editing = panel.edit.is_some();
+                // while editing, the row shows a cursor block so the mode
+                // change is unmistakable (nothing else on screen moves)
+                let model_row = match &panel.edit {
+                    Some(buf) => format!("{}model ✎  {}▌", marker(0), buf),
+                    None => format!("{}model    {}", marker(0), panel.model),
+                };
+                let model_style = if editing {
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD)
+                } else if panel.selected == 0 {
+                    sel
+                } else {
+                    dim
+                };
                 let mut text = vec![
-                    TuiLine::styled(
-                        format!("{}model    {}", marker(0), model_shown),
-                        if panel.selected == 0 { sel } else { dim },
-                    ),
+                    TuiLine::styled(model_row, model_style),
                     TuiLine::styled(
                         format!("{}mode     {}", marker(1), mode_str),
                         if panel.selected == 1 { sel } else { dim },
@@ -1335,8 +1347,20 @@ fn render(
                         format!("config: {}", panel.config_path),
                         Style::default().fg(Color::DarkGray),
                     ),
-                    TuiLine::styled("providers:", Style::default().fg(Color::Gray)),
                 ];
+                // hint sits above the providers so it survives clipping
+                // on short terminals
+                let hint = if editing {
+                    "typing edits the selector · enter apply · esc cancel"
+                } else {
+                    "enter edit/cycle · s save to config · esc close"
+                };
+                text.push(TuiLine::styled(hint, Style::default().fg(Color::DarkGray)));
+                text.push(TuiLine::styled(
+                    "providers:",
+                    Style::default().fg(Color::Gray),
+                ));
+                let url_room = (width.saturating_sub(38)) as usize;
                 for p in &panel.providers {
                     let key = if p.env_var.is_empty() {
                         "(keyless)".to_string()
@@ -1345,6 +1369,7 @@ fn render(
                     } else {
                         format!("{} ✗", p.env_var)
                     };
+                    let url: String = p.base_url.chars().take(url_room).collect();
                     text.push(TuiLine::from(vec![
                         Span::styled(format!("  {:<12}", p.name), dim),
                         Span::styled(
@@ -1355,16 +1380,9 @@ fn render(
                                 Style::default().fg(Color::Red)
                             },
                         ),
-                        Span::styled(
-                            format!("  {}", p.base_url),
-                            Style::default().fg(Color::DarkGray),
-                        ),
+                        Span::styled(format!("  {url}"), Style::default().fg(Color::DarkGray)),
                     ]));
                 }
-                text.push(TuiLine::styled(
-                    "enter edit/cycle · s save to config · esc close",
-                    Style::default().fg(Color::DarkGray),
-                ));
                 let widget = Paragraph::new(text)
                     .block(Block::default().borders(Borders::ALL).title("settings"))
                     .wrap(Wrap { trim: false });
