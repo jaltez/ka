@@ -110,6 +110,7 @@ impl Dialect {
             first_byte_timeout_ms: 0,
             effort_budgets: Default::default(),
             price: Default::default(),
+            priced: false,
             flags: Default::default(),
         }
     }

@@ -145,6 +145,10 @@ pub struct Dialect {
     /// Pricing.
     #[serde(default)]
     pub price: Price,
+    /// Whether the pricing is vendor-verified (false = placeholders —
+    /// surfaces must not display costs from them).
+    #[serde(default)]
+    pub priced: bool,
     /// Behavioral flags.
     #[serde(default)]
     pub flags: Flags,
@@ -258,6 +262,14 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use super::*;
+
+    #[test]
+    fn seeded_rows_are_unpriced_placeholders() {
+        let c = Catalog::embedded();
+        for (id, d) in &c.dialects {
+            assert!(!d.priced, "{id} seeds placeholder pricing");
+        }
+    }
 
     #[test]
     fn embedded_catalog_parses() {

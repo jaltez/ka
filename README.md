@@ -83,6 +83,8 @@ cargo xtask size      # binary size vs the 10 MB contract
 cargo xtask unlink    # remove the kad symlink
 ```
 
+**Pricing honesty**: seeded dialect prices are placeholders and are flagged `priced = false` — surfaces (footer, `ka models`) never display costs from unverified rows. Flip the flag when real numbers land.
+
 **Provider registry**: `openai anthropic google mistral groq cerebras deepseek qwen moonshot xai zhipu nvidia openrouter together fireworks ollama lmstudio llamacpp vllm` — any `vendor/model` selector works against these (no catalog row needed; context/pricing unknown until seeded).
 
 Stable owns the name `ka`; dev is always `kad`. Isolate dev sessions with `KA_DATA_DIR=/tmp/ka-dev kad …` (shares config/rules/hooks, separates strands).

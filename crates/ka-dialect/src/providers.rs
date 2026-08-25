@@ -189,6 +189,7 @@ pub fn synthetic_dialect(provider: &Provider, model: &str) -> Dialect {
         cache: Default::default(),
         ratio: 3.6,
         price: Default::default(),
+        priced: false,
         flags: Default::default(),
         effort_budgets: Default::default(),
         first_byte_timeout_ms: 120_000,

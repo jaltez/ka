@@ -278,7 +278,7 @@ async fn dispatch(cli: Cli) -> Result<ExitCode, String> {
                 ka_dialect::discovery::overlay_discovered(&mut catalog).await;
             }
             let header = format!(
-                "{:<34} {:<20} {:>9} {:>7}  {}",
+                "{:<34} {:<20} {:>9} {:>8}  {}",
                 "model", "wire", "context", "$in/M", "auth"
             );
             println!("{header}");
@@ -288,7 +288,11 @@ async fn dispatch(cli: Cli) -> Result<ExitCode, String> {
                     id,
                     wire_str(d.wire),
                     d.context,
-                    d.price.input_per_mtok,
+                    if d.priced {
+                        format!("{:.2}", d.price.input_per_mtok)
+                    } else {
+                        "-".to_string()
+                    },
                     d.api_key_env.as_deref().unwrap_or("-")
                 );
             }

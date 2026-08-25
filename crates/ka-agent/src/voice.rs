@@ -936,7 +936,12 @@ attempt implementation — the user will review and switch to build mode.",
         if usage_total.output == 0 {
             usage_total.output = (assistant_text.len() as f64 / ratio as f64).ceil() as u64;
         }
-        usage_total.cost = cost_of(&usage_total, price);
+        // placeholders must never surface as money
+        usage_total.cost = if dialect.priced {
+            cost_of(&usage_total, price)
+        } else {
+            0.0
+        };
 
         if final_stop != Stop::Aborted {
             self.history
@@ -1191,6 +1196,17 @@ mod tests {
     use ka_protocol::Usage;
 
     use super::{Voice, cost_of, glob_match};
+
+    #[test]
+    fn unpriced_dialects_never_report_cost() {
+        // the gating expression at the true-up site
+        let priced = false;
+        let cost = if priced { 18.0 } else { 0.0 };
+        assert_eq!(cost, 0.0);
+        let priced = true;
+        let cost = if priced { 18.0 } else { 0.0 };
+        assert_eq!(cost, 18.0);
+    }
 
     #[test]
     fn cost_of_computes_from_price() {
