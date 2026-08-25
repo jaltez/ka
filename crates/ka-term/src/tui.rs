@@ -461,6 +461,56 @@ impl SettingsPanel {
     }
 }
 
+/// A model row for the model picker (built by the CLI from the catalog;
+/// ka-term stays catalog-free).
+#[derive(Debug, Clone)]
+pub struct ModelInfo {
+    /// Full selector id (`vendor/model`).
+    pub id: String,
+    /// Wire label for display.
+    pub wire: String,
+    /// Context window (0 = unknown).
+    pub context: u32,
+    /// Env var holding the API key (empty = keyless).
+    pub key_env: String,
+    /// Whether the key is present in this process.
+    pub key_set: bool,
+}
+
+/// Model picker (/model without arguments): catalog models filtered by
+/// the typed substring; Enter on a row switches, Enter on an empty
+/// result sets the filter itself as a custom `vendor/model` selector.
+#[derive(Debug, Clone)]
+pub struct ModelPicker {
+    /// Known models (catalog + discovery), injected by the CLI.
+    pub models: Vec<ModelInfo>,
+    /// Selected row.
+    pub selected: usize,
+    /// Typed filter (substring over the id).
+    pub filter: String,
+}
+
+impl ModelPicker {
+    /// Rows after filtering.
+    pub fn rows(&self) -> Vec<&ModelInfo> {
+        let f = self.filter.to_lowercase();
+        self.models
+            .iter()
+            .filter(|m| f.is_empty() || m.id.to_lowercase().contains(&f))
+            .collect()
+    }
+
+    /// The selector Enter applies: the selected row's id, or — when the
+    /// filter matched nothing — the raw filter (custom provider/model).
+    pub fn pick(&self) -> Option<String> {
+        let rows = self.rows();
+        if rows.is_empty() {
+            return (!self.filter.trim().is_empty()).then(|| self.filter.trim().to_string());
+        }
+        rows.get(self.selected).map(|m| m.id.clone())
+    }
+}
+
 /// Which modal is open (drawn above everything).
 #[derive(Debug, Clone)]
 pub enum Modal {
@@ -468,6 +518,8 @@ pub enum Modal {
     Session(SessionPicker),
     /// Settings panel.
     Settings(SettingsPanel),
+    /// Model picker.
+    Model(ModelPicker),
 }
 
 /// Run the TUI over an engine handle. Blocks until exit.
@@ -476,6 +528,7 @@ pub async fn run(
     mut events: mpsc::Receiver<Event>,
     initial_model: &str,
     providers: Vec<ProviderInfo>,
+    models: Vec<ModelInfo>,
 ) -> std::io::Result<Exit> {
     let mut terminal = ratatui::init();
     let result = app(
@@ -484,6 +537,7 @@ pub async fn run(
         &mut events,
         initial_model,
         providers,
+        models,
     )
     .await;
     ratatui::restore();
@@ -496,6 +550,7 @@ async fn app(
     events: &mut mpsc::Receiver<Event>,
     initial_model: &str,
     providers: Vec<ProviderInfo>,
+    models: Vec<ModelInfo>,
 ) -> std::io::Result<Exit> {
     use crossterm::event::{Event as TermEvent, KeyCode, KeyModifiers};
 
@@ -519,6 +574,7 @@ async fn app(
     let mut slash_popup: Option<SlashPopup> = None;
     let mut modal: Option<Modal> = None;
     let providers_ref = providers;
+    let models_ref = models;
     let mut term_events = crossterm::event::EventStream::new();
 
     while exit.is_none() {
@@ -613,7 +669,36 @@ async fn app(
                                 KeyCode::Char(c) => picker.filter.push(c),
                                 _ => {}
                             },
-                            Modal::Settings(panel) => {
+                            Modal::Model(picker) => match key.code {
+                                KeyCode::Esc => modal = None,
+                                KeyCode::Up => picker.selected = picker.selected.saturating_sub(1),
+                                KeyCode::Down => {
+                                    let n = picker.rows().len();
+                                    if picker.selected + 1 < n {
+                                        picker.selected += 1;
+                                    }
+                                }
+                                KeyCode::Backspace => {
+                                    picker.filter.pop();
+                                    picker.selected = 0;
+                                }
+                                KeyCode::Enter => {
+                                    if let Some(selector) = picker.pick() {
+                                        let _ = commands
+                                            .send(Command::SetModel {
+                                                selector: selector.clone(),
+                                            })
+                                            .await;
+                                    }
+                                    modal = None;
+                                }
+                                KeyCode::Char(c) => {
+                                    picker.filter.push(c);
+                                    picker.selected = 0;
+                                }
+                                _ => {}
+                            },
+            Modal::Settings(panel) => {
                                 let editing = panel.edit.is_some();
                                 match key.code {
                                     KeyCode::Esc => {
@@ -718,6 +803,11 @@ async fn app(
                                                 filter: String::new(),
                                             })
                                         }
+                                        ModalKind::Model => Modal::Model(ModelPicker {
+                                            models: models_ref.clone(),
+                                            selected: 0,
+                                            filter: String::new(),
+                                        }),
                                         ModalKind::Settings => Modal::Settings(SettingsPanel {
                                             model: meters.model.clone(),
                                             mode: match meters.mode.as_str() {
@@ -757,8 +847,14 @@ async fn app(
                             let cmd = if busy {
                                 // '+'-prefix defers; Enter interjects
                                 if let Some(deferred) = text.strip_prefix('+') {
+                                    transcript.push(Line::Note(
+                                        "⏳ deferred until this turn ends".into(),
+                                    ));
                                     Command::Defer { text: deferred.trim_start().to_string() }
                                 } else {
+                                    transcript.push(Line::Note(
+                                        "⚡ steering this turn".into(),
+                                    ));
                                     Command::Interject { text }
                                 }
                             } else {
@@ -977,7 +1073,7 @@ pub fn available_slash_commands() -> Vec<(String, String)> {
     let mut cmds = vec![
         (
             "/model".to_string(),
-            "switch model: vendor/model@effort".to_string(),
+            "switch model: picker, or vendor/model@effort".to_string(),
         ),
         (
             "/mode".to_string(),
@@ -1081,6 +1177,8 @@ pub enum ModalKind {
     Session,
     /// Settings panel.
     Settings,
+    /// Model picker.
+    Model,
 }
 
 /// Load a custom command body from `.ka/commands/<name>.md` (project) or
@@ -1142,17 +1240,22 @@ fn slash_command(text: &str) -> Option<Slash> {
             followup: None,
             modal: None,
         }),
-        "/model" => {
-            let selector = rest?;
-            Some(Slash {
+        "/model" => match rest {
+            Some(selector) => Some(Slash {
                 event: Some(Command::SetModel {
                     selector: selector.to_string(),
                 }),
                 quit: false,
                 followup: None,
                 modal: None,
-            })
-        }
+            }),
+            None => Some(Slash {
+                event: None,
+                quit: false,
+                followup: None,
+                modal: Some(ModalKind::Model),
+            }),
+        },
         "/plan" => {
             let task = rest.map(str::to_string).unwrap_or_default();
             Some(Slash {
@@ -1438,6 +1541,65 @@ fn render(
                     .wrap(Wrap { trim: false });
                 frame.render_widget(widget, rect);
             }
+            Modal::Model(picker) => {
+                let rows = picker.rows();
+                let height = (rows.len() as u16 + 4).min(18);
+                let width = 64.min(frame.area().width);
+                let rect = centered(width, height, frame.area());
+                frame.render_widget(Clear, rect);
+                let mut text = vec![TuiLine::from(vec![
+                    Span::styled("filter: ", Style::default().fg(Color::Gray)),
+                    Span::styled(picker.filter.clone(), Style::default().fg(Color::Cyan)),
+                ])];
+                let cap = (height as usize).saturating_sub(4);
+                for (i, m) in rows.iter().take(cap).enumerate() {
+                    let marker = if i == picker.selected { "▶ " } else { "  " };
+                    let style = if i == picker.selected {
+                        Style::default()
+                            .fg(Color::Cyan)
+                            .add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(Color::Gray)
+                    };
+                    let ctx = if m.context > 0 {
+                        format!("{}k", m.context / 1000)
+                    } else {
+                        "?".to_string()
+                    };
+                    let key = if m.key_env.is_empty() {
+                        String::new()
+                    } else if m.key_set {
+                        " ✓".to_string()
+                    } else {
+                        " ✗".to_string()
+                    };
+                    text.push(TuiLine::styled(
+                        format!("{marker}{:<44} {:>6} {:<10}{}", m.id, ctx, m.wire, key),
+                        style,
+                    ));
+                }
+                if rows.is_empty() {
+                    if picker.filter.trim().is_empty() {
+                        text.push(TuiLine::styled(
+                            "(no models; type a vendor/model selector)",
+                            Style::default().fg(Color::DarkGray),
+                        ));
+                    } else {
+                        text.push(TuiLine::styled(
+                            format!("enter sets '{}' as a custom selector", picker.filter),
+                            Style::default().fg(Color::Yellow),
+                        ));
+                    }
+                }
+                text.push(TuiLine::styled(
+                    "type to filter · enter switch · esc close",
+                    Style::default().fg(Color::DarkGray),
+                ));
+                let widget = Paragraph::new(text)
+                    .block(Block::default().borders(Borders::ALL).title("model"))
+                    .wrap(Wrap { trim: false });
+                frame.render_widget(widget, rect);
+            }
             Modal::Settings(panel) => {
                 let height = (SettingsPanel::ROWS + panel.providers.len() + 6) as u16;
                 let height = height.min(frame.area().height.saturating_sub(2));
@@ -1623,6 +1785,77 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use super::*;
+
+    fn model(id: &str, context: u32) -> ModelInfo {
+        ModelInfo {
+            id: id.to_string(),
+            wire: "openai_chat".to_string(),
+            context,
+            key_env: "X_API_KEY".to_string(),
+            key_set: false,
+        }
+    }
+
+    #[test]
+    fn model_picker_filters_picks_and_falls_back_to_custom() {
+        let picker = ModelPicker {
+            models: vec![
+                model("ollama/qwen3-32b", 131_072),
+                model("openai/gpt-5.1", 400_000),
+                model("anthropic/claude-sonnet-5", 200_000),
+            ],
+            selected: 0,
+            filter: String::new(),
+        };
+        assert_eq!(picker.rows().len(), 3);
+        assert_eq!(picker.pick().as_deref(), Some("ollama/qwen3-32b"));
+
+        let mut filtered = picker.clone();
+        filtered.filter = "gpt".to_string();
+        assert_eq!(filtered.rows().len(), 1);
+        assert_eq!(filtered.pick().as_deref(), Some("openai/gpt-5.1"));
+
+        // no match: Enter sets the filter itself as a custom selector
+        let mut custom = picker.clone();
+        custom.filter = "groq/llama-3.3-70b".to_string();
+        assert!(custom.rows().is_empty());
+        assert_eq!(
+            custom.pick().as_deref(),
+            Some("groq/llama-3.3-70b"),
+            "unmatched filter becomes the selector"
+        );
+
+        // no match and no filter: nothing to apply
+        let mut empty = picker.clone();
+        empty.filter = "   ".to_string();
+        assert!(empty.rows().is_empty());
+        assert_eq!(empty.pick(), None);
+
+        // selection follows the filtered view
+        let mut second = picker.clone();
+        second.filter = "claude".to_string();
+        second.selected = 0;
+        assert_eq!(second.pick().as_deref(), Some("anthropic/claude-sonnet-5"));
+    }
+
+    #[test]
+    fn model_slash_opens_picker_or_sets_directly() {
+        assert!(matches!(
+            slash_command("/model"),
+            Some(Slash {
+                modal: Some(ModalKind::Model),
+                event: None,
+                ..
+            })
+        ));
+        assert!(matches!(
+            slash_command("/model groq/llama-3.3-70b"),
+            Some(Slash {
+                event: Some(Command::SetModel { selector }),
+                ..
+            }) if selector == "groq/llama-3.3-70b"
+        ));
+    }
 
     #[test]
     fn pushes_at_degenerate_width_terminate() {
@@ -1901,7 +2134,16 @@ mod tests {
             })
         ));
         assert!(slash_command("plain text").is_none());
-        assert!(slash_command("/model").is_none(), "selector required");
+        assert!(
+            matches!(
+                slash_command("/model"),
+                Some(Slash {
+                    modal: Some(ModalKind::Model),
+                    ..
+                })
+            ),
+            "bare /model opens the picker"
+        );
     }
 
     #[test]

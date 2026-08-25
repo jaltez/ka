@@ -427,9 +427,23 @@ async fn run_tui(cli: Cli) -> Result<ExitCode, String> {
             key_set: p.key_env.is_some_and(|k| std::env::var(k).is_ok()),
         })
         .collect();
+    let models: Vec<ka_term::tui::ModelInfo> = catalog
+        .dialects
+        .iter()
+        .map(|(id, d)| ka_term::tui::ModelInfo {
+            id: id.clone(),
+            wire: wire_str(d.wire),
+            context: d.context,
+            key_env: d.api_key_env.clone().unwrap_or_default(),
+            key_set: d
+                .api_key_env
+                .as_deref()
+                .is_some_and(|k| std::env::var(k).is_ok()),
+        })
+        .collect();
     let handle = ka_agent::spawn_full(cfg, catalog, choice);
     let ka_agent::EngineHandle { commands, events } = handle;
-    let exit = ka_term::tui::run(commands, events, &model_label, providers)
+    let exit = ka_term::tui::run(commands, events, &model_label, providers, models)
         .await
         .map_err(|e| format!("tui: {e}"))?;
     match exit {
