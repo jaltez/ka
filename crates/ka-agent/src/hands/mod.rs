@@ -11,6 +11,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde_json::Value;
 
 pub mod bash;
+pub mod delegate;
 pub use bash::BashHand;
 pub mod bashp;
 pub mod edit;

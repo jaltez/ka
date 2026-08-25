@@ -283,6 +283,23 @@ async fn run(
         voice,
         strand,
     };
+    // markdown agents: .ka/agents/*.md etc. become one `delegate` hand
+    let agents = crate::agents::AgentDef::discover(&ctx.cwd);
+    if !agents.is_empty() {
+        let names: Vec<String> = agents.iter().map(|a| a.name.clone()).collect();
+        let slot = ctx.voice.pathfinder_slot();
+        ctx.voice
+            .push_hand(Box::new(crate::hands::delegate::DelegateHand::new(
+                agents, slot,
+            )));
+        ctx.events
+            .send(Event::Note {
+                message: format!("agents available: {}", names.join(", ")),
+            })
+            .await
+            .ok();
+    }
+
     // MCP servers: spawn, handshake, list; each tool becomes a hand at
     // exec-tier clearance. Failures are per-server notes, never fatal.
     for cfg in &mcp_servers {

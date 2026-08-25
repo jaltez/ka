@@ -352,6 +352,10 @@ pub struct PendingAsk {
     pub selected: usize,
 }
 
+/// Agent summaries injected by the CLI for `/agents` (ka-term stays
+/// ka-agent-free).
+pub static AGENTS: std::sync::OnceLock<Vec<(String, String)>> = std::sync::OnceLock::new();
+
 /// Short human tag for a strand id: the first 8 chars of its random tail.
 pub fn short_session(id: &str) -> Option<&str> {
     id.split_once('-')
@@ -551,7 +555,9 @@ pub async fn run(
     initial_model: &str,
     providers: Vec<ProviderInfo>,
     models: Vec<ModelInfo>,
+    agents: Vec<(String, String)>,
 ) -> std::io::Result<Exit> {
+    let _ = AGENTS.set(agents.clone());
     let mut terminal = ratatui::init();
     let result = app(
         &mut terminal,
@@ -560,6 +566,7 @@ pub async fn run(
         initial_model,
         providers,
         models,
+        agents,
     )
     .await;
     ratatui::restore();
@@ -573,8 +580,10 @@ async fn app(
     initial_model: &str,
     providers: Vec<ProviderInfo>,
     models: Vec<ModelInfo>,
+    agents: Vec<(String, String)>,
 ) -> std::io::Result<Exit> {
     use crossterm::event::{Event as TermEvent, KeyCode, KeyModifiers};
+    let _ = agents.clone();
 
     let mut transcript = Transcript::default();
     let mut scroll: Option<usize> = None;
@@ -822,6 +831,9 @@ async fn app(
                             }
                             if let Some(cmd) = slash_command(&text) {
                                 transcript.push(Line::User(text));
+                                if let Some(note) = cmd.note {
+                                    transcript.push(Line::Note(note));
+                                }
                                 if let Some(kind) = cmd.modal {
                                     modal = Some(match kind {
                                         ModalKind::Session => {
@@ -1208,6 +1220,8 @@ struct Slash {
     followup: Option<String>,
     /// Modal to open instead of sending an event.
     modal: Option<ModalKind>,
+    /// Local transcript note (no engine roundtrip).
+    note: Option<String>,
 }
 
 /// Modal a slash command opens.
@@ -1265,6 +1279,7 @@ fn slash_command(text: &str) -> Option<Slash> {
     ) {
         if let Some(body) = custom_command(head, rest) {
             return Some(Slash {
+                note: None,
                 event: Some(Command::Prompt { text: body }),
                 quit: false,
                 followup: None,
@@ -1274,6 +1289,7 @@ fn slash_command(text: &str) -> Option<Slash> {
     }
     match head {
         "/quit" | "/exit" => Some(Slash {
+            note: None,
             event: None,
             quit: true,
             followup: None,
@@ -1281,6 +1297,7 @@ fn slash_command(text: &str) -> Option<Slash> {
         }),
         "/model" => match rest {
             Some(selector) => Some(Slash {
+                note: None,
                 event: Some(Command::SetModel {
                     selector: selector.to_string(),
                 }),
@@ -1289,6 +1306,7 @@ fn slash_command(text: &str) -> Option<Slash> {
                 modal: None,
             }),
             None => Some(Slash {
+                note: None,
                 event: None,
                 quit: false,
                 followup: None,
@@ -1298,6 +1316,7 @@ fn slash_command(text: &str) -> Option<Slash> {
         "/plan" => {
             let task = rest.map(str::to_string).unwrap_or_default();
             Some(Slash {
+                note: None,
                 event: Some(Command::SetMode {
                     mode: ka_protocol::Mode::Plan,
                 }),
@@ -1314,6 +1333,7 @@ then write a concrete numbered implementation plan to .ka/plans/plan.md. Task: {
             })
         }
         "/build" => Some(Slash {
+            note: None,
             event: Some(Command::SetMode {
                 mode: ka_protocol::Mode::Guarded,
             }),
@@ -1328,6 +1348,7 @@ step now; verify each step."
         "/rewind" => {
             let turns: u32 = rest.and_then(|r| r.trim().parse().ok()).unwrap_or(1);
             Some(Slash {
+                note: None,
                 event: Some(Command::Rewind { turns }),
                 quit: false,
                 followup: None,
@@ -1337,6 +1358,7 @@ step now; verify each step."
         "/compact" => {
             let focus = rest.map(str::to_string);
             Some(Slash {
+                note: None,
                 event: Some(Command::Compact { focus }),
                 quit: false,
                 followup: None,
@@ -1344,12 +1366,14 @@ step now; verify each step."
             })
         }
         "/session" | "/resume" => Some(Slash {
+            note: None,
             event: None,
             quit: false,
             followup: None,
             modal: Some(ModalKind::Session),
         }),
         "/new" => Some(Slash {
+            note: None,
             event: Some(Command::SwitchStrand {
                 id: "new".to_string(),
             }),
@@ -1358,18 +1382,38 @@ step now; verify each step."
             modal: None,
         }),
         "/undo" => Some(Slash {
+            note: None,
             event: Some(Command::UndoFile),
             quit: false,
             followup: None,
             modal: None,
         }),
+        "/agents" => Some(Slash {
+            event: None,
+            quit: false,
+            followup: None,
+            modal: None,
+            note: Some(format!(
+                "agents:{}",
+                AGENTS
+                    .get()
+                    .map(|a| {
+                        a.iter()
+                            .map(|x| format!("\n• {} — {}", x.0, x.1))
+                            .collect::<String>()
+                    })
+                    .unwrap_or_default()
+            )),
+        }),
         "/help" => Some(Slash {
+            note: None,
             event: None,
             quit: false,
             followup: None,
             modal: Some(ModalKind::Help),
         }),
         "/settings" => Some(Slash {
+            note: None,
             event: None,
             quit: false,
             followup: None,
@@ -1382,6 +1426,7 @@ step now; verify each step."
                 _ => ka_protocol::Mode::Guarded,
             };
             Some(Slash {
+                note: None,
                 event: Some(Command::SetMode { mode }),
                 quit: false,
                 followup: None,
@@ -1950,6 +1995,7 @@ mod tests {
         assert!(matches!(
             slash_command("/model"),
             Some(Slash {
+                note: None,
                 modal: Some(ModalKind::Model),
                 event: None,
                 ..
@@ -1958,6 +2004,7 @@ mod tests {
         assert!(matches!(
             slash_command("/model groq/llama-3.3-70b"),
             Some(Slash {
+                note: None,
                 event: Some(Command::SetModel { selector }),
                 ..
             }) if selector == "groq/llama-3.3-70b"
@@ -2137,6 +2184,7 @@ mod tests {
         assert!(matches!(
             slash_command("/new"),
             Some(Slash {
+                note: None,
                 event: Some(Command::SwitchStrand { id }),
                 ..
             }) if id == "new"
@@ -2144,6 +2192,7 @@ mod tests {
         assert!(matches!(
             slash_command("/settings"),
             Some(Slash {
+                note: None,
                 modal: Some(ModalKind::Settings),
                 ..
             })
@@ -2151,6 +2200,7 @@ mod tests {
         assert!(matches!(
             slash_command("/resume"),
             Some(Slash {
+                note: None,
                 modal: Some(ModalKind::Session),
                 ..
             })
@@ -2287,6 +2337,7 @@ mod tests {
             matches!(
                 slash_command("/model"),
                 Some(Slash {
+                    note: None,
                     modal: Some(ModalKind::Model),
                     ..
                 })

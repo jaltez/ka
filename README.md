@@ -86,6 +86,8 @@ cargo xtask unlink    # remove the kad symlink
 
 **Three wires**: `anthropic_messages`, `openai_chat` (plus every OpenAI-compatible endpoint), and `openai_responses` — the Responses API for reasoning models (o-series seeded: `openai/o3`, `openai/o4-mini`) with item-based history (`function_call`/`function_call_output`), flat tool definitions, `reasoning.effort`, and streamed reasoning summaries (visible as thinking).
 
+**Markdown agents**: `.ka/agents/*.md` (and `.agents/`, `.claude/agents/`, `~/.config/ka/agents/`) define subagents — frontmatter (`name`, `description`, `max-steps`) plus a body that becomes the agent system prompt. The model delegates self-contained subtasks through the `delegate` tool (read-only nested voice, dense summary back — pathfinder generalized). `ka agents` lists them; `/agents` in the TUI.
+
 **MCP client** (stdio, no new dependencies): configure `[[mcp]]` tables (name/command/args/env) and every server tool appears as a `<name>.<tool>` hand at exec-tier clearance — the gate, rules, and snapshots treat them like any external execution. `ka mcp` probes servers and lists tools. Handshake/tools-list/tools-call only; server noise is ignored; failures are per-server notes.
 
 **File snapshots / undo**: `edit` and `write` park the target's current bytes under the data dir before every mutation (a failed snapshot refuses the change) and journal it per session — `/undo` (or `ka undo`) restores the most recent one, creation-undos delete. `/help` lists commands and keys; `ka --version` carries the git hash.

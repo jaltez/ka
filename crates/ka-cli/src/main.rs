@@ -104,6 +104,8 @@ enum CliCommand {
     Undo,
     /// Probe configured MCP servers and list their tools
     Mcp,
+    /// List discovered markdown agents (.ka/agents/*.md)
+    Agents,
     /// List known providers with API-key env status
     Providers,
     /// Generate a starter AGENTS.md from a quick repo scan
@@ -304,6 +306,7 @@ async fn dispatch(cli: Cli) -> Result<ExitCode, String> {
         Some(CliCommand::Sessions) => run_sessions(),
         Some(CliCommand::Undo) => run_undo(),
         Some(CliCommand::Mcp) => run_mcp().await,
+        Some(CliCommand::Agents) => run_agents(),
         Some(CliCommand::Providers) => run_providers(),
         Some(CliCommand::Init) => run_init(),
         Some(CliCommand::Rewind { turns }) => run_rewind(turns).await,
@@ -452,7 +455,11 @@ async fn run_tui(cli: Cli) -> Result<ExitCode, String> {
         .collect();
     let handle = ka_agent::spawn_full(cfg, catalog, choice);
     let ka_agent::EngineHandle { commands, events } = handle;
-    let exit = ka_term::tui::run(commands, events, &model_label, providers, models)
+    let agents: Vec<(String, String)> = ka_agent::agents::AgentDef::discover(&cwd)
+        .into_iter()
+        .map(|a| (a.name, a.description))
+        .collect();
+    let exit = ka_term::tui::run(commands, events, &model_label, providers, models, agents)
         .await
         .map_err(|e| format!("tui: {e}"))?;
     match exit {
@@ -525,6 +532,25 @@ fn run_undo() -> Result<ExitCode, String> {
 }
 
 /// `ka mcp`: spawn each configured server, list tools, exit.
+/// `ka agents`: list discovered markdown agents.
+fn run_agents() -> Result<ExitCode, String> {
+    let cwd = std::env::current_dir().map_err(|e| format!("cwd: {e}"))?;
+    let agents = ka_agent::agents::AgentDef::discover(&cwd);
+    if agents.is_empty() {
+        println!("no agents configured (.ka/agents/*.md, ~/.config/ka/agents/*.md)");
+        return Ok(ExitCode::SUCCESS);
+    }
+    for a in &agents {
+        let desc = if a.description.is_empty() {
+            "(no description)"
+        } else {
+            &a.description
+        };
+        println!("{:<16} {:<3} steps  {}", a.name, a.max_steps, desc);
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
 async fn run_mcp() -> Result<ExitCode, String> {
     let trust = trust_for_cwd(false);
     let cfg = load_config(&[], None, None, trust)?;
