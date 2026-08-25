@@ -757,9 +757,14 @@ async fn app(
                                         }
                                     },
                                     KeyCode::Char('s') if !editing => {
+                                        // "(canned)" is the no-model placeholder,
+                                        // not a selector — persisting it would
+                                        // poison every later launch
+                                        let model = (panel.model != "(canned)")
+                                            .then(|| panel.model.clone());
                                         let _ = commands
                                             .send(Command::SaveSettings {
-                                                model: Some(panel.model.clone()),
+                                                model,
                                                 effort: panel.effort,
                                                 mode: Some(panel.mode),
                                             })
@@ -835,7 +840,7 @@ async fn app(
                                     transcript.push(Line::Note("(mode set; starting)".into()));
                                     busy = true;
                                     let _ = commands
-                                        .send(Command::Prompt { text: follow, attachments: vec![] })
+                                        .send(Command::Prompt { text: follow })
                                         .await;
                                 }
                                 if cmd.quit {
@@ -858,7 +863,7 @@ async fn app(
                                     Command::Interject { text }
                                 }
                             } else {
-                                Command::Prompt { text, attachments: vec![] }
+                                Command::Prompt { text }
                             };
                             busy = true;
                             let _ = commands.send(cmd).await;
@@ -1223,10 +1228,7 @@ fn slash_command(text: &str) -> Option<Slash> {
     ) {
         if let Some(body) = custom_command(head, rest) {
             return Some(Slash {
-                event: Some(Command::Prompt {
-                    text: body,
-                    attachments: vec![],
-                }),
+                event: Some(Command::Prompt { text: body }),
                 quit: false,
                 followup: None,
                 modal: None,
@@ -1949,6 +1951,19 @@ mod tests {
         let mut fresh = picker.clone();
         fresh.selected = 0;
         assert_eq!(fresh.pick(), None, "row 0 = new session");
+    }
+
+    #[test]
+    fn settings_save_skips_canned_model_placeholder() {
+        // mirrored logic from the 's' handler: the guard is one expression
+        let panel_model = "(canned)";
+        let model = (panel_model != "(canned)").then(|| panel_model.to_string());
+        assert_eq!(model, None);
+        let model = (panel_model == "x/y").then(|| panel_model.to_string());
+        assert_eq!(model, None);
+        let real = "groq/llama-3.3-70b";
+        let model = (real != "(canned)").then(|| real.to_string());
+        assert_eq!(model.as_deref(), Some("groq/llama-3.3-70b"));
     }
 
     #[test]

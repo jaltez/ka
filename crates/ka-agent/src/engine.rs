@@ -237,6 +237,17 @@ impl From<Config> for EngineState {
 
 type DynError = Box<dyn std::error::Error + Send + Sync>;
 
+/// The engine's owned state bundle: one place, passed to every command
+/// handler. Replaces the run()/side_command() split where arms were
+/// partitioned by which pieces they happened to touch.
+struct Ctx {
+    cwd: std::path::PathBuf,
+    events: mpsc::Sender<Event>,
+    state: EngineState,
+    voice: Voice,
+    strand: ka_strand::StrandFile,
+}
+
 async fn run(
     mut commands: mpsc::Receiver<Command>,
     events: mpsc::Sender<Event>,
@@ -255,7 +266,6 @@ async fn run(
     let rules = config.rules.clone();
     let hooks = config.hooks.clone();
     let pathfinder_catalog = catalog.clone();
-    let mut state = EngineState::from(config);
     let mut voice = Voice::new(catalog, cwd.clone(), mode, max_steps);
     voice.set_rules(rules);
     voice.set_hooks(hooks);
@@ -263,131 +273,249 @@ async fn run(
         let slot = voice.pathfinder_slot();
         slot.write().catalog = pathfinder_catalog;
     }
-    let mut strand = attach_strand(&events, &mut state, &mut voice, &cwd, &strand_choice).await?;
+    let mut state = EngineState::from(config);
+    let strand = attach_strand(&events, &mut state, &mut voice, &cwd, &strand_choice).await?;
+    let mut ctx = Ctx {
+        cwd,
+        events,
+        state,
+        voice,
+        strand,
+    };
 
     while let Some(cmd) = commands.recv().await {
-        match cmd {
-            Command::Prompt { text, .. } => {
+        handle_command(cmd, &mut commands, &mut ctx).await?;
+    }
+    Ok(())
+}
+
+/// The single, exhaustive command dispatcher. Every `Command` variant is
+/// handled (or explicitly rejected) here — no unreachable arms, no
+/// routing split. Arms that need to poll the surface mid-turn (Prompt)
+/// also receive the receiver.
+async fn handle_command(
+    cmd: Command,
+    commands: &mut mpsc::Receiver<Command>,
+    ctx: &mut Ctx,
+) -> Result<(), DynError> {
+    match cmd {
+        Command::Prompt { text } => {
+            dispatch_turn(
+                commands,
+                &ctx.events,
+                &mut ctx.state,
+                &mut ctx.voice,
+                text,
+                &mut ctx.strand,
+            )
+            .await;
+            settle_context(&mut ctx.voice, &mut ctx.state, &mut ctx.strand, &ctx.events).await;
+            // Settling: drain deferrals as follow-on turns.
+            while let Some(deferred) = ctx.state.deferrals.pop_front() {
                 dispatch_turn(
-                    &mut commands,
-                    &events,
-                    &mut state,
-                    &mut voice,
-                    text,
-                    &mut strand,
+                    commands,
+                    &ctx.events,
+                    &mut ctx.state,
+                    &mut ctx.voice,
+                    deferred,
+                    &mut ctx.strand,
                 )
                 .await;
-                settle_context(&mut voice, &mut state, &mut strand, &events).await;
-                // Settling: drain deferrals as follow-on turns.
-                while let Some(deferred) = state.deferrals.pop_front() {
-                    dispatch_turn(
-                        &mut commands,
-                        &events,
-                        &mut state,
-                        &mut voice,
-                        deferred,
-                        &mut strand,
-                    )
-                    .await;
-                    settle_context(&mut voice, &mut state, &mut strand, &events).await;
-                }
-                events.send(Event::Idle).await.ok();
+                settle_context(&mut ctx.voice, &mut ctx.state, &mut ctx.strand, &ctx.events).await;
             }
-            Command::SetModel { selector } => {
-                state.model = Some(selector.clone());
-                voice.pathfinder_slot().write().model = Some(selector.clone());
-                let _ = strand.append(ka_strand::Record::Change {
-                    id: ka_strand::new_record_id(),
-                    model: Some(selector.clone()),
-                    effort: None,
-                    mode: None,
-                });
-                events.send(Event::ModelChanged { selector }).await?;
-            }
-            Command::SetMode { mode } => {
-                state.mode = mode;
-                voice.set_mode(mode);
-                let _ = strand.append(ka_strand::Record::Change {
-                    id: ka_strand::new_record_id(),
-                    model: None,
-                    effort: None,
-                    mode: Some(mode),
-                });
-                events.send(Event::ModeChanged { mode }).await?;
-            }
-            Command::SwitchStrand { id } => {
-                let choice = if id.trim() == "new" {
-                    StrandChoice::New
-                } else {
-                    match ka_strand::resolve_id(&cwd, &id) {
-                        Ok(ka_strand::IdMatch::Unique(summary)) => StrandChoice::Path(summary.path),
-                        Ok(ka_strand::IdMatch::Ambiguous(candidates)) => {
-                            let ids: Vec<String> =
-                                candidates.iter().map(|c| c.id.clone()).collect();
-                            events
-                                .send(Event::Error {
-                                    class: ErrorClass::Unsupported,
-                                    retryable: false,
-                                    message: format!(
-                                        "session id '{}' is ambiguous: {}",
-                                        id,
-                                        ids.join(", ")
-                                    ),
-                                })
-                                .await
-                                .ok();
-                            events.send(Event::Idle).await.ok();
-                            continue;
-                        }
-                        other => {
-                            let message = match other {
-                                Ok(ka_strand::IdMatch::None) => {
-                                    format!("no session matches '{id}'")
-                                }
-                                Err(e) => format!("session lookup failed: {e}"),
-                                _ => unreachable!(),
-                            };
-                            events
-                                .send(Event::Error {
-                                    class: ErrorClass::Unsupported,
-                                    retryable: false,
-                                    message,
-                                })
-                                .await
-                                .ok();
-                            events.send(Event::Idle).await.ok();
-                            continue;
-                        }
-                    }
-                };
-                match attach_strand(&events, &mut state, &mut voice, &cwd, &choice).await {
-                    Ok(fresh) => {
-                        strand = fresh;
-                        events
-                            .send(Event::Note {
-                                message: format!("switched to session {}", strand_id(&strand)),
-                            })
-                            .await
-                            .ok();
-                    }
-                    Err(e) => {
-                        events
+            ctx.events.send(Event::Idle).await.ok();
+        }
+        Command::SetModel { selector } => {
+            ctx.state.model = Some(selector.clone());
+            ctx.voice.pathfinder_slot().write().model = Some(selector.clone());
+            let _ = ctx.strand.append(ka_strand::Record::Change {
+                id: ka_strand::new_record_id(),
+                model: Some(selector.clone()),
+                effort: None,
+                mode: None,
+            });
+            ctx.events.send(Event::ModelChanged { selector }).await?;
+        }
+        Command::SetMode { mode } => {
+            ctx.state.mode = mode;
+            ctx.voice.set_mode(mode);
+            let _ = ctx.strand.append(ka_strand::Record::Change {
+                id: ka_strand::new_record_id(),
+                model: None,
+                effort: None,
+                mode: Some(mode),
+            });
+            ctx.events.send(Event::ModeChanged { mode }).await?;
+        }
+        Command::SwitchStrand { id } => {
+            let choice = if id.trim() == "new" {
+                StrandChoice::New
+            } else {
+                match ka_strand::resolve_id(&ctx.cwd, &id) {
+                    Ok(ka_strand::IdMatch::Unique(summary)) => StrandChoice::Path(summary.path),
+                    Ok(ka_strand::IdMatch::Ambiguous(candidates)) => {
+                        let ids: Vec<String> = candidates.iter().map(|c| c.id.clone()).collect();
+                        ctx.events
                             .send(Event::Error {
-                                class: ErrorClass::Protocol,
+                                class: ErrorClass::Unsupported,
                                 retryable: false,
-                                message: format!("session switch failed: {e}"),
+                                message: format!(
+                                    "session id '{}' is ambiguous: {}",
+                                    id,
+                                    ids.join(", ")
+                                ),
                             })
                             .await
                             .ok();
+                        ctx.events.send(Event::Idle).await.ok();
+                        return Ok(());
+                    }
+                    other => {
+                        let message = match other {
+                            Ok(ka_strand::IdMatch::None) => {
+                                format!("no session matches '{id}'")
+                            }
+                            Err(e) => format!("session lookup failed: {e}"),
+                            _ => unreachable!(),
+                        };
+                        ctx.events
+                            .send(Event::Error {
+                                class: ErrorClass::Unsupported,
+                                retryable: false,
+                                message,
+                            })
+                            .await
+                            .ok();
+                        ctx.events.send(Event::Idle).await.ok();
+                        return Ok(());
                     }
                 }
-                events.send(Event::Idle).await.ok();
+            };
+            match attach_strand(
+                &ctx.events,
+                &mut ctx.state,
+                &mut ctx.voice,
+                &ctx.cwd,
+                &choice,
+            )
+            .await
+            {
+                Ok(fresh) => {
+                    ctx.strand = fresh;
+                    ctx.events
+                        .send(Event::Note {
+                            message: format!("switched to session {}", strand_id(&ctx.strand)),
+                        })
+                        .await
+                        .ok();
+                }
+                Err(e) => {
+                    ctx.events
+                        .send(Event::Error {
+                            class: ErrorClass::Protocol,
+                            retryable: false,
+                            message: format!("session switch failed: {e}"),
+                        })
+                        .await
+                        .ok();
+                }
             }
-            other => side_command(&events, &mut state, &mut voice, &mut strand, other).await?,
+            ctx.events.send(Event::Idle).await.ok();
+        }
+        Command::Interject { text } => ctx.state.interjections.push(text),
+        Command::Defer { text } => ctx.state.deferrals.push_back(text),
+        Command::Abort => {}
+        Command::SetEffort { level } => ctx.state.effort = Some(level),
+        Command::Compact { focus } => {
+            run_digest(
+                &mut ctx.voice,
+                &mut ctx.state,
+                &mut ctx.strand,
+                &ctx.events,
+                focus,
+            )
+            .await;
+            ctx.events.send(Event::Idle).await.ok();
+        }
+        Command::Rewind { turns } => {
+            match ctx.voice.rewind(turns) {
+                Some(kept) => {
+                    // kept = index of the dropped user message; keep
+                    // everything strictly before it
+                    let keep_idx = kept.saturating_sub(1);
+                    let kept_from = ctx
+                        .state
+                        .record_ids
+                        .get(keep_idx)
+                        .cloned()
+                        .unwrap_or_else(ka_strand::new_record_id);
+                    let _ = ctx.strand.append(ka_strand::Record::Rewind {
+                        id: ka_strand::new_record_id(),
+                        kept_from,
+                    });
+                    ctx.state.record_ids.truncate(keep_idx + 1);
+                    ctx.events
+                        .send(Event::Note {
+                            message: format!("rewound {turns} turn(s)"),
+                        })
+                        .await
+                        .ok();
+                }
+                None => {
+                    ctx.events
+                        .send(Event::Error {
+                            class: ErrorClass::Protocol,
+                            retryable: false,
+                            message: format!("cannot rewind {turns} turn(s): not enough history"),
+                        })
+                        .await
+                        .ok();
+                }
+            }
+            ctx.events.send(Event::Idle).await.ok();
+        }
+        Command::SaveSettings {
+            model,
+            effort,
+            mode,
+        } => {
+            match crate::config::save_user_settings(model.as_deref(), effort, mode) {
+                Ok(path) => {
+                    ctx.events
+                        .send(Event::Note {
+                            message: format!("saved settings to {}", path.display()),
+                        })
+                        .await
+                        .ok();
+                }
+                Err(e) => {
+                    ctx.events
+                        .send(Event::Error {
+                            class: ErrorClass::Protocol,
+                            retryable: false,
+                            message: format!("saving settings failed: {e}"),
+                        })
+                        .await
+                        .ok();
+                }
+            }
+            ctx.events.send(Event::Idle).await.ok();
+        }
+        Command::Answer { .. } => {
+            // answers are consumed inside the pending ask; one arriving
+            // here means the surface answered an ask that no longer exists
+            ctx.events
+                .send(Event::Error {
+                    class: ErrorClass::Unsupported,
+                    retryable: false,
+                    message: "no pending question to answer".to_string(),
+                })
+                .await?;
         }
     }
     Ok(())
 }
+
 /// Attach to a strand (startup or mid-session switch): open/create it,
 /// replay its settings over the live state, load history into the voice,
 /// mark the waypoint, and announce the session to surfaces.
@@ -669,105 +797,6 @@ fn tty_key() -> Option<String> {
     }
 }
 
-/// Handle a command that arrives outside a turn.
-async fn side_command(
-    events: &mpsc::Sender<Event>,
-    state: &mut EngineState,
-    voice: &mut Voice,
-    strand: &mut ka_strand::StrandFile,
-    cmd: Command,
-) -> Result<(), DynError> {
-    match cmd {
-        Command::Interject { text } => state.interjections.push(text),
-        Command::Defer { text } => state.deferrals.push_back(text),
-        Command::Abort => {}
-        Command::SetEffort { level } => state.effort = Some(level),
-        Command::SetModel { .. } | Command::SetMode { .. } => {
-            unreachable!("handled by caller with voice access")
-        }
-        Command::Compact { focus } => {
-            run_digest(voice, state, strand, events, focus).await;
-            events.send(Event::Idle).await.ok();
-        }
-        Command::Rewind { turns } => {
-            match voice.rewind(turns) {
-                Some(kept) => {
-                    // kept = index of the dropped user message; keep
-                    // everything strictly before it
-                    let keep_idx = kept.saturating_sub(1);
-                    let kept_from = state
-                        .record_ids
-                        .get(keep_idx)
-                        .cloned()
-                        .unwrap_or_else(ka_strand::new_record_id);
-                    let _ = strand.append(ka_strand::Record::Rewind {
-                        id: ka_strand::new_record_id(),
-                        kept_from,
-                    });
-                    state.record_ids.truncate(keep_idx + 1);
-                    events
-                        .send(Event::Note {
-                            message: format!("rewound {turns} turn(s)"),
-                        })
-                        .await
-                        .ok();
-                }
-                None => {
-                    events
-                        .send(Event::Error {
-                            class: ErrorClass::Protocol,
-                            retryable: false,
-                            message: format!("cannot rewind {turns} turn(s): not enough history"),
-                        })
-                        .await
-                        .ok();
-                }
-            }
-            events.send(Event::Idle).await.ok();
-        }
-        Command::SaveSettings {
-            model,
-            effort,
-            mode,
-        } => {
-            match crate::config::save_user_settings(model.as_deref(), effort, mode) {
-                Ok(path) => {
-                    events
-                        .send(Event::Note {
-                            message: format!("saved settings to {}", path.display()),
-                        })
-                        .await
-                        .ok();
-                }
-                Err(e) => {
-                    events
-                        .send(Event::Error {
-                            class: ErrorClass::Protocol,
-                            retryable: false,
-                            message: format!("saving settings failed: {e}"),
-                        })
-                        .await
-                        .ok();
-                }
-            }
-            events.send(Event::Idle).await.ok();
-        }
-        Command::AlwaysAllow { .. } | Command::Answer { .. } | Command::Resume { .. } => {
-            events
-                .send(Event::Error {
-                    class: ErrorClass::Unsupported,
-                    retryable: false,
-                    message: "command not wired".to_string(),
-                })
-                .await?;
-        }
-        Command::Prompt { .. } | Command::SwitchStrand { .. } => {
-            unreachable!("handled by caller")
-        }
-    }
-    Ok(())
-}
-
 /// One canned turn: stream paced chunks, honoring aborts that arrive
 /// mid-stream. Used when no model is configured.
 async fn turn_canned(
@@ -888,10 +917,7 @@ mod tests {
         let mut handle = spawn(Config::default());
         handle
             .commands
-            .send(Command::Prompt {
-                text: "hi".into(),
-                attachments: vec![],
-            })
+            .send(Command::Prompt { text: "hi".into() })
             .await
             .unwrap();
         let seen = drain_until_finished(&mut handle.events).await;
@@ -918,7 +944,6 @@ mod tests {
             .commands
             .send(Command::Prompt {
                 text: "slow".into(),
-                attachments: vec![],
             })
             .await
             .unwrap();
@@ -938,10 +963,7 @@ mod tests {
         let mut handle = spawn(Config::default());
         handle
             .commands
-            .send(Command::Prompt {
-                text: "one".into(),
-                attachments: vec![],
-            })
+            .send(Command::Prompt { text: "one".into() })
             .await
             .unwrap();
         handle
@@ -992,7 +1014,6 @@ mod tests {
         h1.commands
             .send(Command::Prompt {
                 text: "hello there".into(),
-                attachments: vec![],
             })
             .await
             .unwrap();
@@ -1027,7 +1048,6 @@ mod tests {
         h2.commands
             .send(Command::Prompt {
                 text: "second question".into(),
-                attachments: vec![],
             })
             .await
             .unwrap();
@@ -1084,7 +1104,6 @@ mod tests {
             h.commands
                 .send(Command::Prompt {
                     text: prompt.into(),
-                    attachments: vec![],
                 })
                 .await
                 .unwrap();
@@ -1139,7 +1158,6 @@ mod tests {
             .commands
             .send(Command::Prompt {
                 text: "first session question".into(),
-                attachments: vec![],
             })
             .await
             .unwrap();

@@ -796,9 +796,6 @@ attempt implementation — the user will review and switch to build mode.",
                                 self.mode = mode;
                                 events.send(Event::ModeChanged { mode }).await.ok();
                             }
-                            Some(Command::AlwaysAllow { rule }) => {
-                                self.state.rules.insert(rule);
-                            }
                             Some(_) => {}
                         }
                     }
@@ -1022,9 +1019,6 @@ attempt implementation — the user will review and switch to build mode.",
                                         }
                                         _ => break,
                                     }
-                                }
-                                Some(Command::AlwaysAllow { rule }) => {
-                                    self.state.rules.insert(rule);
                                 }
                                 Some(Command::Abort) => {
                                     return ToolOutput::err("aborted");

@@ -17,28 +17,6 @@ pub struct RecordId(pub String);
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct AskId(pub String);
 
-/// Attachment riding along with a prompt.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
-pub struct Attachment {
-    /// Human-readable label for the attachment.
-    pub name: String,
-    /// What kind of payload this is.
-    #[serde(rename = "type")]
-    pub kind: AttachmentKind,
-}
-
-/// Kind of an [`Attachment`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum AttachmentKind {
-    /// A filesystem path.
-    Path,
-    /// Inline text.
-    Text,
-    /// An image path.
-    Image,
-}
-
 /// Reasoning-effort level for the active model.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
@@ -164,8 +142,6 @@ pub enum Command {
     Prompt {
         /// Prompt text.
         text: String,
-        /// Attachments (paths, inline text, images).
-        attachments: Vec<Attachment>,
     },
     /// Deliver user input mid-turn (steering), between tool batches.
     Interject {
@@ -193,18 +169,6 @@ pub enum Command {
     SetMode {
         /// New mode.
         mode: Mode,
-    },
-    /// Persist a session-scoped always-allow rule.
-    AlwaysAllow {
-        /// Rule identifier as presented by the engine.
-        rule: String,
-    },
-    /// Resume a strand, optionally at an offshoot tip.
-    Resume {
-        /// Strand to resume.
-        strand: StrandId,
-        /// Tip record to restore (latest if absent).
-        tip: Option<RecordId>,
     },
     /// Trigger a digest (manual compaction).
     Compact {
@@ -393,14 +357,17 @@ mod tests {
     }
 
     #[test]
+    fn ids_serialize_as_bare_strings() {
+        let line = to_line(&Event::DigestFinished {
+            kept: RecordId("r7".into()),
+        })
+        .unwrap();
+        assert!(line.contains("\"kept\":\"r7\""), "got: {line}");
+    }
+
+    #[test]
     fn commands_roundtrip() {
-        roundtrip_command(Command::Prompt {
-            text: "hi".into(),
-            attachments: vec![Attachment {
-                name: "notes".into(),
-                kind: AttachmentKind::Path,
-            }],
-        });
+        roundtrip_command(Command::Prompt { text: "hi".into() });
         roundtrip_command(Command::Interject {
             text: "use tabs".into(),
         });
@@ -413,13 +380,6 @@ mod tests {
         });
         roundtrip_command(Command::SetEffort { level: Effort::Max });
         roundtrip_command(Command::SetMode { mode: Mode::Free });
-        roundtrip_command(Command::AlwaysAllow {
-            rule: "bash:cargo *".into(),
-        });
-        roundtrip_command(Command::Resume {
-            strand: StrandId("abc".into()),
-            tip: Some(RecordId("r9".into())),
-        });
         roundtrip_command(Command::Compact {
             focus: Some("keep API notes".into()),
         });
@@ -510,15 +470,5 @@ mod tests {
         })
         .unwrap();
         assert!(line.contains("\"type\":\"turn_started\""), "got: {line}");
-    }
-
-    #[test]
-    fn ids_serialize_as_bare_strings() {
-        let line = to_line(&Command::Resume {
-            strand: StrandId("s".into()),
-            tip: None,
-        })
-        .unwrap();
-        assert!(line.contains("\"strand\":\"s\""), "got: {line}");
     }
 }

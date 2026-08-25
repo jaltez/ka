@@ -358,10 +358,7 @@ async fn run_headless(
     let mut handle = spawn_full(cfg, catalog, choice);
     handle
         .commands
-        .send(Command::Prompt {
-            text: prompt,
-            attachments: vec![],
-        })
+        .send(Command::Prompt { text: prompt })
         .await
         .map_err(|_| "engine closed before prompt".to_string())?;
 
