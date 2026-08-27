@@ -2,6 +2,8 @@
 
 A model-agnostic, very-low-footprint coding agent in Rust.
 
+> ⚠️ **Under heavy development.** This project is experimental and moving fast — features, commands, config, and behavior may change or break at any time without notice. Expect rough edges; not ready for production use.
+
 **Status: core complete (Phases 0–7 partial).** Design: [`research/ka/architecture.md`](research/ka/architecture.md) · Roadmap: [`research/ka/roadmap.md`](research/ka/roadmap.md) · Survey of 17 agents that informed it: [`research/`](research/README.md)
 
 ## Quickstart
