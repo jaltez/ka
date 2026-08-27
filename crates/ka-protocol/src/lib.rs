@@ -226,6 +226,19 @@ pub enum Event {
         /// Prior messages, oldest first.
         messages: Vec<ReplayedMessage>,
     },
+    /// Live context meter during a turn (emitted per model step so
+    /// surfaces show usage while the turn runs, not only at the end).
+    ContextMeter {
+        /// Tokens currently in context.
+        used: u64,
+        /// Window size (0 = unknown).
+        window: u64,
+    },
+    /// Reasoning effort changed.
+    EffortChanged {
+        /// Effort level.
+        level: Effort,
+    },
     /// The active session (strand) changed or was announced. Surfaces use
     /// it to label the session and the /session picker.
     SessionInfo {

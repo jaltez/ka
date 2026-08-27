@@ -41,10 +41,7 @@ impl SseParser {
     fn drain(&mut self) -> Vec<SseEvent> {
         let mut out = Vec::new();
         // Split on blank line separators; both "\n\n" and "\r\n\r\n".
-        loop {
-            let Some(idx) = find_separator(&self.buf) else {
-                break;
-            };
+        while let Some(idx) = find_separator(&self.buf) {
             let frame: String = self.buf.drain(..idx).collect();
             // after draining the frame, the separator sits at the start
             let sep_len = separator_len(&self.buf);

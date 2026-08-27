@@ -303,6 +303,8 @@ pub struct Meters {
     pub mode: String,
     /// Active session (strand) id.
     pub session: String,
+    /// Reasoning effort.
+    pub effort: String,
     /// Context usage / window.
     pub context: (u64, u64),
     /// Turn cost.
@@ -332,9 +334,14 @@ impl Meters {
         let tag = short_session(&self.session)
             .map(|t| format!(" · #{t}"))
             .unwrap_or_default();
+        let effort = if self.effort.is_empty() {
+            String::new()
+        } else {
+            format!(" · {}", self.effort)
+        };
         format!(
-            "{} · {} · {}{}{}{}",
-            self.model, self.mode, ctx, cost, cache, tag
+            "{} · {}{} · {}{}{}{}",
+            self.model, self.mode, effort, ctx, cost, cache, tag
         )
     }
 }
@@ -1070,6 +1077,12 @@ fn apply_event(
             let _ = pending_turn_cost;
         }
         Event::ModelChanged { selector } => meters.model = selector.clone(),
+        Event::ContextMeter { used, window } => {
+            meters.context = (*used, *window);
+        }
+        Event::EffortChanged { level } => {
+            meters.effort = format!("{level:?}").to_lowercase();
+        }
         Event::SessionInfo { id } => meters.session = id.clone(),
         Event::ModeChanged { mode } => {
             meters.mode = match mode {
@@ -1177,7 +1190,21 @@ pub fn available_slash_commands() -> Vec<(String, String)> {
                     path.file_stem().unwrap_or_default().to_string_lossy()
                 );
                 if !cmds.iter().any(|(n, _)| *n == name) {
-                    cmds.push((name, "(custom)".to_string()));
+                    let desc = std::fs::read_to_string(&path)
+                        .ok()
+                        .and_then(|body| {
+                            body.lines().find(|l| !l.trim().is_empty()).map(|l| {
+                                l.trim()
+                                    .trim_start_matches(['#', '>'])
+                                    .trim()
+                                    .chars()
+                                    .take(40)
+                                    .collect::<String>()
+                            })
+                        })
+                        .filter(|d| !d.is_empty())
+                        .unwrap_or_else(|| "(custom)".to_string());
+                    cmds.push((name, desc));
                 }
             }
         }
@@ -2239,6 +2266,7 @@ mod tests {
     #[test]
     fn meters_footer_shows_fields() {
         let m = Meters {
+            effort: String::new(),
             session: String::new(),
             model: "ollama/qwen3.5:9b".into(),
             mode: "guarded".into(),

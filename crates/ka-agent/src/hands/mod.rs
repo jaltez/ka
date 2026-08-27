@@ -205,7 +205,7 @@ impl Spill {
                 .duration_since(UNIX_EPOCH)
                 .map(|d| d.as_millis())
                 .unwrap_or(0),
-            &content.len()
+            content.len()
         );
         std::fs::write(self.dir.join(&id), content)?;
         Ok(format!("spill://{id}"))

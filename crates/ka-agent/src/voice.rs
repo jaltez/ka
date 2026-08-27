@@ -847,6 +847,13 @@ attempt implementation — the user will review and switch to build mode.",
                                     + usage.cache_read
                                     + usage.cache_write
                                     + usage.output;
+                                events
+                                    .send(Event::ContextMeter {
+                                        used: self.last_context,
+                                        window: self.window_tokens(),
+                                    })
+                                    .await
+                                    .ok();
                                 final_stop = stop;
                                 step_finished = true;
                             }

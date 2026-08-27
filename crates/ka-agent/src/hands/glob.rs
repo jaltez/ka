@@ -80,7 +80,7 @@ impl Hand for GlobHand {
             if hits.is_empty() {
                 return ToolOutput::ok("no matches");
             }
-            hits.sort_by(|a, b| b.0.cmp(&a.0));
+            hits.sort_by_key(|h| std::cmp::Reverse(h.0));
             hits.truncate(MAX_RESULTS);
             let mut out = String::new();
             for (_, rel) in &hits {

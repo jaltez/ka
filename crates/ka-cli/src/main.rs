@@ -70,6 +70,9 @@ enum CliCommand {
         /// Continue the newest strand for this directory
         #[arg(short = 'c', long)]
         continue_latest: bool,
+        /// Resume a session by id (prefix ok) or file path
+        #[arg(long, value_name = "ID")]
+        session: Option<String>,
         /// Trust this directory's .ka/ka.toml (stores the decision)
         #[arg(long)]
         trust: bool,
@@ -260,6 +263,7 @@ async fn dispatch(cli: Cli) -> Result<ExitCode, String> {
             dialects,
             no_discovery,
             continue_latest,
+            session,
             trust,
         }) => {
             run_headless(
@@ -270,6 +274,7 @@ async fn dispatch(cli: Cli) -> Result<ExitCode, String> {
                 &dialects,
                 !no_discovery,
                 continue_latest,
+                session,
                 trust,
             )
             .await
@@ -346,6 +351,7 @@ async fn run_headless(
     dialects: &[PathBuf],
     with_discovery: bool,
     continue_latest: bool,
+    session: Option<String>,
     force_trust: bool,
 ) -> Result<ExitCode, String> {
     let trust = trust_for_cwd(force_trust);
@@ -359,7 +365,10 @@ async fn run_headless(
     }
 
     let catalog = build_catalog(dialects, with_discovery).await?;
-    let choice = if continue_latest {
+    let choice = if let Some(id) = session {
+        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        resolve_session(&cwd, &id)?
+    } else if continue_latest {
         let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
         match ka_agent::read_waypoint() {
             Some((way_cwd, path)) if way_cwd == cwd && path.exists() => {
