@@ -32,3 +32,20 @@ pub const KEYWORD: Style = Style::new().fg(Color::LightMagenta);
 pub const PLACEHOLDER: Style = Style::new()
     .fg(Color::Rgb(120, 120, 128))
     .add_modifier(Modifier::ITALIC);
+
+// text emphasis: bold pops as near-white, italic shifts to a steel tint —
+// both stay distinguishable on terminals where the font renders subtly
+pub const STRONG: Style = Style::new()
+    .fg(Color::Rgb(236, 238, 242))
+    .add_modifier(Modifier::BOLD);
+pub const EM: Style = Style::new()
+    .fg(Color::Rgb(152, 186, 208))
+    .add_modifier(Modifier::ITALIC);
+
+// tinted surfaces for padded regions
+pub const BG_QUOTE: Color = Color::Rgb(28, 32, 42); // blockquote band
+pub const QUOTE: Style = Style::new()
+    .fg(Color::Rgb(168, 178, 198))
+    .add_modifier(Modifier::ITALIC);
+pub const BG_INPUT: Color = Color::Rgb(20, 24, 32); // input box fill
+pub const BG_ASSIST_LABEL: Color = Color::Rgb(22, 38, 44); // assistant chip

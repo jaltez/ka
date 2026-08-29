@@ -301,10 +301,10 @@ fn render_line(line: &Line, width: u16) -> Vec<ratatui::text::Line<'static>> {
     match line {
         Line::User(text) => push_block(&mut out, text, width),
         Line::Assistant(text) => {
-            out.push(TuiLine::from(vec![
-                ratatui::text::Span::styled("▍ ", crate::palette::LABEL_ASSISTANT),
-                ratatui::text::Span::styled("ka", crate::palette::LABEL_ASSISTANT),
-            ]));
+            out.push(TuiLine::from(vec![ratatui::text::Span::styled(
+                " ▍ ka ",
+                crate::palette::LABEL_ASSISTANT.bg(crate::palette::BG_ASSIST_LABEL),
+            )]));
             out.extend(crate::markdown::render(text, width));
             out.push(TuiLine::default());
         }
@@ -1753,12 +1753,14 @@ fn render(
             .map(|r| TuiLine::from(r.chars().skip(scroll_col).collect::<String>()))
             .collect()
     };
-    let input_widget = Paragraph::new(body).block(
-        Block::default()
-            .borders(Borders::ALL)
-            .title(ratatui::text::Line::from(title).style(crate::palette::META))
-            .border_style(input_border),
-    );
+    let input_widget = Paragraph::new(body)
+        .style(ratatui::style::Style::default().bg(crate::palette::BG_INPUT))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(ratatui::text::Line::from(title).style(crate::palette::META))
+                .border_style(input_border),
+        );
     frame.render_widget(input_widget, chunks[1]);
     let area = chunks[1];
     frame.set_cursor_position((
@@ -2670,7 +2672,7 @@ mod tests {
     fn assistant_entry_starts_with_label_row() {
         let out = super::render_line(&Line::Assistant("**hi** there".into()), 40);
         let text: String = out[0].spans.iter().map(|s| s.content.to_string()).collect();
-        assert_eq!(text, "▍ ka");
+        assert_eq!(text, " ▍ ka ", "chip-wrapped label");
         // markdown body follows, then the trailing blank
         assert!(out.len() >= 3);
     }

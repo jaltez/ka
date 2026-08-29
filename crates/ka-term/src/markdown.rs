@@ -13,12 +13,34 @@ fn code_bg() -> Style {
 
 fn header_style(level: usize) -> Style {
     match level {
+        // h1: white, bold, underlined — plus a full-width rule below
         1 => Style::default()
             .fg(Color::White)
-            .add_modifier(Modifier::BOLD),
+            .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
+        // h2: cyan bold behind an assistant-style ▍ marker
         2 => palette::ACCENT_BOLD,
-        _ => palette::ACCENT,
+        3 => palette::ACCENT,
+        // h4+: quiet but still weighty
+        _ => Style::default()
+            .fg(Color::Rgb(200, 204, 210))
+            .add_modifier(Modifier::BOLD),
     }
+}
+
+/// Extend a line's trailing background to the full transcript width so
+/// tinted regions (code, quotes) read as solid blocks.
+fn pad_to_width(
+    mut line: TuiLine<'static>,
+    width: u16,
+    bg: ratatui::style::Color,
+) -> TuiLine<'static> {
+    let used: usize = line.spans.iter().map(|s| s.content.width()).sum();
+    let w = width as usize;
+    if w > used {
+        line.spans
+            .push(Span::styled(" ".repeat(w - used), Style::new().bg(bg)));
+    }
+    line
 }
 
 /// Render markdown text into styled terminal lines at `width` (the
@@ -36,7 +58,7 @@ pub fn render(text: &str, width: u16) -> Vec<TuiLine<'static>> {
         let trimmed = line.trim_start();
         if let Some(fence) = trimmed.strip_prefix("```") {
             if in_code {
-                push_code_block(&mut out, &code_lines, &code_lang);
+                push_code_block(&mut out, &code_lines, &code_lang, width);
                 code_lines.clear();
                 code_lang.clear();
                 in_code = false;
@@ -83,22 +105,28 @@ pub fn render(text: &str, width: u16) -> Vec<TuiLine<'static>> {
                 strip_atx_closer(h).to_string(),
                 header_style(3),
             ));
-        } else if let Some(h) = trimmed.strip_prefix("## ") {
+        } else if let Some(h) = trimmed.strip_prefix("#### ") {
             out.push(TuiLine::styled(
                 strip_atx_closer(h).to_string(),
+                header_style(4),
+            ));
+        } else if let Some(h) = trimmed.strip_prefix("## ") {
+            out.push(TuiLine::styled(
+                format!("▍ {}", strip_atx_closer(h)),
                 header_style(2),
             ));
         } else if let Some(h) = trimmed.strip_prefix("# ") {
-            out.push(TuiLine::styled(
-                strip_atx_closer(h).to_string(),
-                header_style(1),
-            ));
+            let text = strip_atx_closer(h).to_string();
+            out.push(TuiLine::styled(text, header_style(1)));
+            let rule = "═".repeat(width.min(48) as usize);
+            out.push(TuiLine::styled(rule, palette::ACCENT_BOLD));
         } else if trimmed.starts_with(">") {
             let q = trimmed.trim_start_matches('>').trim();
-            out.push(TuiLine::styled(
-                format!("│ {q}"),
-                palette::META.add_modifier(Modifier::ITALIC),
-            ));
+            let quote = TuiLine::from(vec![
+                Span::styled("▏ ", palette::ACCENT),
+                Span::styled(q.to_string(), palette::QUOTE),
+            ]);
+            out.push(pad_to_width(quote, width, palette::BG_QUOTE));
         } else if trimmed.starts_with("- ") || trimmed.starts_with("* ") {
             let indent = list_indent(line, trimmed);
             let rest = &trimmed[2..];
@@ -129,7 +157,7 @@ pub fn render(text: &str, width: u16) -> Vec<TuiLine<'static>> {
     }
     if in_code {
         // unterminated fence: flush what we have
-        push_code_block(&mut out, &code_lines, &code_lang);
+        push_code_block(&mut out, &code_lines, &code_lang, width);
     }
     out
 }
@@ -451,10 +479,7 @@ pub fn inline_spans(s: &str) -> Vec<Span<'static>> {
             if let Some(end) = find_double(&chars, i + 2, '*') {
                 flush(&mut plain, &mut spans);
                 let bold: String = chars[i + 2..end].iter().collect();
-                spans.push(Span::styled(
-                    bold,
-                    Style::default().add_modifier(Modifier::BOLD),
-                ));
+                spans.push(Span::styled(bold, palette::STRONG));
                 i = end + 2;
                 continue;
             }
@@ -463,10 +488,7 @@ pub fn inline_spans(s: &str) -> Vec<Span<'static>> {
             if let Some(end) = chars[i + 1..].iter().position(|&x| x == '*') {
                 flush(&mut plain, &mut spans);
                 let italic: String = chars[i + 1..i + 1 + end].iter().collect();
-                spans.push(Span::styled(
-                    italic,
-                    Style::default().add_modifier(Modifier::ITALIC),
-                ));
+                spans.push(Span::styled(italic, palette::EM));
                 i += end + 2;
                 continue;
             }
@@ -505,7 +527,7 @@ fn parse_link(chars: &[char], start: usize) -> Option<(String, String, usize)> {
     Some((text, url, close_url + 1))
 }
 
-fn push_code_block(out: &mut Vec<TuiLine<'static>>, lines: &[String], lang: &str) {
+fn push_code_block(out: &mut Vec<TuiLine<'static>>, lines: &[String], lang: &str, width: u16) {
     if lines.is_empty() {
         return;
     }
@@ -514,20 +536,19 @@ fn push_code_block(out: &mut Vec<TuiLine<'static>>, lines: &[String], lang: &str
     } else {
         format!("╾─ {lang} ")
     };
-    out.push(TuiLine::styled(
+    let top = TuiLine::styled(
         format!("{label}{}", "─".repeat(12)),
         palette::META.bg(palette::BG_CODE),
-    ));
+    );
+    out.push(pad_to_width(top, width, palette::BG_CODE));
     for line in lines {
         let mut spans = vec![Span::styled(" ", code_bg())];
         spans.extend(highlight(line));
         spans.push(Span::styled(" ", code_bg()));
-        out.push(TuiLine::from(spans));
+        out.push(pad_to_width(TuiLine::from(spans), width, palette::BG_CODE));
     }
-    out.push(TuiLine::styled(
-        "╾────────────",
-        palette::META.bg(palette::BG_CODE),
-    ));
+    let bottom = TuiLine::styled("╾────────────", palette::META.bg(palette::BG_CODE));
+    out.push(pad_to_width(bottom, width, palette::BG_CODE));
 }
 
 const KEYWORDS: &[&str] = &[
@@ -636,8 +657,53 @@ mod tests {
     fn renders_headers_and_lists() {
         let md = "# Title\n\n- item one\n- **bold** item\n\n1. first\n2. second\n";
         let lines = render(md, 80);
-        assert_eq!(lines.len(), 7);
+        assert_eq!(lines.len(), 8, "title + rule + blank + 2 + blank + 2");
         assert!(format!("{:?}", lines[0]).contains("Title"));
+        assert!(format!("{:?}", lines[1]).contains('═'), "h1 rule row");
+    }
+
+    #[test]
+    fn h2_h3_and_h4_are_distinct() {
+        let lines = render("## mid\n### low\n#### deepest\n", 80);
+        let texts: Vec<String> = lines
+            .iter()
+            .map(|l| l.spans.iter().map(|s| s.content.to_string()).collect())
+            .collect();
+        assert!(texts[0].starts_with("▍ mid"), "h2 marker: {texts:?}");
+        assert_eq!(texts[1], "low");
+        assert_eq!(texts[2], "deepest");
+    }
+
+    #[test]
+    fn emphasis_uses_tinted_palette() {
+        let spans = inline_spans("**loud** and *soft*");
+        let joined = format!("{spans:?}");
+        assert!(
+            joined.contains("Rgb(236, 238, 242)"),
+            "strong near-white: {joined}"
+        );
+        assert!(
+            joined.contains("Rgb(152, 186, 208)"),
+            "em steel tint: {joined}"
+        );
+    }
+
+    #[test]
+    fn quotes_band_and_fill_width() {
+        let lines = render("> deep thought\n", 60);
+        let line = &lines[0];
+        let used: usize = line.spans.iter().map(|s| s.content.chars().count()).sum();
+        assert_eq!(used, 60, "quote fills the width");
+        assert!(format!("{line:?}").contains("Rgb(28, 32, 42)"), "band bg");
+    }
+
+    #[test]
+    fn code_block_lines_fill_width() {
+        let lines = render("```\nlet x = 1;\n```\n", 40);
+        for line in lines.iter().take(3) {
+            let used: usize = line.spans.iter().map(|s| s.content.chars().count()).sum();
+            assert_eq!(used, 40, "code row fills the width: {line:?}");
+        }
     }
 
     #[test]
