@@ -1,10 +1,11 @@
-//! Minimal markdown renderer for the TUI transcript, plus a tiny generic
-//! syntax highlighter for fenced code blocks. No dependencies — the
-//! footprint contract stays intact.
+//! Markdown renderer for the TUI transcript (tables, inline styling,
+//! code highlighting) plus a tiny generic syntax highlighter. The only
+//! dependency is unicode-width, already in the tree via ratatui.
 
 use crate::palette::{self, WARN};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line as TuiLine, Span};
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 fn code_bg() -> Style {
     Style::default().bg(palette::BG_CODE)
@@ -78,11 +79,20 @@ pub fn render(text: &str, width: u16) -> Vec<TuiLine<'static>> {
             continue;
         }
         if let Some(h) = trimmed.strip_prefix("### ") {
-            out.push(TuiLine::styled(h.to_string(), header_style(3)));
+            out.push(TuiLine::styled(
+                strip_atx_closer(h).to_string(),
+                header_style(3),
+            ));
         } else if let Some(h) = trimmed.strip_prefix("## ") {
-            out.push(TuiLine::styled(h.to_string(), header_style(2)));
+            out.push(TuiLine::styled(
+                strip_atx_closer(h).to_string(),
+                header_style(2),
+            ));
         } else if let Some(h) = trimmed.strip_prefix("# ") {
-            out.push(TuiLine::styled(h.to_string(), header_style(1)));
+            out.push(TuiLine::styled(
+                strip_atx_closer(h).to_string(),
+                header_style(1),
+            ));
         } else if trimmed.starts_with(">") {
             let q = trimmed.trim_start_matches('>').trim();
             out.push(TuiLine::styled(
@@ -145,15 +155,26 @@ fn task_marker(rest: &str) -> Option<(Span<'static>, &str)> {
     }
 }
 
-/// Setext underlines: `====` makes an h1, `----` an h2.
+/// Setext `====` underlines make an h1. `----` is deliberately NOT setext:
+/// assistants use `---` as a horizontal rule far more often than as a
+/// header underline, and a rule hijacked into a bold h2 reads as a bug.
 fn setext_level(s: &str) -> Option<usize> {
     let t = s.trim();
     if t.len() >= 2 && t.chars().all(|c| c == '=') {
         Some(1)
-    } else if t.len() >= 2 && t.chars().all(|c| c == '-') {
-        Some(2)
     } else {
         None
+    }
+}
+
+/// Strip a closing ATX sequence: `## Header ##` -> `Header`.
+fn strip_atx_closer(h: &str) -> &str {
+    let h = h.trim_end();
+    let stripped = h.trim_end_matches('#');
+    if stripped.len() < h.len() && stripped.chars().last().is_some_and(|c| c == ' ') {
+        stripped.trim_end()
+    } else {
+        h
     }
 }
 
@@ -199,7 +220,7 @@ fn parse_table(rows: &[&str]) -> Option<(Vec<String>, Vec<Vec<String>>)> {
     }
     let header = split_cells(rows[0]);
     let delim = split_cells(rows[1]);
-    if header.is_empty() || header.len() != delim.len() || !delim.iter().all(|c| is_delim_cell(c)) {
+    if header.is_empty() || delim.is_empty() || !delim.iter().all(|c| is_delim_cell(c)) {
         return None;
     }
     let body = rows[2..]
@@ -227,10 +248,10 @@ fn render_table(
     }
     let mut widths: Vec<usize> = (0..cols)
         .map(|c| {
-            let header_w = visible_len(&inline_spans(&header[c]));
+            let header_w = spans_width(&inline_spans(&header[c]));
             let body_w = body
                 .iter()
-                .map(|r| visible_len(&inline_spans(r.get(c).map(String::as_str).unwrap_or(""))))
+                .map(|r| spans_width(&inline_spans(r.get(c).map(String::as_str).unwrap_or(""))))
                 .max()
                 .unwrap_or(0);
             header_w.max(body_w).max(1)
@@ -256,9 +277,20 @@ fn render_table(
     let mut spans = vec![edge.clone()];
     for (c, h) in header.iter().enumerate() {
         spans.push(Span::styled(" ", palette::META));
-        for mut s in fit_spans(inline_spans(h), widths[c]) {
-            s.style = palette::ACCENT_BOLD;
-            spans.push(s);
+        let fitted: Vec<Span<'static>> = fit_spans(inline_spans(h), widths[c])
+            .into_iter()
+            .map(|mut s| {
+                s.style = palette::ACCENT_BOLD;
+                s
+            })
+            .collect();
+        let used = spans_width(&fitted);
+        spans.extend(fitted);
+        if widths[c] > used {
+            spans.push(Span::styled(
+                " ".repeat(widths[c] - used),
+                palette::ACCENT_BOLD,
+            ));
         }
         spans.push(Span::styled(" ", palette::META));
         if c + 1 < cols {
@@ -282,7 +314,12 @@ fn render_table(
         for (c, w) in widths.iter().enumerate() {
             spans.push(Span::styled(" ", palette::META));
             let cell = row.get(c).map(String::as_str).unwrap_or("");
-            spans.extend(fit_spans(inline_spans(cell), *w));
+            let fitted = fit_spans(inline_spans(cell), *w);
+            let used = spans_width(&fitted);
+            spans.extend(fitted);
+            if *w > used {
+                spans.push(Span::styled(" ".repeat(*w - used), Style::default()));
+            }
             spans.push(Span::styled(" ", palette::META));
             if c + 1 < cols {
                 spans.push(Span::styled("│", palette::META));
@@ -295,7 +332,8 @@ fn render_table(
     Some(lines)
 }
 
-/// Truncate styled spans to `w` visible chars, marking a cut with `…`.
+/// Truncate styled spans to `w` terminal columns (unicode display width,
+/// so CJK and emoji count as 2), marking a cut with `…`.
 fn fit_spans(spans: Vec<Span<'static>>, w: usize) -> Vec<Span<'static>> {
     let mut out = Vec::new();
     let mut left = w;
@@ -303,21 +341,35 @@ fn fit_spans(spans: Vec<Span<'static>>, w: usize) -> Vec<Span<'static>> {
         if left == 0 {
             break;
         }
-        let len = s.content.chars().count();
-        if len <= left {
-            left -= len;
+        let total = s.content.width();
+        if total <= left {
+            left -= total;
             out.push(s);
-        } else {
-            let cut: String = s.content.chars().take(left.saturating_sub(1)).collect();
-            out.push(Span::styled(format!("{cut}…"), s.style));
-            break;
+            continue;
         }
+        // span straddles the boundary: fit char by char
+        let mut acc = String::new();
+        let mut used = 0;
+        for ch in s.content.chars() {
+            let cw = ch.width().unwrap_or(0);
+            if used + cw > left.saturating_sub(1) {
+                break;
+            }
+            acc.push(ch);
+            used += cw;
+        }
+        if !acc.is_empty() {
+            out.push(Span::styled(acc, s.style));
+        }
+        out.push(Span::styled("…", s.style));
+        break;
     }
     out
 }
 
-fn visible_len(spans: &[Span<'static>]) -> usize {
-    spans.iter().map(|s| s.content.chars().count()).sum()
+/// Terminal-column width of styled spans.
+fn spans_width(spans: &[Span<'static>]) -> usize {
+    spans.iter().map(|s| s.content.width()).sum()
 }
 
 fn is_numbered_item(s: &str) -> bool {
@@ -517,15 +569,22 @@ pub fn highlight(line: &str) -> Vec<Span<'static>> {
                 }
             }
         }
-        // string literal
+        // string literal. An opening quote only starts a string when it is
+        // not glued to a word (don't, it's — apostrophes) AND closes on the
+        // same line; otherwise it is a literal character: keep scanning.
         if let Some(quote_pos) = rest.find(['"', '\'']) {
-            let quote = rest.as_bytes()[quote_pos];
-            if quote_pos > 0 {
-                highlight_plain(&rest[..quote_pos], bg, &mut spans);
-            }
+            let quote = rest.as_bytes()[quote_pos] as char;
+            let in_word = quote_pos > 0
+                && rest[..quote_pos]
+                    .chars()
+                    .next_back()
+                    .is_some_and(|c| c.is_alphanumeric() || c == '_');
             let after = &rest[quote_pos + 1..];
-            match after.find(quote as char) {
-                Some(end) => {
+            match after.find(quote) {
+                Some(end) if !in_word => {
+                    if quote_pos > 0 {
+                        highlight_plain(&rest[..quote_pos], bg, &mut spans);
+                    }
                     spans.push(Span::styled(
                         rest[quote_pos..quote_pos + 1 + end + 1].to_string(),
                         palette::OK.bg(palette::BG_CODE),
@@ -533,12 +592,15 @@ pub fn highlight(line: &str) -> Vec<Span<'static>> {
                     rest = &after[end + 1..];
                     continue 'outer;
                 }
-                None => {
-                    spans.push(Span::styled(
-                        rest[quote_pos..].to_string(),
-                        palette::OK.bg(palette::BG_CODE),
-                    ));
-                    break;
+                _ => {
+                    // mid-word apostrophe or unclosed quote: emit the prefix
+                    // and the quote itself as plain code, then keep looking
+                    if quote_pos > 0 {
+                        highlight_plain(&rest[..quote_pos], bg, &mut spans);
+                    }
+                    spans.push(Span::styled(quote.to_string(), bg));
+                    rest = &rest[quote_pos + 1..];
+                    continue 'outer;
                 }
             }
         }
@@ -704,13 +766,58 @@ mod tests {
     }
 
     #[test]
-    fn setext_underlines_make_headers() {
+    fn setext_equals_makes_header_dash_stays_rule() {
         let h1 = render("Title\n=====\n", 80);
         assert!(format!("{h1:?}").contains("bold()"), "{h1:?}");
-        let h2 = render("Sub\n---\n", 80);
-        let joined = format!("{h2:?}");
+        // `---` after text is a horizontal rule, never a hijacked header
+        let out = render("Sub\n---\n", 80);
+        let joined = format!("{out:?}");
         assert!(joined.contains("Sub"), "{joined}");
-        assert!(!joined.contains("─"), "underline consumed: {joined}");
+        assert!(joined.contains("─"), "rule preserved: {joined}");
+        assert!(!joined.contains("bold()"), "no bold header: {joined}");
+    }
+
+    #[test]
+    fn atx_closing_hashes_are_stripped() {
+        let lines = render("## Heading ##\n", 80);
+        let joined = format!("{lines:?}");
+        assert!(joined.contains("Heading"), "{joined}");
+        assert!(!joined.contains("##"), "closing hashes consumed: {joined}");
+    }
+
+    #[test]
+    fn apostrophes_do_not_open_code_strings() {
+        // `don't` must not open a green string that swallows the line
+        let spans = highlight("greet(\"hi\"); // don't panic");
+        let joined = format!("{spans:?}");
+        assert!(
+            joined.contains("Rgb(120, 120, 128)"),
+            "comment colored: {joined}"
+        );
+        // an unclosed quote must not color the rest of the line
+    }
+
+    #[test]
+    fn table_rows_align_to_column_width() {
+        let md = "| Language | Year |\n|---|---|\n| Rust | 2010 |\n| Go | 2009 |\n";
+        let lines = render(md, 60);
+        let bar_cols: Vec<Vec<usize>> = lines
+            .iter()
+            .filter_map(|l| {
+                let mut cols = Vec::new();
+                let mut n = 0;
+                for s in &l.spans {
+                    if s.content.contains('│') {
+                        cols.push(n);
+                    }
+                    n += s.content.chars().count();
+                }
+                (!cols.is_empty()).then_some(cols)
+            })
+            .collect();
+        // header + 2 body rows: every bar-bearing row sits at identical columns
+        assert!(bar_cols.len() >= 3, "{bar_cols:?}");
+        assert!(bar_cols.windows(2).all(|w| w[0] == w[1]), "{bar_cols:?}");
     }
 
     #[test]
