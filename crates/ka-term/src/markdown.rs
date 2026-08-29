@@ -59,9 +59,7 @@ pub fn render(text: &str) -> Vec<TuiLine<'static>> {
             let q = trimmed.trim_start_matches('>').trim();
             out.push(TuiLine::styled(
                 format!("│ {q}"),
-                Style::default()
-                    .fg(Color::DarkGray)
-                    .add_modifier(Modifier::ITALIC),
+                palette::META.add_modifier(Modifier::ITALIC),
             ));
         } else if trimmed.starts_with("- ") || trimmed.starts_with("* ") {
             let rest = &trimmed[2..];
@@ -320,6 +318,9 @@ mod tests {
             "keyword colored: {joined}"
         );
         assert!(joined.contains("yellow()"), "number colored: {joined}");
-        assert!(joined.contains("dark_gray()"), "comment colored: {joined}");
+        assert!(
+            joined.contains("Rgb(120, 120, 128)"),
+            "comment colored: {joined}"
+        );
     }
 }

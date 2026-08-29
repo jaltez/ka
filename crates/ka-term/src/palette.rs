@@ -2,8 +2,10 @@
 use ratatui::style::{Color, Modifier, Style};
 
 pub const TEXT: Style = Style::new().fg(Color::Gray); // base body text
-pub const META: Style = Style::new().fg(Color::DarkGray); // footer, titles, hints, rules
-pub const BORDER: Style = Style::new().fg(Color::DarkGray); // all block borders
+// fixed RGB (not the DarkGray palette slot): several terminal schemes map
+// ANSI bright-black near the background, which rendered chrome invisible
+pub const META: Style = Style::new().fg(Color::Rgb(120, 120, 128)); // footer, titles, hints, rules
+pub const BORDER: Style = Style::new().fg(Color::Rgb(120, 120, 128)); // all block borders
 pub const ACCENT: Style = Style::new().fg(Color::Cyan); // selection, filter, cursor, spinner
 pub const ACCENT_BOLD: Style = Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD);
 pub const WARN: Style = Style::new().fg(Color::Yellow); // busy/attention
@@ -28,5 +30,5 @@ pub const BG_CODE_INLINE: Color = Color::Rgb(48, 44, 30); // inline code fill (k
 pub const KEYWORD: Style = Style::new().fg(Color::LightMagenta);
 
 pub const PLACEHOLDER: Style = Style::new()
-    .fg(Color::DarkGray)
+    .fg(Color::Rgb(120, 120, 128))
     .add_modifier(Modifier::ITALIC);
