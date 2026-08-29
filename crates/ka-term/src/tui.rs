@@ -305,7 +305,7 @@ fn render_line(line: &Line, width: u16) -> Vec<ratatui::text::Line<'static>> {
                 ratatui::text::Span::styled("▍ ", crate::palette::LABEL_ASSISTANT),
                 ratatui::text::Span::styled("ka", crate::palette::LABEL_ASSISTANT),
             ]));
-            out.extend(crate::markdown::render(text));
+            out.extend(crate::markdown::render(text, width));
             out.push(TuiLine::default());
         }
         Line::Thought(text) => {
@@ -709,7 +709,7 @@ async fn app(
 
     let mut transcript = Transcript::default();
     let mut scroll: Option<usize> = None;
-    let mut view_rows: usize = 0;
+    let mut view_rows;
     let mut input = InputBuffer::default();
     let mut meters = Meters {
         model: initial_model.to_string(),
@@ -718,7 +718,7 @@ async fn app(
     };
     let mut busy = false;
     let mut busy_since: Option<Instant> = None;
-    let mut live_cache: Option<(String, Vec<ratatui::text::Line<'static>>, Instant)> = None;
+    let mut live_cache: Option<(String, u16, Vec<ratatui::text::Line<'static>>, Instant)> = None;
     let mut turn_ended = false;
     let mut pending: Option<PendingAsk> = None;
     let mut pending_turn_cost = 0.0f64;
@@ -739,35 +739,39 @@ async fn app(
         let busy_now = busy;
         let ask = pending.clone();
         let input_snapshot = input.text.clone();
+        let (term_w, term_h) = match terminal.size() {
+            Ok(s) => (s.width, s.height),
+            Err(_) => (80, 24),
+        };
+        let md_width = term_w.saturating_sub(2);
+        transcript.set_width(md_width);
+        let input_h = input_height(input.text.split('\n').count());
+        view_rows = visible_rows(term_h, input_h);
         let live = if busy_now {
             let now = Instant::now();
             let stale = live_cache
                 .as_ref()
-                .map(|(_, _, at)| live_stale(*at, now))
+                .map(|(_, _, _, at)| live_stale(*at, now))
                 .unwrap_or(true);
             let changed = live_cache
                 .as_ref()
-                .is_none_or(|(t, _, _)| t != &current_assistant);
+                .is_none_or(|(t, w, _, _)| t != &current_assistant || *w != md_width);
             if changed && (stale || turn_ended) {
                 live_cache = Some((
                     current_assistant.clone(),
-                    crate::markdown::render(&current_assistant),
+                    md_width,
+                    crate::markdown::render(&current_assistant, md_width),
                     now,
                 ));
             }
             live_cache
                 .as_ref()
-                .map(|(_, rows, _)| (current_thought.clone(), rows.clone()))
+                .map(|(_, _, rows, _)| (current_thought.clone(), rows.clone()))
         } else {
             live_cache = None;
             None
         };
         turn_ended = false;
-        if let Ok(size) = terminal.size() {
-            transcript.set_width(size.width.saturating_sub(2));
-            let input_h = input_height(input.text.split('\n').count());
-            view_rows = visible_rows(size.height, input_h);
-        }
         let cursor = input.cursor;
         terminal.draw(|frame| {
             render(
