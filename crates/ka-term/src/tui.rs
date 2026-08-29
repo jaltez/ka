@@ -302,25 +302,13 @@ fn render_line(line: &Line, width: u16) -> Vec<ratatui::text::Line<'static>> {
         Line::User(text) => push_block(&mut out, text, width),
         Line::Assistant(text) => {
             // assistant output on a subtle full-width surface: background
-            // fill only, never border glyphs
-            use unicode_width::UnicodeWidthStr;
+            // fill only, never border glyphs; the trailing gap row carries
+            // the same fill so empty rows stay uniform
             let bg = crate::palette::BG_OUTPUT;
             let mut rows = crate::markdown::render(text, width);
-            for row in rows.iter_mut() {
-                for s in row.spans.iter_mut() {
-                    s.style = s.style.bg(bg);
-                }
-                let used: usize = row.spans.iter().map(|s| s.content.width()).sum();
-                let w = width as usize;
-                if w > used {
-                    row.spans.push(ratatui::text::Span::styled(
-                        " ".repeat(w - used),
-                        ratatui::style::Style::new().bg(bg),
-                    ));
-                }
-            }
+            apply_output_surface(&mut rows, width, bg);
             out.extend(rows);
-            out.push(TuiLine::default()); // unfilled gap between entries
+            out.push(surface_blank(width, bg));
         }
         Line::Thought(text) => push_gutter(&mut out, text, width, "⋯ ", crate::palette::THOUGHT),
         Line::Tool(text) => push_gutter(&mut out, text, width, "⚙ ", crate::palette::META),
@@ -1695,12 +1683,20 @@ fn render(
             }
         }
         // cached markdown rows (clone-on-append; the cache stays cursor-free)
-        live_rows.extend(md_rows.iter().cloned());
+        // live markdown rows get the same surface as final output; the
+        // cursor is appended first so the surface pads around it
         if !md_rows.is_empty() {
-            if let Some(last) = live_rows.last_mut() {
+            let mut md_live: Vec<TuiLine> = md_rows.to_vec();
+            if let Some(last) = md_live.last_mut() {
                 last.spans
                     .push(Span::styled("▌", crate::palette::ACCENT_STYLE));
             }
+            apply_output_surface(
+                &mut md_live,
+                frame.area().width.saturating_sub(2),
+                crate::palette::BG_OUTPUT,
+            );
+            live_rows.extend(md_live);
         }
     }
 
@@ -2117,6 +2113,37 @@ fn render(
     }
 }
 
+/// Merge a background into every span and pad each row to the full
+/// transcript width — the assistant "slab", a fill with no border glyphs.
+fn apply_output_surface(
+    rows: &mut [ratatui::text::Line<'static>],
+    width: u16,
+    bg: ratatui::style::Color,
+) {
+    use unicode_width::UnicodeWidthStr;
+    for row in rows.iter_mut() {
+        for s in row.spans.iter_mut() {
+            s.style = s.style.bg(bg);
+        }
+        let used: usize = row.spans.iter().map(|s| s.content.width()).sum();
+        let w = width as usize;
+        if w > used {
+            row.spans.push(ratatui::text::Span::styled(
+                " ".repeat(w - used),
+                ratatui::style::Style::new().bg(bg),
+            ));
+        }
+    }
+}
+
+/// An empty row carrying only the surface background.
+fn surface_blank(width: u16, bg: ratatui::style::Color) -> ratatui::text::Line<'static> {
+    ratatui::text::Line::styled(
+        " ".repeat(width as usize),
+        ratatui::style::Style::new().bg(bg),
+    )
+}
+
 /// Full-width band for user messages — the only edge-to-edge role
 /// (OMP userMsgBg: warm dark, amber prompt glyph, default text).
 fn push_block(out: &mut Vec<ratatui::text::Line<'static>>, text: &str, width: u16) {
@@ -2158,7 +2185,7 @@ fn push_block(out: &mut Vec<ratatui::text::Line<'static>>, text: &str, width: u1
             start = end;
         }
     }
-    out.push(TuiLine::default()); // spacing after each block
+    out.push(surface_blank(width, crate::palette::BG_USER)); // spacing after each block
 }
 
 /// Gutter-prefixed rows for ambient roles (thought/tool/note): no
@@ -2711,7 +2738,7 @@ mod tests {
     #[test]
     fn assistant_entry_fills_output_surface() {
         // assistant rows carry the output background and fill the width;
-        // the trailing gap row stays unfilled to separate entries
+        // the trailing gap row carries the same fill: empty rows stay uniform
         let out = super::render_line(&Line::Assistant("**hi** there".into()), 40);
         let text: String = out[0].spans.iter().map(|s| s.content.to_string()).collect();
         assert_eq!(text.trim_end(), "hi there");
@@ -2720,7 +2747,19 @@ mod tests {
         let slab = format!("{:?}", out[0]);
         assert!(slab.contains("Rgb(22, 26, 31)"), "output bg: {slab}");
         assert!(out.len() >= 2);
-        assert!(out.last().is_some_and(|l| l.spans.is_empty()), "gap row");
+        let gap = out.last().unwrap();
+        assert_eq!(
+            gap.style.bg,
+            Some(ratatui::style::Color::Rgb(22, 26, 31)),
+            "gap row filled: {gap:?}"
+        );
+        assert_eq!(
+            gap.spans
+                .iter()
+                .map(|s| s.content.chars().count())
+                .sum::<usize>(),
+            40
+        );
     }
 
     #[test]
