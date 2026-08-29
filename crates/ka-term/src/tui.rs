@@ -301,18 +301,19 @@ fn render_line(line: &Line, width: u16) -> Vec<ratatui::text::Line<'static>> {
     match line {
         Line::User(text) => push_block(&mut out, text, width),
         Line::Assistant(text) => {
-            out.push(TuiLine::from(vec![ratatui::text::Span::styled(
-                " ▍ ka ",
-                crate::palette::LABEL_ASSISTANT.bg(crate::palette::BG_ASSIST_LABEL),
-            )]));
+            // OMP-style: assistant output is plain and quiet — no label
             out.extend(crate::markdown::render(text, width));
             out.push(TuiLine::default());
         }
-        Line::Thought(text) => {
-            push_gutter(&mut out, text, width, "⋯ ", crate::palette::LABEL_THOUGHT)
-        }
-        Line::Tool(text) => push_gutter(&mut out, text, width, "⚙ ", crate::palette::LABEL_TOOL),
-        Line::Note(text) => push_gutter(&mut out, text, width, "! ", crate::palette::LABEL_NOTE),
+        Line::Thought(text) => push_gutter(&mut out, text, width, "⋯ ", crate::palette::THOUGHT),
+        Line::Tool(text) => push_gutter(&mut out, text, width, "⚙ ", crate::palette::META),
+        Line::Note(text) => push_gutter(
+            &mut out,
+            text,
+            width,
+            "! ",
+            ratatui::style::Style::new().fg(crate::palette::ERR),
+        ),
     }
     out
 }
@@ -1673,17 +1674,15 @@ fn render(
                 .rev()
                 .collect();
             for l in tail {
-                live_rows.push(TuiLine::styled(
-                    format!("⋯ {l}"),
-                    crate::palette::LABEL_THOUGHT,
-                ));
+                live_rows.push(TuiLine::styled(format!("⋯ {l}"), crate::palette::THOUGHT));
             }
         }
         // cached markdown rows (clone-on-append; the cache stays cursor-free)
         live_rows.extend(md_rows.iter().cloned());
         if !md_rows.is_empty() {
             if let Some(last) = live_rows.last_mut() {
-                last.spans.push(Span::styled("▌", crate::palette::ACCENT));
+                last.spans
+                    .push(Span::styled("▌", crate::palette::ACCENT_STYLE));
             }
         }
     }
@@ -1733,9 +1732,9 @@ fn render(
     let input_border = if modal.is_some() || popup.is_some() {
         crate::palette::META
     } else if busy {
-        crate::palette::WARN
+        ratatui::style::Style::new().fg(crate::palette::WARN)
     } else {
-        crate::palette::ACCENT
+        crate::palette::BORDER
     };
     // shared horizontal window: all rows shift together so the cursor
     // row can always show the cursor
@@ -1753,14 +1752,12 @@ fn render(
             .map(|r| TuiLine::from(r.chars().skip(scroll_col).collect::<String>()))
             .collect()
     };
-    let input_widget = Paragraph::new(body)
-        .style(ratatui::style::Style::default().bg(crate::palette::BG_INPUT))
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(ratatui::text::Line::from(title).style(crate::palette::META))
-                .border_style(input_border),
-        );
+    let input_widget = Paragraph::new(body).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(ratatui::text::Line::from(title).style(crate::palette::META))
+            .border_style(input_border),
+    );
     frame.render_widget(input_widget, chunks[1]);
     let area = chunks[1];
     frame.set_cursor_position((
@@ -1799,7 +1796,7 @@ fn render(
             let style = if i == popup.selected {
                 crate::palette::ACCENT_BOLD
             } else {
-                crate::palette::TEXT
+                ratatui::style::Style::default()
             };
             let desc_trim: String = desc.chars().take(32).collect();
             text.push(TuiLine::styled(
@@ -1828,14 +1825,16 @@ fn render(
         frame.render_widget(Clear, rect);
         let mut text = vec![TuiLine::styled(
             ask.question.clone(),
-            crate::palette::WARN.add_modifier(Modifier::BOLD),
+            ratatui::style::Style::new()
+                .fg(crate::palette::WARN)
+                .add_modifier(Modifier::BOLD),
         )];
         for (i, opt) in ask.options.iter().enumerate() {
             let marker = if i == ask.selected { "▶ " } else { "  " };
             let style = if i == ask.selected {
                 crate::palette::ACCENT_BOLD
             } else {
-                crate::palette::TEXT
+                ratatui::style::Style::default()
             };
             text.push(TuiLine::styled(format!("{marker}{opt}"), style));
         }
@@ -1864,15 +1863,15 @@ fn render(
                 let rect = centered(width, height, frame.area());
                 frame.render_widget(Clear, rect);
                 let mut text = vec![TuiLine::from(vec![
-                    Span::styled("filter: ", crate::palette::TEXT),
-                    Span::styled(picker.filter.clone(), crate::palette::ACCENT),
+                    Span::styled("filter: ", ratatui::style::Style::default()),
+                    Span::styled(picker.filter.clone(), crate::palette::ACCENT_STYLE),
                 ])];
                 for (i, (label, detail)) in rows.iter().take((height as usize) - 4).enumerate() {
                     let marker = if i == picker.selected { "▶ " } else { "  " };
                     let style = if i == picker.selected {
                         crate::palette::ACCENT_BOLD
                     } else {
-                        crate::palette::TEXT
+                        ratatui::style::Style::default()
                     };
                     text.push(TuiLine::styled(
                         format!("{marker}{label}  —  {detail}"),
@@ -1911,16 +1910,19 @@ fn render(
                 let mut text = Vec::new();
                 for (k, v) in keys {
                     text.push(TuiLine::from(vec![
-                        Span::styled(format!("{k:<12} "), crate::palette::ACCENT),
-                        Span::styled(v.to_string(), crate::palette::TEXT),
+                        Span::styled(format!("{k:<12} "), crate::palette::ACCENT_STYLE),
+                        Span::styled(v.to_string(), ratatui::style::Style::default()),
                     ]));
                 }
                 text.push(TuiLine::default());
-                text.push(TuiLine::styled("commands:", crate::palette::TEXT));
+                text.push(TuiLine::styled(
+                    "commands:",
+                    ratatui::style::Style::default(),
+                ));
                 for (name, desc) in available_slash_commands() {
                     text.push(TuiLine::from(vec![
-                        Span::styled(format!("{name:<12} "), crate::palette::ACCENT),
-                        Span::styled(desc, crate::palette::TEXT),
+                        Span::styled(format!("{name:<12} "), crate::palette::ACCENT_STYLE),
+                        Span::styled(desc, ratatui::style::Style::default()),
                     ]));
                 }
                 let widget = Paragraph::new(text)
@@ -1940,8 +1942,8 @@ fn render(
                 let rect = centered(width, height, frame.area());
                 frame.render_widget(Clear, rect);
                 let mut text = vec![TuiLine::from(vec![
-                    Span::styled("filter: ", crate::palette::TEXT),
-                    Span::styled(picker.filter.clone(), crate::palette::ACCENT),
+                    Span::styled("filter: ", ratatui::style::Style::default()),
+                    Span::styled(picker.filter.clone(), crate::palette::ACCENT_STYLE),
                 ])];
                 let cap = (height as usize).saturating_sub(4);
                 for (i, m) in rows.iter().take(cap).enumerate() {
@@ -1949,7 +1951,7 @@ fn render(
                     let style = if i == picker.selected {
                         crate::palette::ACCENT_BOLD
                     } else {
-                        crate::palette::TEXT
+                        ratatui::style::Style::default()
                     };
                     let ctx = if m.context > 0 {
                         format!("{}k", m.context / 1000)
@@ -2003,7 +2005,7 @@ fn render(
                 let rect = centered(width, height, frame.area());
                 frame.render_widget(Clear, rect);
                 let sel = crate::palette::ACCENT_BOLD;
-                let dim = crate::palette::TEXT;
+                let dim = ratatui::style::Style::new().fg(crate::palette::MUTED);
                 let marker =
                     |i: usize| -> &'static str { if i == panel.selected { "▶ " } else { "  " } };
                 let mode_str = match panel.mode {
@@ -2024,7 +2026,9 @@ fn render(
                     None => format!("{}model    {}", marker(0), panel.model),
                 };
                 let model_style = if editing {
-                    crate::palette::WARN.add_modifier(Modifier::BOLD)
+                    ratatui::style::Style::new()
+                        .fg(crate::palette::WARN)
+                        .add_modifier(Modifier::BOLD)
                 } else if panel.selected == 0 {
                     sel
                 } else {
@@ -2053,7 +2057,10 @@ fn render(
                     "enter edit/cycle · s save to config · esc close"
                 };
                 text.push(TuiLine::styled(hint, crate::palette::META));
-                text.push(TuiLine::styled("providers:", crate::palette::TEXT));
+                text.push(TuiLine::styled(
+                    "providers:",
+                    ratatui::style::Style::default(),
+                ));
                 let url_room = (width.saturating_sub(38)) as usize;
                 for p in &panel.providers {
                     let key = if p.env_var.is_empty() {
@@ -2093,12 +2100,16 @@ fn render(
     }
 }
 
-/// Full-width band for user messages — the only edge-to-edge role.
+/// Full-width band for user messages — the only edge-to-edge role
+/// (OMP userMsgBg: warm dark, amber prompt glyph, default text).
 fn push_block(out: &mut Vec<ratatui::text::Line<'static>>, text: &str, width: u16) {
     use ratatui::text::Line as TuiLine;
+    use ratatui::text::Span;
 
-    let prefix = "❯ ";
-    let style = crate::palette::LABEL_USER.bg(crate::palette::BG_USER);
+    let lead_style = ratatui::style::Style::new()
+        .fg(crate::palette::ACCENT)
+        .bg(crate::palette::BG_USER);
+    let body_style = ratatui::style::Style::new().bg(crate::palette::BG_USER);
     // the band spans the full transcript width, edge to edge
     let usable = width as usize;
     for (li, raw) in text.lines().enumerate() {
@@ -2109,15 +2120,21 @@ fn push_block(out: &mut Vec<ratatui::text::Line<'static>>, text: &str, width: u1
             // the prefix goes on the very first segment of the message;
             // every later segment (wrapped or a new source line) indents
             let first = li == 0 && start == 0;
-            let lead = if first { prefix } else { "  " };
+            let lead = if first { "❯ " } else { "  " };
             // max(1) guarantees forward progress even at degenerate
             // widths (0/1 columns) where the lead alone overflows
-            let room = usable.saturating_sub(lead.chars().count()).max(1);
+            let room = usable.saturating_sub(2).max(1);
             let end = (start + room).min(chars.len());
-            let mut segment: String = chars[start..end].iter().collect();
-            let pad = usable.saturating_sub(segment.chars().count() + lead.chars().count());
-            segment.push_str(&" ".repeat(pad));
-            out.push(TuiLine::styled(format!("{lead}{segment}"), style));
+            let segment: String = chars[start..end].iter().collect();
+            let pad = usable.saturating_sub(segment.chars().count() + 2);
+            let mut spans = vec![
+                Span::styled(lead.to_string(), lead_style),
+                Span::styled(segment, body_style),
+            ];
+            if pad > 0 {
+                spans.push(Span::styled(" ".repeat(pad), body_style));
+            }
+            out.push(TuiLine::from(spans));
             if end >= chars.len() {
                 break;
             }
@@ -2644,7 +2661,7 @@ mod tests {
         }
 
         let mut out: Vec<TuiLine> = Vec::new();
-        push_gutter(&mut out, "short text", 40, "⚙ ", crate::palette::LABEL_TOOL);
+        push_gutter(&mut out, "short text", 40, "⚙ ", crate::palette::META);
         assert_eq!(out.len(), 2, "one row + trailing blank");
         assert!(row_width(&out[0]) <= 40, "gutter rows never pad to width");
 
@@ -2655,7 +2672,7 @@ mod tests {
             &"x".repeat(100),
             40,
             "⋯ ",
-            crate::palette::LABEL_THOUGHT,
+            crate::palette::THOUGHT,
         );
         assert!(out2.len() > 2);
         for (i, line) in out2.iter().take(3).enumerate() {
@@ -2664,17 +2681,23 @@ mod tests {
 
         // degenerate width still terminates
         let mut out3: Vec<TuiLine> = Vec::new();
-        push_gutter(&mut out3, "abc", 0, "! ", crate::palette::LABEL_NOTE);
+        push_gutter(
+            &mut out3,
+            "abc",
+            0,
+            "! ",
+            ratatui::style::Style::new().fg(crate::palette::ERR),
+        );
         assert!(!out3.is_empty());
     }
 
     #[test]
-    fn assistant_entry_starts_with_label_row() {
+    fn assistant_entry_is_plain_markdown() {
+        // OMP style: no label chip, markdown starts immediately
         let out = super::render_line(&Line::Assistant("**hi** there".into()), 40);
         let text: String = out[0].spans.iter().map(|s| s.content.to_string()).collect();
-        assert_eq!(text, " ▍ ka ", "chip-wrapped label");
-        // markdown body follows, then the trailing blank
-        assert!(out.len() >= 3);
+        assert_eq!(text, "hi there");
+        assert!(out.len() >= 2);
     }
 
     #[test]
@@ -2704,7 +2727,7 @@ mod tests {
         use ratatui::text::Line as TuiLine;
 
         let mut out: Vec<TuiLine> = Vec::new();
-        push_gutter(&mut out, "one\ntwo", 40, "⚙ ", crate::palette::LABEL_TOOL);
+        push_gutter(&mut out, "one\ntwo", 40, "⚙ ", crate::palette::META);
         let text = |l: &TuiLine| {
             l.spans
                 .iter()
