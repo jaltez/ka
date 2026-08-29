@@ -2,11 +2,12 @@
 //! syntax highlighter for fenced code blocks. No dependencies — the
 //! footprint contract stays intact.
 
+use crate::palette::{self, WARN};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line as TuiLine, Span};
 
 fn code_bg() -> Style {
-    Style::default().bg(Color::Rgb(28, 30, 36))
+    Style::default().bg(palette::BG_CODE)
 }
 
 fn header_style(level: usize) -> Style {
@@ -14,10 +15,8 @@ fn header_style(level: usize) -> Style {
         1 => Style::default()
             .fg(Color::White)
             .add_modifier(Modifier::BOLD),
-        2 => Style::default()
-            .fg(Color::Cyan)
-            .add_modifier(Modifier::BOLD),
-        _ => Style::default().fg(Color::Cyan),
+        2 => palette::ACCENT_BOLD,
+        _ => palette::ACCENT,
     }
 }
 
@@ -66,22 +65,16 @@ pub fn render(text: &str) -> Vec<TuiLine<'static>> {
             ));
         } else if trimmed.starts_with("- ") || trimmed.starts_with("* ") {
             let rest = &trimmed[2..];
-            let mut spans = vec![Span::styled("• ", Style::default().fg(Color::Yellow))];
+            let mut spans = vec![Span::styled("• ", WARN)];
             spans.extend(inline_spans(rest));
             out.push(TuiLine::from(spans));
         } else if is_numbered_item(trimmed) {
             let (num, rest) = trimmed.split_once(". ").unwrap_or(("1", trimmed));
-            let mut spans = vec![Span::styled(
-                format!("{num}. "),
-                Style::default().fg(Color::Yellow),
-            )];
+            let mut spans = vec![Span::styled(format!("{num}. "), WARN)];
             spans.extend(inline_spans(rest));
             out.push(TuiLine::from(spans));
         } else if trimmed == "---" || trimmed == "***" {
-            out.push(TuiLine::styled(
-                "─".repeat(40),
-                Style::default().fg(Color::DarkGray),
-            ));
+            out.push(TuiLine::styled("─".repeat(40), palette::META));
         } else {
             out.push(TuiLine::from(inline_spans(line)));
         }
@@ -117,9 +110,7 @@ pub fn inline_spans(s: &str) -> Vec<Span<'static>> {
                 let code: String = chars[i + 1..i + 1 + end].iter().collect();
                 spans.push(Span::styled(
                     format!(" {code} "),
-                    Style::default()
-                        .fg(Color::Yellow)
-                        .bg(Color::Rgb(48, 44, 30)),
+                    WARN.bg(palette::BG_CODE_INLINE),
                 ));
                 i += end + 2;
                 continue;
@@ -178,9 +169,7 @@ fn push_code_block(out: &mut Vec<TuiLine<'static>>, lines: &[String], lang: &str
     };
     out.push(TuiLine::styled(
         format!("{label}{}", "─".repeat(12)),
-        Style::default()
-            .fg(Color::DarkGray)
-            .bg(Color::Rgb(28, 30, 36)),
+        palette::META.bg(palette::BG_CODE),
     ));
     for line in lines {
         let mut spans = vec![Span::styled(" ", code_bg())];
@@ -190,9 +179,7 @@ fn push_code_block(out: &mut Vec<TuiLine<'static>>, lines: &[String], lang: &str
     }
     out.push(TuiLine::styled(
         "╾────────────",
-        Style::default()
-            .fg(Color::DarkGray)
-            .bg(Color::Rgb(28, 30, 36)),
+        palette::META.bg(palette::BG_CODE),
     ));
 }
 
@@ -229,9 +216,7 @@ pub fn highlight(line: &str) -> Vec<Span<'static>> {
                     }
                     spans.push(Span::styled(
                         rest[pos..].to_string(),
-                        Style::default()
-                            .fg(Color::DarkGray)
-                            .bg(Color::Rgb(28, 30, 36)),
+                        palette::META.bg(palette::BG_CODE),
                     ));
                     return spans;
                 }
@@ -248,7 +233,7 @@ pub fn highlight(line: &str) -> Vec<Span<'static>> {
                 Some(end) => {
                     spans.push(Span::styled(
                         rest[quote_pos..quote_pos + 1 + end + 1].to_string(),
-                        Style::default().fg(Color::Green).bg(Color::Rgb(28, 30, 36)),
+                        palette::OK.bg(palette::BG_CODE),
                     ));
                     rest = &after[end + 1..];
                     continue 'outer;
@@ -256,7 +241,7 @@ pub fn highlight(line: &str) -> Vec<Span<'static>> {
                 None => {
                     spans.push(Span::styled(
                         rest[quote_pos..].to_string(),
-                        Style::default().fg(Color::Green).bg(Color::Rgb(28, 30, 36)),
+                        palette::OK.bg(palette::BG_CODE),
                     ));
                     break;
                 }
@@ -274,17 +259,10 @@ fn highlight_plain(chunk: &str, bg: Style, spans: &mut Vec<Span<'static>>) {
         if KEYWORDS.contains(&bare) {
             spans.push(Span::styled(
                 token.to_string(),
-                Style::default()
-                    .fg(Color::LightMagenta)
-                    .bg(Color::Rgb(28, 30, 36)),
+                palette::KEYWORD.bg(palette::BG_CODE),
             ));
         } else if !bare.is_empty() && bare.chars().next().is_some_and(|c| c.is_ascii_digit()) {
-            spans.push(Span::styled(
-                token.to_string(),
-                Style::default()
-                    .fg(Color::Yellow)
-                    .bg(Color::Rgb(28, 30, 36)),
-            ));
+            spans.push(Span::styled(token.to_string(), WARN.bg(palette::BG_CODE)));
         } else {
             spans.push(Span::styled(token.to_string(), bg));
         }

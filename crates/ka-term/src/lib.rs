@@ -7,6 +7,7 @@ use std::io;
 use crossterm::event::{Event as TermEvent, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
 pub mod markdown;
+pub mod palette;
 pub mod tui;
 
 /// A decoded keypress, surface-agnostic.

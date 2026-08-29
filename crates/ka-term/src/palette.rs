@@ -1,0 +1,32 @@
+//! Central dark-mode palette. Every TUI color decision lives here.
+use ratatui::style::{Color, Modifier, Style};
+
+pub const TEXT: Style = Style::new().fg(Color::Gray); // base body text
+pub const META: Style = Style::new().fg(Color::DarkGray); // footer, titles, hints, rules
+pub const BORDER: Style = Style::new().fg(Color::DarkGray); // all block borders
+pub const ACCENT: Style = Style::new().fg(Color::Cyan); // selection, filter, cursor, spinner
+pub const ACCENT_BOLD: Style = Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD);
+pub const WARN: Style = Style::new().fg(Color::Yellow); // busy/attention
+pub const OK: Style = Style::new().fg(Color::Green);
+pub const ERR: Style = Style::new().fg(Color::LightRed);
+
+// role labels (soft pastels) + user band fill
+pub const LABEL_USER: Style = Style::new().fg(Color::LightBlue);
+pub const BG_USER: Color = Color::Rgb(32, 44, 66); // subtle navy (was 30,54,96)
+pub const LABEL_ASSISTANT: Style = Style::new()
+    .fg(Color::LightCyan)
+    .add_modifier(Modifier::BOLD);
+pub const LABEL_THOUGHT: Style = Style::new().fg(Color::Gray).add_modifier(Modifier::ITALIC);
+pub const LABEL_TOOL: Style = Style::new().fg(Color::LightYellow);
+pub const LABEL_NOTE: Style = Style::new().fg(Color::LightRed);
+
+// markdown surfaces
+pub const BG_CODE: Color = Color::Rgb(28, 30, 36); // fenced code fill (kept)
+pub const BG_CODE_INLINE: Color = Color::Rgb(48, 44, 30); // inline code fill (kept)
+
+// syntax highlighting
+pub const KEYWORD: Style = Style::new().fg(Color::LightMagenta);
+
+pub const PLACEHOLDER: Style = Style::new()
+    .fg(Color::DarkGray)
+    .add_modifier(Modifier::ITALIC);
