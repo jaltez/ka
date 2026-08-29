@@ -16,9 +16,10 @@ pub const ERR: Color = Color::Rgb(252, 58, 75); // #fc3a4b
 pub const HEADING: Color = Color::Rgb(254, 188, 56); // #febc38: every heading level
 pub const CODE_INLINE: Color = Color::Rgb(229, 193, 255); // #e5c1ff: `code`
 pub const CODE_BLOCK: Color = Color::Rgb(157, 205, 254); // #9cdcfe: fenced code base
-
 // user messages are the only surface with a background (OMP userMsgBg)
 pub const BG_USER: Color = Color::Rgb(34, 29, 26); // #221d1a warm dark
+// assistant output slab (OMP toolSuccessBg): a fill, never a border
+pub const BG_OUTPUT: Color = Color::Rgb(22, 26, 31); // #161a1f
 
 // derived styles
 pub const META: Style = Style::new().fg(MUTED); // footer, titles, hints
@@ -26,8 +27,9 @@ pub const BORDER: Style = Style::new().fg(BORDER_DIM); // block borders
 pub const ACCENT_STYLE: Style = Style::new().fg(ACCENT);
 pub const ACCENT_BOLD: Style = Style::new().fg(ACCENT).add_modifier(Modifier::BOLD);
 pub const PLACEHOLDER: Style = Style::new().fg(MUTED).add_modifier(Modifier::ITALIC);
-pub const THOUGHT: Style = Style::new().fg(MUTED).add_modifier(Modifier::ITALIC); // streaming/final thoughts
-
+// thinking sits a tier below normal chrome: dim gray, italic
+pub const THOUGHT: Style = Style::new().fg(DIM).add_modifier(Modifier::ITALIC);
+pub const QUOTE: Style = Style::new().fg(MUTED).add_modifier(Modifier::ITALIC);
 // syntax palette (OMP dark.json syntax*)
 pub const SYNTAX_COMMENT: Color = Color::Rgb(106, 153, 85); // #6a9955
 pub const SYNTAX_KEYWORD: Color = Color::Rgb(86, 156, 214); // #569cd6

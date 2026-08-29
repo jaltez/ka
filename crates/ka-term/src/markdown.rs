@@ -106,7 +106,7 @@ pub fn render(text: &str, width: u16) -> Vec<TuiLine<'static>> {
             let q = trimmed.trim_start_matches('>').trim();
             out.push(TuiLine::from(vec![
                 Span::styled("▏ ", palette::BORDER),
-                Span::styled(q.to_string(), palette::THOUGHT),
+                Span::styled(q.to_string(), palette::QUOTE),
             ]));
         } else if trimmed.starts_with("- ") || trimmed.starts_with("* ") {
             let indent = list_indent(line, trimmed);

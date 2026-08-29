@@ -301,9 +301,26 @@ fn render_line(line: &Line, width: u16) -> Vec<ratatui::text::Line<'static>> {
     match line {
         Line::User(text) => push_block(&mut out, text, width),
         Line::Assistant(text) => {
-            // OMP-style: assistant output is plain and quiet — no label
-            out.extend(crate::markdown::render(text, width));
-            out.push(TuiLine::default());
+            // assistant output on a subtle full-width surface: background
+            // fill only, never border glyphs
+            use unicode_width::UnicodeWidthStr;
+            let bg = crate::palette::BG_OUTPUT;
+            let mut rows = crate::markdown::render(text, width);
+            for row in rows.iter_mut() {
+                for s in row.spans.iter_mut() {
+                    s.style = s.style.bg(bg);
+                }
+                let used: usize = row.spans.iter().map(|s| s.content.width()).sum();
+                let w = width as usize;
+                if w > used {
+                    row.spans.push(ratatui::text::Span::styled(
+                        " ".repeat(w - used),
+                        ratatui::style::Style::new().bg(bg),
+                    ));
+                }
+            }
+            out.extend(rows);
+            out.push(TuiLine::default()); // unfilled gap between entries
         }
         Line::Thought(text) => push_gutter(&mut out, text, width, "⋯ ", crate::palette::THOUGHT),
         Line::Tool(text) => push_gutter(&mut out, text, width, "⚙ ", crate::palette::META),
@@ -2692,12 +2709,18 @@ mod tests {
     }
 
     #[test]
-    fn assistant_entry_is_plain_markdown() {
-        // OMP style: no label chip, markdown starts immediately
+    fn assistant_entry_fills_output_surface() {
+        // assistant rows carry the output background and fill the width;
+        // the trailing gap row stays unfilled to separate entries
         let out = super::render_line(&Line::Assistant("**hi** there".into()), 40);
         let text: String = out[0].spans.iter().map(|s| s.content.to_string()).collect();
-        assert_eq!(text, "hi there");
+        assert_eq!(text.trim_end(), "hi there");
+        let filled: usize = out[0].spans.iter().map(|s| s.content.chars().count()).sum();
+        assert_eq!(filled, 40, "surface fills the width");
+        let slab = format!("{:?}", out[0]);
+        assert!(slab.contains("Rgb(22, 26, 31)"), "output bg: {slab}");
         assert!(out.len() >= 2);
+        assert!(out.last().is_some_and(|l| l.spans.is_empty()), "gap row");
     }
 
     #[test]
