@@ -1725,15 +1725,13 @@ fn render(
     } else {
         format!("ka · ↑{} above (pgdn/esc)", start)
     };
-    let widget = Paragraph::new(window)
-        .block(
-            Block::default()
-                .borders(Borders::TOP)
-                .title(ratatui::text::Line::from(title).style(crate::palette::META))
-                .border_style(crate::palette::BORDER)
-                .padding(ratatui::widgets::Padding::horizontal(1)),
-        )
-        .wrap(Wrap { trim: false });
+    let widget = Paragraph::new(window).block(
+        Block::default()
+            .borders(Borders::TOP)
+            .title(ratatui::text::Line::from(title).style(crate::palette::META))
+            .border_style(crate::palette::BORDER)
+            .padding(ratatui::widgets::Padding::horizontal(1)),
+    );
     frame.render_widget(widget, chunks[0]);
 
     // ── input ─────────────────────────────────────────────────────
@@ -2136,12 +2134,13 @@ fn apply_output_surface(
     }
 }
 
-/// An empty row carrying only the surface background.
+/// An empty row carrying only the surface background. The bg must live on
+/// a SPAN: Paragraph ignores line-level styles when painting cells.
 fn surface_blank(width: u16, bg: ratatui::style::Color) -> ratatui::text::Line<'static> {
-    ratatui::text::Line::styled(
+    ratatui::text::Line::from(vec![ratatui::text::Span::styled(
         " ".repeat(width as usize),
         ratatui::style::Style::new().bg(bg),
-    )
+    )])
 }
 
 /// Full-width band for user messages — the only edge-to-edge role
@@ -2748,10 +2747,11 @@ mod tests {
         assert!(slab.contains("Rgb(22, 26, 31)"), "output bg: {slab}");
         assert!(out.len() >= 2);
         let gap = out.last().unwrap();
-        assert_eq!(
-            gap.style.bg,
-            Some(ratatui::style::Color::Rgb(22, 26, 31)),
-            "gap row filled: {gap:?}"
+        assert!(
+            gap.spans
+                .iter()
+                .all(|s| s.style.bg == Some(ratatui::style::Color::Rgb(22, 26, 31))),
+            "gap row filled at span level: {gap:?}"
         );
         assert_eq!(
             gap.spans
