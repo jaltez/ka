@@ -149,7 +149,84 @@ pub fn render(text: &str, width: u16) -> Vec<TuiLine<'static>> {
         // unterminated fence: flush what we have
         push_code_block(&mut out, &code_lines, &code_lang);
     }
+    wrap_rows(out, width)
+}
+
+/// Soft-wrap every row to at most `width` display columns (greedy
+/// word wrap, long words split at char boundaries). Rows already at or
+/// under the width pass through untouched — tables, fences, rules.
+fn wrap_rows(rows: Vec<TuiLine<'static>>, width: u16) -> Vec<TuiLine<'static>> {
+    let mut out = Vec::with_capacity(rows.len());
+    let w = width as usize;
+    if w == 0 {
+        return rows;
+    }
+    for row in rows {
+        let used: usize = row.spans.iter().map(|s| s.content.width()).sum();
+        if used <= w {
+            out.push(row);
+        } else {
+            out.extend(wrap_spans(row.spans, w).into_iter().map(TuiLine::from));
+        }
+    }
     out
+}
+
+/// Greedy word wrap for styled spans. Breaks at the last space that fits;
+/// words wider than the whole width split at char boundaries.
+fn wrap_spans(spans: Vec<Span<'static>>, width: usize) -> Vec<Vec<Span<'static>>> {
+    let mut chars: Vec<(char, Style)> = Vec::new();
+    for s in &spans {
+        for c in s.content.chars() {
+            chars.push((c, s.style));
+        }
+    }
+    let mut rows: Vec<Vec<(char, Style)>> = Vec::new();
+    let mut idx = 0;
+    while idx < chars.len() {
+        let mut take = 0;
+        let mut used = 0;
+        let mut last_space: Option<usize> = None;
+        while idx + take < chars.len() {
+            let cw = chars[idx + take].0.width().unwrap_or(0);
+            if used + cw > width {
+                break;
+            }
+            if chars[idx + take].0 == ' ' {
+                last_space = Some(take);
+            }
+            used += cw;
+            take += 1;
+        }
+        if take == 0 {
+            take = 1; // a single glyph wider than the width: hard-place it
+        }
+        let (chunk, next) = if idx + take < chars.len() {
+            // prefer breaking at a space over splitting a word; the break
+            // space itself is dropped
+            match last_space {
+                Some(sp) if sp > 0 => (sp, idx + sp + 1),
+                _ => (take, idx + take),
+            }
+        } else {
+            (take, idx + take)
+        };
+        rows.push(chars[idx..idx + chunk].to_vec());
+        idx = next;
+    }
+    rows.into_iter().map(spans_from_chars).collect()
+}
+
+/// Merge a styled char stream into the fewest spans.
+fn spans_from_chars(chars: Vec<(char, Style)>) -> Vec<Span<'static>> {
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    for (c, style) in chars {
+        match spans.last_mut() {
+            Some(last) if last.style == style => last.content.to_mut().push(c),
+            _ => spans.push(Span::styled(c.to_string(), style)),
+        }
+    }
+    spans
 }
 
 /// Two indent spaces per two leading whitespace characters, capped at four
@@ -926,6 +1003,39 @@ mod tests {
             format!("{lines:?}").contains("Rgb(254, 188, 56)"),
             "amber bullet"
         );
+    }
+
+    #[test]
+    fn long_prose_wraps_within_width() {
+        let md = "one two three four five six seven eight nine ten eleven twelve thirteen fourteen fifteen sixteen\n";
+        let lines = render(md, 40);
+        assert!(lines.len() >= 2, "wrapped into multiple rows");
+        for l in &lines {
+            let used: usize = l.spans.iter().map(|s| s.content.width()).sum();
+            assert!(used <= 40, "row overflows: {:?}", l);
+        }
+        // no word lost across the wrap
+        let all: String = lines
+            .iter()
+            .flat_map(|l| l.spans.iter().map(|s| s.content.to_string()))
+            .collect::<Vec<_>>()
+            .join(" ");
+        for w in ["one", "seven", "twelve", "sixteen"] {
+            assert!(all.contains(w), "{w} missing: {all}");
+        }
+    }
+
+    #[test]
+    fn wrapped_rows_stay_single_spans_per_style() {
+        let md = "**bold start** then plain text that continues well past the wrap boundary here\n";
+        let lines = render(md, 30);
+        for l in &lines {
+            let used: usize = l.spans.iter().map(|s| s.content.width()).sum();
+            assert!(used <= 30, "row overflows: {:?}", l);
+        }
+        // the bold run stays bold after re-merging spans
+        let joined = format!("{:?}", lines);
+        assert!(joined.contains("bold()"), "{joined}");
     }
 
     #[test]
