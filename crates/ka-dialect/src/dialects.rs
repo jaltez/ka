@@ -119,6 +119,9 @@ pub struct Dialect {
     /// Environment variable holding the API token (None = keyless local).
     #[serde(default)]
     pub api_key_env: Option<String>,
+    /// Vendor docs URL (pricing/console) surfaced by the key prompt.
+    #[serde(default)]
+    pub doc_url: Option<String>,
     /// Model id override sent on the wire (None = selector model part).
     #[serde(default)]
     pub wire_model: Option<String>,

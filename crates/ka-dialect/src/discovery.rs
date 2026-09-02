@@ -98,6 +98,7 @@ impl Dialect {
         Self {
             wire: Wire::OpenaiChat,
             base_url: None,
+            doc_url: None,
             api_key_env: None,
             wire_model: None,
             discovery: None,

@@ -283,32 +283,25 @@ fn models_sync() -> i32 {
         // marketplaces with hundreds of models drown the picker; keep
         // first-party vendors, subscription plans, and small specialists.
         // Giant aggregators stay reachable through custom selectors.
+        // policy: OFFICIAL vendor APIs and subscription plans only, plus a
+        // few established routers. Western first-parties (openai, anthropic,
+        // google, ...) publish no static endpoint here and live in the
+        // curated dialects.toml instead. Everything else stays reachable
+        // through custom `--dialects` overlays.
         const FIRST_PARTY: &[&str] = &[
-            "openai",
-            "anthropic",
             "deepseek",
-            "groq",
-            "mistral",
-            "xai",
-            "moonshot",
-            "zhipuai",
             "zai",
-            "deepinfra",
-            "together",
-            "fireworks",
-            "cerebras",
+            "zhipuai",
+            "alibaba",
+            "meta",
+            "minimax",
+            "modelscope",
         ];
+        const ROUTERS: &[&str] = &["openrouter", "huggingface", "nvidia"];
         let is_plan = pid.contains("plan");
         let is_first_party = FIRST_PARTY.contains(&pid.as_str());
-        let tool_models = models
-            .values()
-            .filter(|m| {
-                m.get("tool_call")
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(false)
-            })
-            .count();
-        if !is_plan && !is_first_party && tool_models > 25 {
+        let is_router = ROUTERS.contains(&pid.as_str());
+        if !is_plan && !is_first_party && !is_router {
             continue;
         }
         let mut mids: Vec<&String> = models.keys().collect();
@@ -323,8 +316,7 @@ fn models_sync() -> i32 {
             {
                 continue;
             }
-            if !is_plan
-                && !is_first_party
+            if is_router
                 && !m
                     .get("reasoning")
                     .and_then(|v| v.as_bool())
@@ -359,6 +351,9 @@ fn models_sync() -> i32 {
             toml.push_str(&format!("wire = \"{wire}\"\n"));
             toml.push_str(&format!("base_url = \"{api}\"\n"));
             toml.push_str(&format!("api_key_env = \"{env}\"\n"));
+            if let Some(doc) = p.get("doc").and_then(|v| v.as_str()) {
+                toml.push_str(&format!("doc_url = \"{doc}\"\n"));
+            };
             toml.push_str(&format!("context = {context}\n"));
             if max_output > 0 {
                 toml.push_str(&format!("max_output = {max_output}\n"));

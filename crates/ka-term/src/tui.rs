@@ -598,6 +598,8 @@ pub struct ModelInfo {
     pub key_env: String,
     /// Whether the key is present in this process.
     pub key_set: bool,
+    /// Vendor docs URL for the key prompt (empty = unknown).
+    pub doc_url: String,
     /// USD per mtok input (0 = unknown).
     pub price_in: f64,
     /// USD per mtok output (0 = unknown).
@@ -674,8 +676,23 @@ pub enum Modal {
     Settings(SettingsPanel),
     /// Model picker.
     Model(ModelPicker),
+    /// API key prompt for a provider.
+    Key(KeyPrompt),
     /// Help overlay.
     Help,
+}
+
+/// API key entry for a provider's env var.
+#[derive(Debug, Clone)]
+pub struct KeyPrompt {
+    /// Env var the engine reads (e.g. `ZHIPU_API_KEY`).
+    pub env_var: String,
+    /// Vendor prefix for display.
+    pub provider: String,
+    /// Where to get a key (vendor docs).
+    pub doc_url: String,
+    /// Entered (masked) key value.
+    pub input: String,
 }
 
 /// Run the TUI over an engine handle. Blocks until exit.
@@ -881,6 +898,26 @@ async fn app(
                                     modal = None;
                                 }
                             }
+                            Modal::Key(prompt) => match key.code {
+                                KeyCode::Esc => modal = None,
+                                KeyCode::Backspace => {
+                                    prompt.input.pop();
+                                }
+                                KeyCode::Enter => {
+                                    let value = prompt.input.trim().to_string();
+                                    if !value.is_empty() {
+                                        let _ = commands
+                                            .send(Command::SaveApiKey {
+                                                env_var: prompt.env_var.clone(),
+                                                value,
+                                            })
+                                            .await;
+                                    }
+                                    modal = None;
+                                }
+                                KeyCode::Char(c) => prompt.input.push(c),
+                                _ => {}
+                            },
                             Modal::Model(picker) => match key.code {
                                 KeyCode::Esc => modal = None,
                                 KeyCode::Up => picker.selected = picker.selected.saturating_sub(1),
@@ -905,11 +942,29 @@ async fn app(
                                         // future conversations
                                         let _ = commands
                                             .send(Command::SaveSettings {
-                                                model: Some(selector),
+                                                model: Some(selector.clone()),
                                                 effort: None,
                                                 mode: None,
                                             })
                                             .await;
+                                        // a keyed model without a key asks for one
+                                        if let Some(m) =
+                                            picker.models.iter().find(|m| m.id == selector)
+                                        {
+                                            if !m.key_set && !m.key_env.is_empty() {
+                                                modal = Some(Modal::Key(KeyPrompt {
+                                                    env_var: m.key_env.clone(),
+                                                    provider: selector
+                                                        .split('/')
+                                                        .next()
+                                                        .unwrap_or("")
+                                                        .to_string(),
+                                                    doc_url: m.doc_url.clone(),
+                                                    input: String::new(),
+                                                }));
+                                                continue;
+                                            }
+                                        }
                                     }
                                     modal = None;
                                 }
@@ -1021,9 +1076,37 @@ async fn app(
                                 if let Some(note) = cmd.note {
                                     transcript.push(Line::Note(note));
                                 }
-                                if let Some(kind) = cmd.modal {
-                                    modal = Some(match kind {
-                                        ModalKind::Session => {
+                                        if let Some(kind) = cmd.modal {
+            if kind == ModalKind::Key {
+                // /key: open the prompt for the current model's provider
+                let current = meters
+                    .model
+                    .trim_start_matches('+')
+                    .split('@')
+                    .next()
+                    .unwrap_or("")
+                    .to_string();
+                let vendor = current.split('/').next().unwrap_or("").to_string();
+                let info = models_ref
+                    .iter()
+                    .find(|m| m.id == current)
+                    .or_else(|| models_ref.iter().find(|m| current.starts_with(&m.id)));
+                let prompt = info.and_then(|m| {
+                    (!m.key_env.is_empty()).then(|| KeyPrompt {
+                        env_var: m.key_env.clone(),
+                        provider: vendor.clone(),
+                        doc_url: m.doc_url.clone(),
+                        input: String::new(),
+                    })
+                });
+                match prompt {
+                    Some(p) => modal = Some(Modal::Key(p)),
+                    None => transcript
+                        .push(Line::Note("no api key variable is known for this model".into())),
+                }
+            } else {
+                modal = Some(match kind {
+                    ModalKind::Key | ModalKind::Session => {
                                             let sessions = std::env::current_dir()
                                                 .ok()
                                                 .and_then(|cwd| ka_strand::list(&cwd).ok())
@@ -1056,7 +1139,8 @@ async fn app(
                                             config_path: ka_config_path(),
                                         }),
                                     });
-                                }
+                            }
+                        }
                                 if let Some(evt) = cmd.event {
                                     let is_switch =
                                         matches!(evt, Command::SwitchStrand { .. });
@@ -1365,6 +1449,10 @@ pub fn available_slash_commands() -> Vec<(String, String)> {
             "/settings".to_string(),
             "settings & provider status".to_string(),
         ),
+        (
+            "/key".to_string(),
+            "set an api key for the current model".to_string(),
+        ),
         ("/quit".to_string(), "exit".to_string()),
     ];
     if let Ok(cwd) = std::env::current_dir() {
@@ -1461,6 +1549,8 @@ pub enum ModalKind {
     Settings,
     /// Model picker.
     Model,
+    /// API key prompt.
+    Key,
     /// Help overlay.
     Help,
 }
@@ -1504,6 +1594,7 @@ fn slash_command(text: &str) -> Option<Slash> {
             | "/resume"
             | "/new"
             | "/settings"
+            | "/key"
     ) {
         if let Some(body) = custom_command(head, rest) {
             return Some(Slash {
@@ -1647,6 +1738,13 @@ step now; verify each step."
             followup: None,
             modal: Some(ModalKind::Settings),
         }),
+        "/key" => Some(Slash {
+            note: None,
+            event: None,
+            quit: false,
+            followup: None,
+            modal: Some(ModalKind::Key),
+        }),
         "/mode" => {
             let mode = match rest? {
                 "free" => ka_protocol::Mode::Free,
@@ -1682,7 +1780,7 @@ fn render(
     modal: Option<&Modal>,
 ) {
     use ratatui::layout::Constraint::{Length, Min};
-    use ratatui::style::Modifier;
+    use ratatui::style::{Modifier, Style};
     use ratatui::text::{Line as TuiLine, Span};
     use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 
@@ -1927,6 +2025,52 @@ fn render(
                             .title(
                                 ratatui::text::Line::from("sessions").style(crate::palette::META),
                             )
+                            .border_style(crate::palette::BORDER),
+                    )
+                    .wrap(Wrap { trim: false });
+                frame.render_widget(widget, rect);
+            }
+            Modal::Key(prompt) => {
+                // full-frame wipe: switching here from the model picker must
+                // leave no stale pixels outside the prompt rect
+                frame.render_widget(Clear, frame.area());
+                let height = 9u16.min(frame.area().height.saturating_sub(2));
+                let width = 64.min(frame.area().width);
+                let rect = centered(width, height, frame.area());
+                frame.render_widget(Clear, rect);
+                let mut text = vec![TuiLine::styled("api key", crate::palette::ACCENT_BOLD)];
+                text.push(TuiLine::from(vec![
+                    Span::styled("provider  ", crate::palette::META),
+                    Span::styled(prompt.provider.clone(), Style::default()),
+                ]));
+                text.push(TuiLine::from(vec![
+                    Span::styled("key var   ", crate::palette::META),
+                    Span::styled(prompt.env_var.clone(), Style::default()),
+                ]));
+                if !prompt.doc_url.is_empty() {
+                    let doc: String = prompt.doc_url.chars().take(width as usize - 4).collect();
+                    text.push(TuiLine::from(vec![
+                        Span::styled("get one   ", crate::palette::META),
+                        Span::styled(doc, crate::palette::CYAN),
+                    ]));
+                }
+                text.push(TuiLine::default());
+                let masked = "•".repeat(prompt.input.chars().count());
+                text.push(TuiLine::from(vec![
+                    Span::styled("value     ", crate::palette::META),
+                    Span::styled(masked, Style::default()),
+                    Span::styled("▌", crate::palette::ACCENT_STYLE),
+                ]));
+                text.push(TuiLine::default());
+                text.push(TuiLine::styled(
+                    "enter save · esc cancel",
+                    crate::palette::META,
+                ));
+                let widget = Paragraph::new(text)
+                    .block(
+                        Block::default()
+                            .borders(Borders::ALL)
+                            .title(ratatui::text::Line::from("api key").style(crate::palette::META))
                             .border_style(crate::palette::BORDER),
                     )
                     .wrap(Wrap { trim: false });
@@ -2284,6 +2428,7 @@ mod tests {
             context,
             key_env: "X_API_KEY".to_string(),
             key_set: false,
+            doc_url: String::new(),
             price_in: 0.0,
             price_out: 0.0,
             priced: false,

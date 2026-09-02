@@ -160,6 +160,38 @@ impl Config {
 }
 
 /// The user config layer path (`~/.config/ka/ka.toml`, XDG-aware).
+/// Upsert an API key into `~/.config/ka/.env` (created 0600) and the
+/// live dotenv layer, so the key works immediately without a restart.
+pub fn save_api_key(env_var: &str, value: &str) -> std::io::Result<std::path::PathBuf> {
+    let path = user_config_path().with_file_name(".env");
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let mut lines: Vec<String> = std::fs::read_to_string(&path)
+        .unwrap_or_default()
+        .lines()
+        .map(str::to_string)
+        .collect();
+    let pattern = format!("{env_var}=");
+    match lines
+        .iter_mut()
+        .find(|l| l.trim_start().starts_with(&pattern))
+    {
+        Some(slot) => *slot = format!("{env_var}={value}"),
+        None => lines.push(format!("{env_var}={value}")),
+    }
+    let mut text = lines.join("\n");
+    text.push('\n');
+    std::fs::write(&path, text)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+    }
+    ka_dialect::auth::set_dotenv_key(env_var, value);
+    Ok(path)
+}
+
 pub fn user_config_path() -> std::path::PathBuf {
     std::env::var("XDG_CONFIG_HOME")
         .map(std::path::PathBuf::from)

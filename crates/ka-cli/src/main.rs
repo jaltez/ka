@@ -482,6 +482,7 @@ async fn run_tui(cli: Cli) -> Result<ExitCode, String> {
                 .api_key_env
                 .as_deref()
                 .is_some_and(|k| std::env::var(k).is_ok()),
+            doc_url: d.doc_url.clone().unwrap_or_default(),
             price_in: d.price.input_per_mtok,
             price_out: d.price.output_per_mtok,
             priced: d.priced,

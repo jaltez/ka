@@ -179,6 +179,7 @@ pub fn synthetic_dialect(provider: &Provider, model: &str) -> Dialect {
     Dialect {
         wire: provider.wire,
         base_url: Some(provider.base_url.to_string()),
+        doc_url: None,
         api_key_env: provider.key_env.map(str::to_string),
         wire_model: Some(model.to_string()),
         discovery: None,

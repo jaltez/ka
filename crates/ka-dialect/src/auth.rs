@@ -5,7 +5,16 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::LazyLock;
 
-static DOTENV: LazyLock<HashMap<String, String>> = LazyLock::new(scan_dotenv);
+static DOTENV: LazyLock<std::sync::RwLock<HashMap<String, String>>> =
+    LazyLock::new(|| std::sync::RwLock::new(scan_dotenv()));
+
+/// Insert or update a key in the in-process dotenv layer (used by the TUI
+/// key prompt so a saved key works without a restart).
+pub fn set_dotenv_key(key: &str, value: &str) {
+    if let Ok(mut map) = DOTENV.write() {
+        map.insert(key.to_string(), value.to_string());
+    }
+}
 
 fn scan_dotenv() -> HashMap<String, String> {
     let mut map = HashMap::new();
@@ -58,7 +67,11 @@ pub fn resolve_token(spec: &str) -> Option<String> {
             return Some(v);
         }
     }
-    DOTENV.get(spec).cloned().filter(|v| !v.is_empty())
+    DOTENV
+        .read()
+        .ok()
+        .and_then(|map| map.get(spec).cloned())
+        .filter(|v| !v.is_empty())
 }
 
 /// Testable core of [`resolve_token`] against an explicit fallback map.

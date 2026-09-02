@@ -618,6 +618,29 @@ async fn handle_command(
             }
             ctx.events.send(Event::Idle).await.ok();
         }
+        Command::SaveApiKey { env_var, value } => {
+            match crate::config::save_api_key(&env_var, &value) {
+                Ok(path) => {
+                    ctx.events
+                        .send(Event::Note {
+                            message: format!("{env_var} saved to {}", path.display()),
+                        })
+                        .await
+                        .ok();
+                }
+                Err(e) => {
+                    ctx.events
+                        .send(Event::Error {
+                            class: ErrorClass::Protocol,
+                            retryable: false,
+                            message: format!("saving {env_var} failed: {e}"),
+                        })
+                        .await
+                        .ok();
+                }
+            }
+            ctx.events.send(Event::Idle).await.ok();
+        }
         Command::Answer { .. } => {
             // answers are consumed inside the pending ask; one arriving
             // here means the surface answered an ask that no longer exists

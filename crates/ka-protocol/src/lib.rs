@@ -188,6 +188,14 @@ pub enum Command {
     },
     /// Restore the latest pre-mutation snapshot of this session.
     UndoFile,
+    /// Save an API key to the user env layer (~/.config/ka/.env) and the
+    /// live process (used by the TUI key prompt).
+    SaveApiKey {
+        /// Env var name, e.g. `ZHIPU_API_KEY`.
+        env_var: String,
+        /// The key value (never echoed to the transcript).
+        value: String,
+    },
     /// Persist settings to the user config layer (~/.config/ka/ka.toml).
     SaveSettings {
         /// Default model selector.
