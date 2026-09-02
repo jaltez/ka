@@ -399,6 +399,36 @@ fn page_down(scroll: &mut Option<usize>, total: usize, visible: usize) {
     };
 }
 
+/// Scroll a few lines up from the current anchor (pinned counts from the
+/// tail). Wheel granularity — three lines per notch.
+fn line_up(scroll: &mut Option<usize>, total: usize, visible: usize) {
+    if visible == 0 || total <= visible {
+        *scroll = None;
+        return;
+    }
+    let max_anchor = total - visible;
+    let cur = scroll.unwrap_or(max_anchor);
+    *scroll = Some(cur.saturating_sub(WHEEL_STEP).min(max_anchor));
+}
+
+/// Scroll a few lines down; reaching the tail re-pins (None).
+fn line_down(scroll: &mut Option<usize>, total: usize, visible: usize) {
+    let Some(anchor) = *scroll else { return };
+    if visible == 0 {
+        *scroll = None;
+        return;
+    }
+    let max_anchor = total.saturating_sub(visible);
+    *scroll = if anchor + WHEEL_STEP >= max_anchor {
+        None
+    } else {
+        Some(anchor + WHEEL_STEP)
+    };
+}
+
+/// Transcript rows per mouse-wheel notch.
+const WHEEL_STEP: usize = 3;
+
 /// Footer state shown under the editor.
 #[derive(Debug, Clone, Default)]
 pub struct Meters {
@@ -715,7 +745,8 @@ pub async fn run(
             crossterm::event::KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
                 | crossterm::event::KeyboardEnhancementFlags::REPORT_EVENT_TYPES
         ),
-        crossterm::event::EnableBracketedPaste
+        crossterm::event::EnableBracketedPaste,
+        crossterm::event::EnableMouseCapture
     );
     let result = app(
         &mut terminal,
@@ -730,7 +761,8 @@ pub async fn run(
     let _ = crossterm::execute!(
         std::io::stdout(),
         crossterm::event::PopKeyboardEnhancementFlags,
-        crossterm::event::DisableBracketedPaste
+        crossterm::event::DisableBracketedPaste,
+        crossterm::event::DisableMouseCapture
     );
     ratatui::restore();
     result
@@ -1237,6 +1269,20 @@ async fn app(
                 } else if let Some(Ok(TermEvent::Paste(text))) = maybe_term {
                     input.insert_str(&text);
                     slash_popup = update_suggestions(&input.text);
+                } else if let Some(Ok(TermEvent::Mouse(mouse))) = maybe_term {
+                    // the wheel scrolls the chat; overlays keep focus. Line
+                    // granularity (page keys keep their page step).
+                    if modal.is_none() && pending.is_none() && slash_popup.is_none() {
+                        match mouse.kind {
+                            crossterm::event::MouseEventKind::ScrollUp => {
+                                line_up(&mut scroll, transcript.total_rows(), view_rows);
+                            }
+                            crossterm::event::MouseEventKind::ScrollDown => {
+                                line_down(&mut scroll, transcript.total_rows(), view_rows);
+                            }
+                            _ => {}
+                        }
+                    }
                 }
             }
             maybe_evt = events.recv() => {
@@ -2583,6 +2629,28 @@ mod tests {
         // small transcript: PgUp is a no-op
         let mut small = None;
         page_up(&mut small, 5, 20);
+        assert_eq!(small, None);
+    }
+
+    #[test]
+    fn wheel_lines_roundtrip_repins_at_tail() {
+        let mut scroll = None;
+        line_up(&mut scroll, 100, 20);
+        assert_eq!(scroll, Some(80 - 3), "pinned wheel-up unpins 3 rows");
+        line_up(&mut scroll, 100, 20);
+        assert_eq!(scroll, Some(80 - 6));
+        line_down(&mut scroll, 100, 20);
+        assert_eq!(scroll, Some(80 - 3));
+        line_down(&mut scroll, 100, 20);
+        line_down(&mut scroll, 100, 20);
+        assert_eq!(scroll, None, "reaching the tail re-pins");
+        // wheel-down while pinned is a no-op
+        let mut pinned = None;
+        line_down(&mut pinned, 100, 20);
+        assert_eq!(pinned, None);
+        // small transcript: wheel-up is a no-op
+        let mut small = None;
+        line_up(&mut small, 5, 20);
         assert_eq!(small, None);
     }
 
