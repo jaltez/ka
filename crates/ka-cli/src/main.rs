@@ -439,7 +439,7 @@ async fn run_tui(cli: Cli) -> Result<ExitCode, String> {
     let cfg = load_config(&cli.configs, cli.model.clone(), cli.mode.clone(), trust)?;
     let catalog = build_catalog(&cli.dialects, !cli.no_discovery).await?;
     let model_label = cfg.model.clone().unwrap_or_else(|| "(canned)".to_string());
-    let providers: Vec<ka_term::tui::ProviderInfo> = ka_dialect::providers::PROVIDERS
+    let mut providers: Vec<ka_term::tui::ProviderInfo> = ka_dialect::providers::PROVIDERS
         .iter()
         .map(|p| ka_term::tui::ProviderInfo {
             name: p.name.to_string(),
@@ -448,6 +448,28 @@ async fn run_tui(cli: Cli) -> Result<ExitCode, String> {
             key_set: p.key_env.is_some_and(|k| std::env::var(k).is_ok()),
         })
         .collect();
+    // catalog-derived vendors (models.dev: coding plans, z.ai tiers, ...)
+    // beyond the curated registry, so settings and `ka providers` see them
+    for (id, d) in catalog.dialects.iter() {
+        let Some(vendor) = id.split('/').next() else {
+            continue;
+        };
+        if providers.iter().any(|p| p.name == vendor) {
+            continue;
+        }
+        let base_url = d.base_url.clone().unwrap_or_default();
+        if base_url.is_empty() {
+            continue;
+        }
+        let env_var = d.api_key_env.clone().unwrap_or_default();
+        providers.push(ka_term::tui::ProviderInfo {
+            name: vendor.to_string(),
+            env_var: env_var.clone(),
+            base_url,
+            key_set: !env_var.is_empty() && std::env::var(&env_var).is_ok(),
+        });
+    }
+    providers.sort_by(|a, b| a.name.cmp(&b.name));
     let models: Vec<ka_term::tui::ModelInfo> = catalog
         .dialects
         .iter()
@@ -460,6 +482,10 @@ async fn run_tui(cli: Cli) -> Result<ExitCode, String> {
                 .api_key_env
                 .as_deref()
                 .is_some_and(|k| std::env::var(k).is_ok()),
+            price_in: d.price.input_per_mtok,
+            price_out: d.price.output_per_mtok,
+            priced: d.priced,
+            plan: id.split('/').next().is_some_and(|v| v.contains("plan")),
         })
         .collect();
     let handle = ka_agent::spawn_full(cfg, catalog, choice);
@@ -598,23 +624,52 @@ async fn run_mcp() -> Result<ExitCode, String> {
 
 fn run_providers() -> Result<ExitCode, String> {
     let header = format!(
-        "{:<12} {:<22} {:<8} {}",
+        "{:<24} {:<26} {:<8} {}",
         "provider", "api key env", "key", "endpoint"
     );
     println!("{header}");
+    // curated registry first, then catalog-derived vendors (models.dev:
+    // coding plans, provider tiers, ...) the registry does not know
+    let mut seen: Vec<String> = Vec::new();
+    let mut rows: Vec<(String, String, bool, String)> = Vec::new();
     for p in ka_dialect::providers::PROVIDERS {
-        let env = p.key_env.unwrap_or("-");
-        let set = p
-            .key_env
-            .map(|k| {
-                if std::env::var(k).is_ok() {
-                    "yes"
-                } else {
-                    "no"
-                }
-            })
-            .unwrap_or("n/a");
-        println!("{:<12} {:<22} {:<8} {}", p.name, env, set, p.base_url);
+        let env = p.key_env.unwrap_or("-").to_string();
+        let set = p.key_env.is_some_and(|k| std::env::var(k).is_ok());
+        seen.push(p.name.to_string());
+        rows.push((p.name.to_string(), env, set, p.base_url.to_string()));
+    }
+    let catalog = ka_dialect::dialects::Catalog::embedded();
+    for (id, d) in catalog.dialects.iter() {
+        let Some(vendor) = id.split('/').next() else {
+            continue;
+        };
+        if seen.iter().any(|s| s == vendor) || vendor.len() > 24 {
+            continue;
+        }
+        let Some(base_url) = d.base_url.clone() else {
+            continue;
+        };
+        if base_url.is_empty() {
+            continue;
+        }
+        let env = d.api_key_env.clone().unwrap_or_else(|| "-".to_string());
+        let set = d
+            .api_key_env
+            .as_deref()
+            .is_some_and(|k| std::env::var(k).is_ok());
+        seen.push(vendor.to_string());
+        rows.push((vendor.to_string(), env, set, base_url));
+    }
+    rows.sort_by(|a, b| a.0.cmp(&b.0));
+    for (name, env, set, base_url) in rows {
+        let set = if env == "-" {
+            "n/a"
+        } else if set {
+            "yes"
+        } else {
+            "no"
+        };
+        println!("{:<24} {:<26} {:<8} {}", name, env, set, base_url);
     }
     println!("\nany provider/<model> selector works against these vendors, catalog row or not");
     Ok(ExitCode::SUCCESS)

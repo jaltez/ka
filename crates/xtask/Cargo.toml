@@ -12,6 +12,7 @@ name = "xtask"
 path = "src/main.rs"
 
 [dependencies]
+serde_json = { workspace = true }
 
 [lints]
 workspace = true

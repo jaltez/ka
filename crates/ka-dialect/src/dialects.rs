@@ -9,6 +9,11 @@ use serde::{Deserialize, Serialize};
 /// The embedded seed catalog.
 pub const EMBEDDED: &str = include_str!("../dialects.toml");
 
+/// The generated models.dev overlay: providers and real pricing for
+/// tool-capable models (regenerate with `cargo xtask models-sync`).
+/// Curated rows in `dialects.toml` win for the same selector.
+pub const MODELS_DEV: &str = include_str!("../models-dev.toml");
+
 /// Which wire protocol a model speaks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -181,12 +186,18 @@ impl Catalog {
     }
 
     /// The embedded seed catalog. Panics only if the compiled-in table is
-    /// invalid, which is a build-time guarantee.
+    /// invalid, which is a build-time guarantee. The generated models.dev
+    /// overlay is merged in; its generator never emits a curated selector,
+    /// so curated rows keep their richer flags.
     pub fn embedded() -> Self {
-        match Self::parse(EMBEDDED) {
+        let mut curated = match Self::parse(EMBEDDED) {
             Ok(c) => c,
             Err(e) => panic!("embedded dialect catalog is invalid: {e}"),
+        };
+        if let Ok(models_dev) = Self::parse(MODELS_DEV) {
+            curated.overlay(models_dev);
         }
+        curated
     }
 
     /// Overlay another catalog on top (user wins per key).
@@ -267,10 +278,37 @@ mod tests {
 
     #[test]
     fn seeded_rows_are_unpriced_placeholders() {
-        let c = Catalog::embedded();
+        // curated rows still carry placeholder pricing (priced = false);
+        // the models.dev overlay may price its own rows for real
+        let c = Catalog::parse(EMBEDDED).unwrap();
         for (id, d) in &c.dialects {
             assert!(!d.priced, "{id} seeds placeholder pricing");
         }
+    }
+
+    #[test]
+    fn models_dev_overlay_merges_with_real_pricing() {
+        let c = Catalog::embedded();
+        // z.ai api tier: real published pricing
+        let zai = c.get("zai/glm-4.7").expect("zai api tier present");
+        assert!(zai.priced);
+        assert_eq!(
+            zai.base_url.as_deref(),
+            Some("https://api.z.ai/api/paas/v4")
+        );
+        assert_eq!(zai.api_key_env.as_deref(), Some("ZHIPU_API_KEY"));
+        // z.ai coding plan: same key, different endpoint, unpriced plan
+        let plan = c
+            .get("zai-coding-plan/glm-5.3")
+            .expect("zai coding plan present");
+        assert_eq!(
+            plan.base_url.as_deref(),
+            Some("https://api.z.ai/api/coding/paas/v4")
+        );
+        assert!(!plan.priced, "subscription plan is not per-token priced");
+        // curated rows keep their richer flags (not replaced by the overlay)
+        let curated = c.get("anthropic/claude-sonnet-5").unwrap();
+        assert_eq!(curated.cache, Cache::Control);
     }
 
     #[test]

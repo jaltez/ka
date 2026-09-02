@@ -19,6 +19,7 @@ fn main() {
         "dev" => dev(&rest),
         "ci" => ci(),
         "size" => size(),
+        "models-sync" => models_sync(),
         "help" | "--help" | "-h" => {
             print_help();
             0
@@ -42,7 +43,7 @@ fn print_help() {
   dev [...] rebuild release, then run the dev binary with any args
             (hint: KA_DATA_DIR=/tmp/ka-dev cargo xtask dev -- models)
   ci        fmt --check + clippy -D warnings + tests (what CI runs)
-  size      release binary size vs the {SIZE_BUDGET_MB} MB contract
+  models-sync  regenerate crates/ka-dialect/models-dev.toml from models.dev
   help      this message"
     );
 }
@@ -200,4 +201,196 @@ fn size() -> i32 {
         mb, SIZE_BUDGET_MB
     );
     if mb <= SIZE_BUDGET_MB { 0 } else { 1 }
+}
+
+/// Regenerate `crates/ka-dialect/models-dev.toml` from https://models.dev.
+/// Keeps curated `dialects.toml` selectors untouched (their flags and effort
+/// budgets win); adds every tool-capable model on a static OpenAI-compatible
+/// or Anthropic-compatible endpoint, with real pricing when published.
+fn models_sync() -> i32 {
+    let url = "https://models.dev/api.json";
+    eprintln!("models-sync: fetching {url}");
+    let out = Command::new("curl")
+        .args(["-sSL", "--max-time", "60", url])
+        .output();
+    let bytes = match out {
+        Ok(o) if o.status.success() => o.stdout,
+        Ok(o) => {
+            eprintln!("models-sync: curl failed: {}", o.status);
+            return 1;
+        }
+        Err(e) => {
+            eprintln!("models-sync: curl not available: {e}");
+            return 1;
+        }
+    };
+    let root: serde_json::Value = match serde_json::from_slice(&bytes) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("models-sync: bad json: {e}");
+            return 1;
+        }
+    };
+
+    // curated selectors stay authoritative
+    let dialects_path = repo_root().join("crates/ka-dialect/dialects.toml");
+    let curated = fs::read_to_string(&dialects_path).unwrap_or_default();
+    let mut curated_ids: Vec<String> = Vec::new();
+    for line in curated.lines() {
+        if let Some(rest) = line.strip_prefix("[dialects.\"") {
+            if let Some(id) = rest.strip_suffix("\"]") {
+                curated_ids.push(id.to_string());
+            }
+        }
+    }
+
+    let mut toml = String::new();
+    toml.push_str("# ka dialect catalog — generated from https://models.dev (api.json).\n");
+    toml.push_str("# Regenerate with: cargo xtask models-sync\n");
+    toml.push_str("# Curated rows in dialects.toml win for the same selector; this file only\n");
+    toml.push_str("# adds providers and models (real pricing where published, subscription\n");
+    toml.push_str("# plans carry priced = false so costs are never fabricated).\n\n");
+
+    let empty = serde_json::Map::new();
+    let mut providers_written = 0usize;
+    let mut rows_written = 0usize;
+    let Some(providers) = root.as_object() else {
+        eprintln!("models-sync: unexpected root shape");
+        return 1;
+    };
+    let mut pids: Vec<&String> = providers.keys().collect();
+    pids.sort();
+    for pid in pids {
+        let p = providers[pid].as_object().unwrap_or(&empty);
+        let api = p.get("api").and_then(|v| v.as_str()).unwrap_or("");
+        let env = p
+            .get("env")
+            .and_then(|v| v.as_array())
+            .and_then(|a| a.first())
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        if api.is_empty() || env.is_empty() {
+            continue; // needs dynamic config (vertex etc.) or keyless
+        }
+        let wire = if api.contains("/anthropic") {
+            "anthropic_messages"
+        } else {
+            "openai_chat"
+        };
+        let Some(models) = p.get("models").and_then(|m| m.as_object()) else {
+            continue;
+        };
+        // marketplaces with hundreds of models drown the picker; keep
+        // first-party vendors, subscription plans, and small specialists.
+        // Giant aggregators stay reachable through custom selectors.
+        const FIRST_PARTY: &[&str] = &[
+            "openai",
+            "anthropic",
+            "deepseek",
+            "groq",
+            "mistral",
+            "xai",
+            "moonshot",
+            "zhipuai",
+            "zai",
+            "deepinfra",
+            "together",
+            "fireworks",
+            "cerebras",
+        ];
+        let is_plan = pid.contains("plan");
+        let is_first_party = FIRST_PARTY.contains(&pid.as_str());
+        let tool_models = models
+            .values()
+            .filter(|m| {
+                m.get("tool_call")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false)
+            })
+            .count();
+        if !is_plan && !is_first_party && tool_models > 25 {
+            continue;
+        }
+        let mut mids: Vec<&String> = models.keys().collect();
+        mids.sort();
+        let mut wrote_for_provider = false;
+        for mid in mids {
+            let m = models[mid].as_object().unwrap_or(&empty);
+            if !m
+                .get("tool_call")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false)
+            {
+                continue;
+            }
+            if !is_plan
+                && !is_first_party
+                && !m
+                    .get("reasoning")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false)
+            {
+                continue;
+            }
+            let selector = format!("{pid}/{mid}");
+            if curated_ids.contains(&selector) {
+                continue;
+            }
+            let limit = m.get("limit").and_then(|v| v.as_object()).unwrap_or(&empty);
+            let context = limit
+                .get("context")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0)
+                .min(u32::MAX as u64) as u32;
+            let max_output = limit
+                .get("output")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0)
+                .min(u32::MAX as u64) as u32;
+            let cost = m.get("cost").and_then(|v| v.as_object()).unwrap_or(&empty);
+            let pin = cost.get("input").and_then(|v| v.as_f64());
+            let pout = cost.get("output").and_then(|v| v.as_f64());
+            // subscription plans publish 0/0 token costs — that is not
+            // per-token pricing, keep them unpriced and badge them as plans
+            let priced = pin.is_some()
+                && pout.is_some()
+                && (pin.unwrap_or(0.0) > 0.0 || pout.unwrap_or(0.0) > 0.0);
+            toml.push_str(&format!("[dialects.\"{selector}\"]\n"));
+            toml.push_str(&format!("wire = \"{wire}\"\n"));
+            toml.push_str(&format!("base_url = \"{api}\"\n"));
+            toml.push_str(&format!("api_key_env = \"{env}\"\n"));
+            toml.push_str(&format!("context = {context}\n"));
+            if max_output > 0 {
+                toml.push_str(&format!("max_output = {max_output}\n"));
+            }
+            toml.push_str(&format!("priced = {priced}\n"));
+            if priced {
+                toml.push_str(&format!(
+                    "[dialects.\"{selector}\".price]\ninput_per_mtok = {}\noutput_per_mtok = {}\n",
+                    pin.unwrap_or_default(),
+                    pout.unwrap_or_default()
+                ));
+            }
+            toml.push('\n');
+            rows_written += 1;
+            wrote_for_provider = true;
+        }
+        if wrote_for_provider {
+            providers_written += 1;
+        }
+    }
+
+    let out_path = repo_root().join("crates/ka-dialect/models-dev.toml");
+    if let Err(e) = fs::write(&out_path, &toml) {
+        eprintln!("models-sync: write failed: {e}");
+        return 1;
+    }
+    eprintln!(
+        "models-sync: {} providers, {} models, {} bytes -> {}",
+        providers_written,
+        rows_written,
+        toml.len(),
+        out_path.display()
+    );
+    0
 }

@@ -598,14 +598,18 @@ pub struct ModelInfo {
     pub key_env: String,
     /// Whether the key is present in this process.
     pub key_set: bool,
+    /// USD per mtok input (0 = unknown).
+    pub price_in: f64,
+    /// USD per mtok output (0 = unknown).
+    pub price_out: f64,
+    /// Price is real published pricing (footer shows cost).
+    pub priced: bool,
+    /// Subscription plan (no per-token cost).
+    pub plan: bool,
 }
-
-/// Model picker (/model without arguments): catalog models filtered by
-/// the typed substring; Enter on a row switches, Enter on an empty
-/// result sets the filter itself as a custom `vendor/model` selector.
+/// The `/model` picker state.
 #[derive(Debug, Clone)]
 pub struct ModelPicker {
-    /// Known models (catalog + discovery), injected by the CLI.
     pub models: Vec<ModelInfo>,
     /// Selected row.
     pub selected: usize,
@@ -618,12 +622,26 @@ pub struct ModelPicker {
 /// tail models clip off the picker — the exact bug that hid installed
 /// ollama models behind two-line rows.
 fn model_row(marker: &str, m: &ModelInfo, ctx: &str, key: &str) -> String {
-    let id: String = m.id.chars().take(40).collect();
+    let id: String = m.id.chars().take(34).collect();
     let wire = m
         .wire
         .trim_end_matches("_messages")
         .trim_end_matches("_chat");
-    format!("{marker}{id:<40} {ctx:>5} {wire:<9}{key}")
+    let price = if m.plan {
+        "plan".to_string()
+    } else if m.priced {
+        let trim = |v: f64| {
+            if (v - v.round()).abs() < f64::EPSILON {
+                format!("{}", v.round() as u64)
+            } else {
+                format!("{v}")
+            }
+        };
+        format!("${}/${}", trim(m.price_in), trim(m.price_out))
+    } else {
+        "-".to_string()
+    };
+    format!("{marker}{id:<34} {ctx:>5} {price:<10} {wire:<7}{key}")
 }
 
 impl ModelPicker {
@@ -881,6 +899,15 @@ async fn app(
                                         let _ = commands
                                             .send(Command::SetModel {
                                                 selector: selector.clone(),
+                                            })
+                                            .await;
+                                        // the pick also becomes the default for
+                                        // future conversations
+                                        let _ = commands
+                                            .send(Command::SaveSettings {
+                                                model: Some(selector),
+                                                effort: None,
+                                                mode: None,
                                             })
                                             .await;
                                     }
@@ -2073,7 +2100,13 @@ fn render(
                     ratatui::style::Style::default(),
                 ));
                 let url_room = (width.saturating_sub(38)) as usize;
-                for p in &panel.providers {
+                // keyed providers first; cap the list so the panel stays
+                // readable with a large catalog behind it
+                let mut providers: Vec<&ProviderInfo> = panel.providers.iter().collect();
+                providers.sort_by_key(|p| !p.key_set && !p.env_var.is_empty());
+                const CAP: usize = 18;
+                let (shown, rest) = providers.split_at(CAP.min(providers.len()));
+                for p in shown {
                     let key = if p.env_var.is_empty() {
                         "(keyless)".to_string()
                     } else if p.key_set {
@@ -2094,6 +2127,12 @@ fn render(
                         ),
                         Span::styled(format!("  {url}"), crate::palette::META),
                     ]));
+                }
+                if !rest.is_empty() {
+                    text.push(TuiLine::styled(
+                        format!("  +{} more (see `ka providers`)", rest.len()),
+                        crate::palette::META,
+                    ));
                 }
                 let widget = Paragraph::new(text)
                     .block(
@@ -2245,6 +2284,10 @@ mod tests {
             context,
             key_env: "X_API_KEY".to_string(),
             key_set: false,
+            price_in: 0.0,
+            price_out: 0.0,
+            priced: false,
+            plan: false,
         }
     }
 

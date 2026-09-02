@@ -96,9 +96,11 @@ cargo xtask unlink    # remove the kad symlink
 
 **Live meters**: the engine emits a context meter per model step, so the footer's token/ctx gauge moves while a turn runs (not just at the end), and the reasoning effort shows once set. `ka run --session <id>` resumes headless by id. Input keying: `⏎` send · `⇧⏎` newline (Ctrl+J fallback) · bracketed paste pastes multi-line as one draft.
 
-**Pricing honesty**: seeded dialect prices are placeholders and are flagged `priced = false` — surfaces (footer, `ka models`) never display costs from unverified rows. Flip the flag when real numbers land.
+**Pricing honesty**: curated dialect prices are placeholders flagged `priced = false` — surfaces (footer, `ka models`) never display costs from unverified rows. The generated models.dev overlay (`cargo xtask models-sync`) carries real published pricing, subscription plans included as unpriced `plan` rows.
 
-**Provider registry**: `openai anthropic google mistral groq cerebras deepseek qwen moonshot xai zhipu nvidia openrouter together fireworks ollama lmstudio llamacpp vllm` — any `vendor/model` selector works against these (no catalog row needed; context/pricing unknown until seeded).
+**Model catalog**: 130+ providers seeded from [models.dev](https://models.dev) — including subscription tiers (`zai-coding-plan/glm-5.3`, `zhipuai-coding-plan/…`, `alibaba-coding-plan/…`) alongside pay-per-token endpoints, with context windows, pricing, and key status in the `/model` picker. Picking a model in `/model` persists it as the default for future conversations; `/settings` → `s` still saves the full panel.
+
+**Provider registry**: curated vendors (`openai anthropic google … ollama lmstudio llamacpp vllm`) work selector-only; catalog-derived vendors from models.dev appear in `/settings` and `ka providers` (keyed first, capped, `ka providers` for the full list).
 
 Stable owns the name `ka`; dev is always `kad`. Isolate dev sessions with `KA_DATA_DIR=/tmp/ka-dev kad …` (shares config/rules/hooks, separates strands).
 
