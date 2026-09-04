@@ -697,9 +697,10 @@ fn render_line(line: &Line, width: u16) -> Vec<ratatui::text::Line<'static>> {
         Line::User(text) => push_block(&mut out, text, width),
         Line::Assistant(text) => {
             // assistant output on a subtle full-width surface: background
-            // fill only, never border glyphs; the trailing gap row carries
-            // the same fill so empty rows stay uniform
+            // fill only, never border glyphs; blank rows above and below
+            // carry the same fill, giving the card inner top/bottom air
             let bg = crate::palette::BG_OUTPUT;
+            out.push(surface_blank(width, bg));
             let mut rows = crate::markdown::render(text, width);
             apply_output_surface(&mut rows, width, bg);
             out.extend(rows);
@@ -979,18 +980,18 @@ const SIDEBAR_WIDTH: u16 = 26;
 /// Minimum terminal width for the sidebar; below it the transcript keeps
 /// the full row exactly as before.
 const SIDEBAR_MIN_WIDTH: u16 = 100;
-
-/// Inner text width of the transcript column: the terminal narrows by the
-/// sidebar's columns once it fits, minus the paragraph's side padding.
-/// Both the cache (`Transcript::set_width`) and the live surface derive
-/// from this so they always agree.
+/// Inner text width of the transcript column: the terminal narrows by
+/// one margin column on each side, by the sidebar's columns once it
+/// fits, and by the paragraph's side padding. Both the cache
+/// (`Transcript::set_width`) and the live surface derive from this so
+/// they always agree.
 fn transcript_width(term_w: u16) -> u16 {
     let base = if term_w >= SIDEBAR_MIN_WIDTH {
         term_w - SIDEBAR_WIDTH
     } else {
         term_w
     };
-    base.saturating_sub(2)
+    base.saturating_sub(4) // 2 margin cols + the paragraph's side padding
 }
 /// Truncate a string to `max_cols` display columns (unicode-width aware),
 /// marking the cut with `…`.
@@ -1155,25 +1156,38 @@ fn sidebar_rows(
     }
 
     // flatten top-to-bottom, dropping sections that no longer fit and
-    // capping any list section that would overflow the remaining height
+    // capping any list section that would overflow the remaining height.
+    // Air: one blank row after each header and one between sections;
+    // priorities keep their top-down order, the rest truncates.
     let sections = [session, todos, mcp, skills, agents, info];
     let mut out: Vec<TuiLine> = Vec::with_capacity(height.min(40));
     let mut room = height;
+    let mut placed = false;
     for section in sections {
-        if room == 0 {
-            break;
-        }
         let Some((head, body)) = section.split_first() else {
             continue;
         };
         if body.is_empty() {
             continue; // empty sections vanish
         }
-        let show = (room - 1).min(body.len());
-        if show == 0 {
-            break; // not even one body row fits
+        if placed {
+            if room == 0 {
+                break;
+            }
+            out.push(TuiLine::default()); // one blank row between sections
+            room -= 1;
         }
+        // a section needs its header plus the blank row under it
+        if room < 2 {
+            break;
+        }
+        let show = (room - 2).min(body.len());
+        if show == 0 {
+            break; // not even one body row fits under the header air
+        }
+        placed = true;
         out.push(head.clone());
+        out.push(TuiLine::default()); // blank under the header
         if show < body.len() {
             // the cut must be visible: the mark replaces the last row
             out.extend(body[..show - 1].iter().cloned());
@@ -1181,11 +1195,10 @@ fn sidebar_rows(
                 format!("(+{})", body.len() - show + 1),
                 crate::palette::META,
             ));
-            room -= show + 1;
         } else {
             out.extend(body.iter().cloned());
-            room -= show + 1;
         }
+        room -= 2 + show;
     }
     out
 }
@@ -4264,14 +4277,20 @@ fn render(
     use ratatui::style::{Modifier, Style};
     use ratatui::text::{Line as TuiLine, Span};
     use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
+    // one column of air on each side of the frame; rows stay edge to
+    // edge (they are scarce). Every width below derives from these
+    // chunks, never from the raw frame area.
+    let outer = frame.area().inner(ratatui::layout::Margin::new(1, 0));
     let chunks = ratatui::layout::Layout::vertical([
         Min(3),
         Length(input_height(input_area_rows(ask, picker, input))),
         Length(1),
     ])
-    .split(frame.area());
+    .split(outer);
     // wide terminals: the transcript row splits, the sidebar takes a
-    // fixed right column; narrow terminals keep today's full-width row
+    // fixed right column; narrow terminals keep the full-width row.
+    // The threshold reads the raw terminal width, matching
+    // `transcript_width`'s sidebar check.
     let (tx_area, sb_area) = if frame.area().width >= SIDEBAR_MIN_WIDTH {
         let cols = ratatui::layout::Layout::horizontal([
             ratatui::layout::Constraint::Min(0),
@@ -4283,6 +4302,10 @@ fn render(
         (chunks[0], None)
     };
     let tx_inner = tx_area.width.saturating_sub(2);
+    // modals center within the transcript pane, one col clear of its
+    // edges: they never touch the sidebar border, the input box, or the
+    // status bar
+    let modal_area = tx_area.inner(ratatui::layout::Margin::new(1, 0));
 
     // ── transcript: cached rows + live region under a scroll window ──
     let mut live_rows: Vec<TuiLine> = Vec::new();
@@ -4304,15 +4327,19 @@ fn render(
         live_rows.extend(lb.tool.iter().cloned());
         // cached markdown rows (clone-on-append; the cache stays cursor-free)
         // live markdown rows get the same surface as final output; the
-        // cursor is appended first so the surface pads around it
+        // cursor is appended first so the surface pads around it, and
+        // blank rows above and below give the live card the same inner
+        // air the cached rows carry
         if !lb.md.is_empty() {
             let mut md_live: Vec<TuiLine> = lb.md.to_vec();
             if let Some(last) = md_live.last_mut() {
                 last.spans
                     .push(Span::styled("▌", crate::palette::ACCENT_STYLE));
             }
+            live_rows.push(surface_blank(tx_inner, crate::palette::BG_OUTPUT));
             apply_output_surface(&mut md_live, tx_inner, crate::palette::BG_OUTPUT);
             live_rows.extend(md_live);
+            live_rows.push(surface_blank(tx_inner, crate::palette::BG_OUTPUT));
         }
     }
 
@@ -4344,7 +4371,7 @@ fn render(
     let widget = Paragraph::new(window).block(
         Block::default()
             .borders(Borders::TOP)
-            .title(ratatui::text::Line::from(title).style(crate::palette::META))
+            .title(padded_title(title))
             .border_style(crate::palette::BORDER)
             .padding(ratatui::widgets::Padding::horizontal(1)),
     );
@@ -4352,12 +4379,20 @@ fn render(
 
     // ── sidebar: session · todos · mcp · skills · agents · info ──
     if let Some(sb) = sb_area {
-        let rows = sidebar_rows(sidebar, meters, 24, sb.height as usize);
+        // left border + horizontal padding: content starts two cols in
+        // from the border, one col of air remains at the right edge
+        let rows = sidebar_rows(
+            sidebar,
+            meters,
+            (SIDEBAR_WIDTH - 3) as usize,
+            sb.height as usize,
+        );
         let widget = Paragraph::new(rows).block(
             Block::default()
                 .borders(Borders::LEFT)
-                .title(ratatui::text::Line::from("ka").style(crate::palette::META))
-                .border_style(crate::palette::BORDER),
+                .title(padded_title("ka"))
+                .border_style(crate::palette::BORDER)
+                .padding(ratatui::widgets::Padding::horizontal(1)),
         );
         frame.render_widget(widget, sb);
     }
@@ -4401,7 +4436,7 @@ fn render(
         // one row per tier: the selected row is a full-width inverse
         // bar, the label column stays padded so descriptions align, and
         // unselected descriptions ride along in DIM
-        let inner_w = chunks[1].width.saturating_sub(2) as usize;
+        let inner_w = chunks[1].width.saturating_sub(4) as usize; // borders + padding
         let mut rows = Vec::with_capacity(MODE_CHOICES.len());
         for (i, (_, label, desc)) in MODE_CHOICES.iter().enumerate() {
             if i == pk.selected {
@@ -4423,7 +4458,7 @@ fn render(
         // shared horizontal window: all rows shift together so the cursor
         // row can always show the cursor
         let (_, cur_col) = cursor_row_col(input, cursor);
-        let inner_w = chunks[1].width.saturating_sub(2) as usize;
+        let inner_w = chunks[1].width.saturating_sub(4) as usize; // borders + padding
         let scroll_col = cur_col.saturating_sub(inner_w.saturating_sub(1).max(1));
         input
             .split('\n')
@@ -4433,17 +4468,18 @@ fn render(
     let input_widget = Paragraph::new(body).block(
         Block::default()
             .borders(Borders::ALL)
-            .title(ratatui::text::Line::from(title).style(crate::palette::META))
-            .border_style(input_border),
+            .title(padded_title(title))
+            .border_style(input_border)
+            .padding(ratatui::widgets::Padding::horizontal(1)),
     );
     frame.render_widget(input_widget, chunks[1]);
     if ask.is_none() && picker.is_none() {
         let (cur_row, cur_col) = cursor_row_col(input, cursor);
-        let inner_w = chunks[1].width.saturating_sub(2) as usize;
+        let inner_w = chunks[1].width.saturating_sub(4) as usize; // borders + padding
         let scroll_col = cur_col.saturating_sub(inner_w.saturating_sub(1).max(1));
         let area = chunks[1];
         frame.set_cursor_position((
-            area.x + 1 + (cur_col - scroll_col) as u16,
+            area.x + 2 + (cur_col - scroll_col) as u16,
             area.y + 1 + cur_row.min(area.height.saturating_sub(2) as usize) as u16,
         ));
     }
@@ -4500,17 +4536,21 @@ fn render(
     });
     let w = unicode_width::UnicodeWidthStr::width;
     let left_cols: usize = hints.iter().map(|s| w(s.content.as_ref())).sum();
-    let pad = frame
-        .area()
+    // one leading + one trailing col of air: the left zone starts a col
+    // in, the right zone ends a col before the chunk edge
+    let pad = chunks[2]
         .width
+        .saturating_sub(2)
         .saturating_sub((left_cols + w(right.as_str()) + w(spinner.as_str())) as u16)
         .max(1) as usize;
-    let mut bar = hints;
+    let mut bar: Vec<Span<'static>> = vec![Span::raw(" ")];
+    bar.extend(hints);
     bar.push(Span::raw(" ".repeat(pad)));
     bar.push(Span::styled(right, crate::palette::META));
     if !spinner.is_empty() {
         bar.push(Span::styled(spinner, crate::palette::ACCENT_BOLD));
     }
+    bar.push(Span::raw(" "));
     frame.render_widget(Paragraph::new(TuiLine::from(bar)), chunks[2]);
 
     // ── slash autocomplete popup (above input) ────────────────────
@@ -4524,7 +4564,7 @@ fn render(
             height: rows,
         };
         frame.render_widget(Clear, rect);
-        let inner_w = rect.width.saturating_sub(2) as usize;
+        let inner_w = rect.width.saturating_sub(4) as usize; // borders + padding
         let mut text = Vec::new();
         for (i, (name, desc)) in popup.items.iter().take(7).enumerate() {
             let desc_trim: String = desc.chars().take(32).collect();
@@ -4542,8 +4582,9 @@ fn render(
             .block(
                 Block::default()
                     .borders(Borders::ALL)
-                    .title(ratatui::text::Line::from("commands").style(crate::palette::META))
-                    .border_style(crate::palette::BORDER),
+                    .title(padded_title("commands"))
+                    .border_style(crate::palette::BORDER)
+                    .padding(ratatui::widgets::Padding::horizontal(1)),
             )
             .wrap(Wrap { trim: false });
         frame.render_widget(widget, rect);
@@ -4560,7 +4601,7 @@ fn render(
             height: rows,
         };
         frame.render_widget(Clear, rect);
-        let inner_w = rect.width.saturating_sub(2) as usize;
+        let inner_w = rect.width.saturating_sub(4) as usize; // borders + padding
         let mut text = Vec::new();
         for (i, (name, is_dir)) in path.entries.iter().take(7).enumerate() {
             let slash = if *is_dir { "/" } else { "" };
@@ -4582,11 +4623,9 @@ fn render(
             .block(
                 Block::default()
                     .borders(Borders::ALL)
-                    .title(
-                        ratatui::text::Line::from(if path.mentions { "files" } else { "path" })
-                            .style(crate::palette::META),
-                    )
-                    .border_style(crate::palette::BORDER),
+                    .title(padded_title(if path.mentions { "files" } else { "path" }))
+                    .border_style(crate::palette::BORDER)
+                    .padding(ratatui::widgets::Padding::horizontal(1)),
             )
             .wrap(Wrap { trim: false });
         frame.render_widget(widget, rect);
@@ -4597,16 +4636,17 @@ fn render(
         match open {
             Modal::Session(picker) => {
                 let rows = picker.rows();
-                let height = (rows.len() as u16 + 3).min(20);
+                // border(2) + vertical padding(2) + filter row(1)
+                let height = (rows.len() as u16 + 5).min(22);
                 let width = 68.min(frame.area().width);
-                let rect = centered(width, height, frame.area());
+                let rect = centered(width, height, modal_area);
                 frame.render_widget(Clear, rect);
                 let mut text = vec![TuiLine::from(vec![
                     Span::styled("filter: ", ratatui::style::Style::default()),
                     Span::styled(picker.filter.clone(), crate::palette::ACCENT_STYLE),
                 ])];
-                let inner_w = width.saturating_sub(2) as usize;
-                for (i, (label, detail)) in rows.iter().take((height as usize) - 3).enumerate() {
+                let inner_w = width.saturating_sub(4) as usize; // borders + padding
+                for (i, (label, detail)) in rows.iter().take((height as usize) - 5).enumerate() {
                     let row = pad_to_width(format!("{label}  —  {detail}"), inner_w);
                     if i == picker.selected {
                         text.push(TuiLine::styled(row, selection_style()));
@@ -4618,10 +4658,9 @@ fn render(
                     .block(
                         Block::default()
                             .borders(Borders::ALL)
-                            .title(
-                                ratatui::text::Line::from("sessions").style(crate::palette::META),
-                            )
-                            .border_style(crate::palette::BORDER),
+                            .title(padded_title("sessions"))
+                            .border_style(crate::palette::BORDER)
+                            .padding(ratatui::widgets::Padding::new(1, 1, 1, 1)),
                     )
                     .wrap(Wrap { trim: false });
                 frame.render_widget(widget, rect);
@@ -4630,9 +4669,9 @@ fn render(
                 // full-frame wipe: switching here from the model picker must
                 // leave no stale pixels outside the prompt rect
                 frame.render_widget(Clear, frame.area());
-                let height = 8u16.min(frame.area().height.saturating_sub(2));
+                let height = 10u16.min(frame.area().height.saturating_sub(2));
                 let width = 64.min(frame.area().width);
-                let rect = centered(width, height, frame.area());
+                let rect = centered(width, height, modal_area);
                 frame.render_widget(Clear, rect);
                 let mut text = vec![TuiLine::styled("api key", crate::palette::ACCENT_BOLD)];
                 text.push(TuiLine::from(vec![
@@ -4644,7 +4683,12 @@ fn render(
                     Span::styled(prompt.env_var.clone(), Style::default()),
                 ]));
                 if !prompt.doc_url.is_empty() {
-                    let doc: String = prompt.doc_url.chars().take(width as usize - 4).collect();
+                    // "get one   " (10 cols) + doc must fit the padded inner width
+                    let doc: String = prompt
+                        .doc_url
+                        .chars()
+                        .take(width.saturating_sub(14) as usize)
+                        .collect();
                     text.push(TuiLine::from(vec![
                         Span::styled("get one   ", crate::palette::META),
                         Span::styled(doc, crate::palette::CYAN),
@@ -4661,16 +4705,17 @@ fn render(
                     .block(
                         Block::default()
                             .borders(Borders::ALL)
-                            .title(ratatui::text::Line::from("api key").style(crate::palette::META))
-                            .border_style(crate::palette::BORDER),
+                            .title(padded_title("api key"))
+                            .border_style(crate::palette::BORDER)
+                            .padding(ratatui::widgets::Padding::new(1, 1, 1, 1)),
                     )
                     .wrap(Wrap { trim: false });
                 frame.render_widget(widget, rect);
             }
             Modal::Help => {
-                let height = 32u16.min(frame.area().height.saturating_sub(2));
+                let height = 34u16.min(frame.area().height.saturating_sub(2));
                 let width = 66.min(frame.area().width);
-                let rect = centered(width, height, frame.area());
+                let rect = centered(width, height, modal_area);
                 frame.render_widget(Clear, rect);
                 let keys = vec![
                     ("Enter", "send · interject mid-turn"),
@@ -4713,24 +4758,26 @@ fn render(
                     .block(
                         Block::default()
                             .borders(Borders::ALL)
-                            .title(ratatui::text::Line::from("help").style(crate::palette::META))
-                            .border_style(crate::palette::BORDER),
+                            .title(padded_title("help"))
+                            .border_style(crate::palette::BORDER)
+                            .padding(ratatui::widgets::Padding::new(1, 1, 1, 1)),
                     )
                     .wrap(Wrap { trim: false });
                 frame.render_widget(widget, rect);
             }
             Modal::Model(picker) => {
                 let rows = picker.rows();
-                let height = (rows.len() as u16 + 3).min(18);
+                // border(2) + vertical padding(2) + filter row(1)
+                let height = (rows.len() as u16 + 5).min(20);
                 let width = 68.min(frame.area().width);
-                let rect = centered(width, height, frame.area());
+                let rect = centered(width, height, modal_area);
                 frame.render_widget(Clear, rect);
                 let mut text = vec![TuiLine::from(vec![
                     Span::styled("filter: ", ratatui::style::Style::default()),
                     Span::styled(picker.filter.clone(), crate::palette::ACCENT_STYLE),
                 ])];
-                let cap = (height as usize).saturating_sub(3);
-                let inner_w = width.saturating_sub(2) as usize;
+                let cap = (height as usize).saturating_sub(5);
+                let inner_w = width.saturating_sub(4) as usize; // borders + padding
                 for (i, m) in rows.iter().take(cap).enumerate() {
                     let ctx = if m.context > 0 {
                         format!("{}k", m.context / 1000)
@@ -4775,32 +4822,31 @@ fn render(
                     .block(
                         Block::default()
                             .borders(Borders::ALL)
-                            .title(
-                                ratatui::text::Line::from(
-                                    picker
-                                        .vendor
-                                        .as_ref()
-                                        .map_or("model".to_string(), |v| format!("model · {v}")),
-                                )
-                                .style(crate::palette::META),
-                            )
-                            .border_style(crate::palette::BORDER),
+                            .title(padded_title(
+                                picker
+                                    .vendor
+                                    .as_ref()
+                                    .map_or("model".to_string(), |v| format!("model · {v}")),
+                            ))
+                            .border_style(crate::palette::BORDER)
+                            .padding(ratatui::widgets::Padding::new(1, 1, 1, 1)),
                     )
                     .wrap(Wrap { trim: false });
                 frame.render_widget(widget, rect);
             }
             Modal::Provider(picker) => {
                 let rows = picker.rows();
-                let height = (rows.len() as u16 + 3).min(18);
+                // border(2) + vertical padding(2) + filter row(1)
+                let height = (rows.len() as u16 + 5).min(20);
                 let width = 68.min(frame.area().width);
-                let rect = centered(width, height, frame.area());
+                let rect = centered(width, height, modal_area);
                 frame.render_widget(Clear, rect);
-                let inner_w = width.saturating_sub(2) as usize;
+                let inner_w = width.saturating_sub(4) as usize; // borders + padding
                 let mut text = vec![TuiLine::from(vec![
                     Span::styled("filter: ", ratatui::style::Style::default()),
                     Span::styled(picker.filter.clone(), crate::palette::ACCENT_STYLE),
                 ])];
-                let cap = (height as usize).saturating_sub(3);
+                let cap = (height as usize).saturating_sub(5);
                 for (i, (p, detail)) in rows.iter().take(cap).enumerate() {
                     let name: String = p.name.chars().take(16).collect();
                     let detail: String = detail.chars().take(44).collect();
@@ -4831,22 +4877,22 @@ fn render(
                     .block(
                         Block::default()
                             .borders(Borders::ALL)
-                            .title(
-                                ratatui::text::Line::from("providers").style(crate::palette::META),
-                            )
-                            .border_style(crate::palette::BORDER),
+                            .title(padded_title("providers"))
+                            .border_style(crate::palette::BORDER)
+                            .padding(ratatui::widgets::Padding::new(1, 1, 1, 1)),
                     )
                     .wrap(Wrap { trim: false });
                 frame.render_widget(widget, rect);
             }
             Modal::Settings(panel) => {
-                let height = (SettingsPanel::ROWS + panel.providers.len() + 5) as u16;
+                // border(2) + vertical padding(2) + the ROWS/provider rows
+                let height = (SettingsPanel::ROWS + panel.providers.len() + 7) as u16;
                 let height = height.min(frame.area().height.saturating_sub(2));
                 let width = 72.min(frame.area().width);
-                let rect = centered(width, height, frame.area());
+                let rect = centered(width, height, modal_area);
                 frame.render_widget(Clear, rect);
                 let dim = ratatui::style::Style::new().fg(crate::palette::MUTED);
-                let inner_w = width.saturating_sub(2) as usize;
+                let inner_w = width.saturating_sub(4) as usize; // borders + padding
                 let mode_str = mode_label(panel.mode);
                 let effort_str = panel
                     .effort
@@ -4896,7 +4942,7 @@ fn render(
                     "providers:",
                     ratatui::style::Style::default(),
                 ));
-                let url_room = (width.saturating_sub(38)) as usize;
+                let url_room = (width.saturating_sub(40)) as usize;
                 // keyed providers first; cap the list so the panel stays
                 // readable with a large catalog behind it
                 let mut providers: Vec<&ProviderInfo> = panel.providers.iter().collect();
@@ -4935,20 +4981,20 @@ fn render(
                     .block(
                         Block::default()
                             .borders(Borders::ALL)
-                            .title(
-                                ratatui::text::Line::from("settings").style(crate::palette::META),
-                            )
-                            .border_style(crate::palette::BORDER),
+                            .title(padded_title("settings"))
+                            .border_style(crate::palette::BORDER)
+                            .padding(ratatui::widgets::Padding::new(1, 1, 1, 1)),
                     )
                     .wrap(Wrap { trim: false });
                 frame.render_widget(widget, rect);
             }
             Modal::Spills { items, selected } => {
-                let height = (items.len() as u16 + 3).clamp(5, 19);
+                // border(2) + vertical padding(2) + list rows
+                let height = (items.len() as u16 + 5).clamp(7, 21);
                 let width = 68.min(frame.area().width);
-                let rect = centered(width, height, frame.area());
+                let rect = centered(width, height, modal_area);
                 frame.render_widget(Clear, rect);
-                let inner_w = width.saturating_sub(2) as usize;
+                let inner_w = width.saturating_sub(4) as usize; // borders + padding
                 let mut text = Vec::new();
                 if items.is_empty() {
                     text.push(TuiLine::styled(
@@ -4956,7 +5002,7 @@ fn render(
                         crate::palette::META,
                     ));
                 }
-                let cap = (height as usize).saturating_sub(3);
+                let cap = (height as usize).saturating_sub(5);
                 for (i, path) in items.iter().take(cap).enumerate() {
                     if i == *selected {
                         text.push(TuiLine::styled(
@@ -4971,8 +5017,9 @@ fn render(
                     .block(
                         Block::default()
                             .borders(Borders::ALL)
-                            .title(ratatui::text::Line::from("spills").style(crate::palette::META))
-                            .border_style(crate::palette::BORDER),
+                            .title(padded_title("spills"))
+                            .border_style(crate::palette::BORDER)
+                            .padding(ratatui::widgets::Padding::new(1, 1, 1, 1)),
                     )
                     .wrap(Wrap { trim: false });
                 frame.render_widget(widget, rect);
@@ -5101,6 +5148,12 @@ fn centered(width: u16, height: u16, area: ratatui::layout::Rect) -> ratatui::la
         width: width.min(area.width),
         height: height.min(area.height),
     }
+}
+
+/// A block title with one column of air on each side, so titles never
+/// kiss the border glyphs or the frame edge.
+fn padded_title(title: impl Into<String>) -> ratatui::text::Line<'static> {
+    ratatui::text::Line::from(format!(" {} ", title.into())).style(crate::palette::META)
 }
 
 #[cfg(test)]
@@ -6073,29 +6126,38 @@ mod tests {
     #[test]
     fn assistant_entry_fills_output_surface() {
         // assistant rows carry the output background and fill the width;
-        // the trailing gap row carries the same fill: empty rows stay uniform
+        // blank rows above and below carry the same fill, giving the
+        // card inner top/bottom air
         let out = super::render_line(&Line::Assistant("**hi** there".into()), 40);
-        let text: String = out[0].spans.iter().map(|s| s.content.to_string()).collect();
-        assert_eq!(text.trim_end(), "hi there");
-        let filled: usize = out[0].spans.iter().map(|s| s.content.chars().count()).sum();
-        assert_eq!(filled, 40, "surface fills the width");
-        let slab = format!("{:?}", out[0]);
-        assert!(slab.contains("Rgb(22, 26, 31)"), "output bg: {slab}");
-        assert!(out.len() >= 2);
-        let gap = out.last().unwrap();
-        assert!(
-            gap.spans
+        assert!(out.len() >= 3, "blank + content + blank, got {}", out.len());
+        let surface = ratatui::style::Color::Rgb(22, 26, 31);
+        let row_text = |l: &ratatui::text::Line<'static>| {
+            l.spans
                 .iter()
-                .all(|s| s.style.bg == Some(ratatui::style::Color::Rgb(22, 26, 31))),
-            "gap row filled at span level: {gap:?}"
-        );
-        assert_eq!(
-            gap.spans
+                .map(|s| s.content.to_string())
+                .collect::<String>()
+        };
+        let cols = |l: &ratatui::text::Line<'static>| {
+            l.spans
                 .iter()
                 .map(|s| s.content.chars().count())
-                .sum::<usize>(),
-            40
-        );
+                .sum::<usize>()
+        };
+        // the card opens and closes on a full-width surface blank
+        for edge in [out.first().unwrap(), out.last().unwrap()] {
+            assert!(
+                edge.spans.iter().all(|s| s.style.bg == Some(surface)),
+                "edge row filled at span level: {edge:?}"
+            );
+            assert_eq!(cols(edge), 40, "edge blank fills the width");
+            assert!(row_text(edge).trim().is_empty(), "edge row is blank");
+        }
+        // the first content row keeps the surface fill
+        let content = &out[1];
+        assert_eq!(row_text(content).trim_end(), "hi there");
+        assert_eq!(cols(content), 40, "surface fills the width");
+        let slab = format!("{content:?}");
+        assert!(slab.contains("Rgb(22, 26, 31)"), "output bg: {slab}");
     }
 
     #[test]
@@ -7776,12 +7838,45 @@ mod tests {
             },
             ..Default::default()
         };
-        // tiny budget: session(2) + todos header would eat it all — give
-        // skills room to show only part of the list
-        let rows = sidebar_rows(&sidebar, &Meters::default(), 24, 3);
+        // Meters::default leaves session/todos/mcp empty, so skills owns
+        // the whole budget: header + air + show = min(height-2, 30) list
+        // rows, where the cut mark replaces the last one. At height 8:
+        // header, blank, skill-0..4, mark.
+        let rows = sidebar_rows(&sidebar, &Meters::default(), 24, 8);
         let text = plain_text(&rows);
-        assert_eq!(text.len(), 3, "{text:?}");
-        assert!(text.last().unwrap().starts_with("(+"), "{text:?}");
+        assert_eq!(text.len(), 8, "{text:?}");
+        assert_eq!(text[0], "skills", "{text:?}");
+        assert_eq!(text[1], "", "blank row under the header: {text:?}");
+        assert_eq!(text[2], "skill-0", "{text:?}");
+        assert_eq!(text[6], "skill-4", "{text:?}");
+        assert_eq!(text[7], "(+25)", "{text:?}");
+    }
+
+    #[test]
+    fn sidebar_puts_air_between_sections_and_under_headers() {
+        let sidebar = SidebarState {
+            cwd: "…/ka".into(),
+            branch: Some("main".into()),
+            todos: vec![ka_protocol::TodoItem {
+                text: "only todo".into(),
+                state: ka_protocol::TodoState::Pending,
+            }],
+            ..Default::default()
+        };
+        let rows = sidebar_rows(&sidebar, &Meters::default(), 24, 40);
+        let text = plain_text(&rows);
+        // every section header is followed by a blank row; a blank row
+        // also separates each section from the previous one
+        for (i, row) in text.iter().enumerate() {
+            if matches!(row.as_str(), "session" | "todos" | "info") {
+                assert_eq!(text[i + 1], "", "blank under header {row}: {text:?}");
+                if i > 0 {
+                    assert_eq!(text[i - 1], "", "blank before header {row}: {text:?}");
+                }
+            }
+        }
+        assert!(text.contains(&"· only todo".to_string()), "{text:?}");
+        assert!(text.contains(&"…/ka:main".to_string()), "{text:?}");
     }
 
     #[test]
@@ -7799,10 +7894,11 @@ mod tests {
 
     #[test]
     fn transcript_width_shrinks_only_when_sidebar_fits() {
-        assert_eq!(transcript_width(90), 88, "narrow: today's width");
-        assert_eq!(transcript_width(100), 72, "at threshold: minus sidebar");
-        assert_eq!(transcript_width(120), 92);
-        assert_eq!(transcript_width(60), 58, "never underflows");
+        // margin cols on each side, sidebar once it fits, side padding
+        assert_eq!(transcript_width(90), 86, "narrow: margins + padding");
+        assert_eq!(transcript_width(100), 70, "at threshold: minus sidebar");
+        assert_eq!(transcript_width(120), 90);
+        assert_eq!(transcript_width(60), 56, "never underflows");
     }
 
     #[test]
