@@ -906,6 +906,7 @@ attempt implementation — the user will review and switch to build mode.",
                                 events.send(Event::CallStarted {
                                     tool: call.tool.clone(),
                                     id: call.id.clone(),
+                                    detail: call_detail(&call.tool, &call.arguments),
                                 }).await.ok();
                                 step_calls.push(call);
                             }
@@ -1453,6 +1454,33 @@ async fn wait_or_cancel(
     }
 }
 
+/// Short argument summary for [`Event::CallStarted`] transcript headers:
+/// bash → the command flattened to one line (≤48 cols), file tools → the
+/// path's last segment (≤32), searches → the pattern (≤32), anything
+/// else empty (the header shows the bare tool name).
+fn call_detail(tool: &str, arguments: &serde_json::Value) -> String {
+    let str_arg = |key: &str| arguments.get(key).and_then(serde_json::Value::as_str);
+    match tool {
+        "bash" => str_arg("command")
+            .map(|cmd| {
+                cmd.split_whitespace()
+                    .collect::<Vec<_>>()
+                    .join(" ")
+                    .chars()
+                    .take(48)
+                    .collect()
+            })
+            .unwrap_or_default(),
+        "edit" | "write" | "read" => str_arg("path")
+            .map(|p| p.rsplit('/').next().unwrap_or(p).chars().take(32).collect())
+            .unwrap_or_default(),
+        "glob" | "grep" => str_arg("pattern")
+            .map(|p| p.chars().take(32).collect())
+            .unwrap_or_default(),
+        _ => String::new(),
+    }
+}
+
 /// Pose a `[continue, stop]` guard ask and wait for the answer.
 /// `false` = stop (user chose stop, aborted, or the surface went away).
 async fn ask_continue_or_stop(
@@ -1539,7 +1567,7 @@ mod tests {
     };
     use ka_protocol::{Command, Event, Stop, Usage};
 
-    use super::{GuardRuntime, Voice, cost_of, glob_match};
+    use super::{GuardRuntime, Voice, call_detail, cost_of, glob_match};
 
     #[test]
     fn unpriced_dialects_never_report_cost() {
@@ -1551,7 +1579,29 @@ mod tests {
         let cost = if priced { 18.0 } else { 0.0 };
         assert_eq!(cost, 18.0);
     }
-
+    #[test]
+    fn call_detail_summarizes_head_path_and_pattern() {
+        use serde_json::json;
+        // bash: multiline command flattened, capped at 48
+        let d = call_detail("bash", &json!({"command": "echo  a\nb\nc"}));
+        assert_eq!(d, "echo a b c");
+        let long = call_detail("bash", &json!({"command": "x".repeat(60)}));
+        assert_eq!(long.chars().count(), 48);
+        // file tools: last path segment, capped at 32
+        assert_eq!(
+            call_detail("edit", &json!({"path": "src/deep/lib/mod.rs"})),
+            "mod.rs"
+        );
+        assert_eq!(call_detail("read", &json!({"path": "/a/b.rs"})), "b.rs");
+        // searches: pattern
+        assert_eq!(
+            call_detail("grep", &json!({"pattern": "foo.*bar"})),
+            "foo.*bar"
+        );
+        // everything else: empty
+        assert_eq!(call_detail("todo", &json!({"items": []})), "");
+        assert_eq!(call_detail("bash", &json!({})), "");
+    }
     #[test]
     fn cost_of_computes_from_price() {
         let usage = Usage {

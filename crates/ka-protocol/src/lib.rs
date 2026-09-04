@@ -322,6 +322,11 @@ pub enum Event {
         tool: String,
         /// Call identifier.
         id: String,
+        /// Short argument summary for transcript headers (empty when the
+        /// tool has nothing worth showing or the sender predates the
+        /// field). Additive: absent JSON deserializes as empty.
+        #[serde(default)]
+        detail: String,
     },
     /// A tool call finished.
     CallFinished {
@@ -538,6 +543,7 @@ mod tests {
         roundtrip_event(Event::CallStarted {
             tool: "bash".into(),
             id: "c2".into(),
+            detail: "cargo test --workspace".into(),
         });
         roundtrip_event(Event::CallFinished {
             tool: "bash".into(),
@@ -615,6 +621,19 @@ mod tests {
             agents: Vec::new(),
             skills: Vec::new(),
         });
+    }
+
+    #[test]
+    fn call_started_detail_defaults_when_absent() {
+        // pre-detail senders: the additive field must deserialize empty
+        let back: Event = from_line(r#"{"type":"call_started","tool":"bash","id":"c9"}"#).unwrap();
+        match back {
+            Event::CallStarted { tool, id, detail } => {
+                assert_eq!((tool.as_str(), id.as_str()), ("bash", "c9"));
+                assert!(detail.is_empty(), "absent detail must default empty");
+            }
+            other => panic!("wrong event: {other:?}"),
+        }
     }
 
     #[test]

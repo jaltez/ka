@@ -773,12 +773,13 @@ fn input_area_rows(ask: Option<&PendingAsk>, picker: Option<&ModePicker>, draft:
     }
 }
 
-/// The busy-mode input title; queued deferrals surface as a muted hint.
+/// The input title while busy: only the queue hint — the action hints
+/// live in the status bar now.
 fn busy_input_title(queued: usize) -> String {
     if queued == 0 {
-        "input (enter=interject, +=defer, esc=abort)".to_string()
+        "input".to_string()
     } else {
-        format!("input (enter=interject, +=defer, esc=abort) · {queued} queued")
+        format!("input · {queued} queued")
     }
 }
 
@@ -945,39 +946,6 @@ pub struct Meters {
     pub cache_hit: Option<f32>,
 }
 
-impl Meters {
-    /// One-line footer string.
-    pub fn footer(&self) -> String {
-        let (used, window) = self.context;
-        let ctx = if window > 0 {
-            format!("ctx {}%", (used as f64 / window as f64 * 100.0) as u64)
-        } else {
-            format!("~{used} tok")
-        };
-        let cost = if self.cost > 0.0 {
-            format!(" ${:.4}", self.cost)
-        } else {
-            String::new()
-        };
-        let cache = self
-            .cache_hit
-            .map(|h| format!(" cache {:.0}%", h * 100.0))
-            .unwrap_or_default();
-        let tag = short_session(&self.session)
-            .map(|t| format!(" · #{t}"))
-            .unwrap_or_default();
-        let effort = if self.effort.is_empty() {
-            String::new()
-        } else {
-            format!(" · {}", self.effort)
-        };
-        format!(
-            "{} · {}{} · {}{}{}{}",
-            self.model, self.mode, effort, ctx, cost, cache, tag
-        )
-    }
-}
-
 /// Bootstrap inventory for the sidebar (the [`Event::Inventory`] payload,
 /// kept beside the transcript card it also renders).
 #[derive(Debug, Clone, Default)]
@@ -1061,16 +1029,17 @@ fn shorten_cwd(cwd: &std::path::Path) -> String {
 
 /// One-shot git branch detection for the sidebar info section (the
 /// engine's per-turn snapshot never crosses the protocol; this is the
-/// cheap local equivalent — empty when not a repo).
+/// cheap local equivalent — empty when not a repo). `symbolic-ref`
+/// covers fresh repos with no commits yet, where `rev-parse HEAD`
+/// fails.
 fn detect_branch() -> Option<String> {
     let out = std::process::Command::new("git")
-        .args(["rev-parse", "--abbrev-ref", "HEAD"])
+        .args(["symbolic-ref", "--short", "HEAD"])
         .output()
         .ok()?;
     let branch = String::from_utf8_lossy(&out.stdout).trim().to_string();
     (out.status.success() && !branch.is_empty()).then_some(branch)
 }
-
 /// Build the sidebar rows, top to bottom: session, todos, mcp, skills,
 /// agents, info. Empty sections vanish; list sections cap at what fits
 /// and mark the cut with `(+N)`.
@@ -1083,10 +1052,14 @@ fn sidebar_rows(
     use ratatui::style::{Modifier, Style};
     use ratatui::text::{Line as TuiLine, Span};
 
-    let header = |name: &str| TuiLine::styled(name.to_string(), crate::palette::META);
+    let header = |name: &str| {
+        TuiLine::styled(
+            name.to_string(),
+            crate::palette::META.add_modifier(Modifier::BOLD),
+        )
+    };
     let plain = |s: String| TuiLine::from(s);
-
-    // ── session: mirrors the footer, one fact per row ──
+    // ── session: mirrors the sidebar meters, one fact per row ──
     let mut session = vec![header("session")];
     let (used, window) = meters.context;
     let ctx_row = if window > 0 {
@@ -1114,17 +1087,38 @@ fn sidebar_rows(
     let done_style = Style::new()
         .fg(crate::palette::DIM)
         .add_modifier(Modifier::CROSSED_OUT);
+    let first_pending = sidebar
+        .todos
+        .iter()
+        .position(|t| t.state == ka_protocol::TodoState::Pending);
     let todos = std::iter::once(header("todos"))
-        .chain(sidebar.todos.iter().map(|t| match t.state {
-            ka_protocol::TodoState::Done => TuiLine::from(vec![
-                Span::styled("✓ ", done_style),
-                Span::styled(trunc_cols(&t.text, width.saturating_sub(2)), done_style),
-            ]),
-            ka_protocol::TodoState::Pending => TuiLine::from(format!(
-                "  {}",
-                trunc_cols(&t.text, width.saturating_sub(2))
-            )),
-        }))
+        .chain(
+            sidebar
+                .todos
+                .iter()
+                .enumerate()
+                .map(|(i, t)| match t.state {
+                    ka_protocol::TodoState::Done => TuiLine::from(vec![
+                        Span::styled("✓ ", done_style),
+                        Span::styled(trunc_cols(&t.text, width.saturating_sub(2)), done_style),
+                    ]),
+                    // the first pending item is 'next': accent bold; the rest
+                    // stay plain, both under a uniform `· ` lead
+                    ka_protocol::TodoState::Pending if Some(i) == first_pending => {
+                        TuiLine::from(vec![
+                            Span::styled("· ", crate::palette::ACCENT_BOLD),
+                            Span::styled(
+                                trunc_cols(&t.text, width.saturating_sub(2)),
+                                crate::palette::ACCENT_BOLD,
+                            ),
+                        ])
+                    }
+                    ka_protocol::TodoState::Pending => TuiLine::from(format!(
+                        "· {}",
+                        trunc_cols(&t.text, width.saturating_sub(2))
+                    )),
+                }),
+        )
         .collect::<Vec<_>>();
 
     // ── mcp: `name ✓ n` / `name ✗` ──
@@ -1153,13 +1147,11 @@ fn sidebar_rows(
     let skills = names("skills", &sidebar.inventory.skills);
     let agents = names("agents", &sidebar.inventory.agents);
 
-    // ── info: cwd + git branch ──
+    // ── info: one `cwd-short:branch` row at the bottom; without a
+    // startup branch snapshot the whole section stays off ──
     let mut info = vec![header("info")];
-    if !sidebar.cwd.is_empty() {
-        info.push(plain(trunc_cols(&sidebar.cwd, width)));
-    }
     if let Some(b) = &sidebar.branch {
-        info.push(plain(trunc_cols(&format!("branch {b}"), width)));
+        info.push(plain(trunc_cols(&format!("{}:{b}", sidebar.cwd), width)));
     }
 
     // flatten top-to-bottom, dropping sections that no longer fit and
@@ -1484,7 +1476,7 @@ pub struct ModelPicker {
 /// modal's inner width (68 - 2 borders = 66) or Paragraph wraps and the
 /// tail models clip off the picker — the exact bug that hid installed
 /// ollama models behind two-line rows.
-fn model_row(marker: &str, m: &ModelInfo, ctx: &str, key: &str) -> String {
+fn model_row(m: &ModelInfo, ctx: &str, key: &str) -> String {
     let id: String = m.id.chars().take(34).collect();
     let wire = m
         .wire
@@ -1504,7 +1496,7 @@ fn model_row(marker: &str, m: &ModelInfo, ctx: &str, key: &str) -> String {
     } else {
         "-".to_string()
     };
-    format!("{marker}{id:<34} {ctx:>5} {price:<10} {wire:<7}{key}")
+    format!("{id:<34} {ctx:>5} {price:<10} {wire:<7}{key}")
 }
 
 impl ModelPicker {
@@ -1741,7 +1733,7 @@ async fn app(
     // user-deferred prompts (`+` while busy), held locally and auto-sent
     // FIFO, one per turn settle (see the TurnFinished arm below)
     let mut queue: Vec<String> = Vec::new();
-    let mut pending_turn_cost = 0.0f64;
+    let mut turn_produced = false;
     let mut turn_usage: Option<(u64, u64, u64)> = None; // (input+cache_read, total_in_seen, output)
     let mut current_assistant = String::new();
     let mut spills: Vec<String> = Vec::new();
@@ -1764,7 +1756,6 @@ async fn app(
     let mut spin = tokio::time::interval(Duration::from_millis(120));
 
     while exit.is_none() {
-        let footer = meters.footer();
         let busy_now = busy;
         let ask = pending.clone();
         let input_snapshot = input.text.clone();
@@ -1816,7 +1807,6 @@ async fn app(
                 scroll,
                 &input_snapshot,
                 cursor,
-                &footer,
                 busy_now,
                 busy_since,
                 Instant::now(),
@@ -2471,6 +2461,7 @@ async fn app(
                                     ));
                                 } else if let Some(p) = last_user.clone() {
                                     // retry = a fresh turn with the same prompt
+                                    push_turn_air(&mut transcript);
                                     transcript.push(Line::User(p.clone()));
                                     busy = true;
                                     let _ = commands.send(Command::Prompt { text: p }).await;
@@ -2630,6 +2621,7 @@ async fn app(
                                     continue;
                                 }
                             }
+                            push_turn_air(&mut transcript);
                             transcript.push(Line::User(text.clone()));
                             let cmd = if busy {
                                 transcript.push(Line::Note(
@@ -2976,7 +2968,7 @@ async fn app(
                             &mut busy_since,
                             &mut meters,
                             &mut pending,
-                            &mut pending_turn_cost,
+                            &mut turn_produced,
                             &mut turn_usage,
                             &mut current_assistant,
                             &mut current_thought,
@@ -2995,6 +2987,7 @@ async fn app(
                             // unanswered ask holds the queue until answered.
                             if pending.is_none() {
                                 if let Some(next) = pop_queue_head(&mut queue) {
+                                    push_turn_air(&mut transcript);
                                     transcript.push(Line::User(next.clone()));
                                     last_user = Some(next.clone());
                                     busy = true;
@@ -3025,6 +3018,39 @@ struct LiveTool {
     last: Option<(String, bool)>,
 }
 
+/// Tool call header: `→ {tool}`, or `→ {tool} · {detail}` when the
+/// engine supplied an argument summary (the CallStarted detail field).
+fn tool_header(tool: &str, detail: &str) -> String {
+    if detail.is_empty() {
+        format!("→ {tool}")
+    } else {
+        format!("→ {tool} · {detail}")
+    }
+}
+
+/// One dim closing row for a turn that produced output:
+/// `{model} · {elapsed}s · ${cost}`, capped at 60 columns.
+fn turn_meta_row(model: &str, elapsed: f64, cost: f64) -> String {
+    let mut segs: Vec<String> = Vec::new();
+    if !model.is_empty() {
+        segs.push(model.to_string());
+    }
+    segs.push(format!("{elapsed:.1}s"));
+    segs.push(format!("${cost:.4}"));
+    trunc_cols(&segs.join(" · "), 60)
+}
+
+/// Air before a freshly flushed user row: one blank report row, so
+/// consecutive turn groups read as blocks. No-ops when the transcript
+/// is empty or already ends in air.
+fn push_turn_air(transcript: &mut Transcript) {
+    match transcript.entries().split_last() {
+        // fresh transcript or already-breathing tail: no air needed
+        None => {}
+        Some((Line::Report(s), _)) if s.is_empty() => {}
+        Some(_) => transcript.push(Line::Report(String::new())),
+    }
+}
 #[allow(clippy::too_many_arguments)]
 fn apply_event(
     evt: &Event,
@@ -3033,7 +3059,7 @@ fn apply_event(
     busy_since: &mut Option<Instant>,
     meters: &mut Meters,
     pending: &mut Option<PendingAsk>,
-    pending_turn_cost: &mut f64,
+    turn_produced: &mut bool,
     turn_usage: &mut Option<(u64, u64, u64)>,
     current_assistant: &mut String,
     current_thought: &mut String,
@@ -3054,7 +3080,7 @@ fn apply_event(
             *current_thought = String::new();
             *current_tool = String::new();
             *live_tool = None;
-            *pending_turn_cost = 0.0;
+            *turn_produced = false;
             *turn_usage = None;
             // a new turn invalidates a stale in-turn error buffer; the
             // retry target survives so /retry can resend the prompt
@@ -3062,16 +3088,23 @@ fn apply_event(
             *last_error = None;
         }
         Event::Delta { kind } => match kind {
-            ka_protocol::DeltaKind::Text(t) => current_assistant.push_str(t),
-            ka_protocol::DeltaKind::Thought(t) => current_thought.push_str(t),
+            ka_protocol::DeltaKind::Text(t) => {
+                *turn_produced = true;
+                current_assistant.push_str(t);
+            }
+            ka_protocol::DeltaKind::Thought(t) => {
+                *turn_produced = true;
+                current_thought.push_str(t);
+            }
             ka_protocol::DeltaKind::Call { tool, id } => {
+                *turn_produced = true;
                 // chronology: text streamed before the call must render
                 // above it, exactly like the turn-end flush
                 flush_live_text(transcript, current_thought, current_assistant);
                 if !current_tool.is_empty() {
                     transcript.push(Line::Tool(std::mem::take(current_tool)));
                 }
-                *current_tool = format!("→ {tool}");
+                *current_tool = tool_header(tool, "");
                 *live_tool = Some(LiveTool {
                     id: id.clone(),
                     preview: Vec::new(),
@@ -3079,17 +3112,29 @@ fn apply_event(
                 });
             }
         },
-        Event::CallStarted { tool, id } => {
+        Event::CallStarted { tool, id, detail } => {
+            *turn_produced = true;
             flush_live_text(transcript, current_thought, current_assistant);
-            if !current_tool.is_empty() {
-                transcript.push(Line::Tool(std::mem::take(current_tool)));
+            match live_tool.as_ref() {
+                // the streaming header for this exact call is still the
+                // live row: upgrade it in place with the argument detail
+                Some(lt) if lt.id == *id && !current_tool.is_empty() => {
+                    *current_tool = tool_header(tool, detail);
+                }
+                // cold start (no stream header) or a different call:
+                // close the old row and open a fresh live block
+                _ => {
+                    if !current_tool.is_empty() {
+                        transcript.push(Line::Tool(std::mem::take(current_tool)));
+                    }
+                    *current_tool = tool_header(tool, detail);
+                    *live_tool = Some(LiveTool {
+                        id: id.clone(),
+                        preview: Vec::new(),
+                        last: None,
+                    });
+                }
             }
-            *current_tool = format!("→ {tool}");
-            *live_tool = Some(LiveTool {
-                id: id.clone(),
-                preview: Vec::new(),
-                last: None,
-            });
         }
         Event::CallOutput {
             id,
@@ -3098,6 +3143,7 @@ fn apply_event(
             spill,
             ..
         } => {
+            *turn_produced = true;
             if let Some(path) = spill {
                 record_spill(spills, path);
             }
@@ -3137,6 +3183,7 @@ fn apply_event(
         }
         Event::TurnFinished { stop, usage } => {
             let elapsed = busy_since.map_or(0.0, |t| t.elapsed().as_secs_f64());
+            let produced = *turn_produced;
             flush_live_text(transcript, current_thought, current_assistant);
             if let Some(lt) = live_tool.take() {
                 if let Some((excerpt, is_error)) = lt.last {
@@ -3157,7 +3204,6 @@ fn apply_event(
             };
             meters.cache_hit = cache_hit;
             *turn_usage = Some((in_seen, usage.input, usage.output));
-            let _ = pending_turn_cost;
             let tail = usage_tail(usage, elapsed);
             let silent = matches!(stop, ka_protocol::Stop::Done)
                 && usage.input + usage.output + usage.cache_read == 0
@@ -3194,6 +3240,14 @@ fn apply_event(
                 let mut out = std::io::stdout().lock();
                 let _ = out.write_all(format!("\x1b]9;ka · {label}\x07").as_bytes());
                 let _ = out.flush();
+            }
+            // the assistant output's closing metadata row
+            if produced || !silent {
+                transcript.push(Line::Report(turn_meta_row(
+                    &meters.model,
+                    elapsed,
+                    usage.cost,
+                )));
             }
         }
         Event::ModelChanged { selector } => meters.model = selector.clone(),
@@ -4126,6 +4180,64 @@ fn append_tool_note(row: &mut String, excerpt: &str, is_error: bool) {
     }
 }
 
+/// The one selection identity of the whole TUI: full-row inverse video,
+/// bold. Replaces the old `▶ ` + accent marker on every picker.
+fn selection_style() -> ratatui::style::Style {
+    use ratatui::style::Modifier;
+    ratatui::style::Style::new().add_modifier(Modifier::REVERSED | Modifier::BOLD)
+}
+
+/// Pad a row to `width` display columns (unicode-width aware) so an
+/// inverse selection reads as a bar across the row, not a word.
+fn pad_to_width(s: String, width: usize) -> String {
+    use unicode_width::UnicodeWidthStr;
+    let used = s.width();
+    if used >= width {
+        return s;
+    }
+    s + &" ".repeat(width - used)
+}
+
+/// Status-bar key hints: each entry is a bold key plus a dim action,
+/// separated by dim ` · `.
+fn hint_spans(pairs: &[(&str, &str)]) -> Vec<ratatui::text::Span<'static>> {
+    use ratatui::style::{Modifier, Style};
+    use ratatui::text::Span;
+    let key = Style::new().add_modifier(Modifier::BOLD);
+    let mut out: Vec<Span<'static>> = Vec::new();
+    for (i, (k, v)) in pairs.iter().enumerate() {
+        if i > 0 {
+            out.push(Span::styled(" · ".to_string(), crate::palette::META));
+        }
+        out.push(Span::styled((*k).to_string(), key));
+        out.push(Span::styled(format!(" {v}"), crate::palette::META));
+    }
+    out
+}
+
+/// The status bar's right zone: `{model} · {mode} · ctx {pct}% ·
+/// ${cost}` — facts joined only when known, cost always on.
+fn status_right(meters: &Meters) -> String {
+    let (used, window) = meters.context;
+    let mut segs: Vec<String> = Vec::new();
+    if !meters.model.is_empty() {
+        segs.push(meters.model.clone());
+    }
+    if !meters.mode.is_empty() {
+        segs.push(meters.mode.clone());
+    }
+    if window > 0 {
+        segs.push(format!(
+            "ctx {}%",
+            (used as f64 / window as f64 * 100.0) as u64
+        ));
+    } else if used > 0 {
+        segs.push(format!("~{} tok", fmt_tok(used)));
+    }
+    segs.push(format!("${:.4}", meters.cost));
+    segs.join(" · ")
+}
+
 #[allow(clippy::too_many_arguments)]
 fn render(
     frame: &mut ratatui::Frame,
@@ -4133,7 +4245,6 @@ fn render(
     scroll: Option<usize>,
     input: &str,
     cursor: usize,
-    footer: &str,
     busy: bool,
     busy_since: Option<Instant>,
     now: Instant,
@@ -4253,18 +4364,16 @@ fn render(
 
     // ── input ─────────────────────────────────────────────────────
     // a permission ask borrows the box as a form (the draft returns
-    // after the answer); the reverse search takes over the title while
-    // active; queued deferrals surface as a muted busy-title hint
+    // after the answer); titles carry only structural/draft state —
+    // the action hints live in the status bar
     let title = if ask.is_some() {
-        "permission · ↑↓/1-9 select · ⏎ confirm · esc deny".to_string()
+        "permission".to_string()
     } else if picker.is_some() {
         "mode".to_string()
     } else if let Some(q) = rsearch {
         format!("input · {q}")
-    } else if busy {
-        busy_input_title(queued)
     } else {
-        "input · ⏎ send · ⇧⏎/ctrl+j newline".to_string()
+        busy_input_title(queued)
     };
     let input_border = if modal.is_some() || popup.is_some() || path.is_some() || picker.is_some() {
         crate::palette::META
@@ -4274,37 +4383,32 @@ fn render(
         crate::palette::BORDER
     };
     let body: Vec<TuiLine> = if let Some(ask) = ask {
-        // question text, then one options row: `▶ ` marks the selection
-        // (ACCENT_BOLD), unselected options sit plain beside it
+        // question text, then one options row: the selected option is
+        // inverse video, every option carries a single leading space so
+        // the text never shifts when the selection moves
         let mut rows = vec![TuiLine::from(ask.question.as_str())];
         let mut opts: Vec<Span> = Vec::new();
         for (i, opt) in ask.options.iter().enumerate() {
             if i == ask.selected {
-                opts.push(Span::styled(
-                    format!("▶ {opt}"),
-                    crate::palette::ACCENT_BOLD,
-                ));
+                opts.push(Span::styled(format!(" {opt}"), selection_style()));
             } else {
-                opts.push(Span::raw(if i == 0 {
-                    opt.clone()
-                } else {
-                    format!("   {opt}")
-                }));
+                opts.push(Span::raw(format!(" {opt}")));
             }
         }
         rows.push(TuiLine::from(opts));
         rows
     } else if let Some(pk) = picker {
-        // one row per tier: `▶ ` marks the selection (ACCENT_BOLD),
-        // the label column is padded so descriptions align, and the
-        // description rides along in DIM
+        // one row per tier: the selected row is a full-width inverse
+        // bar, the label column stays padded so descriptions align, and
+        // unselected descriptions ride along in DIM
+        let inner_w = chunks[1].width.saturating_sub(2) as usize;
         let mut rows = Vec::with_capacity(MODE_CHOICES.len());
         for (i, (_, label, desc)) in MODE_CHOICES.iter().enumerate() {
             if i == pk.selected {
-                rows.push(TuiLine::from(vec![
-                    Span::styled(format!("▶ {label:<15}"), crate::palette::ACCENT_BOLD),
-                    Span::styled(*desc, crate::palette::DIM),
-                ]));
+                rows.push(TuiLine::styled(
+                    pad_to_width(format!("  {label:<15} {desc}"), inner_w),
+                    selection_style(),
+                ));
             } else {
                 rows.push(TuiLine::from(vec![
                     Span::raw(format!("  {label:<15}")),
@@ -4314,10 +4418,7 @@ fn render(
         }
         rows
     } else if input.is_empty() && !busy && popup.is_none() && path.is_none() && modal.is_none() {
-        vec![TuiLine::styled(
-            "ask ka · / for commands · ⇧⏎ newline",
-            crate::palette::PLACEHOLDER,
-        )]
+        vec![TuiLine::styled("ask ka", crate::palette::PLACEHOLDER)]
     } else {
         // shared horizontal window: all rows shift together so the cursor
         // row can always show the cursor
@@ -4347,25 +4448,75 @@ fn render(
         ));
     }
 
-    // ── footer ────────────────────────────────────────────────────
-    let status = match busy_since {
-        Some(t0) if busy => format!(
-            " {} {} working",
-            spin_frame(now.duration_since(t0).as_millis()),
-            fmt_dur(now.duration_since(t0).as_secs_f64())
-        ),
-        _ => String::new(),
+    // ── status bar: contextual key hints left, meters right ───────
+    let hints: Vec<Span<'static>> = if ask.is_some() {
+        hint_spans(&[(" ↑↓", "select"), (" ⏎", "confirm"), (" esc", "deny")])
+    } else if picker.is_some() {
+        hint_spans(&[
+            (" ↑↓", "select"),
+            (" 1-4", "jump"),
+            (" ⏎", "apply"),
+            (" esc", "close"),
+        ])
+    } else if let Some(open) = modal {
+        match open {
+            Modal::Session(_) => {
+                hint_spans(&[(" type", "filter"), (" ⏎", "switch"), (" esc", "close")])
+            }
+            Modal::Model(_) => {
+                hint_spans(&[(" type", "filter"), (" ⏎", "select"), (" esc", "back")])
+            }
+            Modal::Provider(_) => {
+                hint_spans(&[(" type", "filter"), (" ⏎", "connect"), (" esc", "close")])
+            }
+            Modal::Settings(p) if p.edit.is_some() => hint_spans(&[
+                (" type", "edit selector"),
+                (" ⏎", "apply"),
+                (" esc", "cancel"),
+            ]),
+            Modal::Settings(_) => {
+                hint_spans(&[(" ⏎", "edit/cycle"), (" s", "save"), (" esc", "close")])
+            }
+            Modal::Spills { .. } => {
+                hint_spans(&[(" ↑↓", "choose"), (" ⏎", "open"), (" esc", "close")])
+            }
+            Modal::Key(_) => hint_spans(&[(" type", "value"), (" ⏎", "save"), (" esc", "cancel")]),
+            Modal::Help => hint_spans(&[(" ⏎", "close")]),
+        }
+    } else if popup.is_some() {
+        hint_spans(&[(" ↑↓", "select"), (" tab", "complete"), (" esc", "close")])
+    } else if path.is_some() {
+        hint_spans(&[(" ↑↓", "choose"), (" tab", "accept"), (" esc", "close")])
+    } else if rsearch.is_some() {
+        hint_spans(&[(" ctrl+r", "next"), (" ⏎", "accept"), (" esc", "cancel")])
+    } else if busy {
+        hint_spans(&[(" enter", "interject"), (" +", "defer"), (" esc", "abort")])
+    } else {
+        hint_spans(&[(" enter", "send"), (" /", "commands")])
     };
-    let footer_line = TuiLine::from(vec![
-        Span::styled(footer.to_string(), crate::palette::META),
-        Span::styled(status, crate::palette::ACCENT_BOLD),
-    ]);
-    frame.render_widget(Paragraph::new(footer_line), chunks[2]);
+    let right = status_right(meters);
+    let spinner = busy_since.filter(|_| busy).map_or(String::new(), |t0| {
+        format!("{} ", spin_frame(now.duration_since(t0).as_millis()))
+    });
+    let w = unicode_width::UnicodeWidthStr::width;
+    let left_cols: usize = hints.iter().map(|s| w(s.content.as_ref())).sum();
+    let pad = frame
+        .area()
+        .width
+        .saturating_sub((left_cols + w(right.as_str()) + w(spinner.as_str())) as u16)
+        .max(1) as usize;
+    let mut bar = hints;
+    bar.push(Span::raw(" ".repeat(pad)));
+    bar.push(Span::styled(right, crate::palette::META));
+    if !spinner.is_empty() {
+        bar.push(Span::styled(spinner, crate::palette::ACCENT_BOLD));
+    }
+    frame.render_widget(Paragraph::new(TuiLine::from(bar)), chunks[2]);
 
     // ── slash autocomplete popup (above input) ────────────────────
     if let Some(popup) = popup {
-        // border(2) + up to 7 items + 1 hint row
-        let rows = popup.items.len().min(7) as u16 + 3;
+        // border(2) + up to 7 items (hints live in the status bar)
+        let rows = popup.items.len().min(7) as u16 + 2;
         let rect = ratatui::layout::Rect {
             x: chunks[1].x,
             y: chunks[1].y.saturating_sub(rows),
@@ -4373,24 +4524,20 @@ fn render(
             height: rows,
         };
         frame.render_widget(Clear, rect);
+        let inner_w = rect.width.saturating_sub(2) as usize;
         let mut text = Vec::new();
         for (i, (name, desc)) in popup.items.iter().take(7).enumerate() {
-            let marker = if i == popup.selected { "▶ " } else { "  " };
-            let style = if i == popup.selected {
-                crate::palette::ACCENT_BOLD
-            } else {
-                ratatui::style::Style::default()
-            };
             let desc_trim: String = desc.chars().take(32).collect();
-            text.push(TuiLine::styled(
-                format!("{marker}{name:<12} {desc_trim}"),
-                style,
-            ));
+            let row = format!("{name:<12} {desc_trim}");
+            if i == popup.selected {
+                text.push(TuiLine::styled(
+                    pad_to_width(row, inner_w),
+                    selection_style(),
+                ));
+            } else {
+                text.push(TuiLine::raw(row));
+            }
         }
-        text.push(TuiLine::styled(
-            "tab complete · ↑↓ select",
-            crate::palette::META,
-        ));
         let widget = Paragraph::new(text)
             .block(
                 Block::default()
@@ -4404,8 +4551,8 @@ fn render(
 
     // ── path completion popup (above input) ────────────────────────
     if let Some(path) = path {
-        // border(2) + up to 7 entries + 1 hint row
-        let rows = path.entries.len().min(7) as u16 + 3;
+        // border(2) + up to 7 entries (hints live in the status bar)
+        let rows = path.entries.len().min(7) as u16 + 2;
         let rect = ratatui::layout::Rect {
             x: chunks[1].x,
             y: chunks[1].y.saturating_sub(rows),
@@ -4413,32 +4560,24 @@ fn render(
             height: rows,
         };
         frame.render_widget(Clear, rect);
+        let inner_w = rect.width.saturating_sub(2) as usize;
         let mut text = Vec::new();
         for (i, (name, is_dir)) in path.entries.iter().take(7).enumerate() {
-            let marker = if i == path.selected { "▶ " } else { "  " };
+            let slash = if *is_dir { "/" } else { "" };
             if i == path.selected {
-                let mut spans = vec![Span::styled(
-                    format!("{marker}{name}"),
-                    crate::palette::ACCENT_BOLD,
-                )];
-                if *is_dir {
-                    spans.push(Span::styled("/", crate::palette::MUTED));
-                }
-                text.push(TuiLine::from(spans));
+                text.push(TuiLine::styled(
+                    pad_to_width(format!("{name}{slash}"), inner_w),
+                    selection_style(),
+                ));
             } else if *is_dir {
                 text.push(TuiLine::from(vec![
-                    Span::raw(marker.to_string()),
-                    Span::styled(name.clone(), Style::default()),
+                    Span::raw(name.clone()),
                     Span::styled("/", crate::palette::MUTED),
                 ]));
             } else {
-                text.push(TuiLine::styled(format!("{marker}{name}"), Style::default()));
+                text.push(TuiLine::raw(name.clone()));
             }
         }
-        text.push(TuiLine::styled(
-            "↑↓ choose · tab/enter accept · esc close",
-            crate::palette::META,
-        ));
         let widget = Paragraph::new(text)
             .block(
                 Block::default()
@@ -4458,7 +4597,7 @@ fn render(
         match open {
             Modal::Session(picker) => {
                 let rows = picker.rows();
-                let height = (rows.len() as u16 + 4).min(20);
+                let height = (rows.len() as u16 + 3).min(20);
                 let width = 68.min(frame.area().width);
                 let rect = centered(width, height, frame.area());
                 frame.render_widget(Clear, rect);
@@ -4466,22 +4605,15 @@ fn render(
                     Span::styled("filter: ", ratatui::style::Style::default()),
                     Span::styled(picker.filter.clone(), crate::palette::ACCENT_STYLE),
                 ])];
-                for (i, (label, detail)) in rows.iter().take((height as usize) - 4).enumerate() {
-                    let marker = if i == picker.selected { "▶ " } else { "  " };
-                    let style = if i == picker.selected {
-                        crate::palette::ACCENT_BOLD
+                let inner_w = width.saturating_sub(2) as usize;
+                for (i, (label, detail)) in rows.iter().take((height as usize) - 3).enumerate() {
+                    let row = pad_to_width(format!("{label}  —  {detail}"), inner_w);
+                    if i == picker.selected {
+                        text.push(TuiLine::styled(row, selection_style()));
                     } else {
-                        ratatui::style::Style::default()
-                    };
-                    text.push(TuiLine::styled(
-                        format!("{marker}{label}  —  {detail}"),
-                        style,
-                    ));
+                        text.push(TuiLine::raw(row));
+                    }
                 }
-                text.push(TuiLine::styled(
-                    "type to filter · enter switch · esc close",
-                    crate::palette::META,
-                ));
                 let widget = Paragraph::new(text)
                     .block(
                         Block::default()
@@ -4498,7 +4630,7 @@ fn render(
                 // full-frame wipe: switching here from the model picker must
                 // leave no stale pixels outside the prompt rect
                 frame.render_widget(Clear, frame.area());
-                let height = 9u16.min(frame.area().height.saturating_sub(2));
+                let height = 8u16.min(frame.area().height.saturating_sub(2));
                 let width = 64.min(frame.area().width);
                 let rect = centered(width, height, frame.area());
                 frame.render_widget(Clear, rect);
@@ -4525,11 +4657,6 @@ fn render(
                     Span::styled(masked, Style::default()),
                     Span::styled("▌", crate::palette::ACCENT_STYLE),
                 ]));
-                text.push(TuiLine::default());
-                text.push(TuiLine::styled(
-                    "enter save · esc cancel",
-                    crate::palette::META,
-                ));
                 let widget = Paragraph::new(text)
                     .block(
                         Block::default()
@@ -4594,7 +4721,7 @@ fn render(
             }
             Modal::Model(picker) => {
                 let rows = picker.rows();
-                let height = (rows.len() as u16 + 4).min(18);
+                let height = (rows.len() as u16 + 3).min(18);
                 let width = 68.min(frame.area().width);
                 let rect = centered(width, height, frame.area());
                 frame.render_widget(Clear, rect);
@@ -4602,14 +4729,9 @@ fn render(
                     Span::styled("filter: ", ratatui::style::Style::default()),
                     Span::styled(picker.filter.clone(), crate::palette::ACCENT_STYLE),
                 ])];
-                let cap = (height as usize).saturating_sub(4);
+                let cap = (height as usize).saturating_sub(3);
+                let inner_w = width.saturating_sub(2) as usize;
                 for (i, m) in rows.iter().take(cap).enumerate() {
-                    let marker = if i == picker.selected { "▶ " } else { "  " };
-                    let style = if i == picker.selected {
-                        crate::palette::ACCENT_BOLD
-                    } else {
-                        ratatui::style::Style::default()
-                    };
                     let ctx = if m.context > 0 {
                         format!("{}k", m.context / 1000)
                     } else {
@@ -4622,7 +4744,14 @@ fn render(
                     } else {
                         " ✗".to_string()
                     };
-                    text.push(TuiLine::styled(model_row(marker, m, &ctx, &key), style));
+                    text.push(TuiLine::styled(
+                        pad_to_width(model_row(m, &ctx, &key), inner_w),
+                        if i == picker.selected {
+                            selection_style()
+                        } else {
+                            ratatui::style::Style::default()
+                        },
+                    ));
                 }
                 if rows.is_empty() {
                     if picker.configured_only && picker.filter.trim().is_empty() {
@@ -4642,12 +4771,6 @@ fn render(
                         ));
                     }
                 }
-                let footer = match (&picker.vendor, rows.len() > cap) {
-                    (Some(_), _) => "enter select · esc back",
-                    (None, true) => "more rows — type to filter · enter switch · esc close",
-                    (None, false) => "type to filter · enter switch · esc close",
-                };
-                text.push(TuiLine::styled(footer, crate::palette::META));
                 let widget = Paragraph::new(text)
                     .block(
                         Block::default()
@@ -4668,35 +4791,35 @@ fn render(
             }
             Modal::Provider(picker) => {
                 let rows = picker.rows();
-                let height = (rows.len() as u16 + 4).min(18);
+                let height = (rows.len() as u16 + 3).min(18);
                 let width = 68.min(frame.area().width);
                 let rect = centered(width, height, frame.area());
                 frame.render_widget(Clear, rect);
+                let inner_w = width.saturating_sub(2) as usize;
                 let mut text = vec![TuiLine::from(vec![
                     Span::styled("filter: ", ratatui::style::Style::default()),
                     Span::styled(picker.filter.clone(), crate::palette::ACCENT_STYLE),
                 ])];
-                let cap = (height as usize).saturating_sub(4);
+                let cap = (height as usize).saturating_sub(3);
                 for (i, (p, detail)) in rows.iter().take(cap).enumerate() {
-                    let marker = if i == picker.selected { "▶ " } else { "  " };
-                    let style = if i == picker.selected {
-                        crate::palette::ACCENT_BOLD
-                    } else {
-                        ratatui::style::Style::default()
-                    };
                     let name: String = p.name.chars().take(16).collect();
                     let detail: String = detail.chars().take(44).collect();
-                    text.push(TuiLine::from(vec![
-                        Span::styled(format!("{marker}{name:<16} "), style),
-                        Span::styled(
-                            detail,
-                            if p.key_set || p.env_var.is_empty() {
-                                crate::palette::OK
-                            } else {
-                                crate::palette::ERR
-                            },
-                        ),
-                    ]));
+                    let key_style = if p.key_set || p.env_var.is_empty() {
+                        crate::palette::OK
+                    } else {
+                        crate::palette::ERR
+                    };
+                    if i == picker.selected {
+                        text.push(TuiLine::from(vec![Span::styled(
+                            pad_to_width(format!("{name:<16} {detail}"), inner_w),
+                            selection_style(),
+                        )]));
+                    } else {
+                        text.push(TuiLine::from(vec![
+                            Span::raw(format!("{name:<16} ")),
+                            Span::styled(detail, key_style),
+                        ]));
+                    }
                 }
                 if rows.is_empty() {
                     text.push(TuiLine::styled(
@@ -4704,14 +4827,6 @@ fn render(
                         crate::palette::META,
                     ));
                 }
-                text.push(TuiLine::styled(
-                    if rows.len() > cap {
-                        "more rows — type to filter · enter connect / select · esc close"
-                    } else {
-                        "enter connect / select · esc close"
-                    },
-                    crate::palette::META,
-                ));
                 let widget = Paragraph::new(text)
                     .block(
                         Block::default()
@@ -4725,15 +4840,13 @@ fn render(
                 frame.render_widget(widget, rect);
             }
             Modal::Settings(panel) => {
-                let height = (SettingsPanel::ROWS + panel.providers.len() + 6) as u16;
+                let height = (SettingsPanel::ROWS + panel.providers.len() + 5) as u16;
                 let height = height.min(frame.area().height.saturating_sub(2));
                 let width = 72.min(frame.area().width);
                 let rect = centered(width, height, frame.area());
                 frame.render_widget(Clear, rect);
-                let sel = crate::palette::ACCENT_BOLD;
                 let dim = ratatui::style::Style::new().fg(crate::palette::MUTED);
-                let marker =
-                    |i: usize| -> &'static str { if i == panel.selected { "▶ " } else { "  " } };
+                let inner_w = width.saturating_sub(2) as usize;
                 let mode_str = mode_label(panel.mode);
                 let effort_str = panel
                     .effort
@@ -4743,42 +4856,42 @@ fn render(
                 let editing = panel.edit.is_some();
                 // while editing, the row shows a cursor block so the mode
                 // change is unmistakable (nothing else on screen moves)
-                let model_row = match &panel.edit {
-                    Some(buf) => format!("{}model ✎  {}▌", marker(0), buf),
-                    None => format!("{}model    {}", marker(0), panel.model),
+                let model_label = match &panel.edit {
+                    Some(buf) => format!("model ✎  {buf}▌"),
+                    None => format!("model    {}", panel.model),
                 };
                 let model_style = if editing {
                     ratatui::style::Style::new()
                         .fg(crate::palette::WARN)
                         .add_modifier(Modifier::BOLD)
                 } else if panel.selected == 0 {
-                    sel
+                    selection_style()
                 } else {
                     dim
                 };
                 let mut text = vec![
-                    TuiLine::styled(model_row, model_style),
+                    TuiLine::styled(pad_to_width(model_label, inner_w), model_style),
                     TuiLine::styled(
-                        format!("{}mode     {}", marker(1), mode_str),
-                        if panel.selected == 1 { sel } else { dim },
+                        pad_to_width(format!("mode     {mode_str}"), inner_w),
+                        if panel.selected == 1 {
+                            selection_style()
+                        } else {
+                            dim
+                        },
                     ),
                     TuiLine::styled(
-                        format!("{}effort   {}", marker(2), effort_str),
-                        if panel.selected == 2 { sel } else { dim },
+                        pad_to_width(format!("effort   {effort_str}"), inner_w),
+                        if panel.selected == 2 {
+                            selection_style()
+                        } else {
+                            dim
+                        },
                     ),
                     TuiLine::styled(
                         format!("config: {}", panel.config_path),
                         crate::palette::META,
                     ),
                 ];
-                // hint sits above the providers so it survives clipping
-                // on short terminals
-                let hint = if editing {
-                    "typing edits the selector · enter apply · esc cancel"
-                } else {
-                    "enter edit/cycle · s save to config · esc close"
-                };
-                text.push(TuiLine::styled(hint, crate::palette::META));
                 text.push(TuiLine::styled(
                     "providers:",
                     ratatui::style::Style::default(),
@@ -4831,10 +4944,11 @@ fn render(
                 frame.render_widget(widget, rect);
             }
             Modal::Spills { items, selected } => {
-                let height = (items.len() as u16 + 4).clamp(6, 20);
+                let height = (items.len() as u16 + 3).clamp(5, 19);
                 let width = 68.min(frame.area().width);
                 let rect = centered(width, height, frame.area());
                 frame.render_widget(Clear, rect);
+                let inner_w = width.saturating_sub(2) as usize;
                 let mut text = Vec::new();
                 if items.is_empty() {
                     text.push(TuiLine::styled(
@@ -4842,20 +4956,17 @@ fn render(
                         crate::palette::META,
                     ));
                 }
-                let cap = (height as usize).saturating_sub(4);
+                let cap = (height as usize).saturating_sub(3);
                 for (i, path) in items.iter().take(cap).enumerate() {
-                    let marker = if i == *selected { "▶ " } else { "  " };
-                    let style = if i == *selected {
-                        crate::palette::ACCENT_BOLD
+                    if i == *selected {
+                        text.push(TuiLine::styled(
+                            pad_to_width(path.clone(), inner_w),
+                            selection_style(),
+                        ));
                     } else {
-                        ratatui::style::Style::default()
-                    };
-                    text.push(TuiLine::styled(format!("{marker}{path}"), style));
+                        text.push(TuiLine::raw(path.clone()));
+                    }
                 }
-                text.push(TuiLine::styled(
-                    "↑↓ choose · enter open in $PAGER · esc close",
-                    crate::palette::META,
-                ));
                 let widget = Paragraph::new(text)
                     .block(
                         Block::default()
@@ -4903,7 +5014,7 @@ fn surface_blank(width: u16, bg: ratatui::style::Color) -> ratatui::text::Line<'
 }
 
 /// Full-width band for user messages — the only edge-to-edge role
-/// (OMP userMsgBg: warm dark, amber prompt glyph, default text).
+/// (OMP userMsgBg: warm dark, amber prompt glyph, bold text).
 fn push_block(out: &mut Vec<ratatui::text::Line<'static>>, text: &str, width: u16) {
     use ratatui::text::Line as TuiLine;
     use ratatui::text::Span;
@@ -4911,8 +5022,9 @@ fn push_block(out: &mut Vec<ratatui::text::Line<'static>>, text: &str, width: u1
     let lead_style = ratatui::style::Style::new()
         .fg(crate::palette::ACCENT)
         .bg(crate::palette::BG_USER);
-    let body_style = ratatui::style::Style::new().bg(crate::palette::BG_USER);
-    // the band spans the full transcript width, edge to edge
+    let body_style = ratatui::style::Style::new()
+        .bg(crate::palette::BG_USER)
+        .add_modifier(ratatui::style::Modifier::BOLD);
     let usable = width as usize;
     for (li, raw) in text.lines().enumerate() {
         // wrap long lines at the band width (char boundary)
@@ -5192,7 +5304,7 @@ mod tests {
             "ollama/some-extremely-long-model-name:with-tag-and-more",
             1_000_000,
         );
-        let row = model_row("▶ ", &long, "1000k", " ✗");
+        let row = model_row(&long, "1000k", " ✗");
         assert!(
             row.chars().count() <= 66,
             "row too wide: {} {}",
@@ -5200,7 +5312,7 @@ mod tests {
             row
         );
         let short = model("ollama/qwen3.5:9b", 262_144);
-        let row = model_row("  ", &short, "262k", "");
+        let row = model_row(&short, "262k", "");
         assert!(row.contains("qwen3.5:9b"));
         assert!(row.contains("openai"), "wire abbreviated: {row}");
     }
@@ -5878,21 +5990,20 @@ mod tests {
     }
 
     #[test]
-    fn meters_footer_shows_fields() {
+    fn status_right_joins_known_facts_and_always_shows_cost() {
         let m = Meters {
-            effort: String::new(),
-            session: String::new(),
             model: "ollama/qwen3.5:9b".into(),
             mode: "guarded".into(),
             context: (10_000, 100_000),
-            cost: 0.0,
-            cache_hit: None,
+            cost: 0.0123,
+            ..Default::default()
         };
-        let f = m.footer();
-        assert!(
-            f.contains("qwen3.5:9b") && f.contains("guarded") && f.contains("ctx 10%"),
-            "{f}"
+        assert_eq!(
+            status_right(&m),
+            "ollama/qwen3.5:9b · guarded · ctx 10% · $0.0123"
         );
+        // fresh session: unknown model/mode/window collapse away
+        assert_eq!(status_right(&Meters::default()), "$0.0000");
     }
 
     #[test]
@@ -6085,7 +6196,7 @@ mod tests {
         let mut busy_since = None;
         let mut meters = Meters::default();
         let mut pending = None;
-        let mut cost = 0.0;
+        let mut turn_produced = false;
         let mut usage = None;
         let mut a = String::new();
         let mut t = String::new();
@@ -6105,7 +6216,7 @@ mod tests {
             &mut busy_since,
             &mut meters,
             &mut pending,
-            &mut cost,
+            &mut turn_produced,
             &mut usage,
             &mut a,
             &mut t,
@@ -6125,7 +6236,7 @@ mod tests {
             &mut busy_since,
             &mut meters,
             &mut pending,
-            &mut cost,
+            &mut turn_produced,
             &mut usage,
             &mut a,
             &mut t,
@@ -6140,13 +6251,14 @@ mod tests {
             &Event::CallStarted {
                 tool: "read".into(),
                 id: "c1".into(),
+                detail: "main.rs".into(),
             },
             &mut lines,
             &mut busy,
             &mut busy_since,
             &mut meters,
             &mut pending,
-            &mut cost,
+            &mut turn_produced,
             &mut usage,
             &mut a,
             &mut t,
@@ -6170,7 +6282,7 @@ mod tests {
             &mut busy_since,
             &mut meters,
             &mut pending,
-            &mut cost,
+            &mut turn_produced,
             &mut usage,
             &mut a,
             &mut t,
@@ -6195,7 +6307,7 @@ mod tests {
             &mut busy_since,
             &mut meters,
             &mut pending,
-            &mut cost,
+            &mut turn_produced,
             &mut usage,
             &mut a,
             &mut t,
@@ -6230,7 +6342,7 @@ mod tests {
         let mut busy_since = None;
         let mut meters = Meters::default();
         let mut pending = None;
-        let mut cost = 0.0;
+        let mut turn_produced = false;
         let mut usage = None;
         let mut a = String::new();
         let mut t = String::new();
@@ -6250,7 +6362,7 @@ mod tests {
             &mut busy_since,
             &mut meters,
             &mut pending,
-            &mut cost,
+            &mut turn_produced,
             &mut usage,
             &mut a,
             &mut t,
@@ -6270,7 +6382,7 @@ mod tests {
             &mut busy_since,
             &mut meters,
             &mut pending,
-            &mut cost,
+            &mut turn_produced,
             &mut usage,
             &mut a,
             &mut t,
@@ -6293,7 +6405,7 @@ mod tests {
             &mut busy_since,
             &mut meters,
             &mut pending,
-            &mut cost,
+            &mut turn_produced,
             &mut usage,
             &mut a,
             &mut t,
@@ -6323,7 +6435,7 @@ mod tests {
             &mut busy_since,
             &mut meters,
             &mut pending,
-            &mut cost,
+            &mut turn_produced,
             &mut usage,
             &mut a,
             &mut t,
@@ -6347,7 +6459,7 @@ mod tests {
             &mut busy_since,
             &mut meters,
             &mut pending,
-            &mut cost,
+            &mut turn_produced,
             &mut usage,
             &mut a,
             &mut t,
@@ -6372,7 +6484,7 @@ mod tests {
             &mut busy_since,
             &mut meters,
             &mut pending,
-            &mut cost,
+            &mut turn_produced,
             &mut usage,
             &mut a,
             &mut t,
@@ -6393,7 +6505,7 @@ mod tests {
             &mut busy_since,
             &mut meters,
             &mut pending,
-            &mut cost,
+            &mut turn_produced,
             &mut usage,
             &mut a,
             &mut t,
@@ -6408,13 +6520,14 @@ mod tests {
             &Event::CallStarted {
                 tool: "bash".into(),
                 id: "c2".into(),
+                detail: String::new(),
             },
             &mut lines,
             &mut busy,
             &mut busy_since,
             &mut meters,
             &mut pending,
-            &mut cost,
+            &mut turn_produced,
             &mut usage,
             &mut a,
             &mut t,
@@ -6438,7 +6551,7 @@ mod tests {
             &mut busy_since,
             &mut meters,
             &mut pending,
-            &mut cost,
+            &mut turn_produced,
             &mut usage,
             &mut a,
             &mut t,
@@ -6460,7 +6573,7 @@ mod tests {
             &mut busy_since,
             &mut meters,
             &mut pending,
-            &mut cost,
+            &mut turn_produced,
             &mut usage,
             &mut a,
             &mut t,
@@ -6481,7 +6594,7 @@ mod tests {
             &mut busy_since,
             &mut meters,
             &mut pending,
-            &mut cost,
+            &mut turn_produced,
             &mut usage,
             &mut a,
             &mut t,
@@ -6513,6 +6626,7 @@ mod tests {
                 "T:→ bash ✓ line-3",
                 "A:after",
                 "T:→ bash ✗ boom",
+                "R:0.0s · $0.0000",
             ],
             "final order must interleave text and tools: {shapes:?}"
         );
@@ -6583,7 +6697,7 @@ mod tests {
         let mut busy_since = None;
         let mut meters = Meters::default();
         let mut pending = None;
-        let mut cost = 0.0;
+        let mut turn_produced = false;
         let mut usage = None;
         let mut a = String::new();
         let mut t = String::new();
@@ -6606,7 +6720,7 @@ mod tests {
             &mut busy_since,
             &mut meters,
             &mut pending,
-            &mut cost,
+            &mut turn_produced,
             &mut usage,
             &mut a,
             &mut t,
@@ -6626,7 +6740,7 @@ mod tests {
             &mut busy_since,
             &mut meters,
             &mut pending,
-            &mut cost,
+            &mut turn_produced,
             &mut usage,
             &mut a,
             &mut t,
@@ -6648,7 +6762,7 @@ mod tests {
             &mut busy_since,
             &mut meters,
             &mut pending,
-            &mut cost,
+            &mut turn_produced,
             &mut usage,
             &mut a,
             &mut t,
@@ -6678,7 +6792,7 @@ mod tests {
             &mut busy_since,
             &mut meters,
             &mut pending,
-            &mut cost,
+            &mut turn_produced,
             &mut usage,
             &mut a,
             &mut t,
@@ -6692,16 +6806,18 @@ mod tests {
         let entries = lines.entries();
         assert_eq!(
             entries.len(),
-            2,
-            "assistant row then the report: {entries:?}"
+            3,
+            "assistant, report, then the meta row: {entries:?}"
         );
         assert!(matches!(entries[0], Line::Assistant(_)));
         let Line::ReportErr(report) = &entries[1] else {
-            panic!("final entry must be a ReportErr: {entries:?}");
+            panic!("second entry must be a ReportErr: {entries:?}");
         };
         for want in ["failed", "429", "/retry", "in", "out", "$0.0002"] {
             assert!(report.contains(want), "report {report:?} lacks {want}");
         }
+        // the closing meta row: `{model} · {elapsed}s · ${cost}`
+        assert_eq!(&entries[2], &Line::Report("0.0s · $0.0002".into()));
         assert!(
             last_error.is_none(),
             "buffered error consumed by the report"
@@ -6715,7 +6831,7 @@ mod tests {
         let mut busy_since = None;
         let mut meters = Meters::default();
         let mut pending = None;
-        let mut cost = 0.0;
+        let mut turn_produced = false;
         let mut usage = None;
         let mut a = String::new();
         let mut t = String::new();
@@ -6735,7 +6851,7 @@ mod tests {
             &mut busy_since,
             &mut meters,
             &mut pending,
-            &mut cost,
+            &mut turn_produced,
             &mut usage,
             &mut a,
             &mut t,
@@ -6756,7 +6872,7 @@ mod tests {
             &mut busy_since,
             &mut meters,
             &mut pending,
-            &mut cost,
+            &mut turn_produced,
             &mut usage,
             &mut a,
             &mut t,
@@ -7247,7 +7363,7 @@ mod tests {
         let mut busy_since = None;
         let mut meters = Meters::default();
         let mut pending = None;
-        let mut cost = 0.0;
+        let mut turn_produced = false;
         let mut usage = None;
         let mut a = String::new();
         let mut t = String::new();
@@ -7264,7 +7380,7 @@ mod tests {
             &mut busy_since,
             &mut meters,
             &mut pending,
-            &mut cost,
+            &mut turn_produced,
             &mut usage,
             &mut a,
             &mut t,
@@ -7382,6 +7498,114 @@ mod tests {
     }
 
     #[test]
+    fn turn_air_separates_groups_without_doubling() {
+        let mut t = Transcript::default();
+        push_turn_air(&mut t);
+        assert!(t.entries().is_empty(), "absent transcript: no air");
+        t.push(Line::User("first".into()));
+        push_turn_air(&mut t);
+        assert_eq!(t.entries().last(), Some(&Line::Report(String::new())));
+        push_turn_air(&mut t);
+        assert_eq!(
+            t.entries()
+                .iter()
+                .filter(|l| **l == Line::Report(String::new()))
+                .count(),
+            1,
+            "no double air"
+        );
+    }
+
+    #[test]
+    fn call_started_upgrades_stream_header_by_id() {
+        let mut lines = Transcript::default();
+        let mut busy = true;
+        let mut busy_since = None;
+        let mut meters = Meters::default();
+        let mut pending = None;
+        let mut turn_produced = false;
+        let mut usage = None;
+        let mut a = String::new();
+        let mut t = String::new();
+        let mut tool = String::new();
+        let mut live_tool: Option<LiveTool> = None;
+        let mut last_user: Option<String> = None;
+        let mut last_error: Option<String> = None;
+        let mut spills: Vec<String> = Vec::new();
+        let mut sidebar = SidebarState::default();
+        let mut feed = |lines: &mut Transcript, evt: &Event| -> (String, Option<Line>) {
+            apply_event(
+                evt,
+                lines,
+                &mut busy,
+                &mut busy_since,
+                &mut meters,
+                &mut pending,
+                &mut turn_produced,
+                &mut usage,
+                &mut a,
+                &mut t,
+                &mut tool,
+                &mut live_tool,
+                &mut last_user,
+                &mut last_error,
+                &mut spills,
+                &mut sidebar,
+            );
+            (tool.clone(), lines.entries().last().cloned())
+        };
+        let (head, _last) = feed(
+            &mut lines,
+            &Event::Delta {
+                kind: ka_protocol::DeltaKind::Call {
+                    tool: "bash".into(),
+                    id: "c1".into(),
+                },
+            },
+        );
+        assert_eq!(head, "→ bash", "stream header starts plain");
+        let (head, last) = feed(
+            &mut lines,
+            &Event::CallStarted {
+                tool: "bash".into(),
+                id: "c1".into(),
+                detail: "cargo build".into(),
+            },
+        );
+        assert_eq!(head, "→ bash · cargo build", "same id upgrades in place");
+        assert!(last.is_none(), "upgrade must not close the row");
+        let (head, last) = feed(
+            &mut lines,
+            &Event::CallStarted {
+                tool: "read".into(),
+                id: "c2".into(),
+                detail: "lib.rs".into(),
+            },
+        );
+        assert_eq!(
+            last,
+            Some(Line::Tool("→ bash · cargo build".into())),
+            "new call closes the old row"
+        );
+        assert_eq!(head, "→ read · lib.rs");
+    }
+
+    #[test]
+    fn turn_meta_row_joins_and_caps_at_sixty_columns() {
+        assert_eq!(turn_meta_row("m/1", 3.25, 0.0002), "m/1 · 3.2s · $0.0002");
+        assert_eq!(turn_meta_row("", 0.0, 0.0), "0.0s · $0.0000");
+        let wide = turn_meta_row(&"x".repeat(80), 1.0, 0.0);
+        assert!(wide.width() <= 60, "{wide}");
+    }
+
+    #[test]
+    fn pad_to_width_uses_display_columns() {
+        assert_eq!(pad_to_width("ab".into(), 5), "ab   ");
+        assert_eq!(pad_to_width("世界".into(), 5), "世界 ");
+        assert_eq!(pad_to_width("toolong".into(), 3), "toolong");
+    }
+
+    #[test]
     fn queue_head_auto_sends_fifo_and_drains() {
         let mut queue = vec!["first".to_string(), "second".to_string()];
         assert_eq!(pop_queue_head(&mut queue).as_deref(), Some("first"));
@@ -7390,13 +7614,10 @@ mod tests {
     }
 
     #[test]
-    fn busy_title_surfaces_queue_hint() {
-        assert_eq!(
-            busy_input_title(0),
-            "input (enter=interject, +=defer, esc=abort)"
-        );
-        let hinted = busy_input_title(2);
-        assert!(hinted.contains("· 2 queued"), "got: {hinted}");
+    fn busy_title_carries_only_the_queue_hint() {
+        // action hints moved to the status bar; the title keeps state only
+        assert_eq!(busy_input_title(0), "input");
+        assert_eq!(busy_input_title(2), "input · 2 queued");
     }
 
     #[test]
@@ -7470,10 +7691,10 @@ mod tests {
         assert!(!text.contains(&"mcp".to_string()), "{text:?}");
         assert!(!text.contains(&"skills".to_string()), "{text:?}");
         assert!(!text.contains(&"agents".to_string()), "{text:?}");
-        // info: cwd + branch
+        // info: one `cwd-short:branch` row; the section vanishes without
+        // a startup branch snapshot
         assert!(text.contains(&"info".to_string()), "{text:?}");
-        assert!(text.contains(&"…/projects/ka".to_string()), "{text:?}");
-        assert!(text.contains(&"branch main".to_string()), "{text:?}");
+        assert!(text.contains(&"…/projects/ka:main".to_string()), "{text:?}");
     }
 
     #[test]
@@ -7518,7 +7739,7 @@ mod tests {
             .iter()
             .find(|t| t.contains("implement"))
             .expect("pending row");
-        assert!(pending.starts_with("  "), "{pending}");
+        assert!(pending.starts_with("· "), "{pending}");
         assert!(text.iter().any(|t| t == "demo ✓ 2"), "{text:?}");
         assert!(text.iter().any(|t| t == "jira ✗"), "{text:?}");
         assert!(text.iter().any(|t| t == "rust-docs"), "{text:?}");
@@ -7536,10 +7757,12 @@ mod tests {
             .iter()
             .position(|l| l.spans.iter().any(|s| s.content.contains("implement")))
             .unwrap();
-        assert!(!rows[pend_idx].spans.iter().any(|s| {
+        // the first pending item is 'next': ACCENT fg + BOLD, others plain
+        assert!(rows[pend_idx].spans.iter().any(|s| {
             s.style
                 .add_modifier
-                .contains(ratatui::style::Modifier::CROSSED_OUT)
+                .contains(ratatui::style::Modifier::BOLD)
+                && s.style.fg == Some(crate::palette::ACCENT)
         }));
     }
 
@@ -7597,7 +7820,7 @@ mod tests {
         let mut busy_since = None;
         let mut meters = Meters::default();
         let mut pending = None;
-        let mut cost = 0.0;
+        let mut turn_produced = false;
         let mut usage = None;
         let mut a = String::new();
         let mut t = String::new();
@@ -7624,7 +7847,7 @@ mod tests {
             &mut busy_since,
             &mut meters,
             &mut pending,
-            &mut cost,
+            &mut turn_produced,
             &mut usage,
             &mut a,
             &mut t,
@@ -7650,7 +7873,7 @@ mod tests {
             &mut busy_since,
             &mut meters,
             &mut pending,
-            &mut cost,
+            &mut turn_produced,
             &mut usage,
             &mut a,
             &mut t,
@@ -7671,7 +7894,7 @@ mod tests {
             &mut busy_since,
             &mut meters,
             &mut pending,
-            &mut cost,
+            &mut turn_produced,
             &mut usage,
             &mut a,
             &mut t,
