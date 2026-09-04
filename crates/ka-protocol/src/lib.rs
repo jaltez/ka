@@ -42,6 +42,8 @@ pub enum Mode {
     /// Confirm exec-tier actions and non-allowlisted writes.
     #[default]
     Guarded,
+    /// Auto-apply file edits; commands still confirm.
+    AcceptEdits,
     /// Auto-approve everything except hardstops.
     Free,
     /// Research mode: read-only except the plans directory.
@@ -180,6 +182,21 @@ pub enum Command {
         /// How many user turns back (1 = erase the last exchange).
         turns: u32,
     },
+    /// Copy the current strand into a NEW strand file truncated to drop
+    /// the last `turns` user turns (`0` = exact copy) and switch to it.
+    ForkStrand {
+        /// How many trailing user turns the fork drops.
+        turns: u32,
+    },
+    /// Snapshot the working tree (git-based, non-destructive: never
+    /// touches the index, stash, or HEAD).
+    Checkpoint,
+    /// Restore a checkpoint made with [`Command::Checkpoint`]. The id
+    /// `"list"` asks for a note listing known ids instead.
+    RestoreCheckpoint {
+        /// Checkpoint id, or `list`.
+        id: String,
+    },
     /// Switch the engine to another strand ("new" = fresh session, else a
     /// strand id / id prefix / existing file path).
     SwitchStrand {
@@ -195,6 +212,12 @@ pub enum Command {
         env_var: String,
         /// The key value (never echoed to the transcript).
         value: String,
+    },
+    /// Export this session to markdown. `out` overrides the default
+    /// `ka-session-<tail>.md` file in the working directory.
+    ExportMarkdown {
+        /// Output file path (None = default name in cwd).
+        out: Option<std::path::PathBuf>,
     },
     /// Persist settings to the user config layer (~/.config/ka/ka.toml).
     SaveSettings {
@@ -222,6 +245,36 @@ pub struct ReplayedMessage {
     pub role: String,
     /// Message text.
     pub content: String,
+}
+
+/// Per-MCP-server line of the bootstrap [`Event::Inventory`] card.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct McpSummary {
+    /// Configured server name.
+    pub name: String,
+    /// Whether spawn + handshake + tool listing succeeded.
+    pub ok: bool,
+    /// Tools the server advertises (0 when `ok` is false).
+    pub tools: usize,
+}
+
+/// One entry of the model-maintained todo list ([`Event::Todos`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct TodoItem {
+    /// What to do.
+    pub text: String,
+    /// Whether it is finished.
+    pub state: TodoState,
+}
+
+/// Completion state of a [`TodoItem`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum TodoState {
+    /// Still to do.
+    Pending,
+    /// Finished.
+    Done,
 }
 
 /// Engine → surface events.
@@ -326,6 +379,23 @@ pub enum Event {
     /// The full prompt cycle (turn + settling) is complete; the engine is
     /// idle. Long-lived surfaces keep running; one-shot surfaces may exit.
     Idle,
+    /// Session bootstrap inventory: what this conversation can use.
+    Inventory {
+        /// Built-in + MCP tool names as the model sees them.
+        tools: Vec<String>,
+        /// Per configured MCP server: name, connect ok, tool count.
+        mcp: Vec<McpSummary>,
+        /// Discovered subagent names.
+        agents: Vec<String>,
+        /// Discovered skill names.
+        skills: Vec<String>,
+    },
+    /// The model's live todo list (the `todo` hand). Whole-list
+    /// replacement: each event supersedes the previous one.
+    Todos {
+        /// Current items, in display order.
+        items: Vec<TodoItem>,
+    },
     /// Informational note (pruning/digest notices, etc.).
     Note {
         /// Note text.
@@ -410,6 +480,33 @@ mod tests {
             question: AskId("q1".into()),
             choice: 0,
         });
+        roundtrip_command(Command::ExportMarkdown {
+            out: Some(std::path::PathBuf::from("x.md")),
+        });
+        roundtrip_command(Command::ExportMarkdown { out: None });
+    }
+
+    #[test]
+    fn mode_accept_edits_wire_name_and_roundtrip() {
+        let cmd = Command::SetMode {
+            mode: Mode::AcceptEdits,
+        };
+        let line = to_line(&cmd).unwrap();
+        assert!(line.contains("\"accept_edits\""), "wire name: {line}");
+        let back: Command = from_line(&line).unwrap();
+        assert_eq!(
+            serde_json::to_string(&back).unwrap(),
+            serde_json::to_string(&cmd).unwrap()
+        );
+        let evt = Event::ModeChanged {
+            mode: Mode::AcceptEdits,
+        };
+        let line = to_line(&evt).unwrap();
+        let back: Event = from_line(&line).unwrap();
+        assert_eq!(
+            serde_json::to_string(&back).unwrap(),
+            serde_json::to_string(&evt).unwrap()
+        );
     }
 
     #[test]
@@ -482,6 +579,138 @@ mod tests {
             retryable: false,
             message: "not wired in phase 0".into(),
         });
+        roundtrip_event(Event::Inventory {
+            tools: vec!["read".into(), "demo.fetch".into()],
+            mcp: vec![
+                McpSummary {
+                    name: "demo".into(),
+                    ok: true,
+                    tools: 2,
+                },
+                McpSummary {
+                    name: "jira".into(),
+                    ok: false,
+                    tools: 0,
+                },
+            ],
+            agents: vec!["coder".into()],
+            skills: vec!["rust-docs".into()],
+        });
+        roundtrip_event(Event::Todos {
+            items: vec![
+                TodoItem {
+                    text: "scaffold the parser".into(),
+                    state: TodoState::Done,
+                },
+                TodoItem {
+                    text: "wire the sidebar".into(),
+                    state: TodoState::Pending,
+                },
+            ],
+        });
+        roundtrip_event(Event::Todos { items: Vec::new() });
+        roundtrip_event(Event::Inventory {
+            tools: vec!["read".into()],
+            mcp: Vec::new(),
+            agents: Vec::new(),
+            skills: Vec::new(),
+        });
+    }
+
+    #[test]
+    fn todos_wire_shape_is_snake_case() {
+        let line = to_line(&Event::Todos {
+            items: vec![TodoItem {
+                text: "ship it".into(),
+                state: TodoState::Done,
+            }],
+        })
+        .unwrap();
+        assert!(line.contains("\"type\":\"todos\""), "got: {line}");
+        assert!(line.contains("\"state\":\"done\""), "got: {line}");
+        let back: Event = from_line(&line).unwrap();
+        match back {
+            Event::Todos { items } => {
+                assert_eq!(items.len(), 1);
+                assert_eq!(items[0].text, "ship it");
+                assert_eq!(items[0].state, TodoState::Done);
+            }
+            other => panic!("expected todos, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn todos_decode_from_wire_line() {
+        let line = concat!(
+            r#"{"type":"todos","items":[{"text":"a","state":"pending"},"#,
+            r#"{"text":"b","state":"done"}]}"#,
+        );
+        let evt: Event = from_line(line).unwrap();
+        match evt {
+            Event::Todos { items } => assert_eq!(
+                items,
+                vec![
+                    TodoItem {
+                        text: "a".into(),
+                        state: TodoState::Pending
+                    },
+                    TodoItem {
+                        text: "b".into(),
+                        state: TodoState::Done
+                    },
+                ]
+            ),
+            other => panic!("expected todos, got {other:?}"),
+        }
+    }
+    #[test]
+    fn inventory_decodes_from_wire_line() {
+        let line = concat!(
+            r#"{"type":"inventory","tools":["read","write","#,
+            r#""demo.fetch"],"mcp":[{"name":"demo","ok":true,"tools":2}],"#,
+            r#""agents":[],"skills":["demo"]}"#,
+        );
+        let evt: Event = from_line(line).unwrap();
+        match evt {
+            Event::Inventory {
+                tools,
+                mcp,
+                agents,
+                skills,
+            } => {
+                assert_eq!(
+                    tools,
+                    vec![
+                        "read".to_string(),
+                        "write".to_string(),
+                        "demo.fetch".to_string()
+                    ]
+                );
+                assert_eq!(
+                    mcp,
+                    vec![McpSummary {
+                        name: "demo".into(),
+                        ok: true,
+                        tools: 2,
+                    }]
+                );
+                assert!(agents.is_empty());
+                assert_eq!(skills, vec!["demo".to_string()]);
+            }
+            other => panic!("expected inventory, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn inventory_tags_snake_case_on_wire() {
+        let line = to_line(&Event::Inventory {
+            tools: Vec::new(),
+            mcp: Vec::new(),
+            agents: Vec::new(),
+            skills: Vec::new(),
+        })
+        .unwrap();
+        assert!(line.contains("\"type\":\"inventory\""), "got: {line}");
     }
 
     #[test]

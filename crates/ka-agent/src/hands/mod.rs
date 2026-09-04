@@ -22,6 +22,7 @@ pub mod pathfinder;
 pub mod read;
 pub mod secrets;
 pub mod snapshots;
+pub mod todo;
 pub mod write;
 
 /// Execution clearance tiers.
@@ -212,22 +213,21 @@ impl Spill {
     }
 }
 
-/// The full registry wired for Phase 2.
+/// The full registry wired for Phase 2: an internally-owned todo slot.
 pub fn registry() -> Vec<Box<dyn Hand>> {
-    vec![
-        Box::new(read::ReadHand),
-        Box::new(edit::EditHand),
-        Box::new(write::WriteHand),
-        Box::new(bash::BashHand),
-        Box::new(glob::GlobHand),
-        Box::new(grep::GrepHand),
-        Box::new(pathfinder::PathfinderHand::new()),
-    ]
+    registry_with_pathfinder(
+        std::sync::Arc::new(parking_lot::RwLock::new(
+            pathfinder::PathfinderSource::default(),
+        )),
+        todo::slot(),
+    )
 }
 
-/// Registry with an externally-owned pathfinder bootstrap slot (engine).
+/// Registry with externally-owned pathfinder bootstrap slot (engine) and
+/// todo slot (voice — it forwards the list as `Event::Todos`).
 pub fn registry_with_pathfinder(
     slot: std::sync::Arc<parking_lot::RwLock<pathfinder::PathfinderSource>>,
+    todos: todo::TodoSlot,
 ) -> Vec<Box<dyn Hand>> {
     vec![
         Box::new(read::ReadHand),
@@ -237,6 +237,7 @@ pub fn registry_with_pathfinder(
         Box::new(glob::GlobHand),
         Box::new(grep::GrepHand),
         Box::new(pathfinder::PathfinderHand::from_slot(slot)),
+        Box::new(todo::TodoHand::new(todos)),
     ]
 }
 
@@ -272,6 +273,33 @@ mod tests {
         ledger.invalidate_all();
         assert!(ledger.is_empty());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn registries_carry_todo_and_grow_by_one() {
+        let base = [
+            "read",
+            "edit",
+            "write",
+            "bash",
+            "glob",
+            "grep",
+            "pathfinder",
+        ];
+        let with = registry_with_pathfinder(
+            std::sync::Arc::new(parking_lot::RwLock::new(
+                pathfinder::PathfinderSource::default(),
+            )),
+            todo::slot(),
+        );
+        let names: Vec<String> = with.iter().map(|h| h.def().name).collect();
+        assert_eq!(names.len(), base.len() + 1, "todo grows the registry");
+        assert!(names.iter().any(|n| n == "todo"), "names: {names:?}");
+        assert_eq!(registry().len(), with.len(), "both registries match");
+        let todo = with.iter().find(|h| h.def().name == "todo").unwrap();
+        let def = todo.def();
+        assert_eq!(def.clearance, Clearance::Read, "todo must auto-allow");
+        assert!(def.read_only);
     }
 
     #[test]

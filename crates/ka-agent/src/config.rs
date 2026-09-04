@@ -4,6 +4,18 @@
 //! → project `.ka/ka.toml` → environment (`KA_MODEL`, `KA_MODE`) → CLI flags.
 //! Every textual layer is parsed strictly: unknown keys are hard errors that
 //! carry the TOML position, so typos never silently pass.
+//!
+//! Optional spend/context guards live under `[guards]` (both default off):
+//!
+//! ```toml
+//! [guards]
+//! spend_usd = 2.0   # ask before the session's total cost crosses $2.00
+//! context_pct = 90  # ask when the context meter first passes 90%
+//! ```
+//!
+//! On the first crossing per session per guard the engine poses the
+//! existing `Event::Ask` flow with `[continue, stop]`; `stop` aborts the
+//! current turn cleanly. Each guard latches once per session.
 
 use ka_protocol::{Effort, Mode};
 use serde::{Deserialize, Serialize};
@@ -59,6 +71,28 @@ pub enum Verdict {
     Deny,
 }
 
+/// Persistent tool allowlist (`[permissions] allow = [...]` in a ka.toml
+/// layer). Listed tools skip the permission ask for the rest of the
+/// session; picking "always" on an ask appends here (project layer).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields, default)]
+pub struct Permissions {
+    /// Tool names auto-allowed without asking.
+    pub allow: Vec<String>,
+}
+
+/// Spend/context guard thresholds.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields, default)]
+pub struct Guards {
+    /// USD total for the session at which the engine asks to continue
+    /// (None = disabled).
+    pub spend_usd: Option<f64>,
+    /// Context-window percentage (1–100) at which the engine asks to
+    /// continue (None = disabled).
+    pub context_pct: Option<u64>,
+}
+
 /// Role → model-selector mappings.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields, default)]
@@ -71,14 +105,15 @@ pub struct Roles {
 
 /// Engine configuration. All fields optional at the data level; resolution
 /// order is applied by [`Config::overlay`] consumers.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields, default)]
 pub struct Config {
     /// Default model selector (`vendor/model:effort`).
     pub model: Option<String>,
     /// Default reasoning effort.
     pub effort: Option<Effort>,
-    /// Permission mode (defaults to guarded when absent everywhere).
+    /// Permission mode: `guarded` | `accept_edits` | `free` | `plan`
+    /// (defaults to free when absent everywhere).
     pub mode: Option<Mode>,
     /// Role mappings.
     pub roles: Roles,
@@ -97,6 +132,12 @@ pub struct Config {
     /// MCP servers (stdio): tools appear as `<name>.<tool>` hands.
     #[serde(default)]
     pub mcp: Vec<crate::mcp::McpServerConfig>,
+    /// Persistent tool allowlist ([permissions] allow).
+    #[serde(default)]
+    pub permissions: Permissions,
+    /// Spend/context guard thresholds ([guards]; both default off).
+    #[serde(default)]
+    pub guards: Guards,
 }
 
 impl Config {
@@ -134,22 +175,27 @@ impl Config {
         if !other.rules.is_empty() {
             self.rules = other.rules;
         }
-        if !other.hooks.is_empty() {
-            self.hooks = other.hooks;
+        if !other.permissions.allow.is_empty() {
+            self.permissions.allow = other.permissions.allow;
+        }
+        if other.guards.spend_usd.is_some() {
+            self.guards.spend_usd = other.guards.spend_usd;
+        }
+        if other.guards.context_pct.is_some() {
+            self.guards.context_pct = other.guards.context_pct;
         }
         if !other.mcp.is_empty() {
             self.mcp = other.mcp;
         }
     }
-
     /// Effective step cap (default 20).
     pub fn effective_max_steps(&self) -> u32 {
         self.max_steps.unwrap_or(20)
     }
 
-    /// The effective permission mode (guarded unless explicitly freed).
+    /// The effective permission mode (free unless set in a layer).
     pub fn effective_mode(&self) -> Mode {
-        self.mode.unwrap_or_default()
+        self.mode.unwrap_or(Mode::Free)
     }
 
     /// JSON schema for editor integration (`ka config schema`).
@@ -157,6 +203,27 @@ impl Config {
         let schema = schemars::schema_for!(Config);
         serde_json::to_string_pretty(&schema)
     }
+}
+
+/// Append `tool` to `[permissions] allow` in the PROJECT config layer
+/// (`<cwd>/.ka/ka.toml`), preserving all other keys. Already-listed
+/// tools are a no-op (`None`). Best-effort: parse or write failures
+/// return `None` rather than clobbering a file we could not read.
+pub fn save_project_permission(cwd: &std::path::Path, tool: &str) -> Option<std::path::PathBuf> {
+    let path = cwd.join(".ka/ka.toml");
+    let mut layer = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|text| Config::parse_layer(&text, "project").ok())
+        .unwrap_or_default();
+    if layer.permissions.allow.iter().any(|t| t == tool) {
+        return None;
+    }
+    layer.permissions.allow.push(tool.to_string());
+    let mut text = String::from("# ka project config — extended by an \"always\" permission\n\n");
+    text.push_str(&toml::to_string_pretty(&layer).ok()?);
+    std::fs::create_dir_all(path.parent()?).ok()?;
+    std::fs::write(&path, text).ok()?;
+    Some(path)
 }
 
 /// The user config layer path (`~/.config/ka/ka.toml`, XDG-aware).
@@ -300,8 +367,17 @@ mod tests {
     #[test]
     fn defaults_are_empty() {
         let c = Config::default();
-        assert_eq!(c.effective_mode(), Mode::Guarded);
+        assert_eq!(c.effective_mode(), Mode::Free);
         assert!(c.model.is_none());
+    }
+
+    #[test]
+    fn mode_defaults_to_free_but_explicit_still_wins() {
+        assert_eq!(Config::default().effective_mode(), Mode::Free);
+        let guarded = Config::parse_layer("mode = \"guarded\"\n", "user").unwrap();
+        assert_eq!(guarded.effective_mode(), Mode::Guarded);
+        let accept = Config::parse_layer("mode = \"accept_edits\"\n", "user").unwrap();
+        assert_eq!(accept.effective_mode(), Mode::AcceptEdits);
     }
 
     #[test]
@@ -315,7 +391,7 @@ mod tests {
     }
 
     #[test]
-    fn unknown_key_is_hard_error_with_position() {
+    fn unknown_key_rejected() {
         let err = Config::parse_layer("modle = \"a/x\"\n", "user")
             .unwrap_err()
             .to_string();

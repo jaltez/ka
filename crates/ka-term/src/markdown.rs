@@ -613,6 +613,14 @@ fn parse_link(chars: &[char], start: usize) -> Option<(String, String, usize)> {
 
 /// Code block: dim ` ``` ` fence lines around syntax-colored body
 /// (OMP `codeBlockBorder` + `codeBlock`). No backgrounds.
+///
+/// Fences tagged with a known language go through [`CodeHighlighter`],
+/// which tracks block comments across lines within this block; every
+/// other fence keeps the line-local generic `highlight`. Style roles for
+/// both paths come from the OMP syntax palette (consistent across all
+/// code surfaces): comments → SYNTAX_COMMENT, strings → SYNTAX_STRING,
+/// keywords → SYNTAX_KEYWORD, numbers → SYNTAX_NUMBER, everything else
+/// stays CODE_BLOCK.
 fn push_code_block(out: &mut Vec<TuiLine<'static>>, lines: &[String], lang: &str) {
     if lines.is_empty() {
         return;
@@ -621,8 +629,12 @@ fn push_code_block(out: &mut Vec<TuiLine<'static>>, lines: &[String], lang: &str
         format!("```{lang}"),
         Style::new().fg(palette::BORDER_DIM),
     ));
+    let mut hl = code_lang(lang).map(CodeHighlighter::new);
     for line in lines {
-        out.push(TuiLine::from(highlight(line)));
+        out.push(TuiLine::from(match &mut hl {
+            Some(h) => h.line(line),
+            None => highlight(line),
+        }));
     }
     out.push(TuiLine::styled("```", Style::new().fg(palette::BORDER_DIM)));
     out.push(TuiLine::default());
@@ -728,6 +740,260 @@ fn highlight_plain(chunk: &str, base: Style, spans: &mut Vec<Span<'static>>) {
     }
 }
 
+/// Fence-tag languages the per-language highlighter understands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CodeLang {
+    Rust,
+    Python,
+    Js,
+    Json,
+    Toml,
+    Shell,
+}
+
+/// Map a (lowercased) fence tag to a highlightable language.
+fn code_lang(tag: &str) -> Option<CodeLang> {
+    match tag {
+        "rust" | "rs" => Some(CodeLang::Rust),
+        "python" | "py" => Some(CodeLang::Python),
+        "js" | "ts" | "javascript" | "typescript" | "jsx" | "tsx" => Some(CodeLang::Js),
+        "json" | "jsonc" => Some(CodeLang::Json),
+        "toml" => Some(CodeLang::Toml),
+        "bash" | "sh" | "shell" | "zsh" => Some(CodeLang::Shell),
+        _ => None,
+    }
+}
+
+impl CodeLang {
+    /// `(line-comment marker, block comments exist)`.
+    fn comments(self) -> (Option<&'static str>, bool) {
+        match self {
+            CodeLang::Rust | CodeLang::Js => (Some("//"), true),
+            CodeLang::Json => (Some("//"), false),
+            CodeLang::Python | CodeLang::Toml | CodeLang::Shell => (Some("#"), false),
+        }
+    }
+
+    fn keywords(self) -> &'static [&'static str] {
+        match self {
+            CodeLang::Rust => RUST_KW,
+            CodeLang::Python => PYTHON_KW,
+            CodeLang::Js => JS_KW,
+            CodeLang::Json => JSON_KW,
+            CodeLang::Toml => TOML_KW,
+            CodeLang::Shell => SHELL_KW,
+        }
+    }
+}
+
+const RUST_KW: &[&str] = &[
+    "as", "async", "await", "break", "const", "continue", "crate", "dyn", "else", "enum", "extern",
+    "false", "fn", "for", "if", "impl", "in", "let", "loop", "match", "mod", "move", "mut", "pub",
+    "ref", "return", "self", "Self", "static", "struct", "super", "trait", "true", "type",
+    "unsafe", "use", "where", "while",
+];
+
+const PYTHON_KW: &[&str] = &[
+    "and", "as", "assert", "async", "await", "break", "class", "continue", "def", "del", "elif",
+    "else", "except", "False", "finally", "for", "from", "global", "if", "import", "in", "is",
+    "lambda", "None", "nonlocal", "not", "or", "pass", "raise", "return", "True", "try", "while",
+    "with", "yield",
+];
+
+const JS_KW: &[&str] = &[
+    "async",
+    "await",
+    "break",
+    "case",
+    "catch",
+    "class",
+    "const",
+    "continue",
+    "default",
+    "delete",
+    "do",
+    "else",
+    "export",
+    "extends",
+    "false",
+    "finally",
+    "for",
+    "function",
+    "if",
+    "import",
+    "in",
+    "instanceof",
+    "let",
+    "new",
+    "null",
+    "of",
+    "return",
+    "static",
+    "super",
+    "switch",
+    "this",
+    "throw",
+    "true",
+    "try",
+    "typeof",
+    "undefined",
+    "var",
+    "void",
+    "while",
+    "yield",
+];
+
+const JSON_KW: &[&str] = &["false", "null", "true"];
+
+const TOML_KW: &[&str] = &["false", "inf", "nan", "true"];
+
+const SHELL_KW: &[&str] = &[
+    "break", "case", "continue", "coproc", "do", "done", "elif", "else", "esac", "exit", "export",
+    "fi", "for", "function", "if", "in", "local", "return", "select", "set", "then", "time",
+    "trap", "until", "while",
+];
+
+/// Zero-dependency per-language tokenizer for fenced code. State:
+/// `/* */` block comments carry across lines WITHIN one fence; strings
+/// are line-scoped, so an unterminated quote colors to end of line and
+/// never leaks past the fence (the highlighter is dropped with the
+/// block). Apostrophes glued to a word (`don't`, `'a`) never open a
+/// string.
+struct CodeHighlighter {
+    lang: CodeLang,
+    /// Nesting depth of an open `/* */` comment (0 = not in one).
+    block_depth: usize,
+}
+
+impl CodeHighlighter {
+    fn new(lang: CodeLang) -> Self {
+        Self {
+            lang,
+            block_depth: 0,
+        }
+    }
+
+    /// Tokenize one source line into styled spans, carrying block-comment
+    /// state across calls.
+    fn line(&mut self, src: &str) -> Vec<Span<'static>> {
+        let base = Style::new().fg(palette::CODE_BLOCK);
+        let comment = Style::new().fg(palette::SYNTAX_COMMENT);
+        let string = Style::new().fg(palette::SYNTAX_STRING);
+        let number = Style::new().fg(palette::SYNTAX_NUMBER);
+        let keyword = Style::new().fg(palette::SYNTAX_KEYWORD);
+        if src.trim().is_empty() {
+            return vec![Span::styled(String::new(), base)];
+        }
+        let (line_cmt, block_cmt) = self.lang.comments();
+        let keywords = self.lang.keywords();
+        let chars: Vec<char> = src.chars().collect();
+        let mut out: Vec<(char, Style)> = Vec::with_capacity(chars.len());
+        let mut i = 0;
+        while i < chars.len() {
+            // inside a block comment: scan for the (nesting-aware) close
+            if self.block_depth > 0 {
+                let start = i;
+                while i < chars.len() {
+                    if chars[i] == '*' && chars.get(i + 1) == Some(&'/') {
+                        i += 2;
+                        self.block_depth -= 1;
+                        if self.block_depth == 0 {
+                            break;
+                        }
+                    } else if chars[i] == '/' && chars.get(i + 1) == Some(&'*') {
+                        i += 2;
+                        self.block_depth += 1;
+                    } else {
+                        i += 1;
+                    }
+                }
+                if self.block_depth > 0 {
+                    i = chars.len(); // still open at end of line
+                }
+                for &c in &chars[start..i] {
+                    out.push((c, comment));
+                }
+                continue;
+            }
+            let c = chars[i];
+            // line comment: everything to end of line
+            if line_cmt.is_some_and(|m| marker_at(&chars, i, m)) {
+                for &c in &chars[i..] {
+                    out.push((c, comment));
+                }
+                break;
+            }
+            // block comment opener
+            if block_cmt && c == '/' && chars.get(i + 1) == Some(&'*') {
+                self.block_depth = 1;
+                i += 2;
+                continue;
+            }
+            // string literal: closing quote on the same line, `\` escapes;
+            // an unterminated string colors the rest of the line
+            if matches!(c, '"' | '\'' | '`')
+                && !(c == '\'' && i > 0 && (chars[i - 1].is_alphanumeric() || chars[i - 1] == '_'))
+            {
+                let start = i;
+                i += 1;
+                while i < chars.len() && chars[i] != c {
+                    if chars[i] == '\\' {
+                        i += 1;
+                    }
+                    i += 1;
+                }
+                if i < chars.len() {
+                    i += 1; // the closing quote
+                }
+                for &ch in &chars[start..i.min(chars.len())] {
+                    out.push((ch, string));
+                }
+                continue;
+            }
+            // identifier / keyword
+            if c.is_alphabetic() || c == '_' {
+                let start = i;
+                while i < chars.len() && (chars[i].is_alphanumeric() || chars[i] == '_') {
+                    i += 1;
+                }
+                let word: String = chars[start..i].iter().collect();
+                let style = if keywords.contains(&word.as_str()) {
+                    keyword
+                } else {
+                    base
+                };
+                for ch in word.chars() {
+                    out.push((ch, style));
+                }
+                continue;
+            }
+            // number: digit-led run (0x1F, 3.14, 1_000, 1e5)
+            if c.is_ascii_digit() {
+                let start = i;
+                while i < chars.len()
+                    && (chars[i].is_ascii_alphanumeric() || chars[i] == '.' || chars[i] == '_')
+                {
+                    i += 1;
+                }
+                for &ch in &chars[start..i] {
+                    out.push((ch, number));
+                }
+                continue;
+            }
+            out.push((c, base));
+            i += 1;
+        }
+        spans_from_chars(out)
+    }
+}
+
+/// Whether the char slice has `marker` at position `i`.
+fn marker_at(chars: &[char], i: usize, marker: &str) -> bool {
+    marker
+        .chars()
+        .enumerate()
+        .all(|(k, mc)| chars.get(i + k) == Some(&mc))
+}
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
@@ -1047,6 +1313,144 @@ mod tests {
         assert!(
             format!("{:?}", lines[0]).contains("Rgb(119, 125, 136)"),
             "muted gray"
+        );
+    }
+    #[test]
+    fn rust_fence_uses_the_language_tokenizer() {
+        let mut out: Vec<TuiLine> = Vec::new();
+        push_code_block(
+            &mut out,
+            &["let x = 42; // note".to_string(), "fn f() {}".to_string()],
+            "rust",
+        );
+        let joined = format!("{out:?}");
+        assert!(joined.contains("Rgb(86, 156, 214)"), "keyword: {joined}");
+        assert!(joined.contains("Rgb(181, 206, 168)"), "number: {joined}");
+        assert!(joined.contains("Rgb(106, 153, 85)"), "comment: {joined}");
+    }
+
+    #[test]
+    fn json_and_toml_fences_highlight_basics() {
+        let mut out: Vec<TuiLine> = Vec::new();
+        push_code_block(&mut out, &[r#"{"k": true, "n": 1}"#.to_string()], "json");
+        let joined = format!("{out:?}");
+        assert!(
+            joined.contains("Rgb(206, 145, 120)"),
+            "json string: {joined}"
+        );
+        assert!(
+            joined.contains("Rgb(86, 156, 214)"),
+            "true keyword: {joined}"
+        );
+        assert!(
+            joined.contains("Rgb(181, 206, 168)"),
+            "json number: {joined}"
+        );
+
+        let mut out: Vec<TuiLine> = Vec::new();
+        push_code_block(&mut out, &["rate = 0.5 # capped".to_string()], "toml");
+        let joined = format!("{out:?}");
+        assert!(
+            joined.contains("Rgb(181, 206, 168)"),
+            "toml number: {joined}"
+        );
+        assert!(
+            joined.contains("Rgb(106, 153, 85)"),
+            "toml comment: {joined}"
+        );
+
+        let mut out: Vec<TuiLine> = Vec::new();
+        push_code_block(&mut out, &["for f in *.md; do echo $f; done".into()], "sh");
+        let joined = format!("{out:?}");
+        assert!(
+            joined.matches("Rgb(86, 156, 214)").count() >= 3,
+            "shell keywords (for/in/do/done): {joined}"
+        );
+    }
+
+    #[test]
+    fn block_comments_carry_across_lines_and_strings_do_not_leak() {
+        // the comment swallows line one and the head of line two; the
+        // tokens after `*/` come back
+        let mut out: Vec<TuiLine> = Vec::new();
+        push_code_block(
+            &mut out,
+            &[
+                "/* start of".to_string(),
+                "still comment */ let x = 1;".to_string(),
+            ],
+            "rust",
+        );
+        let second = &out[2];
+        let text: String = second.spans.iter().map(|s| s.content.to_string()).collect();
+        assert_eq!(text, "still comment */ let x = 1;");
+        assert!(
+            format!("{second:?}").contains("Rgb(86, 156, 214)"),
+            "let styled after the close: {second:?}"
+        );
+
+        // unterminated string: rest of line colored, next line unaffected
+        let mut out: Vec<TuiLine> = Vec::new();
+        push_code_block(
+            &mut out,
+            &["let s = \"oops".to_string(), "fn after() {}".to_string()],
+            "rust",
+        );
+        assert!(
+            format!("{:?}", out[2]).contains("Rgb(86, 156, 214)"),
+            "next line keywords styled: {:?}",
+            out[2]
+        );
+
+        // unterminated block comment swallows the rest of the block, no panic
+        let mut out: Vec<TuiLine> = Vec::new();
+        push_code_block(
+            &mut out,
+            &["/* never closed".to_string(), "let x = 1;".to_string()],
+            "rust",
+        );
+        assert!(
+            format!("{:?}", out[2]).contains("Rgb(106, 153, 85)"),
+            "rest of the fence stays comment: {:?}",
+            out[2]
+        );
+    }
+
+    #[test]
+    fn unknown_and_untagged_fences_stay_generic() {
+        for tag in ["", "text", "output"] {
+            assert!(code_lang(tag).is_none(), "{tag:?} must not highlight");
+        }
+        for (tag, lang) in [
+            ("rust", CodeLang::Rust),
+            ("rs", CodeLang::Rust),
+            ("python", CodeLang::Python),
+            ("py", CodeLang::Python),
+            ("js", CodeLang::Js),
+            ("ts", CodeLang::Js),
+            ("javascript", CodeLang::Js),
+            ("typescript", CodeLang::Js),
+            ("json", CodeLang::Json),
+            ("toml", CodeLang::Toml),
+            ("bash", CodeLang::Shell),
+            ("sh", CodeLang::Shell),
+            ("shell", CodeLang::Shell),
+        ] {
+            assert_eq!(code_lang(tag), Some(lang), "{tag:?}");
+        }
+        // untagged fences keep the generic highlighter (keywords still styled)
+        let mut out: Vec<TuiLine> = Vec::new();
+        push_code_block(&mut out, &["let x = 1".to_string()], "");
+        assert!(
+            format!("{out:?}").contains("Rgb(86, 156, 214)"),
+            "generic keyword: {out:?}"
+        );
+        // apostrophes glued to a word never open a string in rust fences
+        let mut out: Vec<TuiLine> = Vec::new();
+        push_code_block(&mut out, &["don't panic;".to_string()], "rust");
+        assert!(
+            !format!("{out:?}").contains("Rgb(206, 145, 120)"),
+            "no phantom string: {out:?}"
         );
     }
 }

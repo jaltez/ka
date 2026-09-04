@@ -13,7 +13,7 @@ use tokio::sync::mpsc;
 
 use super::{Clearance, Hand, HandContext, HandDef, ToolOutput};
 use crate::agents::AgentDef;
-use crate::voice::Voice;
+use crate::voice::{GuardRuntime, Voice};
 
 /// The delegate tool: one hand over every discovered agent.
 pub struct DelegateHand {
@@ -120,6 +120,7 @@ impl Hand for DelegateHand {
                         &evt_tx,
                         &mut interjections,
                         &mut deferrals,
+                        &mut GuardRuntime::default(),
                     )
                     .await;
             });

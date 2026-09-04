@@ -16,6 +16,21 @@ pub fn set_dotenv_key(key: &str, value: &str) {
     }
 }
 
+/// Whether a key variable is present anywhere ka would read it: the
+/// process environment or the dotenv layer (`./.env`,
+/// `~/.config/ka/.env`). Reading the map forces the lazy scan if it has
+/// not run yet, so a key saved to the dotenv before this process started
+/// counts as set — matching what [`resolve_token`] would find.
+pub fn key_is_set(env_var: &str) -> bool {
+    let spec = env_var.trim();
+    !spec.is_empty()
+        && (std::env::var(spec).is_ok_and(|v| !v.is_empty())
+            || DOTENV
+                .read()
+                .ok()
+                .is_some_and(|map| map.get(spec).is_some_and(|v| !v.is_empty())))
+}
+
 fn scan_dotenv() -> HashMap<String, String> {
     let mut map = HashMap::new();
     let mut candidates: Vec<PathBuf> = vec![PathBuf::from(".env")];
@@ -113,6 +128,20 @@ mod tests {
             .iter()
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect()
+    }
+
+    #[test]
+    fn key_is_set_sees_env_and_rejects_blank() {
+        // HOME is present in every test environment (see the note above);
+        // a var set in the process counts as set
+        if std::env::var("HOME").is_ok() {
+            assert!(key_is_set("HOME"));
+        }
+        // a unique name absent from env and from the developer's dotenv
+        assert!(!key_is_set("KA_TEST_KEY_ABSENT_XYZ_9183"));
+        // blank specs are never set
+        assert!(!key_is_set(""));
+        assert!(!key_is_set("   "));
     }
 
     #[test]

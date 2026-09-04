@@ -102,7 +102,12 @@ enum CliCommand {
         session: Option<String>,
     },
     /// List sessions for this directory (ids for `ka --session`)
-    Sessions,
+    Sessions {
+        /// Print a JSON array of session objects (id, ts, title, messages,
+        /// path, cost, tokens).
+        #[arg(long)]
+        json: bool,
+    },
     /// Restore the latest snapshot of the newest session here
     Undo,
     /// Probe configured MCP servers and list their tools
@@ -199,11 +204,13 @@ fn load_config(
 
 fn parse_mode(s: &str) -> Result<ka_protocol::Mode, String> {
     match s {
-        "guarded" => Ok(ka_protocol::Mode::Guarded),
-        "free" => Ok(ka_protocol::Mode::Free),
+        "guarded" | "needs-approval" | "needs_approval" => Ok(ka_protocol::Mode::Guarded),
+        "accept-edits" | "accept_edits" => Ok(ka_protocol::Mode::AcceptEdits),
+        "free" | "full-access" | "full_access" => Ok(ka_protocol::Mode::Free),
         "plan" => Ok(ka_protocol::Mode::Plan),
         other => Err(format!(
-            "unknown mode {other:?} (expected guarded|free|plan)"
+            "unknown mode {other:?} (expected \
+guarded|needs-approval|accept-edits|free|full-access|plan)"
         )),
     }
 }
@@ -287,12 +294,12 @@ async fn dispatch(cli: Cli) -> Result<ExitCode, String> {
             if !no_discovery {
                 ka_dialect::discovery::overlay_discovered(&mut catalog).await;
             }
-            let header = format!(
-                "{:<34} {:<20} {:>9} {:>8}  {}",
-                "model", "wire", "context", "$in/M", "auth"
-            );
-            println!("{header}");
-            for (id, d) in &catalog.dialects {
+            let mut rows: Vec<(&String, &ka_dialect::Dialect)> = catalog.dialects.iter().collect();
+            rows.sort_by_key(|(id, _)| {
+                let vendor = id.split('/').next().unwrap_or(id.as_str());
+                (ka_dialect::providers::vendor_rank(vendor), (*id).clone())
+            });
+            for (id, d) in rows {
                 println!(
                     "{:<34} {:<20} {:>9} {:>7}  {}",
                     id,
@@ -308,12 +315,12 @@ async fn dispatch(cli: Cli) -> Result<ExitCode, String> {
             }
             Ok(ExitCode::SUCCESS)
         }
-        Some(CliCommand::Sessions) => run_sessions(),
         Some(CliCommand::Undo) => run_undo(),
         Some(CliCommand::Mcp) => run_mcp().await,
         Some(CliCommand::Agents) => run_agents(),
         Some(CliCommand::Providers) => run_providers(),
         Some(CliCommand::Init) => run_init(),
+        Some(CliCommand::Sessions { json }) => run_sessions(json),
         Some(CliCommand::Rewind { turns }) => run_rewind(turns).await,
         Some(CliCommand::Export { out, session }) => run_export(out, session),
         Some(CliCommand::Config { cmd }) => match cmd {
@@ -445,7 +452,7 @@ async fn run_tui(cli: Cli) -> Result<ExitCode, String> {
             name: p.name.to_string(),
             env_var: p.key_env.unwrap_or("").to_string(),
             base_url: p.base_url.to_string(),
-            key_set: p.key_env.is_some_and(|k| std::env::var(k).is_ok()),
+            key_set: p.key_env.is_some_and(ka_dialect::auth::key_is_set),
         })
         .collect();
     // catalog-derived vendors (models.dev: coding plans, z.ai tiers, ...)
@@ -466,11 +473,13 @@ async fn run_tui(cli: Cli) -> Result<ExitCode, String> {
             name: vendor.to_string(),
             env_var: env_var.clone(),
             base_url,
-            key_set: !env_var.is_empty() && std::env::var(&env_var).is_ok(),
+            key_set: !env_var.is_empty() && ka_dialect::auth::key_is_set(&env_var),
         });
     }
-    providers.sort_by(|a, b| a.name.cmp(&b.name));
-    let models: Vec<ka_term::tui::ModelInfo> = catalog
+    // official registry order (official block first, locals last);
+    // catalog-only vendors (models.dev plans/tiers) rank as community
+    providers.sort_by_key(|p| ka_dialect::providers::vendor_rank(&p.name));
+    let mut models: Vec<ka_term::tui::ModelInfo> = catalog
         .dialects
         .iter()
         .map(|(id, d)| ka_term::tui::ModelInfo {
@@ -481,7 +490,7 @@ async fn run_tui(cli: Cli) -> Result<ExitCode, String> {
             key_set: d
                 .api_key_env
                 .as_deref()
-                .is_some_and(|k| std::env::var(k).is_ok()),
+                .is_some_and(ka_dialect::auth::key_is_set),
             doc_url: d.doc_url.clone().unwrap_or_default(),
             price_in: d.price.input_per_mtok,
             price_out: d.price.output_per_mtok,
@@ -489,6 +498,12 @@ async fn run_tui(cli: Cli) -> Result<ExitCode, String> {
             plan: id.split('/').next().is_some_and(|v| v.contains("plan")),
         })
         .collect();
+    // the picker inherits catalog order: official block first, then
+    // community vendors, local discoveries last (vendor_rank policy)
+    models.sort_by_key(|m| {
+        let vendor = m.id.split('/').next().unwrap_or_default();
+        (ka_dialect::providers::vendor_rank(vendor), m.id.clone())
+    });
     let handle = ka_agent::spawn_full(cfg, catalog, choice);
     let ka_agent::EngineHandle { commands, events } = handle;
     let agents: Vec<(String, String)> = ka_agent::agents::AgentDef::discover(&cwd)
@@ -519,21 +534,47 @@ fn resolve_session(cwd: &std::path::Path, id: &str) -> Result<ka_agent::StrandCh
 }
 
 /// `ka sessions`: list strands for this cwd with resolvable ids.
-fn run_sessions() -> Result<ExitCode, String> {
+fn run_sessions(json: bool) -> Result<ExitCode, String> {
     let cwd = std::env::current_dir().map_err(|e| format!("cwd: {e}"))?;
     let strands = ka_strand::list(&cwd).map_err(|e| format!("listing sessions: {e}"))?;
+    if json {
+        let rows: Vec<serde_json::Value> = strands
+            .iter()
+            .map(|s| {
+                serde_json::json!({
+                    "id": s.id,
+                    "ts": s.ts,
+                    "title": s.title,
+                    "messages": s.messages,
+                    "path": s.path.display().to_string(),
+                    "cost": s.cost,
+                    "tokens": s.tokens,
+                })
+            })
+            .collect();
+        let text = serde_json::to_string_pretty(&rows).map_err(|e| format!("serialize: {e}"))?;
+        println!("{text}");
+        return Ok(ExitCode::SUCCESS);
+    }
     if strands.is_empty() {
         println!("no sessions yet for {}", cwd.display());
         return Ok(ExitCode::SUCCESS);
     }
     println!(
-        "{:<26} {:>5}  {first_message:<}",
+        "{:<26} {:>5} {:>10}  {first_message:<}",
         "session id",
         "msgs",
+        "cost",
         first_message = "first message"
     );
     for s in strands.iter().take(30) {
-        println!("{:<26} {:>5}  {}", s.id, s.messages, s.title);
+        println!(
+            "{:<26} {:>5} {:>10}  {}",
+            s.id,
+            s.messages,
+            format!("${:.4}", s.cost),
+            s.title
+        );
     }
     Ok(ExitCode::SUCCESS)
 }
@@ -635,7 +676,7 @@ fn run_providers() -> Result<ExitCode, String> {
     let mut rows: Vec<(String, String, bool, String)> = Vec::new();
     for p in ka_dialect::providers::PROVIDERS {
         let env = p.key_env.unwrap_or("-").to_string();
-        let set = p.key_env.is_some_and(|k| std::env::var(k).is_ok());
+        let set = p.key_env.is_some_and(ka_dialect::auth::key_is_set);
         seen.push(p.name.to_string());
         rows.push((p.name.to_string(), env, set, p.base_url.to_string()));
     }
@@ -657,7 +698,7 @@ fn run_providers() -> Result<ExitCode, String> {
         let set = d
             .api_key_env
             .as_deref()
-            .is_some_and(|k| std::env::var(k).is_ok());
+            .is_some_and(ka_dialect::auth::key_is_set);
         seen.push(vendor.to_string());
         rows.push((vendor.to_string(), env, set, base_url));
     }
@@ -838,29 +879,7 @@ fn run_export(out: Option<PathBuf>, session: Option<String>) -> Result<ExitCode,
         },
     };
     let records = ka_strand::read(&target).map_err(|e| format!("{}: {e}", target.display()))?;
-    let mut md = String::from("# ka session\n\n");
-    for r in &records {
-        match r {
-            ka_strand::Record::Header { id, ts, .. } => {
-                md.push_str(&format!("> strand `{}` at {}\n\n", id.0, ts));
-            }
-            ka_strand::Record::Message { role, content, .. } => {
-                let who = match role {
-                    ka_strand::Role::User => "**you**",
-                    ka_strand::Role::Tool => "*tool*",
-                    _ => "**ka**",
-                };
-                if !content.trim().is_empty() {
-                    md.push_str(&format!("### {who}\n\n{}\n\n", content.trim()));
-                }
-            }
-            ka_strand::Record::Digest { summary, .. } => {
-                md.push_str(&format!("### *digest*\n\n> {}\n\n", summary.trim()));
-            }
-            ka_strand::Record::Rewind { .. } => md.push_str("### *rewound*\n\n"),
-            _ => {}
-        }
-    }
+    let md = ka_strand::render_markdown(&records);
     match out {
         Some(path) => {
             std::fs::write(&path, &md).map_err(|e| format!("{}: {e}", path.display()))?;

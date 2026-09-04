@@ -5,6 +5,7 @@
 //! hits.
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::time::Duration;
 
 use ka_dialect::dialects::{Catalog, Wire};
 use ka_dialect::speaker::{
@@ -21,12 +22,51 @@ use crate::hands::{
 /// Session-scoped mutable state the voice needs (owned by the engine).
 #[derive(Default)]
 pub struct VoiceState {
-    /// Session always-allow rules (`tool:<name>`, `bash:<program>`).
+    /// Permission memory: rules granted via the "always" ask option.
     pub rules: HashSet<String>,
-    /// Monotonic ask counter.
-    pub ask_counter: u32,
-    /// Loop-guard counts of (tool, args) signatures this prompt.
-    pub loop_counts: HashMap<String, usize>,
+    /// Ask id counter.
+    pub ask_counter: u64,
+    /// Identical tool+argument counts (loop guard).
+    pub loop_counts: HashMap<String, u32>,
+}
+
+/// Spend/context guard runtime state: thresholds from config, the
+/// running session spend, and per-session latches. Owned by the engine
+/// ([`crate::engine::EngineState`]); the turn consults and latches it.
+#[derive(Debug, Clone, Default)]
+pub struct GuardRuntime {
+    /// Session spend cap in USD (None = off).
+    pub spend_usd: Option<f64>,
+    /// Context-percentage cap (None = off).
+    pub context_pct: Option<u64>,
+    /// True once the spend ask fired this session.
+    pub spend_latched: bool,
+    /// True once the context ask fired this session.
+    pub context_latched: bool,
+    /// Summed cost of completed turns this session.
+    pub session_spend: f64,
+}
+
+impl GuardRuntime {
+    /// Build from parsed `[guards]` config (both knobs default off).
+    pub fn new(spend_usd: Option<f64>, context_pct: Option<u64>) -> Self {
+        Self {
+            spend_usd,
+            context_pct,
+            spend_latched: false,
+            context_latched: false,
+            session_spend: 0.0,
+        }
+    }
+
+    /// Re-arm for a (re)attached strand, seeding the spend total from
+    /// the strand's persisted Usage records. A session resumed above
+    /// its cap counts as already crossed (latched, no fresh ask).
+    pub fn reset(&mut self, session_spend: f64) {
+        self.spend_latched = self.spend_usd.is_some_and(|cap| session_spend >= cap);
+        self.context_latched = false;
+        self.session_spend = session_spend;
+    }
 }
 
 // Context-survival knobs (Phase 4 defaults; config knobs later).
@@ -109,9 +149,15 @@ pub struct Voice {
     rules_cfg: Vec<crate::config::Rule>,
     /// Configured hooks.
     hooks_cfg: Vec<crate::config::Hook>,
+    /// Persistent allowlist from `[permissions] allow` (tools that skip
+    /// the ask entirely).
+    allowed_tools: Vec<String>,
     /// Pathfinder bootstrap slot shared with the hand.
     pathfinder_slot:
         std::sync::Arc<parking_lot::RwLock<crate::hands::pathfinder::PathfinderSource>>,
+    /// Todo list slot shared with the hand; forwarded to surfaces as
+    /// `Event::Todos` after each `todo` call.
+    todo: crate::hands::todo::TodoSlot,
 }
 
 impl Voice {
@@ -125,10 +171,11 @@ impl Voice {
         let slot = std::sync::Arc::new(parking_lot::RwLock::new(
             crate::hands::pathfinder::PathfinderSource::default(),
         ));
+        let todos = crate::hands::todo::slot();
         Self {
             catalog,
             speakers: Default::default(),
-            hands: registry_with_pathfinder(slot.clone()),
+            hands: registry_with_pathfinder(slot.clone(), todos.clone()),
             hand_ctx: HandContext {
                 cwd: cwd.clone(),
                 ledger: std::sync::Arc::new(parking_lot::Mutex::new(Ledger::default())),
@@ -149,13 +196,21 @@ impl Voice {
             last_digest: None,
             rules_cfg: Vec::new(),
             hooks_cfg: Vec::new(),
+            allowed_tools: Vec::new(),
             pathfinder_slot: slot,
+            todo: todos,
         }
     }
 
     /// Register an extra tool (MCP hands arrive after async discovery).
     pub fn push_hand(&mut self, hand: Box<dyn Hand>) {
         self.hands.push(hand);
+    }
+
+    /// Tool names in registry order (built-ins, then anything pushed at
+    /// bootstrap: the delegate hand, MCP hands). Bootstrap inventory.
+    pub fn hand_names(&self) -> Vec<String> {
+        self.hands.iter().map(|h| h.def().name).collect()
     }
 
     /// Share the snapshot journal (engine-side undo + strand tracking).
@@ -175,7 +230,8 @@ impl Voice {
         let slot = std::sync::Arc::new(parking_lot::RwLock::new(
             crate::hands::pathfinder::PathfinderSource::default(),
         ));
-        let hands = crate::hands::registry_with_pathfinder(slot.clone());
+        let todos = crate::hands::todo::slot();
+        let hands = crate::hands::registry_with_pathfinder(slot.clone(), todos.clone());
         let hand_ctx = HandContext {
             cwd,
             ledger: std::sync::Arc::new(parking_lot::Mutex::new(Ledger::default())),
@@ -192,6 +248,9 @@ impl Voice {
             state: VoiceState::default(),
             max_steps,
             mode,
+            rules_cfg: Vec::new(),
+            hooks_cfg: Vec::new(),
+            allowed_tools: Vec::new(),
             history: Vec::new(),
             model_selector: None,
             ratio: 4.0,
@@ -199,13 +258,12 @@ impl Voice {
             last_context: 0,
             digest_revision: 0,
             last_digest: None,
-            rules_cfg: Vec::new(),
-            hooks_cfg: Vec::new(),
             pathfinder_slot: slot,
+            todo: todos,
         }
     }
 
-    /// Set configured permission rules + hooks (engine bootstrap).
+    /// Set configured permission rules (engine bootstrap).
     pub fn set_rules(&mut self, rules: Vec<crate::config::Rule>) {
         self.rules_cfg = rules;
     }
@@ -220,6 +278,11 @@ impl Voice {
     /// Set configured hooks (engine bootstrap).
     pub fn set_hooks(&mut self, hooks: Vec<crate::config::Hook>) {
         self.hooks_cfg = hooks;
+    }
+
+    /// Set the persistent tool allowlist (`[permissions] allow`).
+    pub fn set_allowed_tools(&mut self, tools: Vec<String>) {
+        self.allowed_tools = tools;
     }
 
     /// Run matching hooks for one event. Returns Err(reason) when a
@@ -664,7 +727,8 @@ impl Voice {
     }
 
     /// Run one live prompt to completion. Always emits exactly one
-    /// `TurnFinished`.
+    /// `TurnFinished` and returns the turn's usage. `guards` carries the
+    /// session spend/context thresholds and latches.
     #[allow(clippy::too_many_arguments)]
     pub async fn turn(
         &mut self,
@@ -674,7 +738,8 @@ impl Voice {
         events: &mpsc::Sender<Event>,
         interjections: &mut Vec<String>,
         deferrals: &mut VecDeque<String>,
-    ) {
+        guards: &mut GuardRuntime,
+    ) -> Usage {
         use ka_dialect::parse_selector;
 
         let parsed = match parse_selector(model_selector) {
@@ -743,6 +808,11 @@ impl Voice {
             "\nYou are ka, a precise coding agent. {}. Use the provided tools to inspect and modify the repository; prefer read before edit.",
             snap.summary()
         ));
+        system.push_str(
+            "\nMaintain your plan with the todo tool: on multi-step tasks keep the todo list \
+current — one item per step, mark items done as you finish them (each call replaces the \
+whole list).",
+        );
         if self.mode == ka_protocol::Mode::Plan {
             system.push_str(
                 "\n\nPLAN MODE: research the task with read/glob/grep/pathfinder, then write a \
@@ -769,6 +839,7 @@ attempt implementation — the user will review and switch to build mode.",
         let mut final_stop = Stop::Done;
         let mut steps = 0u32;
         let mut overflow_retried = false;
+        let mut retry_attempt: usize = 0;
 
         'outer: loop {
             let req = SpeakRequest {
@@ -792,7 +863,7 @@ attempt implementation — the user will review and switch to build mode.",
 
             let mut step_calls: Vec<ToolCall> = Vec::new();
             let mut step_text = String::new();
-            let mut step_failed: Option<(ErrorClass, String)> = None;
+            let mut step_failed: Option<(ErrorClass, String, bool)> = None;
             let mut step_finished = false;
 
             while !step_finished {
@@ -800,13 +871,13 @@ attempt implementation — the user will review and switch to build mode.",
                     biased;
                     maybe_cmd = commands.recv() => {
                         match maybe_cmd {
-                            None => return,
+                            None => return Usage::default(),
                             Some(Command::Abort) => {
                                 events.send(Event::TurnFinished {
                                     stop: Stop::Aborted,
                                     usage: Usage::default(),
                                 }).await.ok();
-                                return;
+                                return Usage::default();
                             }
                             Some(Command::Interject { text }) => interjections.push(text),
                             Some(Command::Defer { text }) => deferrals.push_back(text),
@@ -854,11 +925,77 @@ attempt implementation — the user will review and switch to build mode.",
                                     })
                                     .await
                                     .ok();
+                                // session guards: each fires once, on the
+                                // first crossing; stop aborts the turn cleanly
+                                if !guards.context_latched && window > 0 {
+                                    if let Some(cap_pct) = guards.context_pct {
+                                        let pct = self.last_context * 100 / window;
+                                        if pct >= cap_pct {
+                                            guards.context_latched = true;
+                                            let question =
+                                                format!("context {pct}% full — continue?");
+                                            if !ask_continue_or_stop(
+                                                &mut self.state,
+                                                question,
+                                                commands,
+                                                events,
+                                            )
+                                            .await
+                                            {
+                                                events
+                                                    .send(Event::TurnFinished {
+                                                        stop: Stop::Aborted,
+                                                        usage: Usage::default(),
+                                                    })
+                                                    .await
+                                                    .ok();
+                                                return Usage::default();
+                                            }
+                                        }
+                                    }
+                                }
+                                if !guards.spend_latched {
+                                    if let Some(cap) = guards.spend_usd {
+                                        let running = guards.session_spend
+                                            + if dialect.priced {
+                                                cost_of(&usage_total, price)
+                                            } else {
+                                                0.0
+                                            };
+                                        if running >= cap {
+                                            guards.spend_latched = true;
+                                            let question = format!(
+                                                "spend cap ${cap:.2} reached — continue?"
+                                            );
+                                            if !ask_continue_or_stop(
+                                                &mut self.state,
+                                                question,
+                                                commands,
+                                                events,
+                                            )
+                                            .await
+                                            {
+                                                events
+                                                    .send(Event::TurnFinished {
+                                                        stop: Stop::Aborted,
+                                                        usage: Usage::default(),
+                                                    })
+                                                    .await
+                                                    .ok();
+                                                return Usage::default();
+                                            }
+                                        }
+                                    }
+                                }
                                 final_stop = stop;
                                 step_finished = true;
                             }
-                            StreamEvent::Failed { class, message, .. } => {
-                                step_failed = Some((class, message));
+                            StreamEvent::Failed {
+                                class,
+                                message,
+                                retryable,
+                            } => {
+                                step_failed = Some((class, message, retryable));
                                 final_stop = Stop::Error;
                                 step_finished = true;
                             }
@@ -867,7 +1004,7 @@ attempt implementation — the user will review and switch to build mode.",
                 }
             }
 
-            if let Some((class, message)) = step_failed {
+            if let Some((class, message, retryable)) = step_failed {
                 // Overflow → digest-and-retry once.
                 if class == ErrorClass::Overflow && !overflow_retried {
                     overflow_retried = true;
@@ -877,6 +1014,31 @@ attempt implementation — the user will review and switch to build mode.",
                         .await
                     {
                         self.apply_digest(summary, self.ratio);
+                        continue 'outer;
+                    }
+                }
+                // Retryable failure → automatic slow backoff before
+                // giving up (5s / 20s / 60s, max 3 attempts). The failed
+                // step is re-driven from the same history, so the user
+                // record is never duplicated.
+                let delays = retry_delays();
+                if retryable && retry_attempt < delays.len() {
+                    let delay = delays[retry_attempt];
+                    retry_attempt += 1;
+                    events
+                        .send(Event::Note {
+                            message: format!("↻ retrying in {}s (esc cancels)", delay.as_secs()),
+                        })
+                        .await
+                        .ok();
+                    if wait_or_cancel(delay, commands, interjections, deferrals).await {
+                        events
+                            .send(Event::Note {
+                                message: "retry canceled".to_string(),
+                            })
+                            .await
+                            .ok();
+                    } else {
                         continue 'outer;
                     }
                 }
@@ -923,6 +1085,12 @@ attempt implementation — the user will review and switch to build mode.",
                     continue;
                 }
                 let output = self.gate_and_execute(call, commands, events).await;
+                // the todo hand owns normalization; surfaces get the
+                // fresh list as a whole-replacement event
+                if call.tool == "todo" && !output.is_error {
+                    let items = self.todo.lock().clone();
+                    events.send(Event::Todos { items }).await.ok();
+                }
                 events
                     .send(Event::CallOutput {
                         tool: call.tool.clone(),
@@ -983,6 +1151,7 @@ attempt implementation — the user will review and switch to build mode.",
             })
             .await
             .ok();
+        usage_total
     }
 
     /// Clearance gate, then execution. Ask-and-wait for anything not
@@ -1039,6 +1208,23 @@ attempt implementation — the user will review and switch to build mode.",
                                     match choice {
                                         1 => {
                                             self.state.rules.insert(format!("tool:{}", call.tool));
+                                            // persist the allowlist entry to the
+                                            // project layer (best-effort, silent)
+                                            if let Some(path) = crate::config::save_project_permission(
+                                                &self.hand_ctx.cwd,
+                                                &call.tool,
+                                            ) {
+                                                events
+                                                    .send(Event::Note {
+                                                        message: format!(
+                                                            "always-allow for {} saved to {}",
+                                                            call.tool,
+                                                            path.display()
+                                                        ),
+                                                    })
+                                                    .await
+                                                    .ok();
+                                            }
                                             break;
                                         }
                                         2 => {
@@ -1061,7 +1247,50 @@ attempt implementation — the user will review and switch to build mode.",
                 }
             }
         }
-        let mut output = hand.execute(&call.arguments, &self.hand_ctx).await;
+        // convention pre-tool hook: non-zero exit vetoes the call
+        if let Err(reason) = crate::fshooks::run(
+            crate::fshooks::HookPoint::PreTool,
+            &self.hand_ctx.cwd,
+            Some(&call.tool),
+        )
+        .await
+        {
+            events
+                .send(Event::Note {
+                    message: reason.clone(),
+                })
+                .await
+                .ok();
+            return ToolOutput::err(format!("blocked by pre-tool hook: {reason}"));
+        }
+        // bash runs long: pump live preview emissions while the child
+        // works. Partials are new-since-last-emission output on the same
+        // call id (is_error=false, spill=None, redacted, hard-capped);
+        // the final CallOutput emission below is untouched.
+        let mut output = if call.tool == "bash" {
+            let tool = call.tool.clone();
+            let id = call.id.clone();
+            let events = events.clone();
+            let progress = move |fresh: String| {
+                let excerpt = crate::hands::bash::cap_preview(&fresh);
+                let excerpt = crate::hands::secrets::redact(&excerpt);
+                if excerpt.is_empty() {
+                    return;
+                }
+                let _ = events.try_send(Event::CallOutput {
+                    tool: tool.clone(),
+                    id: id.clone(),
+                    excerpt,
+                    is_error: false,
+                    spill: None,
+                });
+            };
+            crate::hands::BashHand
+                .execute_streaming(&call.arguments, &self.hand_ctx, &progress)
+                .await
+        } else {
+            hand.execute(&call.arguments, &self.hand_ctx).await
+        };
         // post_tool_use hooks: exit 2 flags the result as an error
         if let Err(reason) = self
             .run_hooks(
@@ -1104,7 +1333,7 @@ attempt implementation — the user will review and switch to build mode.",
         match clearance {
             Clearance::Read => Gate::Allow,
             Clearance::Write => match self.mode {
-                ka_protocol::Mode::Free => Gate::Allow,
+                ka_protocol::Mode::Free | ka_protocol::Mode::AcceptEdits => Gate::Allow,
                 ka_protocol::Mode::Guarded => Gate::Ask {
                     question: format!("allow {} to modify files?", call.tool),
                 },
@@ -1160,7 +1389,7 @@ use /build to switch to implementation"
                     ka_protocol::Mode::Plan => Gate::Ask {
                         question: format!("plan mode: run `{command}`? (build with /build)"),
                     },
-                    ka_protocol::Mode::Guarded => Gate::Ask {
+                    ka_protocol::Mode::AcceptEdits | ka_protocol::Mode::Guarded => Gate::Ask {
                         question: format!("run `{command}`?"),
                     },
                 }
@@ -1169,10 +1398,93 @@ use /build to switch to implementation"
     }
 }
 
+/// Automatic retry backoff for retryable turn failures: 5s, 20s, 60s
+/// (max 3 attempts) before falling through to the normal error finish.
+/// Tests shrink the schedule to keep the suite fast.
+fn retry_delays() -> Vec<Duration> {
+    #[cfg(test)]
+    {
+        vec![
+            Duration::from_millis(10),
+            Duration::from_millis(10),
+            Duration::from_millis(10),
+        ]
+    }
+    #[cfg(not(test))]
+    {
+        vec![
+            Duration::from_secs(5),
+            Duration::from_secs(20),
+            Duration::from_secs(60),
+        ]
+    }
+}
+
+#[derive(Debug)]
 enum Gate {
     Allow,
     Ask { question: String },
     Deny { reason: String },
+}
+
+/// Wait `delay` before a retry, draining side-effect commands while
+/// waiting. Returns `true` when the wait was canceled (Abort or the
+/// surface went away).
+async fn wait_or_cancel(
+    delay: Duration,
+    commands: &mut mpsc::Receiver<Command>,
+    interjections: &mut Vec<String>,
+    deferrals: &mut VecDeque<String>,
+) -> bool {
+    let sleep = tokio::time::sleep(delay);
+    tokio::pin!(sleep);
+    loop {
+        tokio::select! {
+            biased;
+            maybe = commands.recv() => match maybe {
+                None => return true,
+                Some(Command::Abort) => return true,
+                Some(Command::Interject { text }) => interjections.push(text),
+                Some(Command::Defer { text }) => deferrals.push_back(text),
+                Some(_) => {}
+            },
+            () = &mut sleep => return false,
+        }
+    }
+}
+
+/// Pose a `[continue, stop]` guard ask and wait for the answer.
+/// `false` = stop (user chose stop, aborted, or the surface went away).
+async fn ask_continue_or_stop(
+    state: &mut VoiceState,
+    question: String,
+    commands: &mut mpsc::Receiver<Command>,
+    events: &mpsc::Sender<Event>,
+) -> bool {
+    state.ask_counter += 1;
+    let id = AskId(format!("ask-{}", state.ask_counter));
+    events
+        .send(Event::Ask {
+            id: id.clone(),
+            questions: vec![AskQuestion {
+                text: question,
+                options: vec!["continue".to_string(), "stop".to_string()],
+            }],
+        })
+        .await
+        .ok();
+    loop {
+        tokio::select! {
+            maybe = commands.recv() => match maybe {
+                Some(Command::Answer { question: q, choice }) if q == id => {
+                    return choice == 0;
+                }
+                Some(Command::Abort) => return false,
+                Some(_) => {}
+                None => return false,
+            }
+        }
+    }
 }
 
 fn truncate_excerpt(text: &str) -> String {
@@ -1184,7 +1496,13 @@ fn truncate_excerpt(text: &str) -> String {
     }
 }
 
-async fn finish_after_error(events: &mpsc::Sender<Event>, class: ErrorClass, message: &str) {
+/// Report an error and finish the turn; returns the (empty) usage for
+/// the engine's Usage record.
+async fn finish_after_error(
+    events: &mpsc::Sender<Event>,
+    class: ErrorClass,
+    message: &str,
+) -> Usage {
     events
         .send(Event::Error {
             class,
@@ -1200,6 +1518,7 @@ async fn finish_after_error(events: &mpsc::Sender<Event>, class: ErrorClass, mes
         })
         .await
         .ok();
+    Usage::default()
 }
 
 /// USD cost from usage and per-mtok prices (cache reads billed at input
@@ -1218,9 +1537,9 @@ mod tests {
     use ka_dialect::speaker::{
         SpeakFuture, SpeakRequest, Speaker, StreamEvent, ToolCall, TurnMessage, TurnRole,
     };
-    use ka_protocol::Usage;
+    use ka_protocol::{Command, Event, Stop, Usage};
 
-    use super::{Voice, cost_of, glob_match};
+    use super::{GuardRuntime, Voice, cost_of, glob_match};
 
     #[test]
     fn unpriced_dialects_never_report_cost() {
@@ -1336,6 +1655,7 @@ mod tests {
                     &evt_tx,
                     &mut interjections,
                     &mut deferrals,
+                    &mut GuardRuntime::default(),
                 )
                 .await;
         });
@@ -1376,6 +1696,102 @@ mod tests {
         assert!(result.content.contains("ROUNDTRIP-CONTENT"));
         assert!(!result.is_error);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Fake speaker: first request → one `todo` tool call; once a tool
+    /// result is present → final text.
+    struct TodoSpeaker;
+
+    impl Speaker for TodoSpeaker {
+        fn speak<'a>(
+            &'a self,
+            req: SpeakRequest,
+            out: tokio::sync::mpsc::Sender<StreamEvent>,
+        ) -> SpeakFuture<'a> {
+            Box::pin(async move {
+                let has_result = req
+                    .messages
+                    .iter()
+                    .any(|m| m.role == TurnRole::Tool && !m.results.is_empty());
+                if has_result {
+                    out.send(StreamEvent::Text("plan noted".into())).await.ok();
+                    out.send(StreamEvent::Finished {
+                        stop: ka_protocol::Stop::Done,
+                        usage: ka_protocol::Usage::default(),
+                    })
+                    .await
+                    .ok();
+                } else {
+                    out.send(StreamEvent::Call(ToolCall {
+                        id: "t1".into(),
+                        tool: "todo".into(),
+                        arguments: serde_json::json!({"items": [
+                            {"text": "survey", "state": "done"},
+                            {"text": "implement", "state": "pending"},
+                        ]}),
+                    }))
+                    .await
+                    .ok();
+                    out.send(StreamEvent::Finished {
+                        stop: ka_protocol::Stop::Done,
+                        usage: ka_protocol::Usage::default(),
+                    })
+                    .await
+                    .ok();
+                }
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn todo_call_reaches_surfaces_as_todos_event() {
+        use tokio::sync::mpsc;
+
+        let catalog = Catalog::parse(
+            "[dialects.\"test/m\"]\nwire = \"openai_chat\"\nbase_url = \"http://127.0.0.1:1\"\ncontext = 1000\n",
+        )
+        .unwrap();
+        let mut voice = Voice::new(
+            catalog,
+            std::env::temp_dir(),
+            ka_protocol::Mode::Guarded,
+            10,
+        )
+        .with_speaker(Wire::OpenaiChat, std::sync::Arc::new(TodoSpeaker));
+
+        let (cmd_tx, mut cmd_rx) = mpsc::channel(16);
+        let (evt_tx, mut evt_rx) = mpsc::channel(256);
+        let mut interjections = Vec::new();
+        let mut deferrals = std::collections::VecDeque::new();
+
+        let handle = tokio::spawn(async move {
+            voice
+                .turn(
+                    "test/m",
+                    "plan the work".into(),
+                    &mut cmd_rx,
+                    &evt_tx,
+                    &mut interjections,
+                    &mut deferrals,
+                    &mut GuardRuntime::default(),
+                )
+                .await;
+        });
+
+        let mut todos_event = None;
+        while let Some(evt) = evt_rx.recv().await {
+            if let Event::Todos { items } = evt {
+                todos_event = Some(items);
+                break;
+            }
+        }
+        drop(cmd_tx);
+        handle.await.unwrap();
+        let items = todos_event.expect("todo call must emit Event::Todos");
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].text, "survey");
+        assert_eq!(items[0].state, ka_protocol::TodoState::Done);
+        assert_eq!(items[1].state, ka_protocol::TodoState::Pending);
     }
 
     #[test]
@@ -1618,6 +2034,7 @@ mod tests {
                     &evt_tx,
                     &mut interjections,
                     &mut deferrals,
+                    &mut GuardRuntime::default(),
                 )
                 .await;
         });
@@ -1713,6 +2130,7 @@ mod tests {
                     &evt_tx,
                     &mut interjections,
                     &mut deferrals,
+                    &mut GuardRuntime::default(),
                 )
                 .await;
         });
@@ -1786,6 +2204,7 @@ mod tests {
                     &evt_tx,
                     &mut i,
                     &mut d,
+                    &mut GuardRuntime::default(),
                 )
                 .await;
         });
@@ -1812,6 +2231,76 @@ mod tests {
     }
 
     #[test]
+    fn write_gate_allows_free_and_accept_edits_asks_guarded() {
+        use super::Gate;
+        let catalog = Catalog::parse(
+            "[dialects.\"test/m\"]\nwire = \"openai_chat\"\nbase_url = \"http://127.0.0.1:1\"\ncontext = 1000\n",
+        )
+        .unwrap();
+        let call = ToolCall {
+            id: "w1".into(),
+            tool: "write".into(),
+            arguments: serde_json::json!({"path": "out.txt", "content": "x"}),
+        };
+        for mode in [ka_protocol::Mode::Free, ka_protocol::Mode::AcceptEdits] {
+            let voice = crate::voice::Voice::new(catalog.clone(), std::env::temp_dir(), mode, 5);
+            assert!(
+                matches!(
+                    voice.gate(crate::hands::Clearance::Write, &call),
+                    Gate::Allow
+                ),
+                "write must auto-allow in {mode:?}"
+            );
+        }
+        let voice =
+            crate::voice::Voice::new(catalog, std::env::temp_dir(), ka_protocol::Mode::Guarded, 5);
+        match voice.gate(crate::hands::Clearance::Write, &call) {
+            Gate::Ask { question } => assert_eq!(question, "allow write to modify files?"),
+            Gate::Allow | Gate::Deny { .. } => {
+                panic!("guarded write must ask")
+            }
+        }
+    }
+
+    #[test]
+    fn exec_gate_allows_only_free_and_keeps_plan_phrasing() {
+        use super::Gate;
+        let command = "cargo build --release";
+        let call = ToolCall {
+            id: "b1".into(),
+            tool: "bash".into(),
+            arguments: serde_json::json!({"command": command}),
+        };
+        for (mode, expected) in [
+            (ka_protocol::Mode::Free, None),
+            (
+                ka_protocol::Mode::AcceptEdits,
+                Some("run `cargo build --release`?"),
+            ),
+            (
+                ka_protocol::Mode::Guarded,
+                Some("run `cargo build --release`?"),
+            ),
+            (
+                ka_protocol::Mode::Plan,
+                Some("plan mode: run `cargo build --release`? (build with /build)"),
+            ),
+        ] {
+            let catalog = Catalog::parse(
+                "[dialects.\"test/m\"]\nwire = \"openai_chat\"\nbase_url = \"http://127.0.0.1:1\"\ncontext = 1000\n",
+            )
+            .unwrap();
+            let voice = crate::voice::Voice::new(catalog, std::env::temp_dir(), mode, 5);
+            let gate = voice.gate(crate::hands::Clearance::Exec, &call);
+            match (gate, expected) {
+                (Gate::Allow, None) => {}
+                (Gate::Ask { question }, Some(want)) => assert_eq!(question, want),
+                (other, want) => panic!("exec gate in {mode:?}: got {other:?}, want {want:?}"),
+            }
+        }
+    }
+
+    #[test]
     fn rewind_truncates_before_nth_last_user_message() {
         use ka_dialect::speaker::TurnMessage;
         let catalog = Catalog::parse(
@@ -1831,6 +2320,369 @@ mod tests {
             vec!["q1", "a1", "q2", "a2"],
             "last exchange dropped"
         );
+    }
+
+    /// Speaker that fails `failures` times with a retryable network
+    /// error, then finishes normally. Records request count.
+    struct FlakySpeaker {
+        failures: usize,
+        seen: std::sync::Arc<parking_lot::Mutex<Vec<usize>>>,
+    }
+
+    impl FlakySpeaker {
+        fn new(failures: usize) -> (Self, std::sync::Arc<parking_lot::Mutex<Vec<usize>>>) {
+            let seen = std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
+            (
+                Self {
+                    failures,
+                    seen: seen.clone(),
+                },
+                seen,
+            )
+        }
+    }
+
+    impl Speaker for FlakySpeaker {
+        fn speak<'a>(
+            &'a self,
+            _req: SpeakRequest,
+            out: tokio::sync::mpsc::Sender<StreamEvent>,
+        ) -> SpeakFuture<'a> {
+            let failures = self.failures;
+            let seen = self.seen.clone();
+            Box::pin(async move {
+                let attempt = {
+                    let mut counts = seen.lock();
+                    counts.push(1);
+                    counts.len()
+                };
+                if attempt <= failures {
+                    out.send(StreamEvent::Failed {
+                        class: ka_protocol::ErrorClass::Network,
+                        retryable: true,
+                        message: "connection reset".into(),
+                    })
+                    .await
+                    .ok();
+                    return;
+                }
+                out.send(StreamEvent::Text("recovered".into())).await.ok();
+                out.send(StreamEvent::Finished {
+                    stop: ka_protocol::Stop::Done,
+                    usage: Usage::default(),
+                })
+                .await
+                .ok();
+            })
+        }
+    }
+
+    fn flaky_catalog() -> Catalog {
+        Catalog::parse(
+            "[dialects.\"test/m\"]\nwire = \"openai_chat\"\nbase_url = \"http://127.0.0.1:1\"\ncontext = 1000\n",
+        )
+        .unwrap()
+    }
+
+    /// Drive one turn, answering asks via `answer` (None = never answer).
+    /// Returns (events, seen-request-counts).
+    async fn drive_turn(
+        voice: &mut Voice,
+        guards: &mut GuardRuntime,
+        prompt: &str,
+        answer: Option<usize>,
+    ) -> (Vec<Event>, Vec<usize>) {
+        let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::channel(16);
+        let (evt_tx, mut evt_rx) = tokio::sync::mpsc::channel(256);
+        let mut interjections = Vec::new();
+        let mut deferrals = std::collections::VecDeque::new();
+        let events_handle = tokio::spawn(async move {
+            let mut events = Vec::new();
+            while let Some(evt) = evt_rx.recv().await {
+                let done = matches!(evt, Event::TurnFinished { .. });
+                if let (Event::Ask { id, .. }, Some(choice)) = (&evt, answer) {
+                    cmd_tx
+                        .send(Command::Answer {
+                            question: id.clone(),
+                            choice,
+                        })
+                        .await
+                        .ok();
+                }
+                events.push(evt);
+                if done {
+                    break;
+                }
+            }
+            events
+        });
+        voice
+            .turn(
+                "test/m",
+                prompt.into(),
+                &mut cmd_rx,
+                &evt_tx,
+                &mut interjections,
+                &mut deferrals,
+                guards,
+            )
+            .await;
+        // keep the receiver alive until the turn task wraps up
+        drop(cmd_rx);
+        (events_handle.await.unwrap(), Vec::new())
+    }
+
+    #[tokio::test]
+    async fn retryable_failure_retries_then_succeeds_without_duplicate_user() {
+        let (speaker, seen) = FlakySpeaker::new(2);
+        let mut voice = Voice::new(
+            flaky_catalog(),
+            std::env::temp_dir(),
+            ka_protocol::Mode::Free,
+            5,
+        )
+        .with_speaker(Wire::OpenaiChat, std::sync::Arc::new(speaker));
+        let mut guards = GuardRuntime::default();
+        let (events, _) = drive_turn(&mut voice, &mut guards, "only prompt", None).await;
+
+        let notes: Vec<&str> = events
+            .iter()
+            .filter_map(|e| match e {
+                Event::Note { message } => Some(message.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(notes.len(), 2, "two retry notes expected: {notes:?}");
+        assert!(notes[0].contains("retrying in"), "{notes:?}");
+        assert!(matches!(
+            events.last(),
+            Some(Event::TurnFinished {
+                stop: Stop::Done,
+                ..
+            })
+        ));
+        assert_eq!(seen.lock().len(), 3, "2 failures + 1 success");
+        assert_eq!(
+            voice
+                .history
+                .iter()
+                .filter(|m| m.role == TurnRole::User)
+                .count(),
+            1,
+            "user record must not be duplicated by retries"
+        );
+    }
+
+    #[tokio::test]
+    async fn retry_canceled_by_abort_finishes_with_error() {
+        let (speaker, _seen) = FlakySpeaker::new(usize::MAX);
+        let mut voice = Voice::new(
+            flaky_catalog(),
+            std::env::temp_dir(),
+            ka_protocol::Mode::Free,
+            5,
+        )
+        .with_speaker(Wire::OpenaiChat, std::sync::Arc::new(speaker));
+
+        let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::channel(16);
+        let (evt_tx, mut evt_rx) = tokio::sync::mpsc::channel(256);
+        let mut interjections = Vec::new();
+        let mut deferrals = std::collections::VecDeque::new();
+        let handle = tokio::spawn(async move {
+            voice
+                .turn(
+                    "test/m",
+                    "prompt".into(),
+                    &mut cmd_rx,
+                    &evt_tx,
+                    &mut interjections,
+                    &mut deferrals,
+                    &mut GuardRuntime::default(),
+                )
+                .await;
+        });
+        // wait for the first retry note, then abort the wait
+        let mut saw_retry_note = false;
+        let mut canceled_note = false;
+        let mut finished = None;
+        while let Some(evt) = evt_rx.recv().await {
+            match evt {
+                Event::Note { message } if message.contains("retrying in") => {
+                    saw_retry_note = true;
+                    cmd_tx.send(Command::Abort).await.ok();
+                }
+                Event::Note { message } if message.contains("retry canceled") => {
+                    canceled_note = true;
+                }
+                Event::TurnFinished { stop, .. } => {
+                    finished = Some(stop);
+                    break;
+                }
+                _ => {}
+            }
+        }
+        handle.await.unwrap();
+        assert!(saw_retry_note, "retry note must precede the cancel");
+        assert!(canceled_note, "cancel must be announced");
+        assert_eq!(finished, Some(Stop::Error), "cancel finishes with Error");
+    }
+
+    #[tokio::test]
+    async fn spend_guard_asks_once_and_stop_aborts() {
+        // priced dialect: 1M input tokens at $1/Mtok = $1.00 per step
+        let catalog = Catalog::parse(
+            "[dialects.\"test/m\"]\nwire = \"openai_chat\"\nbase_url = \"http://127.0.0.1:1\"\ncontext = 1000\npriced = true\n\n[dialects.\"test/m\".price]\ninput_per_mtok = 1.0\noutput_per_mtok = 0.0\n",
+        )
+        .unwrap();
+        struct BigUsage;
+        impl Speaker for BigUsage {
+            fn speak<'a>(
+                &'a self,
+                _req: SpeakRequest,
+                out: tokio::sync::mpsc::Sender<StreamEvent>,
+            ) -> SpeakFuture<'a> {
+                Box::pin(async move {
+                    out.send(StreamEvent::Text("hi".into())).await.ok();
+                    out.send(StreamEvent::Finished {
+                        stop: ka_protocol::Stop::Done,
+                        usage: Usage {
+                            input: 1_000_000,
+                            ..Default::default()
+                        },
+                    })
+                    .await
+                    .ok();
+                })
+            }
+        }
+        let mut voice = Voice::new(catalog, std::env::temp_dir(), ka_protocol::Mode::Free, 5)
+            .with_speaker(Wire::OpenaiChat, std::sync::Arc::new(BigUsage));
+        let mut guards = GuardRuntime::new(Some(0.5), None);
+
+        // stop at the ask → clean abort
+        let (events, _) = drive_turn(&mut voice, &mut guards, "q1", Some(1)).await;
+        let asks = events
+            .iter()
+            .filter(|e| matches!(e, Event::Ask { .. }))
+            .count();
+        assert_eq!(asks, 1, "guard ask fires once: {events:?}");
+        assert!(matches!(
+            events.last(),
+            Some(Event::TurnFinished {
+                stop: Stop::Aborted,
+                ..
+            })
+        ));
+        assert!(guards.spend_latched, "guard latches after the ask");
+
+        // second turn: latched → no repeat ask, turn proceeds normally
+        let (events2, _) = drive_turn(&mut voice, &mut guards, "q2", None).await;
+        assert!(
+            !events2.iter().any(|e| matches!(e, Event::Ask { .. })),
+            "latched guard must not re-ask"
+        );
+        assert!(matches!(
+            events2.last(),
+            Some(Event::TurnFinished {
+                stop: Stop::Done,
+                ..
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn permission_memory_answers_once_then_auto_allows() {
+        let dir = std::env::temp_dir().join(format!("ka-perm-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("perm-target.txt"), "one\n").unwrap();
+        struct TwoWrites;
+        impl Speaker for TwoWrites {
+            fn speak<'a>(
+                &'a self,
+                req: SpeakRequest,
+                out: tokio::sync::mpsc::Sender<StreamEvent>,
+            ) -> SpeakFuture<'a> {
+                Box::pin(async move {
+                    let writes = req.messages.iter().flat_map(|m| &m.results).count();
+                    if writes == 0 {
+                        out.send(StreamEvent::Call(ToolCall {
+                            id: "w1".into(),
+                            tool: "write".into(),
+                            arguments: serde_json::json!({
+                                "path": "perm-target.txt",
+                                "content": "changed\n"
+                            }),
+                        }))
+                        .await
+                        .ok();
+                        out.send(StreamEvent::Finished {
+                            stop: ka_protocol::Stop::Done,
+                            usage: Usage::default(),
+                        })
+                        .await
+                        .ok();
+                    } else {
+                        out.send(StreamEvent::Text("done".into())).await.ok();
+                        out.send(StreamEvent::Finished {
+                            stop: ka_protocol::Stop::Done,
+                            usage: Usage::default(),
+                        })
+                        .await
+                        .ok();
+                    }
+                })
+            }
+        }
+        let catalog = Catalog::parse(
+            "[dialects.\"test/m\"]\nwire = \"openai_chat\"\nbase_url = \"http://127.0.0.1:1\"\ncontext = 1000\n",
+        )
+        .unwrap();
+        let mut voice = Voice::new(catalog, dir.clone(), ka_protocol::Mode::Guarded, 5)
+            .with_speaker(Wire::OpenaiChat, std::sync::Arc::new(TwoWrites));
+        let mut guards = GuardRuntime::default();
+        // choice 1 = "always"
+        let (events, _) = drive_turn(&mut voice, &mut guards, "edit it", Some(1)).await;
+        let asks = events
+            .iter()
+            .filter(|e| matches!(e, Event::Ask { .. }))
+            .count();
+        assert_eq!(asks, 1, "exactly one permission ask: {events:?}");
+        assert!(matches!(
+            events.last(),
+            Some(Event::TurnFinished {
+                stop: Stop::Done,
+                ..
+            })
+        ));
+        // session memory holds the grant; a second identical call needs no ask
+        let (events2, _) = drive_turn(&mut voice, &mut guards, "edit again", None).await;
+        assert!(
+            !events2.iter().any(|e| matches!(e, Event::Ask { .. })),
+            "remembered permission must not re-ask"
+        );
+        assert!(matches!(
+            events2.last(),
+            Some(Event::TurnFinished {
+                stop: Stop::Done,
+                ..
+            })
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rewind_to_empty_clears_history() {
+        use ka_dialect::speaker::TurnMessage;
+        let catalog = Catalog::parse(
+            "[dialects.\"test/m\"]\nwire = \"openai_chat\"\nbase_url = \"http://127.0.0.1:1\"\ncontext = 1000\n",
+        )
+        .unwrap();
+        let mut voice = Voice::new(catalog, std::env::temp_dir(), ka_protocol::Mode::Guarded, 5);
+        for (u, a) in [("q1", "a1"), ("q2", "a2")] {
+            voice.history.push(TurnMessage::user(u));
+            voice.history.push(TurnMessage::assistant(a));
+        }
         let kept = voice.rewind(2).unwrap();
         assert_eq!(kept, 0);
         assert!(voice.history.is_empty());

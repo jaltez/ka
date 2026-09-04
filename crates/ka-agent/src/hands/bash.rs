@@ -4,6 +4,7 @@
 
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::time::Duration;
 
 use serde_json::{Value, json};
@@ -21,6 +22,13 @@ pub const TAIL_CAP: usize = 32_768;
 pub const HEAD_CAP: usize = 8_192;
 /// Per-line character cap.
 pub const LINE_CAP: usize = 768;
+
+/// Live-preview cadence: partial output is emitted at most every 300ms.
+pub const PREVIEW_TICK_MS: u64 = 300;
+/// Live-preview cap: at most the last 8 lines per excerpt.
+pub const PREVIEW_LINES: usize = 8;
+/// Live-preview cap: at most ~600 bytes per excerpt.
+pub const PREVIEW_BYTES: usize = 600;
 
 /// The bash tool.
 pub struct BashHand;
@@ -53,6 +61,28 @@ impl Hand for BashHand {
         ctx: &'a HandContext,
     ) -> Pin<Box<dyn Future<Output = ToolOutput> + Send + 'a>> {
         Box::pin(async move {
+            let noop = |_: String| {};
+            Self.execute_streaming(args, ctx, &noop).await
+        })
+    }
+}
+
+impl BashHand {
+    /// Execute with live progress: while the child runs, output produced
+    /// since the last emission is handed to `progress` at most every
+    /// [`PREVIEW_TICK_MS`] (ANSI-stripped, capped, one final drain at exit).
+    /// The returned [`ToolOutput`] and all caps/spill/kill behavior are
+    /// identical to the plain [`Hand::execute`] path.
+    pub fn execute_streaming<'a, P>(
+        &'a self,
+        args: &'a Value,
+        ctx: &'a HandContext,
+        progress: &'a P,
+    ) -> Pin<Box<dyn Future<Output = ToolOutput> + Send + 'a>>
+    where
+        P: Fn(String) + Send + Sync,
+    {
+        Box::pin(async move {
             let Some(command) = args.get("command").and_then(Value::as_str) else {
                 return ToolOutput::err("bash: missing required 'command'");
             };
@@ -80,22 +110,45 @@ impl Hand for BashHand {
             };
             let pid = child.id();
 
+            // shared pending buffer: both stream pumps append freshly read
+            // output here; the ticker drains it as preview excerpts
+            let pending: Arc<parking_lot::Mutex<String>> = Arc::default();
             let collect = async {
                 let stdout = child.stdout.take();
                 let stderr = child.stderr.take();
+                let p_out = pending.clone();
                 let out_task = tokio::spawn(async move {
                     use tokio::io::AsyncReadExt;
                     let mut buf = Vec::new();
                     if let Some(mut s) = stdout {
-                        let _ = s.read_to_end(&mut buf).await;
+                        let mut chunk = [0u8; 4096];
+                        loop {
+                            match s.read(&mut chunk).await {
+                                Ok(0) | Err(_) => break,
+                                Ok(n) => {
+                                    buf.extend_from_slice(&chunk[..n]);
+                                    p_out.lock().push_str(&String::from_utf8_lossy(&chunk[..n]));
+                                }
+                            }
+                        }
                     }
                     buf
                 });
+                let p_err = pending.clone();
                 let err_task = tokio::spawn(async move {
                     use tokio::io::AsyncReadExt;
                     let mut buf = Vec::new();
                     if let Some(mut s) = stderr {
-                        let _ = s.read_to_end(&mut buf).await;
+                        let mut chunk = [0u8; 4096];
+                        loop {
+                            match s.read(&mut chunk).await {
+                                Ok(0) | Err(_) => break,
+                                Ok(n) => {
+                                    buf.extend_from_slice(&chunk[..n]);
+                                    p_err.lock().push_str(&String::from_utf8_lossy(&chunk[..n]));
+                                }
+                            }
+                        }
                     }
                     buf
                 });
@@ -105,25 +158,41 @@ impl Hand for BashHand {
                 (out, err, status)
             };
 
-            let (stdout, stderr, status) =
-                match tokio::time::timeout(Duration::from_millis(timeout_ms), collect).await {
-                    Ok(r) => r,
-                    Err(_) => {
-                        // kill the whole process group, then reap
-                        if let Some(pid) = pid {
-                            #[cfg(unix)]
-                            {
-                                kill_tree(pid);
-                            }
+            let result = tokio::time::timeout(Duration::from_millis(timeout_ms), async {
+                tokio::pin!(collect);
+                let mut ticker = tokio::time::interval(Duration::from_millis(PREVIEW_TICK_MS));
+                ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                loop {
+                    tokio::select! {
+                        _ = ticker.tick() => {
+                            emit_progress(&pending, progress);
                         }
-                        let _ = child.start_kill();
-                        ctx.ledger.lock().invalidate_all();
-                        return ToolOutput::err(format!(
-                            "bash: timed out after {timeout_ms}ms (killed):\n{command}"
-                        ));
+                        r = &mut collect => break r,
                     }
-                };
-
+                }
+            })
+            .await;
+            let (stdout, stderr, status) = match result {
+                Ok(r) => {
+                    // final drain: output produced since the last tick
+                    emit_progress(&pending, progress);
+                    r
+                }
+                Err(_) => {
+                    // kill the whole process group, then reap
+                    if let Some(pid) = pid {
+                        #[cfg(unix)]
+                        {
+                            kill_tree(pid);
+                        }
+                    }
+                    let _ = child.start_kill();
+                    ctx.ledger.lock().invalidate_all();
+                    return ToolOutput::err(format!(
+                        "bash: timed out after {timeout_ms}ms (killed):\n{command}"
+                    ));
+                }
+            };
             ctx.ledger.lock().invalidate_all();
             let mut combined = String::from_utf8_lossy(&stdout).into_owned();
             if !stderr.is_empty() {
@@ -163,6 +232,75 @@ impl Hand for BashHand {
             }
         })
     }
+}
+
+/// Drain the shared pending buffer as one capped preview excerpt.
+fn emit_progress(pending: &parking_lot::Mutex<String>, progress: &impl Fn(String)) {
+    let fresh = std::mem::take(&mut *pending.lock());
+    if fresh.is_empty() {
+        return;
+    }
+    progress(cap_preview(&fresh));
+}
+
+/// Strip ANSI escape sequences (CSI runs and OSC strings), keeping
+/// printable text only.
+pub fn strip_ansi(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '\x1b' {
+            out.push(c);
+            continue;
+        }
+        match chars.peek() {
+            Some('[') => {
+                chars.next();
+                // CSI: parameters + intermediates, then one final byte
+                while let Some(&n) = chars.peek() {
+                    chars.next();
+                    if ('\u{40}'..='\u{7e}').contains(&n) {
+                        break;
+                    }
+                }
+            }
+            Some(']') => {
+                chars.next();
+                // OSC: terminated by BEL or ESC \
+                while let Some(&n) = chars.peek() {
+                    chars.next();
+                    if n == '\u{7}' {
+                        break;
+                    }
+                    if n == '\x1b' {
+                        chars.next();
+                        break;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+/// Cap a live preview excerpt: ANSI-stripped, at most the last
+/// [`PREVIEW_LINES`] lines and [`PREVIEW_BYTES`] bytes.
+pub fn cap_preview(raw: &str) -> String {
+    let plain = strip_ansi(raw);
+    let mut lines: Vec<&str> = plain.lines().collect();
+    if lines.len() > PREVIEW_LINES {
+        lines.drain(..lines.len() - PREVIEW_LINES);
+    }
+    let mut text = lines.join("\n");
+    if text.len() > PREVIEW_BYTES {
+        let start = text.len() - PREVIEW_BYTES;
+        let start = (start..=text.len())
+            .find(|&i| text.is_char_boundary(i))
+            .unwrap_or(text.len());
+        text = text[start..].to_string();
+    }
+    text
 }
 
 #[cfg(unix)]
@@ -231,6 +369,55 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use std::sync::Arc;
+
+    #[tokio::test]
+    async fn streaming_emits_capped_partials() {
+        let dir = std::env::temp_dir().join(format!("ka-bash-stream-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let ctx = ctx_for(&dir);
+        let got: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = got.clone();
+        let progress = move |excerpt: String| sink.lock().push(excerpt);
+        let out = BashHand
+            .execute_streaming(
+                &json!({
+                    "command": "for i in 1 2 3 4 5 6; do echo line-$i; sleep 0.12; done"
+                }),
+                &ctx,
+                &progress,
+            )
+            .await;
+        assert!(!out.is_error, "{}", out.content);
+        assert!(out.content.contains("line-6"), "final output complete");
+        let partials = got.lock().clone();
+        assert!(
+            !partials.is_empty(),
+            "a slow multi-line command must produce partial previews"
+        );
+        for p in &partials {
+            assert!(p.lines().count() <= PREVIEW_LINES, "line cap: {p:?}");
+            assert!(p.len() <= PREVIEW_BYTES, "byte cap: {p:?}");
+            assert!(!p.contains('\x1b'), "ansi stripped: {p:?}");
+            assert!(p.contains("line-"), "output content: {p:?}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cap_preview_strips_ansi_and_keeps_tail() {
+        let text = strip_ansi("\x1b[31mred\x1b[0m plain \x1b]0;title\x07end");
+        assert_eq!(text, "red plain end");
+        let ten: String = (1..=10).map(|i| format!("line-{i}\n")).collect();
+        let capped = cap_preview(&ten);
+        let lines: Vec<&str> = capped.lines().collect();
+        assert_eq!(lines.len(), PREVIEW_LINES, "{capped:?}");
+        assert_eq!(lines.first(), Some(&"line-3"), "keeps the tail");
+        assert_eq!(lines.last(), Some(&"line-10"));
+        let long = format!("x{}y", "é".repeat(1_000));
+        let capped = cap_preview(&long);
+        assert!(capped.len() <= PREVIEW_BYTES, "byte cap on one long line");
+        assert!(capped.ends_with('y'), "tail preserved");
+    }
 
     use parking_lot::Mutex;
 

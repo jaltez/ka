@@ -9,11 +9,15 @@
 use std::collections::VecDeque;
 use std::time::Duration;
 
-use ka_protocol::{Command, ContextMeter, DeltaKind, ErrorClass, Event, Mode, Stop, Usage};
+use ka_protocol::{
+    AskId, AskQuestion, Command, ContextMeter, DeltaKind, ErrorClass, Event, McpSummary, Mode,
+    Stop, Usage,
+};
 use tokio::sync::mpsc;
 
 use crate::canned;
 use crate::config::Config;
+use crate::fshooks::HookPoint;
 use crate::voice::Voice;
 
 /// Handle returned by [`spawn`]: the surface's two queue ends.
@@ -219,6 +223,10 @@ struct EngineState {
     /// Record ids of persisted history messages, aligned with
     /// voice.history[..record_ids.len()] (mod digest truncation).
     record_ids: Vec<ka_protocol::RecordId>,
+    /// Checkpoints taken this session: (commit id, timestamp).
+    checkpoints: Vec<(String, String)>,
+    /// Spend/context guard thresholds + latches for this session.
+    guards: crate::voice::GuardRuntime,
 }
 
 impl From<Config> for EngineState {
@@ -231,6 +239,8 @@ impl From<Config> for EngineState {
             deferrals: VecDeque::new(),
             interjections: Vec::new(),
             record_ids: Vec::new(),
+            checkpoints: Vec::new(),
+            guards: crate::voice::GuardRuntime::new(c.guards.spend_usd, c.guards.context_pct),
         }
     }
 }
@@ -265,10 +275,12 @@ async fn run(
     let mode = config.effective_mode();
     let max_steps = config.effective_max_steps();
     let rules = config.rules.clone();
+    let allowed_tools = config.permissions.allow.clone();
     let hooks = config.hooks.clone();
     let pathfinder_catalog = catalog.clone();
     let mut voice = Voice::new(catalog, cwd.clone(), mode, max_steps);
     voice.set_rules(rules);
+    voice.set_allowed_tools(allowed_tools);
     voice.set_hooks(hooks);
     {
         let slot = voice.pathfinder_slot();
@@ -285,23 +297,18 @@ async fn run(
     };
     // markdown agents: .ka/agents/*.md etc. become one `delegate` hand
     let agents = crate::agents::AgentDef::discover(&ctx.cwd);
+    let agent_names: Vec<String> = agents.iter().map(|a| a.name.clone()).collect();
     if !agents.is_empty() {
-        let names: Vec<String> = agents.iter().map(|a| a.name.clone()).collect();
         let slot = ctx.voice.pathfinder_slot();
         ctx.voice
             .push_hand(Box::new(crate::hands::delegate::DelegateHand::new(
                 agents, slot,
             )));
-        ctx.events
-            .send(Event::Note {
-                message: format!("agents available: {}", names.join(", ")),
-            })
-            .await
-            .ok();
     }
 
     // MCP servers: spawn, handshake, list; each tool becomes a hand at
-    // exec-tier clearance. Failures are per-server notes, never fatal.
+    // exec-tier clearance. Failures are per-server errors, never fatal.
+    let mut mcp_summary = Vec::with_capacity(mcp_servers.len());
     for cfg in &mcp_servers {
         let connected = tokio::time::timeout(
             std::time::Duration::from_secs(20),
@@ -309,34 +316,25 @@ async fn run(
         )
         .await;
         match connected {
-            Ok(Ok((client, tools))) if !tools.is_empty() => {
+            Ok(Ok((client, tools))) => {
+                let tool_count = tools.len();
                 let shared = std::sync::Arc::new(tokio::sync::Mutex::new(client));
-                let names: Vec<String> = tools.iter().map(|t| t.name.clone()).collect();
                 for tool in tools {
                     ctx.voice
                         .push_hand(Box::new(crate::mcp::McpHand::new(tool, shared.clone())));
                 }
-                ctx.events
-                    .send(Event::Note {
-                        message: format!(
-                            "mcp {}: {} tool(s): {}",
-                            cfg.name,
-                            names.len(),
-                            names.join(", ")
-                        ),
-                    })
-                    .await
-                    .ok();
-            }
-            Ok(Ok((_client, _empty))) => {
-                ctx.events
-                    .send(Event::Note {
-                        message: format!("mcp {}: connected but advertises no tools", cfg.name),
-                    })
-                    .await
-                    .ok();
+                mcp_summary.push(McpSummary {
+                    name: cfg.name.clone(),
+                    ok: true,
+                    tools: tool_count,
+                });
             }
             Ok(Err(e)) => {
+                mcp_summary.push(McpSummary {
+                    name: cfg.name.clone(),
+                    ok: false,
+                    tools: 0,
+                });
                 ctx.events
                     .send(Event::Error {
                         class: ErrorClass::Protocol,
@@ -347,6 +345,11 @@ async fn run(
                     .ok();
             }
             Err(_) => {
+                mcp_summary.push(McpSummary {
+                    name: cfg.name.clone(),
+                    ok: false,
+                    tools: 0,
+                });
                 ctx.events
                     .send(Event::Error {
                         class: ErrorClass::Protocol,
@@ -358,6 +361,27 @@ async fn run(
             }
         }
     }
+
+    // One bootstrap inventory card replaces the old ad-hoc notes: the
+    // surface renders tools/MCP/agents/skills compactly at startup.
+    let skill_names: Vec<String> = crate::conventions::discover_skills(&ctx.cwd)
+        .into_iter()
+        .map(|s| s.name)
+        .collect();
+    ctx.events
+        .send(Event::Inventory {
+            tools: ctx.voice.hand_names(),
+            mcp: mcp_summary,
+            agents: agent_names,
+            skills: skill_names,
+        })
+        .await
+        .ok();
+    // surfaces initialize the todo section immediately, before any turn
+    ctx.events
+        .send(Event::Todos { items: Vec::new() })
+        .await
+        .ok();
 
     while let Some(cmd) = commands.recv().await {
         handle_command(cmd, &mut commands, &mut ctx).await?;
@@ -383,6 +407,7 @@ async fn handle_command(
                 &mut ctx.voice,
                 text,
                 &mut ctx.strand,
+                &ctx.cwd,
             )
             .await;
             settle_context(&mut ctx.voice, &mut ctx.state, &mut ctx.strand, &ctx.events).await;
@@ -395,6 +420,7 @@ async fn handle_command(
                     &mut ctx.voice,
                     deferred,
                     &mut ctx.strand,
+                    &ctx.cwd,
                 )
                 .await;
                 settle_context(&mut ctx.voice, &mut ctx.state, &mut ctx.strand, &ctx.events).await;
@@ -411,6 +437,7 @@ async fn handle_command(
                 mode: None,
             });
             ctx.events.send(Event::ModelChanged { selector }).await?;
+            ctx.events.send(Event::Idle).await.ok();
         }
         Command::SetMode { mode } => {
             ctx.state.mode = mode;
@@ -422,6 +449,32 @@ async fn handle_command(
                 mode: Some(mode),
             });
             ctx.events.send(Event::ModeChanged { mode }).await?;
+            ctx.events.send(Event::Idle).await.ok();
+        }
+        Command::SetEffort { level } => {
+            ctx.state.effort = Some(level);
+            let _ = ctx.strand.append(ka_strand::Record::Change {
+                id: ka_strand::new_record_id(),
+                model: None,
+                effort: Some(level),
+                mode: None,
+            });
+            ctx.events.send(Event::EffortChanged { level }).await?;
+            ctx.events.send(Event::Idle).await.ok();
+        }
+        Command::Interject { text } => ctx.state.interjections.push(text),
+        Command::Defer { text } => ctx.state.deferrals.push_back(text),
+        Command::Abort => {}
+        Command::Compact { focus } => {
+            run_digest(
+                &mut ctx.voice,
+                &mut ctx.state,
+                &mut ctx.strand,
+                &ctx.events,
+                focus,
+            )
+            .await;
+            ctx.events.send(Event::Idle).await.ok();
         }
         Command::SwitchStrand { id } => {
             let choice = if id.trim() == "new" {
@@ -478,12 +531,16 @@ async fn handle_command(
             {
                 Ok(fresh) => {
                     ctx.strand = fresh;
-                    ctx.events
-                        .send(Event::Note {
-                            message: format!("switched to session {}", strand_id(&ctx.strand)),
-                        })
-                        .await
-                        .ok();
+                    // fresh sessions stay completely silent — only an
+                    // existing-session switch earns one terse note
+                    if !matches!(choice, StrandChoice::New) {
+                        ctx.events
+                            .send(Event::Note {
+                                message: format!("switched to session {}", strand_id(&ctx.strand)),
+                            })
+                            .await
+                            .ok();
+                    }
                 }
                 Err(e) => {
                     ctx.events
@@ -498,19 +555,150 @@ async fn handle_command(
             }
             ctx.events.send(Event::Idle).await.ok();
         }
-        Command::Interject { text } => ctx.state.interjections.push(text),
-        Command::Defer { text } => ctx.state.deferrals.push_back(text),
-        Command::Abort => {}
-        Command::SetEffort { level } => ctx.state.effort = Some(level),
-        Command::Compact { focus } => {
-            run_digest(
-                &mut ctx.voice,
-                &mut ctx.state,
-                &mut ctx.strand,
-                &ctx.events,
-                focus,
-            )
-            .await;
+        Command::ForkStrand { turns } => {
+            match fork_strand(&ctx.cwd, &ctx.strand, turns) {
+                Ok(path) => {
+                    match attach_strand(
+                        &ctx.events,
+                        &mut ctx.state,
+                        &mut ctx.voice,
+                        &ctx.cwd,
+                        &StrandChoice::Path(path),
+                    )
+                    .await
+                    {
+                        Ok(fresh) => ctx.strand = fresh,
+                        Err(e) => {
+                            ctx.events
+                                .send(Event::Error {
+                                    class: ErrorClass::Protocol,
+                                    retryable: false,
+                                    message: format!("fork created but attach failed: {e}"),
+                                })
+                                .await
+                                .ok();
+                        }
+                    }
+                }
+                Err(e) => {
+                    ctx.events
+                        .send(Event::Error {
+                            class: ErrorClass::Unsupported,
+                            retryable: false,
+                            message: format!("fork failed: {e}"),
+                        })
+                        .await
+                        .ok();
+                }
+            }
+            ctx.events.send(Event::Idle).await.ok();
+        }
+        Command::Checkpoint => {
+            match crate::checkpoint::snapshot(&ctx.cwd) {
+                Ok(id) => {
+                    let ts = ka_strand::now_rfc3339();
+                    ctx.state.checkpoints.push((id.clone(), ts.clone()));
+                    ctx.events
+                        .send(Event::Note {
+                            message: format!(
+                                "checkpoint {} saved ({ts})",
+                                crate::checkpoint::short(&id)
+                            ),
+                        })
+                        .await
+                        .ok();
+                }
+                Err(e) => {
+                    ctx.events
+                        .send(Event::Error {
+                            class: ErrorClass::Internal,
+                            retryable: false,
+                            message: format!("checkpoint failed: {e}"),
+                        })
+                        .await
+                        .ok();
+                }
+            }
+            ctx.events.send(Event::Idle).await.ok();
+        }
+        Command::RestoreCheckpoint { id } => {
+            if id.trim() == "list" {
+                let message = if ctx.state.checkpoints.is_empty() {
+                    "no checkpoints in this session yet".to_string()
+                } else {
+                    ctx.state
+                        .checkpoints
+                        .iter()
+                        .map(|(cid, ts)| format!("{}  {ts}", crate::checkpoint::short(cid)))
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                };
+                ctx.events.send(Event::Note { message }).await.ok();
+            } else {
+                let resolved = ctx.state.checkpoints.iter().find(|(cid, _)| {
+                    cid == &id
+                        || crate::checkpoint::short(cid) == id.trim()
+                        || cid.starts_with(id.trim())
+                });
+                match resolved.cloned() {
+                    None => {
+                        ctx.events
+                            .send(Event::Error {
+                                class: ErrorClass::Unsupported,
+                                retryable: false,
+                                message: format!("no checkpoint matches '{id}' in this session"),
+                            })
+                            .await
+                            .ok();
+                    }
+                    Some((cid, ts)) => {
+                        let answer = engine_ask(
+                            &ctx.events,
+                            commands,
+                            AskId(format!("ckpt-restore-{cid}")),
+                            format!(
+                                "restore checkpoint {} ({ts})? overwrites working tree",
+                                crate::checkpoint::short(&cid)
+                            ),
+                            vec!["restore".to_string(), "cancel".to_string()],
+                        )
+                        .await;
+                        match answer {
+                            Some(0) => match crate::checkpoint::restore(&ctx.cwd, &cid) {
+                                Ok(()) => {
+                                    ctx.events
+                                        .send(Event::Note {
+                                            message: format!(
+                                                "restored checkpoint {}",
+                                                crate::checkpoint::short(&cid)
+                                            ),
+                                        })
+                                        .await
+                                        .ok();
+                                }
+                                Err(e) => {
+                                    ctx.events
+                                        .send(Event::Error {
+                                            class: ErrorClass::Internal,
+                                            retryable: false,
+                                            message: format!("restore failed: {e}"),
+                                        })
+                                        .await
+                                        .ok();
+                                }
+                            },
+                            _ => {
+                                ctx.events
+                                    .send(Event::Note {
+                                        message: "canceled".to_string(),
+                                    })
+                                    .await
+                                    .ok();
+                            }
+                        }
+                    }
+                }
+            }
             ctx.events.send(Event::Idle).await.ok();
         }
         Command::Rewind { turns } => {
@@ -652,6 +840,65 @@ async fn handle_command(
                 })
                 .await?;
         }
+        Command::ExportMarkdown { out } => {
+            let msg_count = ctx
+                .strand
+                .records()
+                .iter()
+                .filter(|r| matches!(r, ka_strand::Record::Message { .. }))
+                .count();
+            if msg_count == 0 {
+                ctx.events
+                    .send(Event::Error {
+                        class: ErrorClass::Unsupported,
+                        retryable: false,
+                        message: "nothing to export — session is empty".to_string(),
+                    })
+                    .await
+                    .ok();
+            } else {
+                let path = match out {
+                    Some(p) => p,
+                    None => {
+                        let id = strand_id(&ctx.strand);
+                        let tail: String = id
+                            .chars()
+                            .rev()
+                            .take(8)
+                            .collect::<String>()
+                            .chars()
+                            .rev()
+                            .collect();
+                        ctx.cwd.join(format!("ka-session-{tail}.md"))
+                    }
+                };
+                let md = ka_strand::render_markdown(ctx.strand.records());
+                match std::fs::write(&path, md) {
+                    Ok(()) => {
+                        ctx.events
+                            .send(Event::Note {
+                                message: format!(
+                                    "exported {msg_count} messages → {}",
+                                    path.display()
+                                ),
+                            })
+                            .await
+                            .ok();
+                    }
+                    Err(e) => {
+                        ctx.events
+                            .send(Event::Error {
+                                class: ErrorClass::Internal,
+                                retryable: false,
+                                message: format!("export failed: {e}"),
+                            })
+                            .await
+                            .ok();
+                    }
+                }
+            }
+            ctx.events.send(Event::Idle).await.ok();
+        }
     }
     Ok(())
 }
@@ -668,8 +915,28 @@ async fn attach_strand(
 ) -> Result<ka_strand::StrandFile, DynError> {
     let mut strand =
         resolve_strand(choice, cwd).map_err(|e| -> DynError { format!("strand: {e}").into() })?;
-    // interrupted-turn synthesis
-    let _ = strand.synthesize_aborted();
+    // interrupted-turn synthesis — observable when something was recovered
+    let recovered = strand.synthesize_aborted().unwrap_or(false);
+    // checkpoints and guard latches are session-scoped; re-arm them from
+    // the strand we just attached to
+    state.checkpoints.clear();
+    let session_spend = strand
+        .records()
+        .iter()
+        .filter_map(|r| match r {
+            ka_strand::Record::Usage { cost, .. } => Some(*cost),
+            _ => None,
+        })
+        .sum();
+    state.guards.reset(session_spend);
+    if recovered {
+        events
+            .send(Event::Note {
+                message: "↩ recovered interrupted turn".to_string(),
+            })
+            .await
+            .ok();
+    }
     // session settings win over whatever the engine was running with
     let settings = strand.settings().clone();
     if settings.model.is_some() {
@@ -711,28 +978,28 @@ async fn attach_strand(
             .await
             .ok();
     }
-    if settings.mode.is_some() {
-        events
-            .send(Event::ModeChanged { mode: state.mode })
-            .await
-            .ok();
-    }
-    // replay resumed history so surfaces can rebuild the transcript
-    if !voice.history.is_empty() {
-        let messages = voice
-            .history
-            .iter()
-            .filter(|m| !m.content.trim().is_empty())
-            .map(|m| ka_protocol::ReplayedMessage {
-                role: match m.role {
-                    ka_dialect::speaker::TurnRole::User => "user".to_string(),
-                    _ => "assistant".to_string(),
-                },
-                content: m.content.clone(),
-            })
-            .collect();
-        events.send(Event::Replay { messages }).await.ok();
-    }
+    // always announce the effective mode at bootstrap so surfaces render
+    // the true state instead of an assumed default
+    events
+        .send(Event::ModeChanged { mode: state.mode })
+        .await
+        .ok();
+    // replay resumed history so surfaces can rebuild the transcript;
+    // emit unconditionally — an empty replay tells surfaces to clear
+    // (fresh strands via /new rely on this to reset the transcript)
+    let messages = voice
+        .history
+        .iter()
+        .filter(|m| !m.content.trim().is_empty())
+        .map(|m| ka_protocol::ReplayedMessage {
+            role: match m.role {
+                ka_dialect::speaker::TurnRole::User => "user".to_string(),
+                _ => "assistant".to_string(),
+            },
+            content: m.content.clone(),
+        })
+        .collect();
+    events.send(Event::Replay { messages }).await.ok();
     Ok(strand)
 }
 
@@ -846,8 +1113,12 @@ async fn dispatch_turn(
     voice: &mut Voice,
     text: String,
     strand: &mut ka_strand::StrandFile,
+    cwd: &std::path::Path,
 ) {
-    if let Some(model) = state.model.clone() {
+    if let Err(note) = crate::fshooks::run(HookPoint::PreTurn, cwd, None).await {
+        events.send(Event::Note { message: note }).await.ok();
+    }
+    let usage = if let Some(model) = state.model.clone() {
         voice
             .turn(
                 &model,
@@ -856,14 +1127,116 @@ async fn dispatch_turn(
                 events,
                 &mut state.interjections,
                 &mut state.deferrals,
+                &mut state.guards,
             )
-            .await;
+            .await
     } else {
         let mut history = std::mem::take(&mut voice.history);
-        turn_canned(commands, events, state, &mut history, text).await;
+        let usage = turn_canned(commands, events, state, &mut history, text).await;
         voice.history = history;
-    }
+        usage
+    };
+    // session spend accounting + the persisted Usage record feed the
+    // spend guard and `ka sessions` stats
+    state.guards.session_spend += usage.cost;
+    let _ = strand.append(ka_strand::Record::Usage {
+        id: ka_strand::new_record_id(),
+        cost: usage.cost,
+        input: usage.input,
+        output: usage.output,
+        cache_read: usage.cache_read,
+        cache_write: usage.cache_write,
+    });
     persist_delta(voice, state, strand);
+    if let Err(note) = crate::fshooks::run(HookPoint::PostTurn, cwd, None).await {
+        events.send(Event::Note { message: note }).await.ok();
+    }
+}
+
+/// Copy the current strand into a new strand file truncated to drop the
+/// last `turns` user turns (0 = exact copy), titled "<original> (fork)".
+fn fork_strand(
+    cwd: &std::path::Path,
+    current: &ka_strand::StrandFile,
+    turns: u32,
+) -> Result<std::path::PathBuf, String> {
+    let records = current.records();
+    let user_idx: Vec<usize> = records
+        .iter()
+        .enumerate()
+        .filter(|(_, r)| {
+            matches!(
+                r,
+                ka_strand::Record::Message {
+                    role: ka_strand::Role::User,
+                    ..
+                }
+            )
+        })
+        .map(|(i, _)| i)
+        .collect();
+    if turns as usize > user_idx.len() {
+        return Err(format!(
+            "cannot drop {turns} turn(s): session has {} user turn(s)",
+            user_idx.len()
+        ));
+    }
+    let cut = match turns {
+        0 => records.len(),
+        n => user_idx[user_idx.len() - n as usize],
+    };
+    let mut fork =
+        ka_strand::StrandFile::create(cwd, repo_snapshot(cwd)).map_err(|e| e.to_string())?;
+    for record in &records[..cut] {
+        if matches!(record, ka_strand::Record::Header { .. }) {
+            continue;
+        }
+        fork.append(record.clone()).map_err(|e| e.to_string())?;
+    }
+    let title = format!("{} (fork)", ka_strand::title_of(records));
+    fork.append(ka_strand::Record::Title {
+        id: ka_strand::new_record_id(),
+        title,
+    })
+    .map_err(|e| e.to_string())?;
+    fork.path()
+        .map(std::path::Path::to_path_buf)
+        .ok_or_else(|| "fork was never materialized".to_string())
+}
+
+/// Pose a question and wait for the surface's answer. `None` = the
+/// surface aborted or went away.
+async fn engine_ask(
+    events: &mpsc::Sender<Event>,
+    commands: &mut mpsc::Receiver<Command>,
+    id: AskId,
+    question: String,
+    options: Vec<String>,
+) -> Option<usize> {
+    events
+        .send(Event::Ask {
+            id: id.clone(),
+            questions: vec![AskQuestion {
+                text: question,
+                options,
+            }],
+        })
+        .await
+        .ok();
+    loop {
+        tokio::select! {
+            maybe = commands.recv() => {
+                match maybe {
+                    None => return None,
+                    Some(Command::Abort) => return None,
+                    Some(Command::Answer { question: q, choice }) if q == id => {
+                        return Some(choice);
+                    }
+                    Some(_) => {}
+                }
+            }
+        }
+    }
 }
 
 /// Persist any pending digest (as a Digest record) and the history delta.
@@ -945,14 +1318,15 @@ fn tty_key() -> Option<String> {
 }
 
 /// One canned turn: stream paced chunks, honoring aborts that arrive
-/// mid-stream. Used when no model is configured.
+/// mid-stream. Used when no model is configured. Returns the turn's
+/// (estimated) usage.
 async fn turn_canned(
     commands: &mut mpsc::Receiver<Command>,
     events: &mpsc::Sender<Event>,
     state: &mut EngineState,
     history: &mut Vec<ka_dialect::speaker::TurnMessage>,
     text: String,
-) {
+) -> Usage {
     let est_in = (text.len() as u64).div_ceil(4);
     events
         .send(Event::TurnStarted {
@@ -975,7 +1349,7 @@ async fn turn_canned(
                 match maybe {
                     None => {
                         // Surface went away; finish quietly.
-                        return;
+                        return Usage::default();
                     }
                     Some(Command::Abort) => {
                         aborted = true;
@@ -1010,7 +1384,7 @@ async fn turn_canned(
             })
             .await
             .ok();
-        return;
+        return Usage::default();
     }
 
     // Settling: unhandled interjections become deferrals so they are not lost.
@@ -1023,17 +1397,19 @@ async fn turn_canned(
         .sum::<u64>()
         .div_ceil(4);
     history.push(ka_dialect::speaker::TurnMessage::assistant(chunks.concat()));
+    let usage = Usage {
+        input: est_in,
+        output: est_out,
+        ..Usage::default()
+    };
     events
         .send(Event::TurnFinished {
             stop: Stop::Done,
-            usage: Usage {
-                input: est_in,
-                output: est_out,
-                ..Usage::default()
-            },
+            usage,
         })
         .await
         .ok();
+    usage
 }
 
 #[cfg(test)]
@@ -1045,7 +1421,7 @@ mod tests {
     use tokio::sync::mpsc;
 
     use crate::config::Config;
-    use crate::engine::spawn;
+    use crate::engine::{EngineHandle, spawn};
 
     async fn drain_until_finished(events: &mut mpsc::Receiver<Event>) -> Vec<Event> {
         let mut seen = Vec::new();
@@ -1228,6 +1604,165 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn export_markdown_writes_and_rejects_empty_sessions() {
+        use crate::engine::{StrandChoice, spawn_full};
+
+        let data = std::env::temp_dir().join(format!("ka-eng-export-{}", std::process::id()));
+        let work = data.join("work");
+        let _ = std::fs::remove_dir_all(&data);
+        std::fs::create_dir_all(&work).unwrap();
+        ka_strand::set_data_dir_for_tests(data.join("data"));
+
+        let cfg = Config {
+            cwd: Some(work.display().to_string()),
+            ..Default::default()
+        };
+        let mut h = spawn_full(
+            cfg.clone(),
+            ka_dialect::Catalog::embedded(),
+            StrandChoice::New,
+        );
+        h.commands
+            .send(Command::Prompt { text: "hi".into() })
+            .await
+            .unwrap();
+        while let Some(evt) = h.events.recv().await {
+            if matches!(evt, Event::TurnFinished { .. }) {
+                break;
+            }
+        }
+        let out = work.join("out.md");
+        h.commands
+            .send(Command::ExportMarkdown {
+                out: Some(out.clone()),
+            })
+            .await
+            .unwrap();
+        let mut saw_note = false;
+        while let Some(evt) = h.events.recv().await {
+            if let Event::Note { message } = evt {
+                assert!(
+                    message.contains("exported") && message.contains("out.md"),
+                    "{message}"
+                );
+                saw_note = true;
+                break;
+            }
+        }
+        assert!(saw_note, "export must announce its output path");
+        let md = std::fs::read_to_string(&out).unwrap();
+        assert!(md.contains("### **you**"), "{md}");
+        assert!(md.contains("hi"), "{md}");
+        drop(h);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // empty session: error, and no default-named file appears in cwd
+        let mut h2 = spawn_full(cfg, ka_dialect::Catalog::embedded(), StrandChoice::New);
+        h2.commands
+            .send(Command::ExportMarkdown { out: None })
+            .await
+            .unwrap();
+        let mut saw_err = false;
+        while let Some(evt) = h2.events.recv().await {
+            if let Event::Error { message, .. } = evt {
+                assert!(message.contains("nothing to export"), "{message}");
+                saw_err = true;
+                break;
+            }
+        }
+        assert!(saw_err, "empty session export must error");
+        drop(h2);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let leftovers: Vec<String> = std::fs::read_dir(&work)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|n| n.starts_with("ka-session-"))
+            .collect();
+        assert!(leftovers.is_empty(), "{leftovers:?}");
+        let _ = std::fs::remove_dir_all(&data);
+    }
+
+    #[tokio::test]
+    async fn fresh_bootstrap_emits_single_empty_replay() {
+        use crate::engine::{StrandChoice, spawn_full};
+        use ka_protocol::Command;
+
+        let data = std::env::temp_dir().join(format!("ka-eng-boot-replay-{}", std::process::id()));
+        let work = data.join("work");
+        let _ = std::fs::remove_dir_all(&data);
+        std::fs::create_dir_all(&work).unwrap();
+        ka_strand::set_data_dir_for_tests(data.clone());
+
+        let cfg = Config {
+            cwd: Some(work.display().to_string()),
+            ..Default::default()
+        };
+        // fresh session: exactly one Replay, with zero messages
+        let mut h = spawn_full(
+            cfg.clone(),
+            ka_dialect::Catalog::embedded(),
+            StrandChoice::New,
+        );
+        let mut replays: Vec<usize> = Vec::new();
+        loop {
+            match tokio::time::timeout(Duration::from_millis(300), h.events.recv()).await {
+                Ok(Some(Event::Replay { messages })) => replays.push(messages.len()),
+                Ok(Some(_)) => {}
+                Ok(None) | Err(_) => break,
+            }
+        }
+        assert_eq!(
+            replays,
+            vec![0],
+            "fresh bootstrap: one empty replay, got {replays:?}"
+        );
+        drop(h);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // resumed session with content: exactly one Replay, populated
+        let mut h2 = spawn_full(
+            cfg.clone(),
+            ka_dialect::Catalog::embedded(),
+            StrandChoice::Latest,
+        );
+        h2.commands
+            .send(Command::Prompt {
+                text: "hello".into(),
+            })
+            .await
+            .unwrap();
+        while let Some(evt) = h2.events.recv().await {
+            if matches!(evt, Event::Idle) {
+                break;
+            }
+        }
+        drop(h2);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let mut h3 = spawn_full(cfg, ka_dialect::Catalog::embedded(), StrandChoice::Latest);
+        let mut replays: Vec<usize> = Vec::new();
+        loop {
+            match tokio::time::timeout(Duration::from_millis(300), h3.events.recv()).await {
+                Ok(Some(Event::Replay { messages })) => replays.push(messages.len()),
+                Ok(Some(_)) => {}
+                Ok(None) | Err(_) => break,
+            }
+        }
+        assert_eq!(
+            replays.len(),
+            1,
+            "resumed bootstrap: exactly one replay, got {replays:?}"
+        );
+        assert_eq!(
+            replays[0], 2,
+            "resumed replay covers the prior exchange, got {replays:?}"
+        );
+        drop(h3);
+        let _ = std::fs::remove_dir_all(&data);
+    }
+
+    #[tokio::test]
     async fn rewind_persists_and_resume_truncates() {
         use crate::engine::{StrandChoice, spawn_full};
         use ka_protocol::Command;
@@ -1397,7 +1932,9 @@ mod tests {
                 Event::SessionInfo { .. }
                 | Event::ModelChanged { .. }
                 | Event::ModeChanged { .. }
-                | Event::Replay { .. } => continue,
+                | Event::Replay { .. }
+                | Event::Inventory { .. }
+                | Event::Todos { .. } => continue,
                 other => break other,
             }
         };
@@ -1407,6 +1944,263 @@ mod tests {
                 class: ErrorClass::Unsupported,
                 ..
             }
+        ));
+    }
+
+    /// Drain events until the next Idle, collecting what came before.
+    async fn drain_to_idle(handle: &mut EngineHandle) -> Vec<Event> {
+        let mut seen = Vec::new();
+        loop {
+            let evt = tokio::time::timeout(Duration::from_millis(2_000), handle.events.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            let idle = matches!(evt, Event::Idle);
+            seen.push(evt);
+            if idle {
+                return seen;
+            }
+        }
+    }
+
+    async fn prompt_and_settle(handle: &mut EngineHandle, text: &str) {
+        handle
+            .commands
+            .send(Command::Prompt {
+                text: text.to_string(),
+            })
+            .await
+            .unwrap();
+        drain_to_idle(handle).await;
+    }
+
+    #[tokio::test]
+    async fn fork_truncates_copies_and_rejects_overlarge_turns() {
+        use crate::engine::{StrandChoice, spawn_full};
+
+        let data = std::env::temp_dir().join(format!("ka-eng-fork-{}", std::process::id()));
+        let work = data.join("work");
+        let _ = std::fs::remove_dir_all(&data);
+        std::fs::create_dir_all(&work).unwrap();
+        ka_strand::set_data_dir_for_tests(data.clone());
+
+        let cfg = Config {
+            cwd: Some(work.display().to_string()),
+            ..Default::default()
+        };
+        let mut handle = spawn_full(cfg, ka_dialect::Catalog::embedded(), StrandChoice::New);
+        prompt_and_settle(&mut handle, "first question").await;
+        prompt_and_settle(&mut handle, "second question").await;
+
+        let sessions = ka_strand::list(&work).unwrap();
+        assert_eq!(sessions.len(), 1);
+        let original_id = sessions[0].id.clone();
+        let original_path = sessions[0].path.clone();
+
+        // fork dropping the last user turn: copy ends after exchange one,
+        // titled "<first user message> (fork)", and the engine switches to it
+        handle
+            .commands
+            .send(Command::ForkStrand { turns: 1 })
+            .await
+            .unwrap();
+        let events = drain_to_idle(&mut handle).await;
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, Event::SessionInfo { id } if *id != original_id)),
+            "fork must announce a new session: {events:?}"
+        );
+        let sessions = ka_strand::list(&work).unwrap();
+        assert_eq!(sessions.len(), 2, "{sessions:?}");
+        let fork = sessions.iter().find(|s| s.id != original_id).unwrap();
+        assert_eq!(fork.title, "first question (fork)");
+        assert_eq!(fork.messages, 2, "last user turn dropped: {fork:?}");
+
+        // overlarge turns: Error + Idle, no new strand, engine unchanged
+        handle
+            .commands
+            .send(Command::ForkStrand { turns: 3 })
+            .await
+            .unwrap();
+        let events = drain_to_idle(&mut handle).await;
+        assert!(
+            events.iter().any(|e| matches!(e, Event::Error { .. })),
+            "overlarge fork must error: {events:?}"
+        );
+        assert_eq!(ka_strand::list(&work).unwrap().len(), 2);
+
+        // exact copy (turns = 0) of the ACTIVE strand (the first fork):
+        // same messages, fork-of-fork title
+        handle
+            .commands
+            .send(Command::ForkStrand { turns: 0 })
+            .await
+            .unwrap();
+        drain_to_idle(&mut handle).await;
+        let sessions = ka_strand::list(&work).unwrap();
+        assert_eq!(sessions.len(), 3, "{sessions:?}");
+        let copy = sessions
+            .iter()
+            .find(|s| s.id != original_id && s.path != fork.path)
+            .unwrap();
+        assert_eq!(copy.title, "first question (fork) (fork)");
+        assert_eq!(copy.messages, fork.messages, "exact copy keeps messages");
+        let copy_records = ka_strand::read(&copy.path).unwrap();
+        let fork_records = ka_strand::read(&fork.path).unwrap();
+        let msg_contents = |records: &[ka_strand::Record]| -> Vec<String> {
+            records
+                .iter()
+                .filter_map(|r| match r {
+                    ka_strand::Record::Message { content, .. } => Some(content.clone()),
+                    _ => None,
+                })
+                .collect()
+        };
+        assert_eq!(msg_contents(&copy_records), msg_contents(&fork_records));
+
+        // the ORIGINAL strand file is untouched by all three forks
+        let original = ka_strand::read(&original_path).unwrap();
+        assert_eq!(msg_contents(&original).len(), 4);
+        drop(handle);
+        let _ = std::fs::remove_dir_all(&data);
+    }
+
+    /// Spawn with `cwd` pinned to a fresh empty dir, drop the command
+    /// side, and collect everything the engine emits at bootstrap.
+    async fn drain_bootstrap(tag: &str, mut cfg: Config) -> Vec<Event> {
+        let root = std::env::temp_dir().join(format!(
+            "ka-eng-inv-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        cfg.cwd = Some(root.to_string_lossy().into_owned());
+        let mut handle = spawn(cfg);
+        drop(handle.commands);
+        let mut seen = Vec::new();
+        while let Some(evt) = handle.events.recv().await {
+            seen.push(evt);
+        }
+        let _ = std::fs::remove_dir_all(&root);
+        seen
+    }
+
+    #[tokio::test]
+    async fn bootstrap_emits_exactly_one_inventory() {
+        let seen = drain_bootstrap("bare", Config::default()).await;
+        let mut inventories = seen.iter().filter(|e| matches!(e, Event::Inventory { .. }));
+        assert!(
+            inventories.next().is_some(),
+            "bootstrap must emit an Inventory: {seen:?}"
+        );
+        assert!(
+            inventories.next().is_none(),
+            "exactly one Inventory expected: {seen:?}"
+        );
+        // the ad-hoc inventory notes are gone
+        assert!(
+            seen.iter().all(|e| !matches!(
+                e,
+                Event::Note { message } if message.contains("agents available")
+            )),
+            "no agents-available note expected: {seen:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn bootstrap_inventory_lists_agents_skills_and_failed_mcp() {
+        let root = std::env::temp_dir().join(format!(
+            "ka-eng-inv-rich-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join(".ka/agents")).unwrap();
+        std::fs::write(
+            root.join(".ka/agents/reviewer.md"),
+            "---\nname: reviewer\ndescription: reviews code\n---\nBe harsh.\n",
+        )
+        .unwrap();
+        for name in ["demo", "second"] {
+            std::fs::create_dir_all(root.join(format!(".ka/skills/{name}"))).unwrap();
+            std::fs::write(
+                root.join(format!(".ka/skills/{name}/SKILL.md")),
+                format!("---\ndescription: {name} skill\n---\nDo things.\n"),
+            )
+            .unwrap();
+        }
+        let cfg = Config {
+            cwd: Some(root.to_string_lossy().into_owned()),
+            mcp: vec![crate::mcp::McpServerConfig {
+                name: "ghost".into(),
+                command: "ka-definitely-not-a-binary-9x7".into(),
+                args: Vec::new(),
+                env: Default::default(),
+            }],
+            ..Config::default()
+        };
+        let mut handle = spawn(cfg);
+        drop(handle.commands);
+        let mut seen = Vec::new();
+        while let Some(evt) = handle.events.recv().await {
+            seen.push(evt);
+        }
+        let _ = std::fs::remove_dir_all(&root);
+
+        // the spawn failure stays visible as an Error naming the server
+        let errors: Vec<String> = seen
+            .iter()
+            .filter_map(|e| match e {
+                Event::Error { message, .. } => Some(message.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(errors.len(), 1, "one mcp failure error: {seen:?}");
+        assert!(errors[0].contains("ghost"), "error names the server");
+
+        // exactly one Inventory carrying the injected counts
+        let inventories: Vec<&Event> = seen
+            .iter()
+            .filter(|e| matches!(e, Event::Inventory { .. }))
+            .collect();
+        assert_eq!(inventories.len(), 1, "exactly one Inventory: {seen:?}");
+        let Event::Inventory {
+            tools,
+            mcp,
+            agents,
+            skills,
+        } = inventories[0]
+        else {
+            unreachable!("filtered above")
+        };
+        assert_eq!(agents, &["reviewer".to_string()]);
+        // discovery also sees the user HOME layer, so only the injected
+        // names are asserted exactly
+        assert!(skills.contains(&"demo".to_string()), "skills: {skills:?}");
+        assert!(skills.contains(&"second".to_string()), "skills: {skills:?}");
+        assert_eq!(
+            mcp,
+            &[ka_protocol::McpSummary {
+                name: "ghost".into(),
+                ok: false,
+                tools: 0,
+            }]
+        );
+        // 7 built-ins + todo + the delegate hand the discovered agent adds
+        assert_eq!(tools.len(), 9, "tools: {tools:?}");
+        assert!(tools.contains(&"delegate".to_string()), "tools: {tools:?}");
+        assert!(tools.contains(&"todo".to_string()), "tools: {tools:?}");
+        // and the ad-hoc notes stay gone
+        assert!(seen.iter().all(
+            |e| !matches!(e, Event::Note { message } if message.contains("agents available") || message.contains("tool(s)"))
         ));
     }
 }
