@@ -707,7 +707,12 @@ fn render_line(line: &Line, width: u16) -> Vec<ratatui::text::Line<'static>> {
             out.push(surface_blank(width, bg));
         }
         Line::Thought(text) => push_gutter(&mut out, text, width, "⋯ ", crate::palette::THOUGHT),
-        Line::Tool(text) => push_gutter(&mut out, text, width, "⚙ ", crate::palette::TOOL.into()),
+        // finished tool calls cache as ONE full-width band row, so tool
+        // activity reads as its own stratum (the live block's band)
+        Line::Tool(text) => out.push(TuiLine::from(vec![ratatui::text::Span::styled(
+            pad_to_width(format!(" {text}"), width as usize),
+            crate::palette::TOOL_BAND_STYLE,
+        )])),
         Line::Note(text) => push_gutter(
             &mut out,
             text,
@@ -744,10 +749,11 @@ fn window_range(total: usize, visible: usize, scroll: Option<usize>) -> (usize, 
     }
 }
 
-/// Visible transcript rows for a terminal height: input area + footer +
-/// transcript top border are the three rows carved out of the viewport.
+/// Visible transcript rows for a terminal height: the top margin, input
+/// area, footer, and transcript top border are the four rows carved out
+/// of the viewport.
 fn visible_rows(term_h: u16, input_h: u16) -> usize {
-    term_h.saturating_sub(input_h + 2) as usize
+    term_h.saturating_sub(input_h + 3) as usize
 }
 /// Cursor `(row, col)` in `text` for a char-index cursor position.
 fn cursor_row_col(text: &str, cursor_chars: usize) -> (usize, usize) {
@@ -3256,6 +3262,10 @@ fn apply_event(
                     elapsed,
                     usage.cost,
                 )));
+                // one plain canvas blank after the turn's last row, so
+                // the next block starts on clear ground; a following
+                // user turn's air push sees this blank and no-ops
+                transcript.push(Line::Report(String::new()));
             }
         }
         Event::ModelChanged { selector } => meters.model = selector.clone(),
@@ -4155,8 +4165,11 @@ fn preview_row(line: &str, width: usize) -> String {
     out
 }
 
-/// Live tool block rows: the `→ {tool}` header plus up to
-/// [`PREVIEW_WINDOW`] dim preview lines while the call is unfinished.
+/// Live tool block rows on the tool band: the `→ {tool}` header plus up
+/// to [`PREVIEW_WINDOW`] dim preview lines while the call is unfinished.
+/// Every row is inset one column and filled to the full transcript
+/// width with [`BG_TOOL`] — the band is the live block's background,
+/// same fill treatment as the assistant surface.
 fn tool_live_rows(
     header: &str,
     live: Option<&LiveTool>,
@@ -4166,12 +4179,22 @@ fn tool_live_rows(
     let Some(lt) = live else {
         return Vec::new();
     };
-    let mut rows = vec![TuiLine::styled(header.to_string(), crate::palette::TOOL)];
+    // one full-width band row: one column of air, the content, band fill.
+    // The bg must live on a SPAN — Paragraph ignores line-level styles
+    let band_row = |content: String, fg: ratatui::style::Color| {
+        TuiLine::from(vec![ratatui::text::Span::styled(
+            pad_to_width(format!(" {content}"), width),
+            ratatui::style::Style::new()
+                .fg(fg)
+                .bg(crate::palette::BG_TOOL),
+        )])
+    };
+    let mut rows = vec![band_row(header.to_string(), crate::palette::TOOL)];
     let start = lt.preview.len().saturating_sub(PREVIEW_WINDOW);
     for line in &lt.preview[start..] {
-        rows.push(TuiLine::styled(
+        rows.push(band_row(
             format!("  {}", preview_row(line, width)),
-            ratatui::style::Style::new().fg(crate::palette::FAINT),
+            crate::palette::FAINT,
         ));
     }
     rows
@@ -4274,16 +4297,19 @@ fn render(
     use ratatui::layout::Constraint::{Length, Min};
     use ratatui::style::{Modifier, Style};
     use ratatui::text::{Line as TuiLine, Span};
-    use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
+    use ratatui::widgets::{Block, BorderType, Borders, Paragraph, Wrap};
     // ── canvas: paint the whole frame before any widget so the app sits
     // on the warm mocha ground with cream prose, whatever the terminal
     // theme paints behind it ──
     frame.render_widget(Block::new().style(crate::palette::CANVAS), frame.area());
     // one column of air on each side of the frame; rows stay edge to
-    // edge (they are scarce). Every width below derives from these
-    // chunks, never from the raw frame area.
+    // edge (they are scarce) — except the single empty row above the
+    // transcript's top border, which gives the window a top margin.
+    // Every width below derives from these chunks, never from the raw
+    // frame area.
     let outer = frame.area().inner(ratatui::layout::Margin::new(1, 0));
     let chunks = ratatui::layout::Layout::vertical([
+        Length(1),
         Min(3),
         Length(input_height(input_area_rows(ask, picker, input))),
         Length(1),
@@ -4298,10 +4324,10 @@ fn render(
             ratatui::layout::Constraint::Min(0),
             ratatui::layout::Constraint::Length(SIDEBAR_WIDTH),
         ])
-        .split(chunks[0]);
+        .split(chunks[1]);
         (cols[0], Some(cols[1]))
     } else {
-        (chunks[0], None)
+        (chunks[1], None)
     };
     let tx_inner = tx_area.width.saturating_sub(2);
     // modals center within the transcript pane, one col clear of its
@@ -4347,10 +4373,10 @@ fn render(
 
     let cached = transcript.total_rows();
     let total = cached + live_rows.len();
-    let visible = chunks[0].height.saturating_sub(1) as usize;
+    let visible = chunks[1].height.saturating_sub(1) as usize;
     debug_assert_eq!(
         visible,
-        visible_rows(frame.area().height, chunks[1].height),
+        visible_rows(frame.area().height, chunks[2].height),
         "viewport arithmetic must agree with the layout"
     );
     let (start, pinned) = window_range(total, visible, scroll);
@@ -4366,9 +4392,9 @@ fn render(
         }
     }
     let title = if pinned {
-        "ka".to_string()
+        "𓂓".to_string()
     } else {
-        format!("ka · ↑{} above (pgdn/esc)", start)
+        format!("𓂓 · ↑{} above (pgdn/esc)", start)
     };
     let widget = Paragraph::new(window).block(
         Block::default()
@@ -4393,7 +4419,7 @@ fn render(
             .block(
                 Block::default()
                     .borders(Borders::LEFT)
-                    .title(padded_title("ka"))
+                    .title(padded_title("𓂓"))
                     .border_style(crate::palette::BORDER_STYLE)
                     .padding(ratatui::widgets::Padding::horizontal(1)),
             )
@@ -4440,7 +4466,7 @@ fn render(
         // one row per tier: the selected row is a full-width inverse
         // bar, the label column stays padded so descriptions align, and
         // unselected descriptions ride along in DIM
-        let inner_w = chunks[1].width.saturating_sub(4) as usize; // borders + padding
+        let inner_w = chunks[2].width.saturating_sub(4) as usize; // borders + padding
         let mut rows = Vec::with_capacity(MODE_CHOICES.len());
         for (i, (_, label, desc)) in MODE_CHOICES.iter().enumerate() {
             if i == pk.selected {
@@ -4462,7 +4488,7 @@ fn render(
         // shared horizontal window: all rows shift together so the cursor
         // row can always show the cursor
         let (_, cur_col) = cursor_row_col(input, cursor);
-        let inner_w = chunks[1].width.saturating_sub(4) as usize; // borders + padding
+        let inner_w = chunks[2].width.saturating_sub(4) as usize; // borders + padding
         let scroll_col = cur_col.saturating_sub(inner_w.saturating_sub(1).max(1));
         input
             .split('\n')
@@ -4473,17 +4499,18 @@ fn render(
         .block(
             Block::default()
                 .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
                 .title(padded_title(title))
                 .border_style(input_border)
                 .padding(ratatui::widgets::Padding::horizontal(1)),
         )
         .style(ratatui::style::Style::new().bg(crate::palette::BG_PANEL));
-    frame.render_widget(input_widget, chunks[1]);
+    frame.render_widget(input_widget, chunks[2]);
     if ask.is_none() && picker.is_none() {
         let (cur_row, cur_col) = cursor_row_col(input, cursor);
-        let inner_w = chunks[1].width.saturating_sub(4) as usize; // borders + padding
+        let inner_w = chunks[2].width.saturating_sub(4) as usize; // borders + padding
         let scroll_col = cur_col.saturating_sub(inner_w.saturating_sub(1).max(1));
-        let area = chunks[1];
+        let area = chunks[2];
         frame.set_cursor_position((
             area.x + 2 + (cur_col - scroll_col) as u16,
             area.y + 1 + cur_row.min(area.height.saturating_sub(2) as usize) as u16,
@@ -4544,7 +4571,7 @@ fn render(
     let left_cols: usize = hints.iter().map(|s| w(s.content.as_ref())).sum();
     // one leading + one trailing col of air: the left zone starts a col
     // in, the right zone ends a col before the chunk edge
-    let pad = chunks[2]
+    let pad = chunks[3]
         .width
         .saturating_sub(2)
         .saturating_sub((left_cols + w(right.as_str()) + w(spinner.as_str())) as u16)
@@ -4557,16 +4584,16 @@ fn render(
         bar.push(Span::styled(spinner, crate::palette::ACCENT_BOLD));
     }
     bar.push(Span::raw(" "));
-    frame.render_widget(Paragraph::new(TuiLine::from(bar)), chunks[2]);
+    frame.render_widget(Paragraph::new(TuiLine::from(bar)), chunks[3]);
 
     // ── slash autocomplete popup (above input) ────────────────────
     if let Some(popup) = popup {
         // border(2) + up to 7 items (hints live in the status bar)
         let rows = popup.items.len().min(7) as u16 + 2;
         let rect = ratatui::layout::Rect {
-            x: chunks[1].x,
-            y: chunks[1].y.saturating_sub(rows),
-            width: (chunks[1].width).min(56),
+            x: chunks[2].x,
+            y: chunks[2].y.saturating_sub(rows),
+            width: (chunks[2].width).min(56),
             height: rows,
         };
         let inner_w = rect.width.saturating_sub(4) as usize; // borders + padding
@@ -4601,9 +4628,9 @@ fn render(
         // border(2) + up to 7 entries (hints live in the status bar)
         let rows = path.entries.len().min(7) as u16 + 2;
         let rect = ratatui::layout::Rect {
-            x: chunks[1].x,
-            y: chunks[1].y.saturating_sub(rows),
-            width: (chunks[1].width).min(56),
+            x: chunks[2].x,
+            y: chunks[2].y.saturating_sub(rows),
+            width: (chunks[2].width).min(56),
             height: rows,
         };
         let inner_w = rect.width.saturating_sub(4) as usize; // borders + padding
@@ -5073,6 +5100,9 @@ fn push_block(out: &mut Vec<ratatui::text::Line<'static>>, text: &str, width: u1
     use ratatui::text::Line as TuiLine;
     use ratatui::text::Span;
 
+    // one blank band row above the text: the user card reads as a pad
+    // above AND below (the trailing blank below closes the card)
+    out.push(surface_blank(width, crate::palette::BG_USER));
     let lead_style = ratatui::style::Style::new()
         .fg(crate::palette::ACCENT)
         .bg(crate::palette::BG_USER);
@@ -5734,12 +5764,12 @@ mod tests {
     }
     #[test]
     fn visible_rows_carves_out_chrome() {
-        // input area + footer + transcript top border
-        assert_eq!(visible_rows(24, 3), 19);
+        // top margin + input area + footer + transcript top border
+        assert_eq!(visible_rows(24, 3), 18);
         assert_eq!(visible_rows(5, 3), 0, "never underflows");
         assert_eq!(visible_rows(0, 0), 0);
         // growth of the input eats the viewport one row at a time
-        assert_eq!(visible_rows(24, 8), 14);
+        assert_eq!(visible_rows(24, 8), 13);
     }
 
     #[test]
@@ -6186,12 +6216,21 @@ mod tests {
                 .map(|s| s.content.to_string())
                 .collect::<String>()
         };
-        assert!(text(&out[0]).starts_with("❯ alpha"));
+        // the card opens and closes on a BG_USER pad row
+        let user_bg = ratatui::style::Color::Rgb(38, 43, 69);
+        for pad in [out.first().unwrap(), out.last().unwrap()] {
+            assert!(
+                pad.spans.iter().all(|s| s.style.bg == Some(user_bg)),
+                "pad rows carry BG_USER: {pad:?}"
+            );
+            assert!(text(pad).trim().is_empty(), "pad row is blank");
+        }
+        assert!(text(&out[1]).starts_with("❯ alpha"));
         assert!(
-            text(&out[1]).starts_with("  beta"),
+            text(&out[2]).starts_with("  beta"),
             "second source line indents"
         );
-        assert_eq!(out.len(), 3, "two rows + trailing blank");
+        assert_eq!(out.len(), 4, "pad + two rows + pad");
     }
 
     #[test]
@@ -6702,6 +6741,7 @@ mod tests {
                 "A:after",
                 "T:→ bash ✗ boom",
                 "R:0.0s · $0.0000",
+                "R:",
             ],
             "final order must interleave text and tools: {shapes:?}"
         );
@@ -6760,8 +6800,21 @@ mod tests {
                     .collect::<String>()
             })
             .collect();
-        assert_eq!(texts[0], "→ bash");
-        assert_eq!(texts[1..], ["  line-3", "  line-4", "  line-5"]);
+        // inset one col, padded to the full band width
+        assert_eq!(texts[0].trim_end(), " → bash");
+        assert_eq!(
+            texts[1..].iter().map(|t| t.trim_end()).collect::<Vec<_>>(),
+            ["   line-3", "   line-4", "   line-5"]
+        );
+        for (i, row) in rows.iter().enumerate() {
+            assert_eq!(texts[i].chars().count(), 40, "band row fills the width");
+            assert!(
+                row.spans
+                    .iter()
+                    .all(|s| s.style.bg == Some(ratatui::style::Color::Rgb(27, 30, 44))),
+                "live rows ride BG_TOOL: {row:?}"
+            );
+        }
         assert_eq!(tool_live_rows("→ bash", None, 40).len(), 0);
     }
 
@@ -6881,8 +6934,8 @@ mod tests {
         let entries = lines.entries();
         assert_eq!(
             entries.len(),
-            3,
-            "assistant, report, then the meta row: {entries:?}"
+            4,
+            "assistant, report, meta row, then the canvas separator: {entries:?}"
         );
         assert!(matches!(entries[0], Line::Assistant(_)));
         let Line::ReportErr(report) = &entries[1] else {
@@ -6893,6 +6946,8 @@ mod tests {
         }
         // the closing meta row: `{model} · {elapsed}s · ${cost}`
         assert_eq!(&entries[2], &Line::Report("0.0s · $0.0002".into()));
+        // one plain canvas blank closes the turn block
+        assert_eq!(&entries[3], &Line::Report(String::new()));
         assert!(
             last_error.is_none(),
             "buffered error consumed by the report"
@@ -8015,5 +8070,73 @@ mod tests {
             &mut sidebar,
         );
         assert!(sidebar.todos.is_empty());
+    }
+
+    #[test]
+    fn cached_tool_row_is_a_single_band_row() {
+        let out = super::render_line(&Line::Tool("→ bash ✓ done".into()), 40);
+        assert_eq!(out.len(), 1, "exactly one band row, no trailing blank");
+        let row = &out[0];
+        let text: String = row.spans.iter().map(|s| s.content.to_string()).collect();
+        assert_eq!(text.trim_end(), " → bash ✓ done", "inset one col");
+        assert_eq!(text.chars().count(), 40, "band fills the width");
+        let band = crate::palette::TOOL_BAND_STYLE;
+        assert!(
+            row.spans
+                .iter()
+                .all(|s| s.style.fg == band.fg && s.style.bg == band.bg),
+            "cached row rides the tool band: {row:?}"
+        );
+    }
+
+    #[test]
+    fn frame_has_top_margin_glyph_title_and_rounded_input() {
+        use ratatui::backend::TestBackend;
+        let mut terminal = ratatui::Terminal::new(TestBackend::new(120, 40)).unwrap();
+        terminal
+            .draw(|f| {
+                super::render(
+                    f,
+                    &Transcript::default(),
+                    None,
+                    "",
+                    0,
+                    false,
+                    None,
+                    Instant::now(),
+                    0,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    &Meters::default(),
+                    &SidebarState::default(),
+                )
+            })
+            .unwrap();
+        let buf = terminal.backend().buffer();
+        // (a) the first UI row is empty canvas
+        for x in 0..120u16 {
+            let cell = &buf[(x, 0)];
+            assert_eq!(cell.symbol(), " ", "row 0 col {x} must be blank");
+            assert_eq!(cell.bg, crate::palette::BG, "row 0 rides the canvas");
+        }
+        // the transcript title row carries the 𓂓 glyph
+        let title_row: String = (1..93u16).map(|x| buf[(x, 1)].symbol()).collect();
+        assert!(title_row.contains('𓂓'), "glyph title: {title_row}");
+        // the sidebar title carries it too
+        let sb_title: String = (93..119u16).map(|x| buf[(x, 1)].symbol()).collect();
+        assert!(sb_title.contains('𓂓'), "sidebar glyph title: {sb_title}");
+        // the input box closes with rounded corners (rows 36..39)
+        assert_eq!(buf[(1, 36)].symbol(), "╭");
+        assert_eq!(buf[(118, 36)].symbol(), "╮");
+        assert_eq!(buf[(1, 38)].symbol(), "╰");
+        assert_eq!(buf[(118, 38)].symbol(), "╯");
+        // the status bar still owns the last row (no bottom margin)
+        let last_row: String = (0..120u16).map(|x| buf[(x, 39)].symbol()).collect();
+        assert!(last_row.contains("enter"), "status hints on the last row");
     }
 }

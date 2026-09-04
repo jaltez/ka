@@ -19,6 +19,10 @@ pub const BG_OUTPUT: Color = Color::Rgb(32, 25, 19); // #201913 assistant cards
 pub const BG_SURFACE: Color = Color::Rgb(36, 28, 22); // #241C16 modal/picker boxes
 // user rows ride a twilight-indigo band lightened toward dusk
 pub const BG_USER: Color = Color::Rgb(38, 43, 69); // #262B45
+// tool activity rides twilight-indigo darkened: its own stratum
+pub const BG_TOOL: Color = Color::Rgb(27, 30, 44); // #1B1E2C
+/// Tool band: `→ tool` text on the darkened indigo stratum.
+pub const TOOL_BAND_STYLE: Style = Style::new().fg(TOOL).bg(BG_TOOL);
 
 // ── text: cream ramp over the warm ground ────────────────────────
 pub const FG: Color = Color::Rgb(232, 220, 201); // #E8DCC9 primary prose
