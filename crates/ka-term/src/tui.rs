@@ -652,6 +652,14 @@ impl Transcript {
         }
         None
     }
+
+    /// Append an entry, preceded by [`separate_before`] air when the
+    /// cached tail is a different-family block. Every cached block push
+    /// goes through this, so the vertical rhythm has exactly one source.
+    pub fn push_separated(&mut self, line: Line) {
+        separate_before(self, family(&line));
+        self.push(line);
+    }
     /// Case-insensitive search over the source entries starting at
     /// absolute rendered row `from_row`: the first entry whose FIRST row
     /// sits at or below `from_row` and whose text contains `needle`.
@@ -689,6 +697,46 @@ fn line_text(line: &Line) -> &str {
         | Line::ReportErr(t) => t,
     }
 }
+
+/// Coarse visual family of an entry: vertical air (one blank canvas row)
+/// separates consecutive blocks of different families, while a
+/// same-family run stays tight.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Family {
+    User,
+    Assistant,
+    Thought,
+    Tool,
+    /// Notes, turn reports, error rows — and the blank separator itself.
+    Meta,
+}
+
+/// The [`Family`] of a transcript entry (a separator blank reads as
+/// Meta, but [`separate_before`] no-ops on it before consulting family).
+fn family(line: &Line) -> Family {
+    match line {
+        Line::User(_) => Family::User,
+        Line::Assistant(_) => Family::Assistant,
+        Line::Thought(_) => Family::Thought,
+        Line::Tool(_) => Family::Tool,
+        Line::Note(_) | Line::Report(_) | Line::ReportErr(_) => Family::Meta,
+    }
+}
+
+/// Air between blocks: push one blank canvas row (`Report("")`) unless
+/// the transcript is fresh, the tail already is a blank, or the tail
+/// belongs to the incoming family — same-family runs stay tight, and air
+/// is never doubled. Separators only ever sit BETWEEN blocks: the final
+/// entry of a session leaves no trailing blank.
+fn separate_before(transcript: &mut Transcript, incoming: Family) {
+    let Some(last) = transcript.entries().last() else {
+        return;
+    };
+    if line_text(last).is_empty() || family(last) == incoming {
+        return;
+    }
+    transcript.push(Line::Report(String::new()));
+}
 /// Render one transcript entry into styled rows at `width`.
 fn render_line(line: &Line, width: u16) -> Vec<ratatui::text::Line<'static>> {
     use ratatui::text::Line as TuiLine;
@@ -720,6 +768,9 @@ fn render_line(line: &Line, width: u16) -> Vec<ratatui::text::Line<'static>> {
             "! ",
             ratatui::style::Style::new().fg(crate::palette::ERR),
         ),
+        // the vertical separator is one true canvas-blank row (gutter
+        // text is empty, so the prefix loop would emit nothing)
+        Line::Report(text) if text.is_empty() => out.push(TuiLine::default()),
         Line::Report(text) => push_gutter(&mut out, text, width, "─ ", crate::palette::META.into()),
         Line::ReportErr(text) => push_gutter(
             &mut out,
@@ -2207,7 +2258,7 @@ async fn app(
                                     if let Some(path) = items.get(*selected).cloned() {
                                         modal = None;
                                         if !std::path::Path::new(&path).exists() {
-                                            transcript.push(Line::Note(format!(
+                                            transcript.push_separated(Line::Note(format!(
                                                 "spill file is gone: {path}"
                                             )));
                                         } else {
@@ -2230,8 +2281,7 @@ async fn app(
                                                     ),
                                                 };
                                             if let Err(e) = opened {
-                                                transcript
-                                                    .push(Line::Note(format!("pager failed: {e}")));
+                                                transcript.push_separated(Line::Note(format!("pager failed: {e}")));
                                             }
                                         }
                                     }
@@ -2447,8 +2497,7 @@ async fn app(
                                     None => match &find_last {
                                         Some((q, row)) => (q.clone(), row + 1),
                                         None => {
-                                            transcript
-                                                .push(Line::Note("no previous /find".into()));
+                                            transcript.push_separated(Line::Note("no previous /find".into()));
                                             continue;
                                         }
                                     },
@@ -2459,8 +2508,7 @@ async fn app(
                                         find_last = Some((q, offset));
                                     }
                                     None => {
-                                        transcript
-                                            .push(Line::Note(format!("no matches for '{q}'")));
+                                        transcript.push_separated(Line::Note(format!("no matches for '{q}'")));
                                         // resume past the searched-from row so a
                                         // later /find re-scans only fresh rows
                                         find_last = Some((q, from));
@@ -2470,17 +2518,16 @@ async fn app(
                             }
                             if text.trim() == "/retry" {
                                 if busy {
-                                    transcript.push(Line::Note(
+                                    transcript.push_separated(Line::Note(
                                         "⏳ turn running — esc to abort first".into(),
                                     ));
                                 } else if let Some(p) = last_user.clone() {
                                     // retry = a fresh turn with the same prompt
-                                    push_turn_air(&mut transcript);
-                                    transcript.push(Line::User(p.clone()));
+                                    transcript.push_separated(Line::User(p.clone()));
                                     busy = true;
                                     let _ = commands.send(Command::Prompt { text: p }).await;
                                 } else {
-                                    transcript.push(Line::Note("nothing to retry yet".into()));
+                                    transcript.push_separated(Line::Note("nothing to retry yet".into()));
                                 }
                                 continue;
                             }
@@ -2494,7 +2541,7 @@ async fn app(
                                         _ => None,
                                     });
                                 match last {
-                                    None => transcript.push(Line::Note(
+                                    None => transcript.push_separated(Line::Note(
                                         "no assistant reply to copy".into(),
                                     )),
                                     Some(s) => {
@@ -2509,9 +2556,9 @@ async fn app(
                                 continue;
                             }
                             if let Some(cmd) = slash_command(&text) {
-                                transcript.push(Line::User(text));
+                                transcript.push_separated(Line::User(text));
                                 if let Some(note) = cmd.note {
-                                    transcript.push(Line::Note(note));
+                                    transcript.push_separated(Line::Note(note));
                                 }
                                         if let Some(kind) = cmd.modal {
                                             match kind {
@@ -2548,8 +2595,7 @@ async fn app(
                 });
                 match prompt {
                     Some(p) => modal = Some(Modal::Key(p)),
-                    None => transcript
-                        .push(Line::Note("no api key variable is known for this model".into())),
+                    None => transcript.push_separated(Line::Note("no api key variable is known for this model".into())),
                 }
                                                 }
                                                 _ => {
@@ -2608,7 +2654,7 @@ async fn app(
                                     }
                                 }
                                 if let Some(follow) = cmd.followup {
-                                    transcript.push(Line::Note("(mode set; starting)".into()));
+                                    transcript.push_separated(Line::Note("(mode set; starting)".into()));
                                     busy = true;
                                     let _ = commands
                                         .send(Command::Prompt { text: follow })
@@ -2627,7 +2673,7 @@ async fn app(
                                     let item = deferred.trim().to_string();
                                     if !item.is_empty() {
                                         queue.push(item);
-                                        transcript.push(Line::Note(format!(
+                                        transcript.push_separated(Line::Note(format!(
                                             "⏳ queued · {} waiting for this turn to end",
                                             queue.len()
                                         )));
@@ -2635,10 +2681,9 @@ async fn app(
                                     continue;
                                 }
                             }
-                            push_turn_air(&mut transcript);
-                            transcript.push(Line::User(text.clone()));
+                            transcript.push_separated(Line::User(text.clone()));
                             let cmd = if busy {
-                                transcript.push(Line::Note(
+                                transcript.push_separated(Line::Note(
                                     "⚡ steering this turn".into(),
                                 ));
                                 Command::Interject { text }
@@ -2854,7 +2899,7 @@ async fn app(
                             let path_str = path.to_string_lossy().into_owned();
                             match std::fs::write(&path, &input.text) {
                                 Err(e) => {
-                                    transcript.push(Line::Note(format!("edit failed: {e}")));
+                                    transcript.push_separated(Line::Note(format!("edit failed: {e}")));
                                 }
                                 Ok(()) => {
                                     let editor = std::env::var("EDITOR")
@@ -2867,8 +2912,7 @@ async fn app(
                                         mouse_capture,
                                         terminal,
                                     ) {
-                                        Err(e) => transcript
-                                            .push(Line::Note(format!("editor failed: {e}"))),
+                                        Err(e) => transcript.push_separated(Line::Note(format!("editor failed: {e}"))),
                                         Ok(()) => {
                                             let read = std::fs::read_to_string(&path);
                                             let _ = std::fs::remove_file(&path);
@@ -2880,7 +2924,7 @@ async fn app(
                                                     slash_popup =
                                                         update_suggestions(&input.text);
                                                 }
-                                                Err(e) => transcript.push(Line::Note(format!(
+                                                Err(e) => transcript.push_separated(Line::Note(format!(
                                                     "edit failed: {e}"
                                                 ))),
                                             }
@@ -3001,8 +3045,7 @@ async fn app(
                             // unanswered ask holds the queue until answered.
                             if pending.is_none() {
                                 if let Some(next) = pop_queue_head(&mut queue) {
-                                    push_turn_air(&mut transcript);
-                                    transcript.push(Line::User(next.clone()));
+                                    transcript.push_separated(Line::User(next.clone()));
                                     last_user = Some(next.clone());
                                     busy = true;
                                     let _ = commands.send(Command::Prompt { text: next }).await;
@@ -3054,17 +3097,6 @@ fn turn_meta_row(model: &str, elapsed: f64, cost: f64) -> String {
     trunc_cols(&segs.join(" · "), 60)
 }
 
-/// Air before a freshly flushed user row: one blank report row, so
-/// consecutive turn groups read as blocks. No-ops when the transcript
-/// is empty or already ends in air.
-fn push_turn_air(transcript: &mut Transcript) {
-    match transcript.entries().split_last() {
-        // fresh transcript or already-breathing tail: no air needed
-        None => {}
-        Some((Line::Report(s), _)) if s.is_empty() => {}
-        Some(_) => transcript.push(Line::Report(String::new())),
-    }
-}
 #[allow(clippy::too_many_arguments)]
 fn apply_event(
     evt: &Event,
@@ -3116,7 +3148,7 @@ fn apply_event(
                 // above it, exactly like the turn-end flush
                 flush_live_text(transcript, current_thought, current_assistant);
                 if !current_tool.is_empty() {
-                    transcript.push(Line::Tool(std::mem::take(current_tool)));
+                    transcript.push_separated(Line::Tool(std::mem::take(current_tool)));
                 }
                 *current_tool = tool_header(tool, "");
                 *live_tool = Some(LiveTool {
@@ -3139,7 +3171,7 @@ fn apply_event(
                 // close the old row and open a fresh live block
                 _ => {
                     if !current_tool.is_empty() {
-                        transcript.push(Line::Tool(std::mem::take(current_tool)));
+                        transcript.push_separated(Line::Tool(std::mem::take(current_tool)));
                     }
                     *current_tool = tool_header(tool, detail);
                     *live_tool = Some(LiveTool {
@@ -3182,7 +3214,7 @@ fn apply_event(
                 }
             }
             if !current_tool.is_empty() {
-                transcript.push(Line::Tool(std::mem::take(current_tool)));
+                transcript.push_separated(Line::Tool(std::mem::take(current_tool)));
             }
         }
         Event::Ask { id, questions } => {
@@ -3205,7 +3237,7 @@ fn apply_event(
                 }
             }
             if !current_tool.is_empty() {
-                transcript.push(Line::Tool(std::mem::take(current_tool)));
+                transcript.push_separated(Line::Tool(std::mem::take(current_tool)));
             }
             *busy = false;
             *busy_since = None;
@@ -3243,7 +3275,7 @@ fn apply_event(
                         None => Line::ReportErr(format!("failed{tail} · /retry")),
                     },
                 };
-                transcript.push(row);
+                transcript.push_separated(row);
                 // best-effort desktop notification (OSC 9); one write
                 let label = match stop {
                     ka_protocol::Stop::Done => format!("done · {}", fmt_dur(elapsed)),
@@ -3257,15 +3289,11 @@ fn apply_event(
             }
             // the assistant output's closing metadata row
             if produced || !silent {
-                transcript.push(Line::Report(turn_meta_row(
+                transcript.push_separated(Line::Report(turn_meta_row(
                     &meters.model,
                     elapsed,
                     usage.cost,
                 )));
-                // one plain canvas blank after the turn's last row, so
-                // the next block starts on clear ground; a following
-                // user turn's air push sees this blank and no-ops
-                transcript.push(Line::Report(String::new()));
             }
         }
         Event::ModelChanged { selector } => meters.model = selector.clone(),
@@ -3285,7 +3313,7 @@ fn apply_event(
                 // surfaces it once the turn settles
                 *last_error = Some(message.clone());
             } else {
-                transcript.push(Line::ReportErr(message.clone()));
+                transcript.push_separated(Line::ReportErr(message.clone()));
             }
         }
         Event::Replay { messages } => {
@@ -3303,20 +3331,20 @@ fn apply_event(
             *last_error = None;
             for m in messages {
                 if m.role == "user" {
-                    transcript.push(Line::User(m.content.clone()));
+                    transcript.push_separated(Line::User(m.content.clone()));
                 } else {
-                    transcript.push(Line::Assistant(m.content.clone()));
+                    transcript.push_separated(Line::Assistant(m.content.clone()));
                 }
             }
         }
-        Event::Note { message } => transcript.push(Line::Note(message.clone())),
+        Event::Note { message } => transcript.push_separated(Line::Note(message.clone())),
         Event::Inventory {
             tools,
             mcp,
             agents,
             skills,
         } => {
-            transcript.push(Line::Report(inventory_card(tools, mcp, agents, skills)));
+            transcript.push_separated(Line::Report(inventory_card(tools, mcp, agents, skills)));
             sidebar.inventory = Inventory {
                 tools: tools.clone(),
                 mcp: mcp.clone(),
@@ -3332,7 +3360,9 @@ fn apply_event(
             *busy = false;
             *busy_since = None;
         }
-        Event::DigestStarted => transcript.push(Line::Note("⋯ digesting context…".to_string())),
+        Event::DigestStarted => {
+            transcript.push_separated(Line::Note("⋯ digesting context…".to_string()))
+        }
         Event::DigestFinished { .. } => {}
     }
 }
@@ -4137,10 +4167,10 @@ const PREVIEW_WINDOW: usize = 3;
 /// turn order. Used at call boundaries (chronology) and at turn end.
 fn flush_live_text(transcript: &mut Transcript, thought: &mut String, assistant: &mut String) {
     if !thought.trim().is_empty() {
-        transcript.push(Line::Thought(std::mem::take(thought)));
+        transcript.push_separated(Line::Thought(std::mem::take(thought)));
     }
     if !assistant.trim().is_empty() {
-        transcript.push(Line::Assistant(std::mem::take(assistant)));
+        transcript.push_separated(Line::Assistant(std::mem::take(assistant)));
     }
 }
 
@@ -5142,8 +5172,9 @@ fn push_block(out: &mut Vec<ratatui::text::Line<'static>>, text: &str, width: u1
     out.push(surface_blank(width, crate::palette::BG_USER)); // spacing after each block
 }
 
-/// Gutter-prefixed rows for ambient roles (thought/tool/note): no
-/// background, no full-width padding.
+/// Gutter-prefixed rows for ambient roles (thought/note/report): no
+/// background, no full-width padding, and no built-in spacing — air
+/// between blocks is [`separate_before`]'s job alone.
 fn push_gutter(
     out: &mut Vec<ratatui::text::Line<'static>>,
     text: &str,
@@ -5173,7 +5204,6 @@ fn push_gutter(
             start = end;
         }
     }
-    out.push(TuiLine::default()); // spacing after each entry
 }
 
 fn centered(width: u16, height: u16, area: ratatui::layout::Rect) -> ratatui::layout::Rect {
@@ -6137,7 +6167,7 @@ mod tests {
             "⚙ ",
             crate::palette::META.into(),
         );
-        assert_eq!(out.len(), 2, "one row + trailing blank");
+        assert_eq!(out.len(), 1, "text rows only: air is the separator's job");
         assert!(row_width(&out[0]) <= 40, "gutter rows never pad to width");
 
         // long text wraps at the width
@@ -6736,12 +6766,16 @@ mod tests {
             shapes,
             vec![
                 "T:pondering",
-                "A:before ",
-                "T:→ bash ✓ line-3",
-                "A:after",
-                "T:→ bash ✗ boom",
-                "R:0.0s · $0.0000",
                 "R:",
+                "A:before ",
+                "R:",
+                "T:→ bash ✓ line-3",
+                "R:",
+                "A:after",
+                "R:",
+                "T:→ bash ✗ boom",
+                "R:",
+                "R:0.0s · $0.0000",
             ],
             "final order must interleave text and tools: {shapes:?}"
         );
@@ -6764,10 +6798,13 @@ mod tests {
             .map(|l| match l {
                 Line::Thought(s) => format!("T:{s}"),
                 Line::Assistant(s) => format!("A:{s}"),
+                Line::Report(s) => format!("R:{s}"),
                 _ => "?".to_string(),
             })
             .collect();
-        assert_eq!(shapes, vec!["T:why\n", "T:more", "A:answer"]);
+        // the assistant card is a different family: air opens between it
+        // and the thought above
+        assert_eq!(shapes, vec!["T:why\n", "T:more", "R:", "A:answer"]);
     }
 
     #[test]
@@ -6935,19 +6972,20 @@ mod tests {
         assert_eq!(
             entries.len(),
             4,
-            "assistant, report, meta row, then the canvas separator: {entries:?}"
+            "assistant, air, error report, meta row — nothing stranded: {entries:?}"
         );
         assert!(matches!(entries[0], Line::Assistant(_)));
-        let Line::ReportErr(report) = &entries[1] else {
-            panic!("second entry must be a ReportErr: {entries:?}");
+        // air opens between the card and the error report (family change)
+        assert_eq!(&entries[1], &Line::Report(String::new()));
+        let Line::ReportErr(report) = &entries[2] else {
+            panic!("third entry must be a ReportErr: {entries:?}");
         };
         for want in ["failed", "429", "/retry", "in", "out", "$0.0002"] {
             assert!(report.contains(want), "report {report:?} lacks {want}");
         }
-        // the closing meta row: `{model} · {elapsed}s · ${cost}`
-        assert_eq!(&entries[2], &Line::Report("0.0s · $0.0002".into()));
-        // one plain canvas blank closes the turn block
-        assert_eq!(&entries[3], &Line::Report(String::new()));
+        // the closing meta row follows its ReportErr sibling tight: same
+        // meta family, and no blank is stranded after the turn's last row
+        assert_eq!(&entries[3], &Line::Report("0.0s · $0.0002".into()));
         assert!(
             last_error.is_none(),
             "buffered error consumed by the report"
@@ -7391,6 +7429,25 @@ mod tests {
     }
 
     #[test]
+    fn find_never_matches_blank_separator_rows() {
+        let mut t = Transcript::default();
+        t.set_width(40);
+        t.push_separated(Line::User("alpha".into()));
+        t.push_separated(Line::Assistant("needle here".into()));
+        t.push_separated(Line::Note("beta".into()));
+        // every anchor row must land on a content entry — the Report("")
+        // separators hold no text and can never be hits
+        let mut hits: Vec<usize> = Vec::new();
+        for row in 0..t.total_rows() {
+            if let Some((i, _)) = t.find_from(row, "needle") {
+                hits.push(i);
+            }
+        }
+        hits.dedup();
+        assert_eq!(hits, vec![2], "only the assistant entry matches");
+    }
+
+    #[test]
     fn record_spill_dedupes_and_caps_at_50() {
         let mut spills: Vec<String> = Vec::new();
         record_spill(&mut spills, "/tmp/a");
@@ -7549,8 +7606,8 @@ mod tests {
         );
         let entries = lines.entries();
         assert_eq!(entries, [Line::Report("· 7 tools".into())]);
-        // one rendered text row (plus the spacing row every entry gets)
-        assert_eq!(lines.total_rows(), 2);
+        // one rendered text row (gutter rows carry no built-in spacing)
+        assert_eq!(lines.total_rows(), 1);
     }
 
     #[test]
@@ -7628,21 +7685,71 @@ mod tests {
     }
 
     #[test]
-    fn turn_air_separates_groups_without_doubling() {
+    fn separate_before_puts_air_between_families_only() {
         let mut t = Transcript::default();
-        push_turn_air(&mut t);
-        assert!(t.entries().is_empty(), "absent transcript: no air");
+        separate_before(&mut t, Family::User);
+        assert!(t.entries().is_empty(), "fresh transcript: no air");
         t.push(Line::User("first".into()));
-        push_turn_air(&mut t);
-        assert_eq!(t.entries().last(), Some(&Line::Report(String::new())));
-        push_turn_air(&mut t);
+        separate_before(&mut t, Family::User);
+        assert_eq!(t.entries().len(), 1, "same family: no air");
+        separate_before(&mut t, Family::Meta);
+        assert_eq!(
+            t.entries().last(),
+            Some(&Line::Report(String::new())),
+            "different family: exactly one blank"
+        );
+        separate_before(&mut t, Family::Assistant);
         assert_eq!(
             t.entries()
                 .iter()
                 .filter(|l| **l == Line::Report(String::new()))
                 .count(),
             1,
-            "no double air"
+            "blank tail: never doubled"
+        );
+    }
+
+    #[test]
+    fn tool_run_stays_tight_then_reopens_air() {
+        let mut t = Transcript::default();
+        t.push_separated(Line::Tool("→ read · lib.rs".into()));
+        t.push_separated(Line::Tool("→ bash ✓ ok".into()));
+        t.push_separated(Line::Assistant("answer".into()));
+        // a turn ends on meta; the next user card reopens the air
+        t.push_separated(Line::Report("done · 0.0s".into()));
+        t.push_separated(Line::Report("mock · 0.0s · $0".into()));
+        t.push_separated(Line::User("again".into()));
+        let shapes: Vec<String> = t
+            .entries()
+            .iter()
+            .map(|l| match l {
+                Line::User(s) => format!("U:{s}"),
+                Line::Assistant(s) => format!("A:{s}"),
+                Line::Tool(s) => format!("T:{s}"),
+                Line::Report(s) => format!("R:{s}"),
+                _ => "?".to_string(),
+            })
+            .collect();
+        assert_eq!(
+            shapes,
+            [
+                "T:→ read · lib.rs",
+                "T:→ bash ✓ ok",
+                "R:",
+                "A:answer",
+                "R:",
+                "R:done · 0.0s",
+                "R:mock · 0.0s · $0",
+                "R:",
+                "U:again",
+            ],
+            "tool runs stay tight, meta runs stay tight, families get air"
+        );
+        // nothing is stranded: the blank is exactly BETWEEN the blocks
+        assert_ne!(
+            t.entries().last(),
+            Some(&Line::Report(String::new())),
+            "no trailing blank after the final user row"
         );
     }
 
