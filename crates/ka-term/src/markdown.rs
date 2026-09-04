@@ -354,6 +354,7 @@ fn render_table(
             header_w.max(body_w).max(1)
         })
         .collect();
+
     let available = width as usize - overhead;
     while widths.iter().sum::<usize>() > available {
         let (mi, mw) = widths
@@ -369,6 +370,14 @@ fn render_table(
 
     let mut lines: Vec<TuiLine<'static>> = Vec::new();
     let edge = Span::styled("│", palette::BORDER_STYLE);
+
+    // top rule
+    let mut top = String::from("┌");
+    for (c, w) in widths.iter().enumerate() {
+        top.push_str(&"─".repeat(w + 2));
+        top.push(if c + 1 == cols { '┐' } else { '┬' });
+    }
+    lines.push(TuiLine::styled(top, palette::BORDER_STYLE));
 
     // header row: bold, default text color
     let mut spans = vec![edge.clone()];
@@ -425,6 +434,13 @@ fn render_table(
         spans.push(edge.clone());
         lines.push(TuiLine::from(spans));
     }
+    // bottom rule
+    let mut bottom = String::from("└");
+    for (c, w) in widths.iter().enumerate() {
+        bottom.push_str(&"─".repeat(w + 2));
+        bottom.push(if c + 1 == cols { '┘' } else { '┴' });
+    }
+    lines.push(TuiLine::styled(bottom, palette::BORDER_STYLE));
     lines.push(TuiLine::default());
     Some(lines)
 }
@@ -1116,15 +1132,17 @@ mod tests {
             .map(|l| l.spans.iter().map(|s| s.content.to_string()).collect())
             .collect();
         assert!(
-            texts[0].contains("Name") && texts[0].contains("Qty"),
+            texts[1].contains("Name") && texts[1].contains("Qty"),
             "{texts:?}"
         );
         assert!(
-            texts[0].starts_with('│') && texts[0].ends_with('│'),
+            texts[1].starts_with('│') && texts[1].ends_with('│'),
             "{:?}",
-            texts[0]
+            texts[1]
         );
-        assert!(texts[1].contains('┼') && texts[1].contains('├') && texts[1].contains('┤'));
+        assert!(texts[0].starts_with('┌') && texts[0].ends_with('┐') && texts[0].contains('┬'));
+        assert!(texts[2].contains('┼') && texts[2].contains('├') && texts[2].contains('┤'));
+        assert!(texts[5].starts_with('└') && texts[5].ends_with('┘'));
         assert!(texts.iter().any(|t| t.contains("alpha")));
         assert!(texts.iter().any(|t| t.contains("12")));
         for t in &texts {
@@ -1152,6 +1170,23 @@ mod tests {
             .collect();
         assert!(bar_cols.len() >= 3, "{bar_cols:?}");
         assert!(bar_cols.windows(2).all(|w| w[0] == w[1]), "{bar_cols:?}");
+    }
+
+    #[test]
+    fn table_has_top_and_bottom_rules() {
+        let md = "| a | b |\n|---|---|\n| 1 | 2 |\n";
+        let lines = render(md, 40);
+        let texts: Vec<String> = lines
+            .iter()
+            .map(|l| l.spans.iter().map(|s| s.content.to_string()).collect())
+            .collect();
+        assert_eq!(texts.len(), 6, "{texts:?}");
+        assert_eq!(texts[0], "┌───┬───┐");
+        assert_eq!(texts[1], "│ a │ b │");
+        assert_eq!(texts[2], "├───┼───┤");
+        assert_eq!(texts[3], "│ 1 │ 2 │");
+        assert_eq!(texts[4], "└───┴───┘");
+        assert_eq!(texts[5], "");
     }
 
     #[test]
