@@ -1,8 +1,9 @@
-//! Markdown renderer for the TUI transcript, mirroring the Oh My Pi / pi
-//! design language: one accent color for headings, dim fence lines around
-//! syntax-colored code, quiet gutters for quotes, and pure font-modifier
-//! emphasis on default text. The only dependency beyond ratatui is
-//! unicode-width, already in the tree via ratatui.
+//! Markdown renderer for the TUI transcript. One accent color for
+//! headings, faint fence lines around syntax-colored code, quiet gutters
+//! for quotes, and pure font-modifier emphasis on cream text — all tuned
+//! to the warm camel/mocha palette in [`crate::palette`]. The only
+//! dependency beyond ratatui is unicode-width, already in the tree via
+//! ratatui.
 
 use crate::palette;
 use ratatui::style::{Modifier, Style};
@@ -105,7 +106,7 @@ pub fn render(text: &str, width: u16) -> Vec<TuiLine<'static>> {
         } else if trimmed.starts_with(">") {
             let q = trimmed.trim_start_matches('>').trim();
             out.push(TuiLine::from(vec![
-                Span::styled("▏ ", palette::BORDER),
+                Span::styled("▏ ", palette::BORDER_STYLE),
                 Span::styled(q.to_string(), palette::QUOTE),
             ]));
         } else if trimmed.starts_with("- ") || trimmed.starts_with("* ") {
@@ -132,7 +133,7 @@ pub fn render(text: &str, width: u16) -> Vec<TuiLine<'static>> {
         } else if trimmed == "---" || trimmed == "***" {
             out.push(TuiLine::styled(
                 "─".repeat(width.min(80) as usize),
-                palette::BORDER,
+                palette::BORDER_STYLE,
             ));
         } else if lines.get(i + 1).and_then(|n| setext_level(n)).is_some() {
             // setext `====` h1 (underlined, like ATX h1)
@@ -239,7 +240,7 @@ fn list_indent(line: &str, trimmed: &str) -> String {
 /// `- [ ]` / `- [x]` task boxes.
 fn task_marker(rest: &str) -> Option<(Span<'static>, &str)> {
     if let Some(r) = rest.strip_prefix("[ ] ") {
-        Some((Span::styled("☐ ", Style::new().fg(palette::MUTED)), r))
+        Some((Span::styled("☐ ", Style::new().fg(palette::META)), r))
     } else if let Some(r) = rest
         .strip_prefix("[x] ")
         .or_else(|| rest.strip_prefix("[X] "))
@@ -367,7 +368,7 @@ fn render_table(
     }
 
     let mut lines: Vec<TuiLine<'static>> = Vec::new();
-    let edge = Span::styled("│", palette::BORDER);
+    let edge = Span::styled("│", palette::BORDER_STYLE);
 
     // header row: bold, default text color
     let mut spans = vec![edge.clone()];
@@ -390,7 +391,7 @@ fn render_table(
         }
         spans.push(Span::styled(" ", Style::default()));
         if c + 1 < cols {
-            spans.push(Span::styled("│", palette::BORDER));
+            spans.push(Span::styled("│", palette::BORDER_STYLE));
         }
     }
     spans.push(edge.clone());
@@ -402,7 +403,7 @@ fn render_table(
         sep.push_str(&"─".repeat(w + 2));
         sep.push(if c + 1 == cols { '┤' } else { '┼' });
     }
-    lines.push(TuiLine::styled(sep, palette::BORDER));
+    lines.push(TuiLine::styled(sep, palette::BORDER_STYLE));
 
     // body rows (inline markdown intact inside cells)
     for row in body {
@@ -418,7 +419,7 @@ fn render_table(
             }
             spans.push(Span::styled(" ", Style::default()));
             if c + 1 < cols {
-                spans.push(Span::styled("│", palette::BORDER));
+                spans.push(Span::styled("│", palette::BORDER_STYLE));
             }
         }
         spans.push(edge.clone());
@@ -500,11 +501,11 @@ pub fn inline_spans(s: &str) -> Vec<Span<'static>> {
                 flush(&mut plain, &mut spans);
                 spans.push(Span::styled(
                     format!("🖼 {alt}"),
-                    Style::new().fg(palette::DIM),
+                    Style::new().fg(palette::FAINT),
                 ));
                 spans.push(Span::styled(
                     format!(" ({url})"),
-                    Style::new().fg(palette::DIM),
+                    Style::new().fg(palette::FAINT),
                 ));
                 i = next_i;
                 continue;
@@ -517,12 +518,12 @@ pub fn inline_spans(s: &str) -> Vec<Span<'static>> {
                 spans.push(Span::styled(
                     text,
                     Style::new()
-                        .fg(palette::CYAN)
+                        .fg(palette::TOOL)
                         .add_modifier(Modifier::UNDERLINED),
                 ));
                 spans.push(Span::styled(
                     format!(" ({url})"),
-                    Style::new().fg(palette::DIM),
+                    Style::new().fg(palette::FAINT),
                 ));
                 i = next_i;
                 continue;
@@ -611,13 +612,13 @@ fn parse_link(chars: &[char], start: usize) -> Option<(String, String, usize)> {
     Some((text, url, close_url + 1))
 }
 
-/// Code block: dim ` ``` ` fence lines around syntax-colored body
-/// (OMP `codeBlockBorder` + `codeBlock`). No backgrounds.
+/// Code block: faint ` ``` ` fence lines around syntax-colored code, which
+/// rides the assistant card surface (BG_OUTPUT).
 ///
 /// Fences tagged with a known language go through [`CodeHighlighter`],
 /// which tracks block comments across lines within this block; every
 /// other fence keeps the line-local generic `highlight`. Style roles for
-/// both paths come from the OMP syntax palette (consistent across all
+/// both paths come from the palette's syntax ramp (consistent across all
 /// code surfaces): comments → SYNTAX_COMMENT, strings → SYNTAX_STRING,
 /// keywords → SYNTAX_KEYWORD, numbers → SYNTAX_NUMBER, everything else
 /// stays CODE_BLOCK.
@@ -627,7 +628,7 @@ fn push_code_block(out: &mut Vec<TuiLine<'static>>, lines: &[String], lang: &str
     }
     out.push(TuiLine::styled(
         format!("```{lang}"),
-        Style::new().fg(palette::BORDER_DIM),
+        Style::new().fg(palette::FAINT),
     ));
     let mut hl = code_lang(lang).map(CodeHighlighter::new);
     for line in lines {
@@ -636,7 +637,7 @@ fn push_code_block(out: &mut Vec<TuiLine<'static>>, lines: &[String], lang: &str
             None => highlight(line),
         }));
     }
-    out.push(TuiLine::styled("```", Style::new().fg(palette::BORDER_DIM)));
+    out.push(TuiLine::styled("```", Style::new().fg(palette::FAINT)));
     out.push(TuiLine::default());
 }
 
@@ -1013,7 +1014,7 @@ mod tests {
     }
 
     #[test]
-    fn headings_follow_omp_hierarchy() {
+    fn headings_share_one_accent() {
         let lines = render("# Top\n## Mid\n### Deep\n#### Deepest\n", 80);
         assert!(
             format!("{:?}", lines[0]).contains("underlined()"),
@@ -1029,7 +1030,7 @@ mod tests {
         assert!(!joined.contains('═'), "no rules: {joined}");
         assert!(!joined.contains('▍'), "no markers: {joined}");
         // single heading color everywhere
-        assert!(joined.contains("Rgb(254, 188, 56)"));
+        assert!(joined.contains("Rgb(199, 158, 101)"));
     }
 
     #[test]
@@ -1040,15 +1041,15 @@ mod tests {
         assert_eq!(line_text(&lines[0]), "```rust", "literal fence kept");
         let rendered = format!("{:?}", lines);
         assert!(
-            rendered.contains("Rgb(206, 145, 120)"),
+            rendered.contains("Rgb(163, 179, 108)"),
             "string: {rendered}"
         );
         assert!(
-            rendered.contains("Rgb(86, 156, 214)"),
+            rendered.contains("Rgb(199, 158, 101)"),
             "keyword: {rendered}"
         );
         assert!(
-            rendered.contains("Rgb(106, 153, 85)"),
+            rendered.contains("Rgb(165, 145, 123)"),
             "comment: {rendered}"
         );
     }
@@ -1059,8 +1060,8 @@ mod tests {
         let joined = format!("{spans:?}");
         assert!(joined.contains("cargo build"), "{joined}");
         assert!(
-            joined.contains("Rgb(229, 193, 255)"),
-            "violet code: {joined}"
+            joined.contains("Rgb(201, 123, 93)"),
+            "inline code tint: {joined}"
         );
         assert!(joined.contains("bold()"), "{joined}");
     }
@@ -1085,9 +1086,9 @@ mod tests {
     fn highlight_numbers_and_keywords() {
         let spans = highlight("let count = 42; // note");
         let joined = format!("{spans:?}");
-        assert!(joined.contains("Rgb(86, 156, 214)"), "keyword: {joined}");
-        assert!(joined.contains("Rgb(181, 206, 168)"), "number: {joined}");
-        assert!(joined.contains("Rgb(106, 153, 85)"), "comment: {joined}");
+        assert!(joined.contains("Rgb(199, 158, 101)"), "keyword: {joined}");
+        assert!(joined.contains("Rgb(217, 142, 74)"), "number: {joined}");
+        assert!(joined.contains("Rgb(165, 145, 123)"), "comment: {joined}");
     }
 
     #[test]
@@ -1095,13 +1096,13 @@ mod tests {
         let spans = highlight("greet(\"hi\"); // don't panic");
         let joined = format!("{spans:?}");
         assert!(
-            joined.contains("Rgb(206, 145, 120)"),
+            joined.contains("Rgb(163, 179, 108)"),
             "real string colored: {joined}"
         );
         // an unclosed quote must not color the rest of the line
         let spans = highlight("let s = 'abc;");
         assert!(
-            !format!("{spans:?}").contains("Rgb(206, 145, 120)"),
+            !format!("{spans:?}").contains("Rgb(163, 179, 108)"),
             "no phantom string"
         );
     }
@@ -1192,7 +1193,10 @@ mod tests {
         assert!(joined.contains("docs"), "{joined}");
         assert!(joined.contains("http://x.io"), "{joined}");
         assert!(joined.contains("underlined()"), "{joined}");
-        assert!(joined.contains("Rgb(0, 136, 250)"), "link blue: {joined}");
+        assert!(
+            joined.contains("Rgb(122, 134, 194)"),
+            "link indigo: {joined}"
+        );
     }
 
     #[test]
@@ -1266,8 +1270,8 @@ mod tests {
     fn bullets_use_accent_amber() {
         let lines = render("- item\n", 80);
         assert!(
-            format!("{lines:?}").contains("Rgb(254, 188, 56)"),
-            "amber bullet"
+            format!("{lines:?}").contains("Rgb(199, 158, 101)"),
+            "camel bullet"
         );
     }
 
@@ -1311,7 +1315,7 @@ mod tests {
         assert!(text.starts_with("▏ "), "{text}");
         assert!(format!("{:?}", lines[0]).contains("italic()"));
         assert!(
-            format!("{:?}", lines[0]).contains("Rgb(119, 125, 136)"),
+            format!("{:?}", lines[0]).contains("Rgb(165, 145, 123)"),
             "muted gray"
         );
     }
@@ -1324,9 +1328,9 @@ mod tests {
             "rust",
         );
         let joined = format!("{out:?}");
-        assert!(joined.contains("Rgb(86, 156, 214)"), "keyword: {joined}");
-        assert!(joined.contains("Rgb(181, 206, 168)"), "number: {joined}");
-        assert!(joined.contains("Rgb(106, 153, 85)"), "comment: {joined}");
+        assert!(joined.contains("Rgb(199, 158, 101)"), "keyword: {joined}");
+        assert!(joined.contains("Rgb(217, 142, 74)"), "number: {joined}");
+        assert!(joined.contains("Rgb(165, 145, 123)"), "comment: {joined}");
     }
 
     #[test]
@@ -1335,15 +1339,15 @@ mod tests {
         push_code_block(&mut out, &[r#"{"k": true, "n": 1}"#.to_string()], "json");
         let joined = format!("{out:?}");
         assert!(
-            joined.contains("Rgb(206, 145, 120)"),
+            joined.contains("Rgb(163, 179, 108)"),
             "json string: {joined}"
         );
         assert!(
-            joined.contains("Rgb(86, 156, 214)"),
+            joined.contains("Rgb(199, 158, 101)"),
             "true keyword: {joined}"
         );
         assert!(
-            joined.contains("Rgb(181, 206, 168)"),
+            joined.contains("Rgb(217, 142, 74)"),
             "json number: {joined}"
         );
 
@@ -1351,11 +1355,11 @@ mod tests {
         push_code_block(&mut out, &["rate = 0.5 # capped".to_string()], "toml");
         let joined = format!("{out:?}");
         assert!(
-            joined.contains("Rgb(181, 206, 168)"),
+            joined.contains("Rgb(217, 142, 74)"),
             "toml number: {joined}"
         );
         assert!(
-            joined.contains("Rgb(106, 153, 85)"),
+            joined.contains("Rgb(165, 145, 123)"),
             "toml comment: {joined}"
         );
 
@@ -1363,7 +1367,7 @@ mod tests {
         push_code_block(&mut out, &["for f in *.md; do echo $f; done".into()], "sh");
         let joined = format!("{out:?}");
         assert!(
-            joined.matches("Rgb(86, 156, 214)").count() >= 3,
+            joined.matches("Rgb(199, 158, 101)").count() >= 3,
             "shell keywords (for/in/do/done): {joined}"
         );
     }
@@ -1385,7 +1389,7 @@ mod tests {
         let text: String = second.spans.iter().map(|s| s.content.to_string()).collect();
         assert_eq!(text, "still comment */ let x = 1;");
         assert!(
-            format!("{second:?}").contains("Rgb(86, 156, 214)"),
+            format!("{second:?}").contains("Rgb(199, 158, 101)"),
             "let styled after the close: {second:?}"
         );
 
@@ -1397,7 +1401,7 @@ mod tests {
             "rust",
         );
         assert!(
-            format!("{:?}", out[2]).contains("Rgb(86, 156, 214)"),
+            format!("{:?}", out[2]).contains("Rgb(199, 158, 101)"),
             "next line keywords styled: {:?}",
             out[2]
         );
@@ -1410,7 +1414,7 @@ mod tests {
             "rust",
         );
         assert!(
-            format!("{:?}", out[2]).contains("Rgb(106, 153, 85)"),
+            format!("{:?}", out[2]).contains("Rgb(165, 145, 123)"),
             "rest of the fence stays comment: {:?}",
             out[2]
         );
@@ -1442,14 +1446,14 @@ mod tests {
         let mut out: Vec<TuiLine> = Vec::new();
         push_code_block(&mut out, &["let x = 1".to_string()], "");
         assert!(
-            format!("{out:?}").contains("Rgb(86, 156, 214)"),
+            format!("{out:?}").contains("Rgb(199, 158, 101)"),
             "generic keyword: {out:?}"
         );
         // apostrophes glued to a word never open a string in rust fences
         let mut out: Vec<TuiLine> = Vec::new();
         push_code_block(&mut out, &["don't panic;".to_string()], "rust");
         assert!(
-            !format!("{out:?}").contains("Rgb(206, 145, 120)"),
+            !format!("{out:?}").contains("Rgb(163, 179, 108)"),
             "no phantom string: {out:?}"
         );
     }

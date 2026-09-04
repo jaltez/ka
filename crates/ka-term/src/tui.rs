@@ -707,7 +707,7 @@ fn render_line(line: &Line, width: u16) -> Vec<ratatui::text::Line<'static>> {
             out.push(surface_blank(width, bg));
         }
         Line::Thought(text) => push_gutter(&mut out, text, width, "⋯ ", crate::palette::THOUGHT),
-        Line::Tool(text) => push_gutter(&mut out, text, width, "⚙ ", crate::palette::META),
+        Line::Tool(text) => push_gutter(&mut out, text, width, "⚙ ", crate::palette::TOOL.into()),
         Line::Note(text) => push_gutter(
             &mut out,
             text,
@@ -715,7 +715,7 @@ fn render_line(line: &Line, width: u16) -> Vec<ratatui::text::Line<'static>> {
             "! ",
             ratatui::style::Style::new().fg(crate::palette::ERR),
         ),
-        Line::Report(text) => push_gutter(&mut out, text, width, "─ ", crate::palette::META),
+        Line::Report(text) => push_gutter(&mut out, text, width, "─ ", crate::palette::META.into()),
         Line::ReportErr(text) => push_gutter(
             &mut out,
             text,
@@ -1053,12 +1053,7 @@ fn sidebar_rows(
     use ratatui::style::{Modifier, Style};
     use ratatui::text::{Line as TuiLine, Span};
 
-    let header = |name: &str| {
-        TuiLine::styled(
-            name.to_string(),
-            crate::palette::META.add_modifier(Modifier::BOLD),
-        )
-    };
+    let header = |name: &str| TuiLine::styled(name.to_string(), crate::palette::ACCENT_BOLD);
     let plain = |s: String| TuiLine::from(s);
     // ── session: mirrors the sidebar meters, one fact per row ──
     let mut session = vec![header("session")];
@@ -1086,7 +1081,7 @@ fn sidebar_rows(
     }
 
     let done_style = Style::new()
-        .fg(crate::palette::DIM)
+        .fg(crate::palette::FAINT)
         .add_modifier(Modifier::CROSSED_OUT);
     let first_pending = sidebar
         .todos
@@ -4171,12 +4166,12 @@ fn tool_live_rows(
     let Some(lt) = live else {
         return Vec::new();
     };
-    let mut rows = vec![TuiLine::styled(header.to_string(), crate::palette::META)];
+    let mut rows = vec![TuiLine::styled(header.to_string(), crate::palette::TOOL)];
     let start = lt.preview.len().saturating_sub(PREVIEW_WINDOW);
     for line in &lt.preview[start..] {
         rows.push(TuiLine::styled(
             format!("  {}", preview_row(line, width)),
-            ratatui::style::Style::new().fg(crate::palette::DIM),
+            ratatui::style::Style::new().fg(crate::palette::FAINT),
         ));
     }
     rows
@@ -4193,11 +4188,14 @@ fn append_tool_note(row: &mut String, excerpt: &str, is_error: bool) {
     }
 }
 
-/// The one selection identity of the whole TUI: full-row inverse video,
-/// bold. Replaces the old `▶ ` + accent marker on every picker.
+/// The one selection identity of the whole TUI: a full-row twilight-indigo
+/// bar carrying cream text (pad_to_width fills the row with SEL_BG).
 fn selection_style() -> ratatui::style::Style {
     use ratatui::style::Modifier;
-    ratatui::style::Style::new().add_modifier(Modifier::REVERSED | Modifier::BOLD)
+    ratatui::style::Style::new()
+        .fg(crate::palette::SEL_FG)
+        .bg(crate::palette::SEL_BG)
+        .add_modifier(Modifier::BOLD)
 }
 
 /// Pad a row to `width` display columns (unicode-width aware) so an
@@ -4276,7 +4274,11 @@ fn render(
     use ratatui::layout::Constraint::{Length, Min};
     use ratatui::style::{Modifier, Style};
     use ratatui::text::{Line as TuiLine, Span};
-    use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
+    use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
+    // ── canvas: paint the whole frame before any widget so the app sits
+    // on the warm mocha ground with cream prose, whatever the terminal
+    // theme paints behind it ──
+    frame.render_widget(Block::new().style(crate::palette::CANVAS), frame.area());
     // one column of air on each side of the frame; rows stay edge to
     // edge (they are scarce). Every width below derives from these
     // chunks, never from the raw frame area.
@@ -4372,7 +4374,7 @@ fn render(
         Block::default()
             .borders(Borders::TOP)
             .title(padded_title(title))
-            .border_style(crate::palette::BORDER)
+            .border_style(crate::palette::BORDER_QUIET_STYLE)
             .padding(ratatui::widgets::Padding::horizontal(1)),
     );
     frame.render_widget(widget, tx_area);
@@ -4387,13 +4389,15 @@ fn render(
             (SIDEBAR_WIDTH - 3) as usize,
             sb.height as usize,
         );
-        let widget = Paragraph::new(rows).block(
-            Block::default()
-                .borders(Borders::LEFT)
-                .title(padded_title("ka"))
-                .border_style(crate::palette::BORDER)
-                .padding(ratatui::widgets::Padding::horizontal(1)),
-        );
+        let widget = Paragraph::new(rows)
+            .block(
+                Block::default()
+                    .borders(Borders::LEFT)
+                    .title(padded_title("ka"))
+                    .border_style(crate::palette::BORDER_STYLE)
+                    .padding(ratatui::widgets::Padding::horizontal(1)),
+            )
+            .style(ratatui::style::Style::new().bg(crate::palette::BG_PANEL));
         frame.render_widget(widget, sb);
     }
 
@@ -4411,11 +4415,11 @@ fn render(
         busy_input_title(queued)
     };
     let input_border = if modal.is_some() || popup.is_some() || path.is_some() || picker.is_some() {
-        crate::palette::META
+        crate::palette::META_STYLE
     } else if busy {
         ratatui::style::Style::new().fg(crate::palette::WARN)
     } else {
-        crate::palette::BORDER
+        crate::palette::BORDER_STYLE
     };
     let body: Vec<TuiLine> = if let Some(ask) = ask {
         // question text, then one options row: the selected option is
@@ -4447,7 +4451,7 @@ fn render(
             } else {
                 rows.push(TuiLine::from(vec![
                     Span::raw(format!("  {label:<15}")),
-                    Span::styled(*desc, crate::palette::DIM),
+                    Span::styled(*desc, crate::palette::FAINT),
                 ]));
             }
         }
@@ -4465,13 +4469,15 @@ fn render(
             .map(|r| TuiLine::from(r.chars().skip(scroll_col).collect::<String>()))
             .collect()
     };
-    let input_widget = Paragraph::new(body).block(
-        Block::default()
-            .borders(Borders::ALL)
-            .title(padded_title(title))
-            .border_style(input_border)
-            .padding(ratatui::widgets::Padding::horizontal(1)),
-    );
+    let input_widget = Paragraph::new(body)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(padded_title(title))
+                .border_style(input_border)
+                .padding(ratatui::widgets::Padding::horizontal(1)),
+        )
+        .style(ratatui::style::Style::new().bg(crate::palette::BG_PANEL));
     frame.render_widget(input_widget, chunks[1]);
     if ask.is_none() && picker.is_none() {
         let (cur_row, cur_col) = cursor_row_col(input, cursor);
@@ -4563,7 +4569,6 @@ fn render(
             width: (chunks[1].width).min(56),
             height: rows,
         };
-        frame.render_widget(Clear, rect);
         let inner_w = rect.width.saturating_sub(4) as usize; // borders + padding
         let mut text = Vec::new();
         for (i, (name, desc)) in popup.items.iter().take(7).enumerate() {
@@ -4583,9 +4588,10 @@ fn render(
                 Block::default()
                     .borders(Borders::ALL)
                     .title(padded_title("commands"))
-                    .border_style(crate::palette::BORDER)
+                    .border_style(crate::palette::BORDER_STYLE)
                     .padding(ratatui::widgets::Padding::horizontal(1)),
             )
+            .style(ratatui::style::Style::new().bg(crate::palette::BG_SURFACE))
             .wrap(Wrap { trim: false });
         frame.render_widget(widget, rect);
     }
@@ -4600,7 +4606,6 @@ fn render(
             width: (chunks[1].width).min(56),
             height: rows,
         };
-        frame.render_widget(Clear, rect);
         let inner_w = rect.width.saturating_sub(4) as usize; // borders + padding
         let mut text = Vec::new();
         for (i, (name, is_dir)) in path.entries.iter().take(7).enumerate() {
@@ -4613,7 +4618,7 @@ fn render(
             } else if *is_dir {
                 text.push(TuiLine::from(vec![
                     Span::raw(name.clone()),
-                    Span::styled("/", crate::palette::MUTED),
+                    Span::styled("/", crate::palette::META),
                 ]));
             } else {
                 text.push(TuiLine::raw(name.clone()));
@@ -4624,9 +4629,10 @@ fn render(
                 Block::default()
                     .borders(Borders::ALL)
                     .title(padded_title(if path.mentions { "files" } else { "path" }))
-                    .border_style(crate::palette::BORDER)
+                    .border_style(crate::palette::BORDER_STYLE)
                     .padding(ratatui::widgets::Padding::horizontal(1)),
             )
+            .style(ratatui::style::Style::new().bg(crate::palette::BG_SURFACE))
             .wrap(Wrap { trim: false });
         frame.render_widget(widget, rect);
     }
@@ -4640,7 +4646,6 @@ fn render(
                 let height = (rows.len() as u16 + 5).min(22);
                 let width = 68.min(frame.area().width);
                 let rect = centered(width, height, modal_area);
-                frame.render_widget(Clear, rect);
                 let mut text = vec![TuiLine::from(vec![
                     Span::styled("filter: ", ratatui::style::Style::default()),
                     Span::styled(picker.filter.clone(), crate::palette::ACCENT_STYLE),
@@ -4659,20 +4664,21 @@ fn render(
                         Block::default()
                             .borders(Borders::ALL)
                             .title(padded_title("sessions"))
-                            .border_style(crate::palette::BORDER)
+                            .border_style(crate::palette::BORDER_STYLE)
                             .padding(ratatui::widgets::Padding::new(1, 1, 1, 1)),
                     )
+                    .style(ratatui::style::Style::new().bg(crate::palette::BG_SURFACE))
                     .wrap(Wrap { trim: false });
                 frame.render_widget(widget, rect);
             }
             Modal::Key(prompt) => {
-                // full-frame wipe: switching here from the model picker must
-                // leave no stale pixels outside the prompt rect
-                frame.render_widget(Clear, frame.area());
+                // full-frame repaint: switching here from the model picker
+                // must leave no stale pixels outside the prompt rect; the
+                // canvas (not a bare wipe) keeps the warm ground intact
+                frame.render_widget(Block::new().style(crate::palette::CANVAS), frame.area());
                 let height = 10u16.min(frame.area().height.saturating_sub(2));
                 let width = 64.min(frame.area().width);
                 let rect = centered(width, height, modal_area);
-                frame.render_widget(Clear, rect);
                 let mut text = vec![TuiLine::styled("api key", crate::palette::ACCENT_BOLD)];
                 text.push(TuiLine::from(vec![
                     Span::styled("provider  ", crate::palette::META),
@@ -4691,7 +4697,7 @@ fn render(
                         .collect();
                     text.push(TuiLine::from(vec![
                         Span::styled("get one   ", crate::palette::META),
-                        Span::styled(doc, crate::palette::CYAN),
+                        Span::styled(doc, crate::palette::TOOL),
                     ]));
                 }
                 text.push(TuiLine::default());
@@ -4706,9 +4712,10 @@ fn render(
                         Block::default()
                             .borders(Borders::ALL)
                             .title(padded_title("api key"))
-                            .border_style(crate::palette::BORDER)
+                            .border_style(crate::palette::BORDER_STYLE)
                             .padding(ratatui::widgets::Padding::new(1, 1, 1, 1)),
                     )
+                    .style(ratatui::style::Style::new().bg(crate::palette::BG_SURFACE))
                     .wrap(Wrap { trim: false });
                 frame.render_widget(widget, rect);
             }
@@ -4716,7 +4723,6 @@ fn render(
                 let height = 34u16.min(frame.area().height.saturating_sub(2));
                 let width = 66.min(frame.area().width);
                 let rect = centered(width, height, modal_area);
-                frame.render_widget(Clear, rect);
                 let keys = vec![
                     ("Enter", "send · interject mid-turn"),
                     ("Esc / Ctrl-C", "abort turn · close overlays · unpin scroll"),
@@ -4759,9 +4765,10 @@ fn render(
                         Block::default()
                             .borders(Borders::ALL)
                             .title(padded_title("help"))
-                            .border_style(crate::palette::BORDER)
+                            .border_style(crate::palette::BORDER_STYLE)
                             .padding(ratatui::widgets::Padding::new(1, 1, 1, 1)),
                     )
+                    .style(ratatui::style::Style::new().bg(crate::palette::BG_SURFACE))
                     .wrap(Wrap { trim: false });
                 frame.render_widget(widget, rect);
             }
@@ -4771,7 +4778,6 @@ fn render(
                 let height = (rows.len() as u16 + 5).min(20);
                 let width = 68.min(frame.area().width);
                 let rect = centered(width, height, modal_area);
-                frame.render_widget(Clear, rect);
                 let mut text = vec![TuiLine::from(vec![
                     Span::styled("filter: ", ratatui::style::Style::default()),
                     Span::styled(picker.filter.clone(), crate::palette::ACCENT_STYLE),
@@ -4828,9 +4834,10 @@ fn render(
                                     .as_ref()
                                     .map_or("model".to_string(), |v| format!("model · {v}")),
                             ))
-                            .border_style(crate::palette::BORDER)
+                            .border_style(crate::palette::BORDER_STYLE)
                             .padding(ratatui::widgets::Padding::new(1, 1, 1, 1)),
                     )
+                    .style(ratatui::style::Style::new().bg(crate::palette::BG_SURFACE))
                     .wrap(Wrap { trim: false });
                 frame.render_widget(widget, rect);
             }
@@ -4840,7 +4847,6 @@ fn render(
                 let height = (rows.len() as u16 + 5).min(20);
                 let width = 68.min(frame.area().width);
                 let rect = centered(width, height, modal_area);
-                frame.render_widget(Clear, rect);
                 let inner_w = width.saturating_sub(4) as usize; // borders + padding
                 let mut text = vec![TuiLine::from(vec![
                     Span::styled("filter: ", ratatui::style::Style::default()),
@@ -4878,9 +4884,10 @@ fn render(
                         Block::default()
                             .borders(Borders::ALL)
                             .title(padded_title("providers"))
-                            .border_style(crate::palette::BORDER)
+                            .border_style(crate::palette::BORDER_STYLE)
                             .padding(ratatui::widgets::Padding::new(1, 1, 1, 1)),
                     )
+                    .style(ratatui::style::Style::new().bg(crate::palette::BG_SURFACE))
                     .wrap(Wrap { trim: false });
                 frame.render_widget(widget, rect);
             }
@@ -4890,8 +4897,7 @@ fn render(
                 let height = height.min(frame.area().height.saturating_sub(2));
                 let width = 72.min(frame.area().width);
                 let rect = centered(width, height, modal_area);
-                frame.render_widget(Clear, rect);
-                let dim = ratatui::style::Style::new().fg(crate::palette::MUTED);
+                let dim = ratatui::style::Style::new().fg(crate::palette::META);
                 let inner_w = width.saturating_sub(4) as usize; // borders + padding
                 let mode_str = mode_label(panel.mode);
                 let effort_str = panel
@@ -4982,9 +4988,10 @@ fn render(
                         Block::default()
                             .borders(Borders::ALL)
                             .title(padded_title("settings"))
-                            .border_style(crate::palette::BORDER)
+                            .border_style(crate::palette::BORDER_STYLE)
                             .padding(ratatui::widgets::Padding::new(1, 1, 1, 1)),
                     )
+                    .style(ratatui::style::Style::new().bg(crate::palette::BG_SURFACE))
                     .wrap(Wrap { trim: false });
                 frame.render_widget(widget, rect);
             }
@@ -4993,7 +5000,6 @@ fn render(
                 let height = (items.len() as u16 + 5).clamp(7, 21);
                 let width = 68.min(frame.area().width);
                 let rect = centered(width, height, modal_area);
-                frame.render_widget(Clear, rect);
                 let inner_w = width.saturating_sub(4) as usize; // borders + padding
                 let mut text = Vec::new();
                 if items.is_empty() {
@@ -5018,9 +5024,10 @@ fn render(
                         Block::default()
                             .borders(Borders::ALL)
                             .title(padded_title("spills"))
-                            .border_style(crate::palette::BORDER)
+                            .border_style(crate::palette::BORDER_STYLE)
                             .padding(ratatui::widgets::Padding::new(1, 1, 1, 1)),
                     )
+                    .style(ratatui::style::Style::new().bg(crate::palette::BG_SURFACE))
                     .wrap(Wrap { trim: false });
                 frame.render_widget(widget, rect);
             }
@@ -6093,7 +6100,13 @@ mod tests {
         }
 
         let mut out: Vec<TuiLine> = Vec::new();
-        push_gutter(&mut out, "short text", 40, "⚙ ", crate::palette::META);
+        push_gutter(
+            &mut out,
+            "short text",
+            40,
+            "⚙ ",
+            crate::palette::META.into(),
+        );
         assert_eq!(out.len(), 2, "one row + trailing blank");
         assert!(row_width(&out[0]) <= 40, "gutter rows never pad to width");
 
@@ -6130,7 +6143,7 @@ mod tests {
         // card inner top/bottom air
         let out = super::render_line(&Line::Assistant("**hi** there".into()), 40);
         assert!(out.len() >= 3, "blank + content + blank, got {}", out.len());
-        let surface = ratatui::style::Color::Rgb(22, 26, 31);
+        let surface = ratatui::style::Color::Rgb(32, 25, 19);
         let row_text = |l: &ratatui::text::Line<'static>| {
             l.spans
                 .iter()
@@ -6157,7 +6170,7 @@ mod tests {
         assert_eq!(row_text(content).trim_end(), "hi there");
         assert_eq!(cols(content), 40, "surface fills the width");
         let slab = format!("{content:?}");
-        assert!(slab.contains("Rgb(22, 26, 31)"), "output bg: {slab}");
+        assert!(slab.contains("Rgb(32, 25, 19)"), "output bg: {slab}");
     }
 
     #[test]
@@ -6187,7 +6200,7 @@ mod tests {
         use ratatui::text::Line as TuiLine;
 
         let mut out: Vec<TuiLine> = Vec::new();
-        push_gutter(&mut out, "one\ntwo", 40, "⚙ ", crate::palette::META);
+        push_gutter(&mut out, "one\ntwo", 40, "⚙ ", crate::palette::META.into());
         let text = |l: &TuiLine| {
             l.spans
                 .iter()
