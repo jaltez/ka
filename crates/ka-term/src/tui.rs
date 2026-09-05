@@ -800,6 +800,19 @@ fn window_range(total: usize, visible: usize, scroll: Option<usize>) -> (usize, 
     }
 }
 
+/// Scrollbar rail geometry for a track of `track_h` cells: returns
+/// `(thumb_pos, thumb_len)` for a viewport showing `visible` of `total`
+/// rows with the window anchored at `start`. The thumb keeps at least
+/// one cell and never runs past the track end; `(0, 0)` means no rail.
+fn rail_thumb(track_h: usize, total: usize, visible: usize, start: usize) -> (usize, usize) {
+    if track_h == 0 || total <= visible {
+        return (0, 0);
+    }
+    let len = (visible * track_h / total).max(1);
+    let pos = (start * track_h / total).min(track_h - len);
+    (pos, len)
+}
+
 /// Visible transcript rows for a terminal height: the top margin, input
 /// area, footer, and transcript top border are the four rows carved out
 /// of the viewport.
@@ -852,7 +865,31 @@ fn spin_frame(elapsed_ms: u128) -> char {
     F[(elapsed_ms / 120) as usize % F.len()]
 }
 
-/// Live-region markdown re-parse gate: at most ~12 re-renders/second.
+/// The transient live working-indicator row: spinner glyph + elapsed
+/// seconds while a turn streams, a static WARN line while a permission
+/// ask holds the turn. Never cached — rebuilt every frame.
+fn working_row(
+    ask: Option<&PendingAsk>,
+    busy_since: Option<Instant>,
+    now: Instant,
+) -> ratatui::text::Line<'static> {
+    use ratatui::text::Span;
+    let ms = busy_since.map_or(0, |t0| now.duration_since(t0).as_millis());
+    // span-level styling: Paragraph paints span styles, not line styles
+    let (text, style) = if ask.is_some() {
+        (
+            format!("… waiting for approval · {:.1}s", ms as f64 / 1000.0),
+            crate::palette::WARN,
+        )
+    } else {
+        (
+            format!("{} working · {:.1}s", spin_frame(ms), ms as f64 / 1000.0),
+            crate::palette::META,
+        )
+    };
+    ratatui::text::Line::from(vec![Span::styled(text, style)])
+}
+
 fn live_stale(cached_at: Instant, now: Instant) -> bool {
     now.duration_since(cached_at).as_millis() >= 80
 }
@@ -1731,16 +1768,18 @@ pub async fn run(
     let mut terminal = ratatui::init();
     // Kitty keyboard protocol: Shift+Enter as a distinct key + bracketed
     // paste. Best effort — hosts without support degrade to plain Enter;
-    // Ctrl+J always works as the newline fallback. Mouse capture stays
-    // OFF so transcript text can be selected natively (Ctrl+M toggles
-    // wheel scrolling back on).
+    // Ctrl+J always works as the newline fallback. Mouse capture starts
+    // ON so the wheel scrolls the transcript out of the box; Ctrl+M
+    // releases it for native selection (shift+drag selects under
+    // capture too).
     let _ = crossterm::execute!(
         std::io::stdout(),
         crossterm::event::PushKeyboardEnhancementFlags(
             crossterm::event::KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
                 | crossterm::event::KeyboardEnhancementFlags::REPORT_EVENT_TYPES
         ),
-        crossterm::event::EnableBracketedPaste
+        crossterm::event::EnableBracketedPaste,
+        crossterm::event::EnableMouseCapture
     );
     let result = app(
         &mut terminal,
@@ -1778,7 +1817,7 @@ async fn app(
     let mut scroll: Option<usize> = None;
     let mut transcript = Transcript::default();
 
-    let mut mouse_capture = false;
+    let mut mouse_capture = true;
     let mut view_rows;
     let mut input = InputBuffer::default();
     let mut meters = Meters {
@@ -2428,8 +2467,9 @@ async fn app(
                             continue;
                         }
                         (KeyCode::Char('m'), KeyModifiers::CONTROL) => {
-                            // capture off by default keeps text selection
-                            // native; toggling restores wheel scrolling
+                            // capture on by default (wheel scrolling);
+                            // toggling releases the mouse for native
+                            // text selection
                             mouse_capture = !mouse_capture;
                             let _ = if mouse_capture {
                                 crossterm::execute!(
@@ -2995,7 +3035,8 @@ async fn app(
                 } else if let Some(Ok(TermEvent::Mouse(mouse))) = maybe_term {
                     // the wheel scrolls the chat; overlays keep focus. Line
                     // granularity (page keys keep their page step). With
-                    // capture off the terminal owns the mouse (selection).
+                    // capture off (Ctrl+M) the terminal owns the mouse
+                    // (native selection).
                     if mouse_capture
                         && modal.is_none()
                         && pending.is_none()
@@ -4399,6 +4440,9 @@ fn render(
             live_rows.extend(md_live);
             live_rows.push(surface_blank(tx_inner, crate::palette::BG_OUTPUT));
         }
+        // transient tail of the live region: the working indicator
+        // rides below the last live row and is never cached
+        live_rows.push(working_row(ask, busy_since, now));
     }
 
     let cached = transcript.total_rows();
@@ -4434,6 +4478,31 @@ fn render(
             .padding(ratatui::widgets::Padding::horizontal(1)),
     );
     frame.render_widget(widget, tx_area);
+
+    // ── scrollbar rail: painted into the transcript's always-blank
+    // right padding column, so no width math ever learns about it ──
+    if total > visible {
+        let (thumb_pos, thumb_len) = rail_thumb(visible, total, visible, start);
+        // span-level styling: Paragraph paints span styles, not line styles
+        let rail: Vec<TuiLine> = (0..visible)
+            .map(|i| {
+                if (thumb_pos..thumb_pos + thumb_len).contains(&i) {
+                    TuiLine::from(vec![Span::styled("█", crate::palette::META_STYLE)])
+                } else {
+                    TuiLine::from(vec![Span::styled("│", crate::palette::BORDER_QUIET_STYLE)])
+                }
+            })
+            .collect();
+        frame.render_widget(
+            Paragraph::new(rail),
+            ratatui::layout::Rect {
+                x: tx_area.x + tx_area.width.saturating_sub(1),
+                y: tx_area.y + 1,
+                width: 1,
+                height: visible as u16,
+            },
+        );
+    }
 
     // ── sidebar: session · todos · mcp · skills · agents · info ──
     if let Some(sb) = sb_area {
@@ -4594,9 +4663,6 @@ fn render(
         hint_spans(&[(" enter", "send"), (" /", "commands")])
     };
     let right = status_right(meters);
-    let spinner = busy_since.filter(|_| busy).map_or(String::new(), |t0| {
-        format!("{} ", spin_frame(now.duration_since(t0).as_millis()))
-    });
     let w = unicode_width::UnicodeWidthStr::width;
     let left_cols: usize = hints.iter().map(|s| w(s.content.as_ref())).sum();
     // one leading + one trailing col of air: the left zone starts a col
@@ -4604,15 +4670,12 @@ fn render(
     let pad = chunks[3]
         .width
         .saturating_sub(2)
-        .saturating_sub((left_cols + w(right.as_str()) + w(spinner.as_str())) as u16)
+        .saturating_sub((left_cols + w(right.as_str())) as u16)
         .max(1) as usize;
     let mut bar: Vec<Span<'static>> = vec![Span::raw(" ")];
     bar.extend(hints);
     bar.push(Span::raw(" ".repeat(pad)));
     bar.push(Span::styled(right, crate::palette::META));
-    if !spinner.is_empty() {
-        bar.push(Span::styled(spinner, crate::palette::ACCENT_BOLD));
-    }
     bar.push(Span::raw(" "));
     frame.render_widget(Paragraph::new(TuiLine::from(bar)), chunks[3]);
 
@@ -4784,7 +4847,7 @@ fn render(
                     ("Enter", "send · interject mid-turn"),
                     ("Esc / Ctrl-C", "abort turn · close overlays · unpin scroll"),
                     ("Ctrl+C", "quit (abort the running turn first)"),
-                    ("Ctrl+M", "toggle mouse capture (text selection)"),
+                    ("Ctrl+M", "mouse capture · shift+drag select"),
                     ("Ctrl+R", "search history · ctrl+r next · enter accept"),
                     ("Alt+E", "edit the draft in $EDITOR"),
                     ("PgUp / PgDn", "scroll the transcript"),
@@ -5793,6 +5856,20 @@ mod tests {
         assert_eq!(window_range(100, 0, Some(10)), (0, true));
     }
     #[test]
+    fn rail_thumb_sizes_and_positions_proportionally() {
+        // no rail when everything fits or the track is empty
+        assert_eq!(rail_thumb(10, 10, 10, 0), (0, 0));
+        assert_eq!(rail_thumb(0, 100, 0, 0), (0, 0));
+        // the thumb never collapses to zero cells
+        assert_eq!(rail_thumb(10, 1000, 10, 0), (0, 1));
+        // half the content visible: half-size thumb, tail-pinned bottom
+        assert_eq!(rail_thumb(10, 20, 10, 10), (5, 5));
+        // mid-scroll anchor rides proportionally
+        assert_eq!(rail_thumb(10, 100, 20, 40), (4, 2));
+        // an out-of-range anchor clamps inside the track
+        assert_eq!(rail_thumb(10, 20, 10, 999), (5, 5));
+    }
+    #[test]
     fn visible_rows_carves_out_chrome() {
         // top margin + input area + footer + transcript top border
         assert_eq!(visible_rows(24, 3), 18);
@@ -6098,6 +6175,35 @@ mod tests {
         for ms in (0..3000).step_by(40) {
             assert!(frames.contains(spin_frame(ms)));
         }
+    }
+    #[test]
+    fn working_row_spins_then_waits_for_approval() {
+        let t0 = Instant::now();
+        let now = t0 + Duration::from_millis(1500);
+        // streaming: a spinner glyph leads, elapsed seconds trail
+        let row = working_row(None, Some(t0), now);
+        let text: String = row.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(text.ends_with("working · 1.5s"), "{text}");
+        assert!(
+            "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏".contains(text.chars().next().unwrap()),
+            "spinner glyph leads: {text}"
+        );
+        assert_eq!(row.spans[0].style.fg, Some(crate::palette::META));
+        // permission ask up: static WARN line, no spinner glyph
+        let ask = PendingAsk {
+            id: ka_protocol::AskId("a".into()),
+            question: "allow?".into(),
+            options: vec!["yes".into()],
+            selected: 0,
+        };
+        let row = working_row(Some(&ask), Some(t0), now);
+        let text: String = row.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(text, "… waiting for approval · 1.5s");
+        assert_eq!(row.spans[0].style.fg, Some(crate::palette::WARN));
+        // a missing clock degrades to zero elapsed, never panics
+        let row = working_row(None, None, now);
+        let text: String = row.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(text.ends_with("working · 0.0s"), "{text}");
     }
 
     #[test]
