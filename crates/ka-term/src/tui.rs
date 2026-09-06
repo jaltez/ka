@@ -1116,17 +1116,17 @@ fn skills_header_label(open: bool, count: usize) -> String {
 }
 
 /// Full skills header line: label plus the ` ▾`/` ▸` disclosure arrow.
-/// Hover paints the whole header ACCENT + UNDERLINE; at rest the label
-/// keeps its accent-bold look and the arrow stays dim META.
+/// Hover lifts the whole header onto the modal surface tint (ACCENT on
+/// BG_SURFACE); at rest the label keeps its accent-bold look and the
+/// arrow stays dim META.
 fn skills_header_line(open: bool, hover: bool, count: usize) -> ratatui::text::Line<'static> {
-    use ratatui::style::{Modifier, Style};
     use ratatui::text::{Line as TuiLine, Span};
     let label = skills_header_label(open, count);
     let arrow = if open { " ▾" } else { " ▸" };
     if hover {
-        let st = Style::new()
+        let st = ratatui::style::Style::new()
             .fg(crate::palette::ACCENT)
-            .add_modifier(Modifier::UNDERLINED);
+            .bg(crate::palette::BG_SURFACE);
         TuiLine::from(vec![Span::styled(label, st), Span::styled(arrow, st)])
     } else {
         TuiLine::from(vec![
@@ -8307,7 +8307,7 @@ mod tests {
     }
 
     #[test]
-    fn skills_header_hover_swaps_meta_for_accent_underline() {
+    fn skills_header_hover_lifts_onto_surface_tint() {
         use ratatui::style::Modifier;
         let rest = skills_header_line(true, false, 4);
         let rest_spans: Vec<_> = rest
@@ -8317,7 +8317,7 @@ mod tests {
             .collect();
         assert_eq!(rest_spans[0].0, "skills");
         assert_eq!(rest_spans[1].0, " ▾");
-        assert!(!rest_spans[0].1.add_modifier.contains(Modifier::UNDERLINED));
+        assert_eq!(rest_spans[0].1.bg, None);
         // collapsed label keeps its count under hover too
         let hovered = skills_header_line(false, true, 4);
         let hovered_spans: Vec<_> = hovered
@@ -8329,7 +8329,8 @@ mod tests {
         assert_eq!(hovered_spans[1].0, " ▸");
         for (_, st) in &hovered_spans {
             assert_eq!(st.fg, Some(crate::palette::ACCENT));
-            assert!(st.add_modifier.contains(Modifier::UNDERLINED));
+            assert_eq!(st.bg, Some(crate::palette::BG_SURFACE));
+            assert!(!st.add_modifier.contains(Modifier::UNDERLINED));
         }
     }
 
