@@ -1,9 +1,10 @@
-//! Minimal MCP (Model Context Protocol) stdio client: newline-delimited
-//! JSON-RPC 2.0 over a spawned server process. Hand-rolled on purpose —
+//! Minimal MCP (Model Context Protocol) client: newline-delimited
+//! JSON-RPC 2.0 over a spawned process (stdio), or streamable HTTP with
+//! legacy-SSE fallback for HTTP endpoints. Hand-rolled on purpose —
 //! the footprint budget has no room for rmcp, and ka only needs
-//! initialize / tools-list / tools-call.
+//! initialize / tools-list / tools-call (plus resources and prompts).
 //!
-//! Lifecycle: [`McpClient::spawn`] boots the server, handshakes, and
+//! Lifecycle: [`McpClient::spawn_connect`] connects, handshakes, and
 //! lists tools. Failures are per-server and non-fatal: the engine notes
 //! them and carries on with the built-in hands.
 
@@ -25,14 +26,40 @@ use tokio::sync::{Mutex, mpsc, oneshot};
 pub struct McpServerConfig {
     /// Tool-name prefix (`<name>.<tool>`).
     pub name: String,
-    /// Executable to run.
-    pub command: String,
-    /// Arguments for the executable.
+    /// Executable to run (stdio transport). Mutually exclusive with
+    /// [`McpServerConfig::url`].
+    #[serde(default)]
+    pub command: Option<String>,
+    /// Arguments for the executable (stdio transport).
     #[serde(default)]
     pub args: Vec<String>,
-    /// Extra environment for the process.
+    /// Extra environment for the process (stdio transport).
     #[serde(default)]
     pub env: HashMap<String, String>,
+    /// HTTP(S) endpoint (streamable-HTTP transport, with legacy-SSE
+    /// fallback). Mutually exclusive with `command`.
+    #[serde(default)]
+    pub url: Option<String>,
+    /// Extra HTTP headers (url transports, e.g. auth).
+    #[serde(default)]
+    pub headers: Vec<(String, String)>,
+}
+
+impl McpServerConfig {
+    /// Exactly one transport must be configured.
+    pub fn validate(&self) -> Result<(), String> {
+        match (self.command.is_some(), self.url.is_some()) {
+            (true, false) | (false, true) => Ok(()),
+            (true, true) => Err(format!(
+                "mcp {}: set either command or url, not both",
+                self.name
+            )),
+            (false, false) => Err(format!(
+                "mcp {}: one of command or url is required",
+                self.name
+            )),
+        }
+    }
 }
 
 /// One tool advertised by a server.
@@ -48,27 +75,156 @@ pub struct McpTool {
     pub schema: Value,
 }
 
-/// Connection to one MCP server over stdio.
+/// Protocol version ka speaks (negotiation tolerates others).
+const PROTOCOL_VERSION: &str = "2025-06-18";
+
+/// Per-request response timeout.
+const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Connection to one MCP server over stdio or HTTP.
 #[derive(Debug)]
 pub struct McpClient {
     server_name: String,
-    child: Child,
-    stdin: ChildStdin,
-    /// Responses routed by id (shared with the reader task).
+    transport: Transport,
+    /// Responses routed by id (shared with the stdio/SSE reader tasks).
     pending: Arc<Mutex<HashMap<u64, oneshot::Sender<Value>>>>,
     next_id: AtomicU64,
     /// Server-initiated notifications/requests (logged, not handled).
     _noise: mpsc::Receiver<String>,
 }
 
-/// Protocol version ka speaks (negotiation tolerates others).
-const PROTOCOL_VERSION: &str = "2025-06-18";
+/// How one client talks to its server.
+#[derive(Debug)]
+enum Transport {
+    /// Newline-delimited JSON-RPC over a spawned process.
+    Stdio { child: Child, stdin: ChildStdin },
+    /// Streamable HTTP: each request POSTs and the response comes back
+    /// on the POST (JSON body or an SSE stream).
+    StreamableHttp(HttpRpc),
+    /// Legacy SSE: requests POST to the messages endpoint, responses
+    /// arrive on the long-lived GET stream (routed by reader task).
+    LegacySse(HttpRpc),
+}
+
+/// POST side of the HTTP transports: target URL, static headers, and
+/// the `Mcp-Session-Id` the server assigned (streamable HTTP).
+#[derive(Debug)]
+struct HttpRpc {
+    url: String,
+    headers: Vec<(String, String)>,
+    session_id: Option<String>,
+    client: reqwest::Client,
+}
+
+/// Transport-level failure. The message carries the HTTP status when
+/// one was received (a 404/405 on a streamable POST hints at a
+/// legacy-SSE-only server — see [`McpClient::legacy_fallback_possible`]).
+#[derive(Debug)]
+struct HttpError {
+    message: String,
+}
+
+impl HttpRpc {
+    fn new(url: String, headers: Vec<(String, String)>) -> Self {
+        Self {
+            url,
+            headers,
+            session_id: None,
+            client: reqwest::Client::new(),
+        }
+    }
+
+    fn apply_common(&self, req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        let mut req = req
+            .header("Accept", "application/json, text/event-stream")
+            .header("MCP-Protocol-Version", PROTOCOL_VERSION);
+        for (k, v) in &self.headers {
+            req = req.header(k.as_str(), v.as_str());
+        }
+        if let Some(sid) = &self.session_id {
+            req = req.header("Mcp-Session-Id", sid);
+        }
+        req
+    }
+
+    /// POST one JSON-RPC message. `Ok(None)` = accepted with no body
+    /// (notifications / 202).
+    async fn post(&mut self, msg: &Value) -> Result<Option<Value>, HttpError> {
+        let resp = self
+            .apply_common(self.client.post(&self.url))
+            .json(msg)
+            .send()
+            .await
+            .map_err(|e| HttpError {
+                message: format!("mcp http: {e}"),
+            })?;
+        if let Some(sid) = resp
+            .headers()
+            .get("mcp-session-id")
+            .and_then(|v| v.to_str().ok())
+        {
+            self.session_id = Some(sid.to_string());
+        }
+        let status = resp.status();
+        if !status.is_success() {
+            return Err(HttpError {
+                message: format!("mcp http: status {status}"),
+            });
+        }
+        if status.as_u16() == 202 {
+            return Ok(None);
+        }
+        let ct = resp
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+        let body = resp.text().await.map_err(|e| HttpError {
+            message: format!("mcp http: {e}"),
+        })?;
+        if ct.contains("event-stream") {
+            return Ok(first_sse_response(&body));
+        }
+        Ok(serde_json::from_str::<Value>(&body).ok())
+    }
+}
+
+/// Pull the first JSON-RPC response out of an SSE body.
+fn first_sse_response(body: &str) -> Option<Value> {
+    for frame in body.split("\n\n") {
+        for line in frame.lines() {
+            if let Some(data) = line.strip_prefix("data:") {
+                if let Ok(v) = serde_json::from_str::<Value>(data.trim()) {
+                    if v.get("result").is_some() || v.get("error").is_some() {
+                        return Some(v);
+                    }
+                }
+            }
+        }
+    }
+    None
+}
 
 impl McpClient {
-    /// Spawn the server, run the initialize handshake, and list tools.
-    /// One call so callers get a fully-usable client or an error string.
+    /// Connect to the server (spawn or HTTP), run the initialize
+    /// handshake, and list tools. One call so callers get a
+    /// fully-usable client or an error string.
     pub async fn spawn_connect(cfg: &McpServerConfig) -> Result<(Self, Vec<McpTool>), String> {
-        let mut child = Command::new(&cfg.command)
+        cfg.validate()?;
+        match (&cfg.command, &cfg.url) {
+            (Some(command), _) => Self::spawn_stdio(cfg, command).await,
+            (None, Some(url)) => Self::connect_http(cfg, url).await,
+            (None, None) => Err("mcp: unreachable: unvalidated config".to_string()),
+        }
+    }
+
+    /// Stdio transport: boot the server process.
+    async fn spawn_stdio(
+        cfg: &McpServerConfig,
+        command: &str,
+    ) -> Result<(Self, Vec<McpTool>), String> {
+        let mut child = Command::new(command)
             .args(&cfg.args)
             .envs(&cfg.env)
             .stdin(Stdio::piped())
@@ -76,7 +232,7 @@ impl McpClient {
             .stderr(Stdio::null())
             .kill_on_drop(true)
             .spawn()
-            .map_err(|e| format!("spawn {} failed: {e}", cfg.command))?;
+            .map_err(|e| format!("spawn {command} failed: {e}"))?;
         let stdin = child
             .stdin
             .take()
@@ -91,8 +247,7 @@ impl McpClient {
         tokio::spawn(read_loop(stdout, pending.clone(), noise_tx));
         let mut client = Self {
             server_name: cfg.name.clone(),
-            child,
-            stdin,
+            transport: Transport::Stdio { child, stdin },
             pending,
             next_id: AtomicU64::new(1),
             _noise: noise_rx,
@@ -100,6 +255,81 @@ impl McpClient {
         client.initialize().await?;
         let tools = client.list_tools().await?;
         Ok((client, tools))
+    }
+
+    /// HTTP transport: try streamable HTTP first; on a 404/405 from the
+    /// POST fall back to a legacy-SSE server (GET endpoint event gives
+    /// the messages URL).
+    async fn connect_http(
+        cfg: &McpServerConfig,
+        url: &str,
+    ) -> Result<(Self, Vec<McpTool>), String> {
+        let rpc = HttpRpc::new(url.to_string(), cfg.headers.clone());
+        let mut client = Self {
+            server_name: cfg.name.clone(),
+            transport: Transport::StreamableHttp(rpc),
+            pending: Arc::new(Mutex::new(HashMap::new())),
+            next_id: AtomicU64::new(1),
+            _noise: mpsc::channel(64).1,
+        };
+        match client.initialize().await {
+            Ok(()) => {}
+            Err(e) if client.legacy_fallback_possible(&e) => {
+                let rpc = client.legacy_endpoint_rpc().await?;
+                client.transport = Transport::LegacySse(rpc);
+                client.initialize().await?;
+            }
+            Err(e) => return Err(e),
+        }
+        let tools = client.list_tools().await?;
+        Ok((client, tools))
+    }
+
+    /// Whether an initialize failure should trigger a legacy-SSE retry.
+    fn legacy_fallback_possible(&self, err: &str) -> bool {
+        matches!(self.transport, Transport::StreamableHttp(_))
+            && (err.contains("status 404") || err.contains("status 405"))
+    }
+
+    /// Open the legacy-SSE GET stream and learn the messages endpoint.
+    async fn legacy_endpoint_rpc(&mut self) -> Result<HttpRpc, String> {
+        let Transport::StreamableHttp(old) = &self.transport else {
+            return Err("legacy fallback: not an HTTP transport".to_string());
+        };
+        let base = old.url.clone();
+        let headers = old.headers.clone();
+        let client = old.client.clone();
+        let resp = client
+            .get(&base)
+            .header("Accept", "text/event-stream")
+            .send()
+            .await
+            .map_err(|e| format!("mcp sse: {e}"))?;
+        if !resp.status().is_success() {
+            return Err(format!("mcp sse: status {}", resp.status()));
+        }
+        let (ep_tx, ep_rx) = oneshot::channel::<String>();
+        let pending = self.pending.clone();
+        let (noise_tx, noise_rx) = mpsc::channel(64);
+        self._noise = noise_rx;
+        tokio::spawn(sse_read_loop(resp, pending, noise_tx, Some(ep_tx)));
+        let endpoint = tokio::time::timeout(REQUEST_TIMEOUT, ep_rx)
+            .await
+            .map_err(|_| "mcp sse: endpoint event timed out".to_string())?
+            .map_err(|_| "mcp sse: reader dropped".to_string())?;
+        let post_url = if endpoint.starts_with("http://") || endpoint.starts_with("https://") {
+            endpoint
+        } else {
+            let (scheme, rest) = base.split_once("://").unwrap_or(("http", &base));
+            let host = rest.split('/').next().unwrap_or(rest);
+            format!("{scheme}://{host}{endpoint}")
+        };
+        Ok(HttpRpc {
+            url: post_url,
+            headers,
+            session_id: None,
+            client,
+        })
     }
 
     /// The configured server name.
@@ -110,29 +340,60 @@ impl McpClient {
     async fn request(&mut self, method: &str, params: Value) -> Result<Value, String> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let msg = json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params});
-        let (tx, rx) = oneshot::channel();
-        self.pending.lock().await.insert(id, tx);
-        let line = serde_json::to_string(&msg).map_err(|e| format!("serialize {method}: {e}"))?;
-        self.stdin
-            .write_all(line.as_bytes())
-            .await
-            .map_err(|e| format!("write to server: {e}"))?;
-        self.stdin
-            .write_all(b"\n")
-            .await
-            .map_err(|e| format!("write to server: {e}"))?;
-        self.stdin
-            .flush()
-            .await
-            .map_err(|e| format!("write to server: {e}"))?;
-        let resp = tokio::time::timeout(std::time::Duration::from_secs(30), rx)
-            .await
-            .map_err(|_| format!("{method}: server timed out"))?
-            .map_err(|_| format!("{method}: reader dropped the reply"))?;
-        if let Some(err) = resp.get("error") {
-            return Err(format!("{method}: {err}"));
+        match &mut self.transport {
+            // streamable HTTP: the response rides the POST itself
+            Transport::StreamableHttp(rpc) => {
+                let resp = tokio::time::timeout(REQUEST_TIMEOUT, rpc.post(&msg))
+                    .await
+                    .map_err(|_| format!("{method}: request timed out"))?
+                    .map_err(|e| e.message)?
+                    .ok_or_else(|| format!("{method}: no response body"))?;
+                if let Some(err) = resp.get("error") {
+                    return Err(format!("{method}: {err}"));
+                }
+                Ok(resp["result"].clone())
+            }
+            // stdio and legacy SSE: the write only submits the request;
+            // responses arrive via the reader task, routed by id
+            _ => {
+                let (tx, rx) = oneshot::channel();
+                self.pending.lock().await.insert(id, tx);
+                self.send_msg(&msg).await?;
+                let resp = tokio::time::timeout(REQUEST_TIMEOUT, rx)
+                    .await
+                    .map_err(|_| format!("{method}: server timed out"))?
+                    .map_err(|_| format!("{method}: reader dropped the reply"))?;
+                if let Some(err) = resp.get("error") {
+                    return Err(format!("{method}: {err}"));
+                }
+                Ok(resp["result"].clone())
+            }
         }
-        Ok(resp["result"].clone())
+    }
+
+    /// Submit a message on the write side (stdin line or HTTP POST).
+    async fn send_msg(&mut self, msg: &Value) -> Result<(), String> {
+        match &mut self.transport {
+            Transport::Stdio { stdin, .. } => {
+                let line = serde_json::to_string(msg).map_err(|e| format!("serialize: {e}"))?;
+                stdin
+                    .write_all(line.as_bytes())
+                    .await
+                    .map_err(|e| format!("write to server: {e}"))?;
+                stdin
+                    .write_all(b"\n")
+                    .await
+                    .map_err(|e| format!("write to server: {e}"))?;
+                stdin
+                    .flush()
+                    .await
+                    .map_err(|e| format!("write to server: {e}"))
+            }
+            Transport::StreamableHttp(rpc) | Transport::LegacySse(rpc) => {
+                rpc.post(msg).await.map(|_| ()).map_err(|e| e.message)?;
+                Ok(())
+            }
+        }
     }
 
     async fn initialize(&mut self) -> Result<(), String> {
@@ -151,43 +412,12 @@ impl McpClient {
 
     async fn notify(&mut self, method: &str, params: Value) -> Result<(), String> {
         let msg = json!({"jsonrpc": "2.0", "method": method, "params": params});
-        let line = serde_json::to_string(&msg).map_err(|e| format!("serialize {method}: {e}"))?;
-        self.stdin
-            .write_all(line.as_bytes())
-            .await
-            .map_err(|e| format!("write to server: {e}"))?;
-        self.stdin
-            .write_all(b"\n")
-            .await
-            .map_err(|e| format!("write to server: {e}"))?;
-        self.stdin
-            .flush()
-            .await
-            .map_err(|e| format!("write to server: {e}"))
+        self.send_msg(&msg).await
     }
 
     async fn list_tools(&mut self) -> Result<Vec<McpTool>, String> {
         let result = self.request("tools/list", json!({})).await?;
-        let tools = result["tools"]
-            .as_array()
-            .ok_or_else(|| "tools/list: no tools array".to_string())?;
-        Ok(tools
-            .iter()
-            .filter_map(|t| {
-                let raw_name = t["name"].as_str()?.to_string();
-                let description = t["description"].as_str().unwrap_or("").to_string();
-                let schema = t
-                    .get("inputSchema")
-                    .cloned()
-                    .unwrap_or_else(|| json!({"type": "object", "properties": {}}));
-                Some(McpTool {
-                    name: format!("{}.{}", self.server_name, raw_name),
-                    raw_name,
-                    description,
-                    schema,
-                })
-            })
-            .collect())
+        parse_tools(&result, &self.server_name)
     }
 
     /// Invoke a tool; returns the concatenated text content.
@@ -204,10 +434,45 @@ impl McpClient {
         Ok(extract_text(&result))
     }
 
-    /// Whether the server process is still alive.
+    /// Whether the server is still reachable: process liveness on
+    /// stdio, an MCP `ping` round-trip on HTTP transports.
     pub async fn alive(&mut self) -> bool {
-        matches!(self.child.try_wait(), Ok(None))
+        match &mut self.transport {
+            Transport::Stdio { child, .. } => matches!(child.try_wait(), Ok(None)),
+            _ => self.request("ping", json!({})).await.is_ok(),
+        }
     }
+
+    /// Reconnect after a transport death: rebuild the same transport
+    /// from the config and re-handshake. Returns the fresh tools list
+    /// so callers can diff against the old one.
+    pub async fn reconnect(cfg: &McpServerConfig) -> Result<(Self, Vec<McpTool>), String> {
+        Self::spawn_connect(cfg).await
+    }
+}
+
+/// Parse a tools/list result into prefixed [`McpTool`]s.
+fn parse_tools(result: &Value, server_name: &str) -> Result<Vec<McpTool>, String> {
+    let tools = result["tools"]
+        .as_array()
+        .ok_or_else(|| "tools/list: no tools array".to_string())?;
+    Ok(tools
+        .iter()
+        .filter_map(|t| {
+            let raw_name = t["name"].as_str()?.to_string();
+            let description = t["description"].as_str().unwrap_or("").to_string();
+            let schema = t
+                .get("inputSchema")
+                .cloned()
+                .unwrap_or_else(|| json!({"type": "object", "properties": {}}));
+            Some(McpTool {
+                name: format!("{server_name}.{raw_name}"),
+                raw_name,
+                description,
+                schema,
+            })
+        })
+        .collect())
 }
 
 /// Concatenate a tool result's text content parts.
@@ -235,12 +500,68 @@ async fn read_loop(
         let Ok(msg) = serde_json::from_str::<Value>(&line) else {
             continue;
         };
-        if let Some(id) = msg["id"].as_u64() {
-            if let Some(tx) = pending.lock().await.remove(&id) {
-                tx.send(msg).ok();
+        route_message(msg, &pending, &noise).await;
+    }
+}
+
+/// Route one decoded JSON-RPC message: responses by id, methods to the
+/// noise channel.
+async fn route_message(
+    msg: Value,
+    pending: &Arc<Mutex<HashMap<u64, oneshot::Sender<Value>>>>,
+    noise: &mpsc::Sender<String>,
+) {
+    if let Some(id) = msg["id"].as_u64() {
+        if let Some(tx) = pending.lock().await.remove(&id) {
+            tx.send(msg).ok();
+        }
+    } else if let Some(method) = msg["method"].as_str() {
+        let _ = noise.send(method.to_string()).await;
+    }
+}
+
+/// Legacy-SSE reader task: consume the long-lived GET stream, capture
+/// the `endpoint` event, route subsequent data frames like stdio lines.
+async fn sse_read_loop(
+    mut resp: reqwest::Response,
+    pending: Arc<Mutex<HashMap<u64, oneshot::Sender<Value>>>>,
+    noise: mpsc::Sender<String>,
+    endpoint_tx: Option<oneshot::Sender<String>>,
+) {
+    let mut buf = String::new();
+    let mut endpoint_tx = endpoint_tx;
+    loop {
+        match resp.chunk().await {
+            Ok(Some(bytes)) => {
+                buf.push_str(&String::from_utf8_lossy(&bytes));
+                while let Some(pos) = buf.find("\n\n") {
+                    let frame: String = buf.drain(..pos + 2).collect();
+                    let mut event = String::new();
+                    let mut data = String::new();
+                    for line in frame.lines() {
+                        if let Some(v) = line.strip_prefix("event:") {
+                            event = v.trim().to_string();
+                        } else if let Some(v) = line.strip_prefix("data:") {
+                            if !data.is_empty() {
+                                data.push('\n');
+                            }
+                            data.push_str(v.trim());
+                        }
+                    }
+                    if event == "endpoint" {
+                        if let Some(tx) = endpoint_tx.take() {
+                            tx.send(data.clone()).ok();
+                        }
+                        continue;
+                    }
+                    let Ok(msg) = serde_json::from_str::<Value>(&data) else {
+                        continue;
+                    };
+                    route_message(msg, &pending, &noise).await;
+                }
             }
-        } else if let Some(method) = msg["method"].as_str() {
-            let _ = noise.send(method.to_string()).await;
+            Ok(None) => break,
+            Err(_) => break,
         }
     }
 }
@@ -278,8 +599,7 @@ impl crate::hands::Hand for McpHand {
         &'a self,
         args: &'a Value,
         _ctx: &'a crate::hands::HandContext,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = crate::hands::ToolOutput> + Send + 'a>>
-    {
+    ) -> std::pin::Pin<Box<dyn Future<Output = crate::hands::ToolOutput> + Send + 'a>> {
         let tool = self.tool.raw_name.clone();
         let args = args.clone();
         let client = self.client.clone();
@@ -337,9 +657,11 @@ for line in sys.stdin:
     fn cfg() -> McpServerConfig {
         McpServerConfig {
             name: "fake".to_string(),
-            command: "python3".to_string(),
+            command: Some("python3".to_string()),
             args: vec!["-c".to_string(), FAKE_SERVER.to_string()],
             env: HashMap::new(),
+            url: None,
+            headers: Vec::new(),
         }
     }
 
@@ -373,9 +695,271 @@ for line in sys.stdin:
     #[tokio::test]
     async fn bad_command_reports_spawn_error() {
         let mut bad = cfg();
-        bad.command = "ka-no-such-binary".to_string();
+        bad.command = Some("ka-no-such-binary".to_string());
         let err = McpClient::spawn_connect(&bad).await.unwrap_err();
         assert!(err.contains("spawn"), "{err}");
+    }
+
+    #[test]
+    fn config_requires_exactly_one_transport() {
+        let mut c = cfg();
+        assert!(c.validate().is_ok());
+        c.url = Some("http://127.0.0.1:1/mcp".into());
+        assert!(c.validate().is_err(), "both set must error");
+        c.command = None;
+        assert!(c.validate().is_ok());
+        c.url = None;
+        assert!(c.validate().is_err(), "neither set must error");
+    }
+
+    // ------------------------------------------------------------- HTTP
+
+    /// Serve one raw HTTP request per connection; `handler` decides the
+    /// response from the request body.
+    type Handler = std::sync::Arc<
+        dyn Fn(String, Vec<u8>) -> std::pin::Pin<Box<dyn Future<Output = Vec<u8>> + Send>>
+            + Send
+            + Sync,
+    >;
+
+    async fn serve_http(listener: tokio::net::TcpListener, handler: Handler) {
+        loop {
+            let Ok((mut sock, _)) = listener.accept().await else {
+                return;
+            };
+            let handler = handler.clone();
+            tokio::spawn(async move {
+                use tokio::io::AsyncReadExt;
+                let mut buf: Vec<u8> = Vec::new();
+                let mut tmp = [0u8; 8192];
+                loop {
+                    match sock.read(&mut tmp).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => {
+                            buf.extend_from_slice(&tmp[..n]);
+                            if let Ok(text) = std::str::from_utf8(&buf) {
+                                if let Some(head_end) = text.find("\r\n\r\n") {
+                                    let cl = text
+                                        .lines()
+                                        .find_map(|l| {
+                                            l.strip_prefix("content-length:")
+                                                .or_else(|| l.strip_prefix("Content-Length:"))
+                                                .and_then(|v| v.trim().parse::<usize>().ok())
+                                        })
+                                        .unwrap_or(0);
+                                    if buf.len() >= head_end + 4 + cl {
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                let text = String::from_utf8_lossy(&buf).into_owned();
+                let split = text.find("\r\n\r\n").map(|p| (p, p + 4)).unwrap_or((0, 0));
+                let head = text[..split.0].to_string();
+                let body = buf[split.1..].to_vec();
+                let resp = handler(head, body).await;
+                sock.write_all(&resp).await.ok();
+                sock.shutdown().await.ok();
+            });
+        }
+    }
+
+    fn http_ok(content_type: &str, extra: &str, body: &str) -> Vec<u8> {
+        format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\n{extra}Connection: close\r\n\r\n{body}",
+            body.len()
+        )
+        .into_bytes()
+    }
+
+    /// Minimal streamable-HTTP MCP server: initialize (assigns a
+    /// session), notifications accepted, tools/list returns one tool.
+    async fn streamable_server(listener: tokio::net::TcpListener) {
+        serve_http(
+            listener,
+            std::sync::Arc::new(|_head, body| {
+                Box::pin(async move {
+                    let text = String::from_utf8_lossy(&body).into_owned();
+                    let msg: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
+                    match msg["method"].as_str() {
+                        Some("initialize") => {
+                            let result = json!({
+                                "jsonrpc": "2.0",
+                                "id": msg["id"],
+                                "result": {
+                                    "protocolVersion": msg["params"]["protocolVersion"],
+                                    "capabilities": {"tools": {}},
+                                    "serverInfo": {"name": "fake-http", "version": "0"}
+                                }
+                            });
+                            let mut resp = http_ok("application/json", "", &result.to_string());
+                            // splice a session header in
+                            let resp_str = String::from_utf8(resp).unwrap().replace(
+                                "Content-Type:",
+                                "Mcp-Session-Id: sess-1\r\nContent-Type:",
+                            );
+                            resp = resp_str.into_bytes();
+                            resp
+                        }
+                        Some("notifications/initialized") => {
+                            b"HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                                .to_vec()
+                        }
+                        Some("ping") => {
+                            let result = json!({"jsonrpc": "2.0", "id": msg["id"], "result": {}});
+                            http_ok("application/json", "", &result.to_string())
+                        }
+                        Some("tools/list") => {
+                            let result = json!({
+                                "jsonrpc": "2.0",
+                                "id": msg["id"],
+                                "result": {"tools": [
+                                    {"name": "echo", "description": "echo", "inputSchema": {"type": "object"}}
+                                ]}
+                            });
+                            http_ok("application/json", "", &result.to_string())
+                        }
+                        _ => {
+                            b"HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                                .to_vec()
+                        }
+                    }
+                })
+            }),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn streamable_http_handshake_and_tools() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(streamable_server(listener));
+        let cfg = McpServerConfig {
+            name: "http".to_string(),
+            command: None,
+            args: Vec::new(),
+            env: HashMap::new(),
+            url: Some(format!("http://{addr}/mcp")),
+            headers: vec![("Authorization".into(), "Bearer t".into())],
+        };
+        let (mut client, tools) = McpClient::spawn_connect(&cfg).await.unwrap();
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].name, "http.echo");
+        // session id from the initialize response is echoed on later calls
+        assert!(client.alive().await, "ping round-trip must succeed");
+    }
+
+    /// Minimal legacy-SSE server: GET /sse emits the endpoint event then
+    /// forwards JSON-RPC responses written to the channel; POST
+    /// /messages answers 202 and dispatches the response over SSE.
+    async fn legacy_sse_server(listener: tokio::net::TcpListener) {
+        use tokio::io::AsyncReadExt;
+        let (tx, rx) = mpsc::channel::<Vec<u8>>(16);
+        let rx = Arc::new(tokio::sync::Mutex::new(rx));
+        loop {
+            let Ok((sock, _)) = listener.accept().await else {
+                return;
+            };
+            let tx = tx.clone();
+            let rx = rx.clone();
+            tokio::spawn(async move {
+                let mut sock = sock;
+                let mut buf: Vec<u8> = Vec::new();
+                let mut tmp = [0u8; 8192];
+                loop {
+                    match sock.read(&mut tmp).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => {
+                            buf.extend_from_slice(&tmp[..n]);
+                            if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                                break;
+                            }
+                        }
+                    }
+                }
+                let req = String::from_utf8_lossy(&buf).into_owned();
+                if req.starts_with("GET /sse") {
+                    let _ = sock
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n",
+                    )
+                    .await;
+                    let _ = sock
+                        .write_all(b"event: endpoint\ndata: /messages\n\n")
+                        .await;
+                    let _ = sock.flush().await;
+                    // forward JSON responses over the SSE stream
+                    let mut rx = rx.lock().await;
+                    while let Some(body) = rx.recv().await {
+                        let frame = format!("data: {}\n\n", String::from_utf8_lossy(&body));
+                        if sock.write_all(frame.as_bytes()).await.is_err() {
+                            break;
+                        }
+                        let _ = sock.flush().await;
+                    }
+                } else if req.starts_with("POST /sse") {
+                    // a streamable-HTTP probe against a legacy-only server:
+                    // answer 405 so the client falls back to this SSE stream
+                    let _ = sock
+                    .write_all(
+                        b"HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    )
+                    .await;
+                    let _ = sock.shutdown().await;
+                } else if req.starts_with("POST /messages") {
+                    let body_start = req.find("\r\n\r\n").map(|p| p + 4).unwrap_or(req.len());
+                    let msg: Value =
+                        serde_json::from_str(req[body_start..].trim()).unwrap_or(Value::Null);
+                    let reply = match msg["method"].as_str() {
+                        Some("initialize") => json!({
+                            "jsonrpc": "2.0",
+                            "id": msg["id"],
+                            "result": {
+                                "protocolVersion": msg["params"]["protocolVersion"],
+                                "capabilities": {"tools": {}},
+                                "serverInfo": {"name": "fake-sse", "version": "0"}
+                            }
+                        }),
+                        Some("tools/list") => json!({
+                            "jsonrpc": "2.0",
+                            "id": msg["id"],
+                            "result": {"tools": [
+                                {"name": "ping_tool", "description": "p", "inputSchema": {"type": "object"}}
+                            ]}
+                        }),
+                        _ => json!({"jsonrpc": "2.0", "id": msg["id"], "result": {}}),
+                    };
+                    let _ = sock
+                    .write_all(
+                        b"HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    )
+                    .await;
+                    let _ = sock.shutdown().await;
+                    tx.send(reply.to_string().into_bytes()).await.ok();
+                }
+            });
+        }
+    }
+
+    #[tokio::test]
+    async fn legacy_sse_fallback_handshake_and_tools() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(legacy_sse_server(listener));
+        let cfg = McpServerConfig {
+            name: "sse".to_string(),
+            command: None,
+            args: Vec::new(),
+            env: HashMap::new(),
+            url: Some(format!("http://{addr}/sse")),
+            headers: Vec::new(),
+        };
+        let (_client, tools) = McpClient::spawn_connect(&cfg).await.unwrap();
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].name, "sse.ping_tool");
     }
 
     #[test]

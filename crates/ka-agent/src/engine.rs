@@ -2357,9 +2357,11 @@ mod tests {
             cwd: Some(root.to_string_lossy().into_owned()),
             mcp: vec![crate::mcp::McpServerConfig {
                 name: "ghost".into(),
-                command: "ka-definitely-not-a-binary-9x7".into(),
+                command: Some("ka-definitely-not-a-binary-9x7".into()),
                 args: Vec::new(),
                 env: Default::default(),
+                url: None,
+                headers: Vec::new(),
             }],
             ..Config::default()
         };

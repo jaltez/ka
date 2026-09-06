@@ -891,6 +891,7 @@ dependencies = [
  "ka-strand",
  "parking_lot",
  "regex",
+ "reqwest",
  "schemars",
  "serde",
  "serde_json",
