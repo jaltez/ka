@@ -105,6 +105,10 @@ pub struct Flags {
     /// Request field for output-token cap (None = `max_tokens`).
     #[serde(default)]
     pub max_tokens_field: Option<String>,
+    /// Whether the model accepts tool calls on the wire (sniffed for
+    /// discovered local models; `false` = unknown or absent).
+    #[serde(default)]
+    pub tools: bool,
 }
 
 /// One model's wire profile.
