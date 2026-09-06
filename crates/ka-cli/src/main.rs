@@ -362,6 +362,7 @@ async fn run_headless(
     force_trust: bool,
 ) -> Result<ExitCode, String> {
     let trust = trust_for_cwd(force_trust);
+    warn_untrusted_conventions(&std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
     let cfg = load_config(configs, model, mode, trust)?;
     let prompt = match prompt {
         Some(p) => p,
@@ -443,6 +444,7 @@ async fn run_tui(cli: Cli) -> Result<ExitCode, String> {
     };
 
     let trust = trust_for_cwd(cli.trust);
+    warn_untrusted_conventions(&cwd);
     let cfg = load_config(&cli.configs, cli.model.clone(), cli.mode.clone(), trust)?;
     let catalog = build_catalog(&cli.dialects, !cli.no_discovery).await?;
     let model_label = cfg.model.clone().unwrap_or_else(|| "(canned)".to_string());
@@ -717,64 +719,79 @@ fn run_providers() -> Result<ExitCode, String> {
     Ok(ExitCode::SUCCESS)
 }
 
-/// Trust store: directories whose `.ka/` local config ka will load.
-fn trust_path() -> PathBuf {
-    std::env::var("XDG_STATE_HOME")
-        .map(PathBuf::from)
-        .or_else(|_| std::env::var("HOME").map(|h| PathBuf::from(h).join(".local/state")))
-        .unwrap_or_else(|_| std::env::temp_dir())
-        .join("ka/trust.json")
+/// Whether `dir` exists and holds at least one entry.
+fn dir_has_entries(dir: &std::path::Path) -> bool {
+    std::fs::read_dir(dir)
+        .map(|mut d| d.next().is_some())
+        .unwrap_or(false)
 }
 
-fn load_trust() -> Vec<PathBuf> {
-    std::fs::read_to_string(trust_path())
-        .ok()
-        .and_then(|t| serde_json::from_str(&t).ok())
-        .unwrap_or_default()
+/// Whether this project ships gateable `.ka/` content: a local config,
+/// skills, or convention hooks. Nothing gateable → nothing to trust.
+fn has_gateable_ka(cwd: &std::path::Path) -> bool {
+    cwd.join(".ka/ka.toml").is_file()
+        || dir_has_entries(&cwd.join(".ka/skills"))
+        || dir_has_entries(&cwd.join(".ka/hooks"))
 }
 
-fn save_trust(dirs: &[PathBuf]) {
-    let path = trust_path();
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    if let Ok(json) = serde_json::to_string_pretty(dirs) {
-        let _ = std::fs::write(path, json);
-    }
-}
-
-/// Whether the project config layer for `cwd` may load. Prompts on a TTY
-/// (first sighting), skips with a warning otherwise. `--trust` forces.
+/// Whether the project `.ka/` layer (config, skills, hooks) for `cwd` may
+/// load. Prompts on a TTY (first sighting), skips with a warning
+/// otherwise. `--trust` forces. The store itself lives in
+/// [`ka_agent::trust`]; approval unlocks all three layers.
 fn project_config_trusted(cwd: &std::path::Path, force_trust: bool) -> bool {
-    // nothing to trust — and no prompt — without a project config
-    if !cwd.join(".ka/ka.toml").is_file() {
+    // nothing to trust — and no prompt — without gateable .ka/ content
+    if !has_gateable_ka(cwd) {
         return false;
     }
+    if ka_agent::trust::trusted_in(cwd, &ka_agent::trust::load_trust()) {
+        return true;
+    }
     let canonical = std::fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
-    let mut trusted = load_trust();
     if force_trust {
-        trusted.push(canonical);
-        save_trust(&trusted);
+        ka_agent::trust::approve(cwd);
         return true;
     }
     // prompt only when interactive
     if std::io::IsTerminal::is_terminal(&std::io::stdin()) {
         eprintln!(
-            "ka: this directory has a .ka/ka.toml project config.\n     {}\n   Trust it (loads its rules/model settings)? [y/N]",
+            "ka: this directory has a .ka/ project config, skills, or hooks.\n     {}\n   Trust it (loads its rules/model settings, skills and hooks)? [y/N]",
             canonical.display()
         );
         let mut line = String::new();
         if std::io::stdin().read_line(&mut line).is_ok() {
             let ans = line.trim().to_lowercase();
             if ans == "y" || ans == "yes" {
-                trusted.push(canonical);
-                save_trust(&trusted);
+                ka_agent::trust::approve(cwd);
                 return true;
             }
         }
     }
-    eprintln!("ka: project config NOT trusted; skipping .ka/ka.toml (pass --trust to trust it)");
+    eprintln!(
+        "ka: project .ka/ NOT trusted; skipping its config, skills and hooks (pass --trust to trust it)"
+    );
     false
+}
+
+/// Startup note: when an untrusted project's `.ka/` would have contributed
+/// skills or hooks (both silently skipped by the engine), say so.
+fn warn_untrusted_conventions(cwd: &std::path::Path) {
+    if ka_agent::trust::project_trusted(cwd) {
+        return;
+    }
+    let mut layers: Vec<&str> = Vec::new();
+    if dir_has_entries(&cwd.join(".ka/skills")) {
+        layers.push("skills");
+    }
+    if dir_has_entries(&cwd.join(".ka/hooks")) {
+        layers.push("hooks");
+    }
+    if !layers.is_empty() {
+        eprintln!(
+            "ka: project .ka/{} present but NOT trusted; skipping {} (pass --trust to enable)",
+            layers.join(" and "),
+            if layers.len() == 1 { "it" } else { "them" }
+        );
+    }
 }
 
 /// Deterministic starter AGENTS.md from repo shape (no model call).

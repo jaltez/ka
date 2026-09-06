@@ -66,18 +66,40 @@ pub struct Skill {
 /// Discover SKILL.md skills across ka-native and ecosystem directories.
 /// Progressive disclosure: only name+description+path reach the prompt.
 pub fn discover_skills(cwd: &Path) -> Vec<Skill> {
+    let project_trusted = crate::trust::project_trusted(cwd);
     let home = std::env::var("HOME").map(PathBuf::from).ok();
-    let mut roots: Vec<PathBuf> = vec![
+    let project = vec![
         cwd.join(".ka/skills"),
         cwd.join(".agents/skills"),
         cwd.join(".claude/skills"),
     ];
-    if let Some(h) = &home {
-        roots.push(h.join(".config/ka/skills"));
-        roots.push(h.join(".agents/skills"));
-        roots.push(h.join(".claude/skills"));
-    }
-    discover_skills_in(roots)
+    let user = match &home {
+        Some(h) => vec![
+            h.join(".config/ka/skills"),
+            h.join(".agents/skills"),
+            h.join(".claude/skills"),
+        ],
+        None => Vec::new(),
+    };
+    discover_skills_scoped(project, user, project_trusted)
+}
+
+/// [`discover_skills`] with explicit roots and trust decision: untrusted
+/// projects contribute no roots, user scope always loads (tests).
+pub fn discover_skills_scoped(
+    project: Vec<PathBuf>,
+    user: Vec<PathBuf>,
+    project_trusted: bool,
+) -> Vec<Skill> {
+    let project = if project_trusted { project } else { Vec::new() };
+    discover_in(project, user)
+}
+
+/// Merge pre-gated project roots with always-on user roots; earlier roots
+/// shadow later ones, so project skills win over user skills of the same
+/// name. Tests: [`discover_skills`] derives `project` from the trust store.
+pub fn discover_in(project: Vec<PathBuf>, user: Vec<PathBuf>) -> Vec<Skill> {
+    discover_skills_in(project.into_iter().chain(user).collect())
 }
 
 /// Skill discovery against explicit roots (tests).
@@ -114,7 +136,6 @@ pub fn discover_skills_in(roots: Vec<PathBuf>) -> Vec<Skill> {
     skills.truncate(20);
     skills
 }
-
 /// Extract `description:` from YAML-ish frontmatter (no YAML dep).
 fn parse_frontmatter_description(content: &str) -> Option<String> {
     let rest = content.strip_prefix("---\n")?;
@@ -189,5 +210,92 @@ mod tests {
             Some("quoted desc".to_string())
         );
         assert_eq!(parse_frontmatter_description("no frontmatter"), None);
+    }
+
+    #[test]
+    fn untrusted_project_skills_absent_user_scope_present() {
+        let root = temp_tree("gated-untrusted");
+        for dir in [
+            root.join("proj/.ka/skills/ship"),
+            root.join("user/skills/shared"),
+        ] {
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("SKILL.md"), "---\ndescription: d\n---\n").unwrap();
+        }
+        crate::trust::test_support::with_trust_file(|_| {
+            // untrusted via the real store: the project skill is hidden
+            // (user-scope skills from the real HOME may still appear)
+            let skills = discover_skills(&root.join("proj"));
+            assert!(
+                skills.iter().all(|s| s.name != "ship"),
+                "untrusted project skill must be absent: {:?}",
+                skills.iter().map(|s| &s.name).collect::<Vec<_>>()
+            );
+            // user scope is never gated
+            let skills = discover_skills_scoped(
+                vec![root.join("proj/.ka/skills")],
+                vec![root.join("user/skills")],
+                false,
+            );
+            let names: Vec<&str> = skills.iter().map(|s| s.name.as_str()).collect();
+            assert_eq!(
+                names,
+                vec!["shared"],
+                "project hidden, user kept: {names:?}"
+            );
+        });
+    }
+
+    #[test]
+    fn trusted_project_skills_load_and_shadow_user() {
+        let root = temp_tree("gated-trusted");
+        for (dir, desc) in [
+            (root.join("proj/.ka/skills/deploy"), "How we ship"),
+            (root.join("user/skills/deploy"), "shadowed"),
+            (root.join("user/skills/lint"), "user lint"),
+        ] {
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(
+                dir.join("SKILL.md"),
+                format!("---\ndescription: {desc}\n---\n"),
+            )
+            .unwrap();
+        }
+        let proj = root.join("proj");
+        crate::trust::test_support::with_trust_file(|_| {
+            // approve via the shared trust path, exactly like the CLI does
+            crate::trust::approve(&proj);
+            let skills = discover_skills(&proj);
+            let by_name: std::collections::HashMap<&str, &str> = skills
+                .iter()
+                .map(|s| (s.name.as_str(), s.description.as_str()))
+                .collect();
+            // user roots still load through discover_skills' HOME derivation
+            let scoped = discover_skills_scoped(
+                vec![proj.join(".ka/skills")],
+                vec![root.join("user/skills")],
+                crate::trust::project_trusted(&proj),
+            );
+            let by_name_scoped: std::collections::HashMap<String, String> = scoped
+                .into_iter()
+                .map(|s| (s.name, s.description))
+                .collect();
+            assert_eq!(
+                by_name_scoped.get("deploy").map(String::as_str),
+                Some("How we ship"),
+                "project shadows user"
+            );
+            assert_eq!(
+                by_name_scoped.get("lint").map(String::as_str),
+                Some("user lint"),
+                "user scope still loads"
+            );
+            // and the real store approved above: project deploy is present
+            assert_eq!(
+                by_name.get("deploy").map(|s| &**s),
+                Some("How we ship"),
+                "approved project contributes its skills: {by_name:?}"
+            );
+        });
     }
 }

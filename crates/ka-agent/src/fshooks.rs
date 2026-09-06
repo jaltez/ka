@@ -45,7 +45,24 @@ const TAIL_CHARS: usize = 400;
 /// Run the convention hook for `event` if one exists. `Ok(())` means
 /// proceed (hook missing, or exited zero); `Err(reason)` means the hook
 /// failed or timed out, with the stderr tail as the reason.
+///
+/// Convention hooks are project-scope `.ka/` content: they only run in a
+/// trusted project (see [`crate::trust`]). An untrusted project's hook is
+/// silently skipped.
 pub async fn run(event: HookPoint, cwd: &Path, tool: Option<&str>) -> Result<(), String> {
+    run_trusted(event, cwd, tool, crate::trust::project_trusted(cwd)).await
+}
+
+/// [`run`] with an explicit trust decision (tests).
+pub async fn run_trusted(
+    event: HookPoint,
+    cwd: &Path,
+    tool: Option<&str>,
+    project_trusted: bool,
+) -> Result<(), String> {
+    if !project_trusted {
+        return Ok(());
+    }
     let Some(script) = locate(event, cwd) else {
         return Ok(());
     };
@@ -148,8 +165,16 @@ mod tests {
     #[tokio::test]
     async fn missing_hooks_are_a_noop() {
         let dir = hook_dir("missing");
-        assert!(run(HookPoint::PreTurn, &dir, None).await.is_ok());
-        assert!(run(HookPoint::PreTool, &dir, Some("bash")).await.is_ok());
+        assert!(
+            run_trusted(HookPoint::PreTurn, &dir, None, true)
+                .await
+                .is_ok()
+        );
+        assert!(
+            run_trusted(HookPoint::PreTool, &dir, Some("bash"), true)
+                .await
+                .is_ok()
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -157,7 +182,9 @@ mod tests {
     async fn failing_pre_turn_reports_stderr_tail() {
         let dir = hook_dir("pre-turn-fail");
         std::fs::write(dir.join(".ka/hooks/pre-turn.sh"), "echo boom >&2; exit 3\n").unwrap();
-        let err = run(HookPoint::PreTurn, &dir, None).await.unwrap_err();
+        let err = run_trusted(HookPoint::PreTurn, &dir, None, true)
+            .await
+            .unwrap_err();
         assert!(err.contains("exited 3"), "{err}");
         assert!(err.contains("boom"), "{err}");
         let _ = std::fs::remove_dir_all(&dir);
@@ -167,7 +194,11 @@ mod tests {
     async fn successful_hook_and_bare_name_resolution() {
         let dir = hook_dir("ok");
         std::fs::write(dir.join(".ka/hooks/post-turn"), "exit 0\n").unwrap();
-        assert!(run(HookPoint::PostTurn, &dir, None).await.is_ok());
+        assert!(
+            run_trusted(HookPoint::PostTurn, &dir, None, true)
+                .await
+                .is_ok()
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -179,7 +210,7 @@ mod tests {
             "test \"$KA_TOOL\" = bash -a \"$KA_HOOK\" = pre-tool || exit 1\nexit 5\n",
         )
         .unwrap();
-        let err = run(HookPoint::PreTool, &dir, Some("bash"))
+        let err = run_trusted(HookPoint::PreTool, &dir, Some("bash"), true)
             .await
             .unwrap_err();
         assert!(err.contains("exited 5"), "{err}");
@@ -190,8 +221,37 @@ mod tests {
     async fn hanging_hook_times_out() {
         let dir = hook_dir("hang");
         std::fs::write(dir.join(".ka/hooks/pre-turn.sh"), "sleep 30\n").unwrap();
-        let err = run(HookPoint::PreTurn, &dir, None).await.unwrap_err();
+        let err = run_trusted(HookPoint::PreTurn, &dir, None, true)
+            .await
+            .unwrap_err();
         assert!(err.contains("timed out"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn untrusted_project_hook_is_skipped() {
+        let dir = hook_dir("untrusted");
+        std::fs::write(dir.join(".ka/hooks/pre-turn.sh"), "echo boom >&2; exit 3\n").unwrap();
+        assert!(
+            run_trusted(HookPoint::PreTurn, &dir, None, false)
+                .await
+                .is_ok(),
+            "untrusted project hook must not run"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn trust_store_approval_unlocks_hooks() {
+        let (_file, _guard) = crate::trust::test_support::trust_guard();
+        let dir = hook_dir("store-trusted");
+        std::fs::write(dir.join(".ka/hooks/pre-turn.sh"), "exit 3\n").unwrap();
+        // still untrusted: the hook is skipped even though it exists
+        assert!(run(HookPoint::PreTurn, &dir, None).await.is_ok());
+        // approve through the shared trust path (writes the store file)
+        crate::trust::approve(&dir);
+        let err = run(HookPoint::PreTurn, &dir, None).await.unwrap_err();
+        assert!(err.contains("exited 3"), "{err}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

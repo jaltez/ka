@@ -10,6 +10,7 @@ mod engine;
 mod fshooks;
 pub mod hands;
 pub mod mcp;
+pub mod trust;
 mod voice;
 
 pub use config::{Config, ConfigError};
