@@ -1,5 +1,7 @@
 //! Token sources and the `.env` chain. Ladder: process env > `./.env` >
-//! `~/.config/ka/.env`. `!command` indirection keeps secrets out of files.
+//! `~/.config/ka/.env` > OS keyring (`service "ka"`, user = the env var
+//! name). `!command` indirection keeps secrets out of files. A missing or
+//! unusable keyring backend silently falls through.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -17,9 +19,9 @@ pub fn set_dotenv_key(key: &str, value: &str) {
 }
 
 /// Whether a key variable is present anywhere ka would read it: the
-/// process environment or the dotenv layer (`./.env`,
-/// `~/.config/ka/.env`). Reading the map forces the lazy scan if it has
-/// not run yet, so a key saved to the dotenv before this process started
+/// process environment, the dotenv layer (`./.env`, `~/.config/ka/.env`),
+/// or the OS keyring. Reading the map forces the lazy scan if it has not
+/// run yet, so a key saved to the dotenv before this process started
 /// counts as set — matching what [`resolve_token`] would find.
 pub fn key_is_set(env_var: &str) -> bool {
     let spec = env_var.trim();
@@ -28,7 +30,28 @@ pub fn key_is_set(env_var: &str) -> bool {
             || DOTENV
                 .read()
                 .ok()
-                .is_some_and(|map| map.get(spec).is_some_and(|v| !v.is_empty())))
+                .is_some_and(|map| map.get(spec).is_some_and(|v| !v.is_empty()))
+            || keyring_is_set(spec))
+}
+
+/// Keyring service name ka stores credential entries under.
+const KEYRING_SERVICE: &str = "ka";
+
+/// Best-effort keyring lookup for an env-var-named entry. Any failure —
+/// no backend, no entry, blank value — returns `None` so callers fall
+/// through as if the layer did not exist.
+fn keyring_lookup(env_var: &str) -> Option<String> {
+    let entry = keyring::Entry::new(KEYRING_SERVICE, env_var).ok()?;
+    match entry.get_password() {
+        Ok(v) if !v.is_empty() => Some(v),
+        _ => None,
+    }
+}
+
+/// Whether a keyring entry exists for the variable (best effort; a dead
+/// backend counts as absent).
+fn keyring_is_set(env_var: &str) -> bool {
+    keyring_lookup(env_var).is_some()
 }
 
 fn scan_dotenv() -> HashMap<String, String> {
@@ -69,9 +92,10 @@ fn parse_env_line(line: &str) -> Option<(String, String)> {
     Some((key, unquoted.to_string()))
 }
 
-/// Resolve a token spec: an environment variable name (checked against the
-/// process env first, then the lazily-scanned `.env` map), or `!command` to
-/// run (trimmed stdout). The map never overrides real variables.
+/// Resolve a token spec: an environment variable name (checked against
+/// the process env first, then the lazily-scanned `.env` map, then the
+/// OS keyring), or `!command` to run (trimmed stdout). The map never
+/// overrides real variables.
 pub fn resolve_token(spec: &str) -> Option<String> {
     let spec = spec.trim();
     if let Some(cmd) = spec.strip_prefix('!') {
@@ -87,9 +111,11 @@ pub fn resolve_token(spec: &str) -> Option<String> {
         .ok()
         .and_then(|map| map.get(spec).cloned())
         .filter(|v| !v.is_empty())
+        .or_else(|| keyring_lookup(spec))
 }
 
-/// Testable core of [`resolve_token`] against an explicit fallback map.
+/// Testable core of [`resolve_token`] against an explicit fallback map
+/// (standing in for the dotenv layer).
 pub fn resolve_token_with(fallback: &HashMap<String, String>, spec: &str) -> Option<String> {
     let spec = spec.trim();
     if let Some(cmd) = spec.strip_prefix('!') {
@@ -100,7 +126,11 @@ pub fn resolve_token_with(fallback: &HashMap<String, String>, spec: &str) -> Opt
             return Some(v);
         }
     }
-    fallback.get(spec).cloned().filter(|v| !v.is_empty())
+    fallback
+        .get(spec)
+        .cloned()
+        .filter(|v| !v.is_empty())
+        .or_else(|| keyring_lookup(spec))
 }
 
 fn run_command(cmd: &str) -> Option<String> {
@@ -192,6 +222,54 @@ mod tests {
             resolve_token_with(&HashMap::new(), "!echo ka-test-token").unwrap(),
             "ka-test-token"
         );
+    }
+
+    /// Skip guard for machines without a working keyring backend.
+    fn seed_keyring(var: &str, secret: &str) -> bool {
+        let Ok(entry) = keyring::Entry::new("ka", var) else {
+            return false;
+        };
+        entry.set_password(secret).is_ok()
+    }
+
+    #[test]
+    fn keyring_entry_resolves_as_last_layer() {
+        let var = "KA_TEST_KEYRING_XYZ_1";
+        if !seed_keyring(var, "from-keyring") {
+            eprintln!("no usable keyring backend; skipping");
+            return;
+        }
+        // no env, empty map → the keyring answers
+        assert_eq!(
+            resolve_token_with(&HashMap::new(), var).as_deref(),
+            Some("from-keyring")
+        );
+        assert!(key_is_set(var));
+        let _ = keyring::Entry::new("ka", var).unwrap().delete_credential();
+    }
+
+    #[test]
+    fn fallback_map_beats_keyring() {
+        let var = "KA_TEST_KEYRING_XYZ_2";
+        if !seed_keyring(var, "from-keyring") {
+            eprintln!("no usable keyring backend; skipping");
+            return;
+        }
+        let fb = map(&[(var, "from-map")]);
+        assert_eq!(
+            resolve_token_with(&fb, var).as_deref(),
+            Some("from-map"),
+            "dotenv layer must shadow the keyring"
+        );
+        let _ = keyring::Entry::new("ka", var).unwrap().delete_credential();
+    }
+
+    #[test]
+    fn keyring_absence_is_transparent() {
+        // a variable with no env, no map and no entry stays unset and
+        // unresolved even though the keyring layer is consulted
+        assert!(!key_is_set("KA_TEST_KEYRING_ABSENT_XYZ_3"));
+        assert!(resolve_token_with(&HashMap::new(), "KA_TEST_KEYRING_ABSENT_XYZ_3").is_none());
     }
 
     #[test]
