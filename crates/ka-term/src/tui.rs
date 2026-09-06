@@ -1057,7 +1057,7 @@ pub struct Inventory {
 
 /// Everything the right sidebar displays. Session figures come from the
 /// footer meters at render time; this state carries the rest.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct SidebarState {
     /// Bootstrap inventory.
     pub inventory: Inventory,
@@ -1067,6 +1067,73 @@ pub struct SidebarState {
     pub cwd: String,
     /// Git branch when cheaply detectable at startup.
     pub branch: Option<String>,
+    /// Skills section expanded? Collapsed via a mouse click on its
+    /// header; the header keeps rendering as `skills (+N)`.
+    pub skills_open: bool,
+    /// Cursor is over the skills header (drives the hover affordance).
+    pub skills_hover: bool,
+}
+
+impl Default for SidebarState {
+    fn default() -> Self {
+        Self {
+            inventory: Default::default(),
+            todos: Vec::new(),
+            cwd: String::new(),
+            branch: None,
+            skills_open: true,
+            skills_hover: false,
+        }
+    }
+}
+
+/// A clickable sidebar region, recorded at render time so the mouse
+/// handler can hit-test without duplicating the layout math. New
+/// collapsible sections add a variant here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SidebarZone {
+    /// The skills section header row (spans the sidebar's full width).
+    SkillsHeader(ratatui::layout::Rect),
+}
+
+impl SidebarZone {
+    /// Does a terminal-cell click land inside this zone?
+    fn hit(&self, x: u16, y: u16) -> bool {
+        match self {
+            SidebarZone::SkillsHeader(rect) => rect.contains(ratatui::layout::Position { x, y }),
+        }
+    }
+}
+
+/// Sidebar skills header text: bare when expanded, count-marked when
+/// collapsed (the ` ▾`/` ▸` affordance rides separately as a dim span).
+fn skills_header_label(open: bool, count: usize) -> String {
+    if open {
+        "skills".to_string()
+    } else {
+        format!("skills (+{count})")
+    }
+}
+
+/// Full skills header line: label plus the ` ▾`/` ▸` disclosure arrow.
+/// Hover paints the whole header ACCENT + UNDERLINE; at rest the label
+/// keeps its accent-bold look and the arrow stays dim META.
+fn skills_header_line(open: bool, hover: bool, count: usize) -> ratatui::text::Line<'static> {
+    use ratatui::style::{Modifier, Style};
+    use ratatui::text::{Line as TuiLine, Span};
+    let label = skills_header_label(open, count);
+    let arrow = if open { " ▾" } else { " ▸" };
+    if hover {
+        let st = Style::new()
+            .fg(crate::palette::ACCENT)
+            .add_modifier(Modifier::UNDERLINED);
+        TuiLine::from(vec![Span::styled(label, st), Span::styled(arrow, st)])
+    } else {
+        TuiLine::from(vec![
+            Span::styled(label, crate::palette::ACCENT_BOLD),
+            Span::styled(arrow, crate::palette::META),
+        ])
+    }
 }
 
 /// Sidebar column width when shown.
@@ -1135,14 +1202,15 @@ fn detect_branch() -> Option<String> {
     let branch = String::from_utf8_lossy(&out.stdout).trim().to_string();
     (out.status.success() && !branch.is_empty()).then_some(branch)
 }
-/// Build the sidebar rows, top to bottom: session, todos, mcp, skills,
-/// agents, info. Empty sections vanish; list sections cap at what fits
-/// and mark the cut with `(+N)`.
+/// `hit`: when given, the cell receives the skills header's on-screen
+/// rectangle (or `None` when no skills header is on screen), so the
+/// mouse handler can hit-test with render-time truth.
 fn sidebar_rows(
     sidebar: &SidebarState,
     meters: &Meters,
     width: usize,
     height: usize,
+    hit: Option<(&std::cell::Cell<Option<SidebarZone>>, ratatui::layout::Rect)>,
 ) -> Vec<ratatui::text::Line<'static>> {
     use ratatui::style::{Modifier, Style};
     use ratatui::text::{Line as TuiLine, Span};
@@ -1228,13 +1296,28 @@ fn sidebar_rows(
         };
         mcp.push(row);
     }
-
     let names = |label: &str, items: &[String]| {
         std::iter::once(header(label))
             .chain(items.iter().map(|s| plain(trunc_cols(s, width))))
             .collect::<Vec<_>>()
     };
-    let skills = names("skills", &sidebar.inventory.skills);
+    // collapsed skills render their header alone, with the count moved
+    // into the label; the header carries the disclosure arrow and the
+    // hover affordance
+    let skills = if sidebar.skills_open {
+        let mut rows = names("skills", &sidebar.inventory.skills);
+        if !rows.is_empty() {
+            rows[0] =
+                skills_header_line(true, sidebar.skills_hover, sidebar.inventory.skills.len());
+        }
+        rows
+    } else {
+        vec![skills_header_line(
+            false,
+            sidebar.skills_hover,
+            sidebar.inventory.skills.len(),
+        )]
+    };
     let agents = names("agents", &sidebar.inventory.agents);
 
     // ── info: one `cwd-short:branch` row at the bottom; without a
@@ -1248,15 +1331,20 @@ fn sidebar_rows(
     // capping any list section that would overflow the remaining height.
     // Air: one blank row after each header and one between sections;
     // priorities keep their top-down order, the rest truncates.
+    const SKILLS_SECTION: usize = 3;
     let sections = [session, todos, mcp, skills, agents, info];
     let mut out: Vec<TuiLine> = Vec::with_capacity(height.min(40));
     let mut room = height;
     let mut placed = false;
-    for section in sections {
+    let mut skills_header_row: Option<usize> = None;
+    for (si, section) in sections.into_iter().enumerate() {
         let Some((head, body)) = section.split_first() else {
             continue;
         };
-        if body.is_empty() {
+        // a collapsed skills section carries no body but its header
+        // must still land on screen
+        let forced = si == SKILLS_SECTION && !sidebar.skills_open && body.is_empty();
+        if body.is_empty() && !forced {
             continue; // empty sections vanish
         }
         if placed {
@@ -1266,15 +1354,14 @@ fn sidebar_rows(
             out.push(TuiLine::default()); // one blank row between sections
             room -= 1;
         }
-        // a section needs its header plus the blank row under it
-        if room < 2 {
-            break;
-        }
         let show = (room - 2).min(body.len());
-        if show == 0 {
+        if show == 0 && !forced {
             break; // not even one body row fits under the header air
         }
         placed = true;
+        if si == SKILLS_SECTION {
+            skills_header_row = Some(out.len());
+        }
         out.push(head.clone());
         out.push(TuiLine::default()); // blank under the header
         if show < body.len() {
@@ -1288,6 +1375,18 @@ fn sidebar_rows(
             out.extend(body.iter().cloned());
         }
         room -= 2 + show;
+    }
+    if let Some((cell, area)) = hit {
+        cell.set(skills_header_row.map(|row| {
+            SidebarZone::SkillsHeader(ratatui::layout::Rect {
+                x: area.x,
+                // the block title consumes the area's first row, so a
+                // rendered row lives one below area.y
+                y: area.y + 1 + row as u16,
+                width: area.width,
+                height: 1,
+            })
+        }));
     }
     out
 }
@@ -1779,8 +1878,13 @@ pub async fn run(
                 | crossterm::event::KeyboardEnhancementFlags::REPORT_EVENT_TYPES
         ),
         crossterm::event::EnableBracketedPaste,
-        crossterm::event::EnableMouseCapture
+        crossterm::event::EnableMouseCapture,
     );
+    // any-event (motion) tracking: crossterm has no wrapper for the raw
+    // `1003` sequence; without it Moved events only flow while a button
+    // is held. Popped at every capture-disable path below.
+    let _ = std::io::stdout().write_all(b"\x1b[?1003h");
+    let _ = std::io::stdout().flush();
     let result = app(
         &mut terminal,
         &mut commands,
@@ -1791,6 +1895,8 @@ pub async fn run(
         agents,
     )
     .await;
+    let _ = std::io::stdout().write_all(b"\x1b[?1003l");
+    let _ = std::io::stdout().flush();
     let _ = crossterm::execute!(
         std::io::stdout(),
         crossterm::event::PopKeyboardEnhancementFlags,
@@ -1856,6 +1962,8 @@ async fn app(
     let mut find_last: Option<(String, usize)> = None;
     let mut modal: Option<Modal> = None;
     let mut mode_picker: Option<ModePicker> = None;
+    // clickable sidebar regions, refreshed every frame by render()
+    let sidebar_zone: std::cell::Cell<Option<SidebarZone>> = std::cell::Cell::new(None);
     let mut term_events = crossterm::event::EventStream::new();
     let mut spin = tokio::time::interval(Duration::from_millis(120));
 
@@ -1924,6 +2032,7 @@ async fn app(
                 mode_picker.as_ref(),
                 &meters,
                 &sidebar,
+                &sidebar_zone,
             );
         })?;
 
@@ -2469,18 +2578,29 @@ async fn app(
                         (KeyCode::Char('m'), KeyModifiers::CONTROL) => {
                             // capture on by default (wheel scrolling);
                             // toggling releases the mouse for native
-                            // text selection
+                            // text selection. Motion tracking (1003)
+                            // follows capture so hover never leaks.
                             mouse_capture = !mouse_capture;
                             let _ = if mouse_capture {
-                                crossterm::execute!(
-                                    std::io::stdout(),
-                                    crossterm::event::EnableMouseCapture
-                                )
+                                std::io::stdout()
+                                    .write_all(b"\x1b[?1003h")
+                                    .and_then(|_| std::io::stdout().flush())
+                                    .and_then(|_| {
+                                        crossterm::execute!(
+                                            std::io::stdout(),
+                                            crossterm::event::EnableMouseCapture
+                                        )
+                                    })
                             } else {
-                                crossterm::execute!(
-                                    std::io::stdout(),
-                                    crossterm::event::DisableMouseCapture
-                                )
+                                std::io::stdout()
+                                    .write_all(b"\x1b[?1003l")
+                                    .and_then(|_| std::io::stdout().flush())
+                                    .and_then(|_| {
+                                        crossterm::execute!(
+                                            std::io::stdout(),
+                                            crossterm::event::DisableMouseCapture
+                                        )
+                                    })
                             };
                         }
                         // Reverse history search: while active it captures
@@ -3029,7 +3149,6 @@ async fn app(
                             input.search_push(c);
                         }
                     } else {
-                        input.insert_str(&text);
                         slash_popup = update_suggestions(&input.text);
                     }
                 } else if let Some(Ok(TermEvent::Mouse(mouse))) = maybe_term {
@@ -3044,6 +3163,32 @@ async fn app(
                         && path_popup.is_none()
                     {
                         match mouse.kind {
+                            // a click on the skills header toggles the
+                            // section; checked before the wheel arms so a
+                            // click never also scrolls
+                            crossterm::event::MouseEventKind::Down(
+                                crossterm::event::MouseButton::Left,
+                            ) => {
+                                if sidebar_zone
+                                    .get()
+                                    .is_some_and(|z| z.hit(mouse.column, mouse.row))
+                                {
+                                    sidebar.skills_open = !sidebar.skills_open;
+                                }
+                            }
+                            // hover affordance: only re-render when the
+                            // pointer actually crosses the header boundary
+                            crossterm::event::MouseEventKind::Moved
+                            | crossterm::event::MouseEventKind::Drag(
+                                crossterm::event::MouseButton::Left,
+                            ) => {
+                                let hit = sidebar_zone
+                                    .get()
+                                    .is_some_and(|z| z.hit(mouse.column, mouse.row));
+                                if sidebar.skills_hover != hit {
+                                    sidebar.skills_hover = hit;
+                                }
+                            }
                             crossterm::event::MouseEventKind::ScrollUp => {
                                 line_up(&mut scroll, transcript.total_rows(), view_rows);
                             }
@@ -3385,7 +3530,10 @@ fn apply_event(
             agents,
             skills,
         } => {
-            transcript.push_separated(Line::Report(inventory_card(tools, mcp, agents, skills)));
+            let card = inventory_card(mcp, agents);
+            if !card.is_empty() {
+                transcript.push_separated(Line::Report(card));
+            }
             sidebar.inventory = Inventory {
                 tools: tools.clone(),
                 mcp: mcp.clone(),
@@ -3409,28 +3557,14 @@ fn apply_event(
 }
 
 /// Compact bootstrap inventory card for [`Event::Inventory`]: one muted
-/// transcript entry. The first row summarizes counts (`· 7 tools · mcp
-/// 2/3 up · 2 agents · 4 skills`); each non-empty segment gets a detail
-/// row, all kept under ~90 columns via `(+N)` overflow marks.
-fn inventory_card(
-    tools: &[String],
-    mcp: &[ka_protocol::McpSummary],
-    agents: &[String],
-    skills: &[String],
-) -> String {
+/// transcript entry covering only what the sidebar does not own — the
+/// mcp (`name ✓ n` / `name ✗`) and agents segments, one detail row each
+/// under ~90 columns via `(+N)` overflow marks. With both empty no card
+/// line lands at all (the transcript stays clean; the sidebar owns
+/// tools and skills).
+fn inventory_card(mcp: &[ka_protocol::McpSummary], agents: &[String]) -> String {
     const CAP: usize = 90;
-    let mut head = format!("· {} tools", tools.len());
-    if !mcp.is_empty() {
-        let up = mcp.iter().filter(|s| s.ok).count();
-        head.push_str(&format!(" · mcp {up}/{} up", mcp.len()));
-    }
-    if !agents.is_empty() {
-        head.push_str(&format!(" · {} agents", agents.len()));
-    }
-    if !skills.is_empty() {
-        head.push_str(&format!(" · {} skills", skills.len()));
-    }
-    let mut rows = vec![head];
+    let mut rows = Vec::new();
     if !mcp.is_empty() {
         let items: Vec<String> = mcp
             .iter()
@@ -3446,9 +3580,6 @@ fn inventory_card(
     }
     if !agents.is_empty() {
         rows.push(pack_row("agents", agents, CAP));
-    }
-    if !skills.is_empty() {
-        rows.push(pack_row("skills", skills, CAP));
     }
     rows.join("\n")
 }
@@ -3480,7 +3611,6 @@ fn pack_row(label: &str, items: &[String], cap: usize) -> String {
     row
 }
 
-/// Record a spill path for /spills: deduped, newest last, capped at 50.
 fn record_spill(spills: &mut Vec<String>, path: &str) {
     if spills.contains(&path.to_string()) {
         return;
@@ -3514,6 +3644,8 @@ fn run_external(
     let _ = crossterm::terminal::enable_raw_mode();
     if mouse_capture {
         let _ = crossterm::execute!(std::io::stdout(), crossterm::event::EnableMouseCapture);
+        let _ = std::io::stdout().write_all(b"\x1b[?1003h");
+        let _ = std::io::stdout().flush();
     }
     let _ = terminal.clear();
     res
@@ -4364,6 +4496,7 @@ fn render(
     picker: Option<&ModePicker>,
     meters: &Meters,
     sidebar: &SidebarState,
+    sidebar_zone: &std::cell::Cell<Option<SidebarZone>>,
 ) {
     use ratatui::layout::Constraint::{Length, Min};
     use ratatui::style::{Modifier, Style};
@@ -4513,6 +4646,7 @@ fn render(
             meters,
             (SIDEBAR_WIDTH - 3) as usize,
             sb.height as usize,
+            Some((sidebar_zone, sb)),
         );
         let widget = Paragraph::new(rows)
             .block(
@@ -4524,8 +4658,10 @@ fn render(
             )
             .style(ratatui::style::Style::new().bg(crate::palette::BG_PANEL));
         frame.render_widget(widget, sb);
+    } else {
+        // no sidebar column: no clickable zones this frame
+        sidebar_zone.set(None);
     }
-
     // ── input ─────────────────────────────────────────────────────
     // a permission ask borrows the box as a form (the draft returns
     // after the answer); titles carry only structural/draft state —
@@ -7687,33 +7823,24 @@ mod tests {
     }
 
     #[test]
-    fn inventory_bare_session_is_a_single_tools_line() {
+    fn inventory_without_mcp_or_agents_lands_no_card_line() {
         let mut lines = Transcript::default();
         lines.set_width(90);
         feed(
             &mut lines,
             &Event::Inventory {
-                tools: [
-                    "read",
-                    "edit",
-                    "write",
-                    "bash",
-                    "glob",
-                    "grep",
-                    "pathfinder",
-                ]
-                .iter()
-                .map(|s| s.to_string())
-                .collect(),
+                tools: ["read", "edit", "bash"]
+                    .iter()
+                    .map(|s| s.to_string())
+                    .collect(),
                 mcp: Vec::new(),
                 agents: Vec::new(),
-                skills: Vec::new(),
+                skills: vec!["rust-docs".into()],
             },
         );
-        let entries = lines.entries();
-        assert_eq!(entries, [Line::Report("· 7 tools".into())]);
-        // one rendered text row (gutter rows carry no built-in spacing)
-        assert_eq!(lines.total_rows(), 1);
+        // tools and skills live in the sidebar now: nothing in the chat
+        assert!(lines.entries().is_empty(), "{:?}", lines.entries());
+        assert_eq!(lines.total_rows(), 0);
     }
 
     #[test]
@@ -7744,22 +7871,22 @@ mod tests {
             panic!("one Report row expected, got {entries:?}")
         };
         let rows: Vec<&str> = text.split('\n').collect();
-        assert_eq!(rows, ["· 1 tools · mcp 1/2 up", "mcp: fetch ✓ 3 · jira ✗"]);
+        assert_eq!(rows, ["mcp: fetch ✓ 3 · jira ✗"]);
     }
 
     #[test]
-    fn inventory_truncates_long_skill_list_with_overflow_mark() {
+    fn inventory_agents_only_row_with_overflow_mark() {
         let mut lines = Transcript::default();
-        let skills: Vec<String> = (0..6)
-            .map(|i| format!("skill-with-a-fairly-long-name-{i}"))
+        let agents: Vec<String> = (0..6)
+            .map(|i| format!("agent-with-a-long-name-{i}"))
             .collect();
         feed(
             &mut lines,
             &Event::Inventory {
                 tools: vec!["read".into()],
                 mcp: Vec::new(),
-                agents: vec!["coder".into(), "reviewer".into()],
-                skills,
+                agents,
+                skills: vec!["rust-docs".into()],
             },
         );
         let entries = lines.entries();
@@ -7767,10 +7894,12 @@ mod tests {
             panic!("one Report row expected, got {entries:?}")
         };
         assert!(
-            text.starts_with("· 1 tools · 2 agents · 6 skills"),
-            "headline counts all segments: {text}"
+            text.starts_with("agents: agent-with-a-long-name-0"),
+            "agents-only card, no headline: {text}"
         );
         assert!(text.contains("(+4)"), "overflow mark present: {text}");
+        assert!(!text.contains("tools"), "no tools segment: {text}");
+        assert!(!text.contains("skills"), "no skills segment: {text}");
         for row in text.split('\n') {
             assert!(row.chars().count() <= 90, "row fits ~90 cols: {row}");
         }
@@ -8018,7 +8147,7 @@ mod tests {
             branch: Some("main".into()),
             ..Default::default()
         };
-        let rows = sidebar_rows(&sidebar, &meters_sample(), 24, 40);
+        let rows = sidebar_rows(&sidebar, &meters_sample(), 24, 40, None);
         let text = plain_text(&rows);
         assert_eq!(text[0], "session");
         assert!(text.contains(&"model mockco/mock".to_string()), "{text:?}");
@@ -8071,7 +8200,7 @@ mod tests {
             },
             ..Default::default()
         };
-        let rows = sidebar_rows(&sidebar, &Meters::default(), 24, 40);
+        let rows = sidebar_rows(&sidebar, &Meters::default(), 24, 40, None);
         let text = plain_text(&rows);
         let done = text
             .iter()
@@ -8123,14 +8252,85 @@ mod tests {
         // the whole budget: header + air + show = min(height-2, 30) list
         // rows, where the cut mark replaces the last one. At height 8:
         // header, blank, skill-0..4, mark.
-        let rows = sidebar_rows(&sidebar, &Meters::default(), 24, 8);
+        let rows = sidebar_rows(&sidebar, &Meters::default(), 24, 8, None);
         let text = plain_text(&rows);
         assert_eq!(text.len(), 8, "{text:?}");
-        assert_eq!(text[0], "skills", "{text:?}");
+        assert_eq!(text[0], "skills ▾", "{text:?}");
         assert_eq!(text[1], "", "blank row under the header: {text:?}");
         assert_eq!(text[2], "skill-0", "{text:?}");
         assert_eq!(text[6], "skill-4", "{text:?}");
         assert_eq!(text[7], "(+25)", "{text:?}");
+    }
+
+    #[test]
+    fn skills_header_label_marks_count_when_collapsed() {
+        assert_eq!(skills_header_label(true, 4), "skills");
+        assert_eq!(skills_header_label(false, 0), "skills (+0)");
+        assert_eq!(skills_header_label(false, 12), "skills (+12)");
+    }
+
+    #[test]
+    fn sidebar_collapsed_skills_render_header_alone() {
+        let sidebar = SidebarState {
+            inventory: Inventory {
+                skills: vec!["a".into(), "b".into(), "c".into()],
+                ..Default::default()
+            },
+            skills_open: false,
+            ..Default::default()
+        };
+        let rows = sidebar_rows(&sidebar, &Meters::default(), 24, 40, None);
+        let text = plain_text(&rows);
+        let idx = text
+            .iter()
+            .position(|t| t == "skills (+3) ▸")
+            .expect("collapsed header present");
+        // only the header row: the next rendered row is another section's
+        // separating blank / header, never a skill name
+        assert!(!text.iter().any(|t| t == "a" || t == "b" || t == "c"));
+        assert!(idx + 1 < text.len());
+    }
+
+    #[test]
+    fn sidebar_zone_hit_testing() {
+        let zone = SidebarZone::SkillsHeader(ratatui::layout::Rect {
+            x: 94,
+            y: 5,
+            width: 26,
+            height: 1,
+        });
+        assert!(zone.hit(94, 5));
+        assert!(zone.hit(119, 5), "right edge of the sidebar chunk");
+        assert!(!zone.hit(120, 5), "past the sidebar");
+        assert!(!zone.hit(100, 6), "row below the header");
+        assert!(!zone.hit(93, 5), "left of the sidebar");
+    }
+
+    #[test]
+    fn skills_header_hover_swaps_meta_for_accent_underline() {
+        use ratatui::style::Modifier;
+        let rest = skills_header_line(true, false, 4);
+        let rest_spans: Vec<_> = rest
+            .spans
+            .iter()
+            .map(|s| (s.content.as_ref(), s.style))
+            .collect();
+        assert_eq!(rest_spans[0].0, "skills");
+        assert_eq!(rest_spans[1].0, " ▾");
+        assert!(!rest_spans[0].1.add_modifier.contains(Modifier::UNDERLINED));
+        // collapsed label keeps its count under hover too
+        let hovered = skills_header_line(false, true, 4);
+        let hovered_spans: Vec<_> = hovered
+            .spans
+            .iter()
+            .map(|s| (s.content.as_ref(), s.style))
+            .collect();
+        assert_eq!(hovered_spans[0].0, "skills (+4)");
+        assert_eq!(hovered_spans[1].0, " ▸");
+        for (_, st) in &hovered_spans {
+            assert_eq!(st.fg, Some(crate::palette::ACCENT));
+            assert!(st.add_modifier.contains(Modifier::UNDERLINED));
+        }
     }
 
     #[test]
@@ -8144,7 +8344,7 @@ mod tests {
             }],
             ..Default::default()
         };
-        let rows = sidebar_rows(&sidebar, &Meters::default(), 24, 40);
+        let rows = sidebar_rows(&sidebar, &Meters::default(), 24, 40, None);
         let text = plain_text(&rows);
         // every section header is followed by a blank row; a blank row
         // also separates each section from the previous one
@@ -8166,7 +8366,7 @@ mod tests {
             cwd: "…/世界/世界".into(),
             ..Default::default()
         };
-        let rows = sidebar_rows(&sidebar, &Meters::default(), 10, 40);
+        let rows = sidebar_rows(&sidebar, &Meters::default(), 10, 40, None);
         for row in &rows {
             let text: String = row.spans.iter().map(|s| s.content.as_ref()).collect();
             assert!(text.width() <= 10, "{text}");
@@ -8327,6 +8527,7 @@ mod tests {
                     None,
                     &Meters::default(),
                     &SidebarState::default(),
+                    &std::cell::Cell::new(None),
                 )
             })
             .unwrap();
