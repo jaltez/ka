@@ -1053,6 +1053,8 @@ pub struct Inventory {
     pub agents: Vec<String>,
     /// Discovered skill names.
     pub skills: Vec<String>,
+    /// Advertised MCP prompts (`server/name (args)`).
+    pub prompts: Vec<String>,
 }
 
 /// Everything the right sidebar displays. Session figures come from the
@@ -1843,6 +1845,13 @@ pub enum Modal {
         /// Selected row index.
         selected: usize,
     },
+    /// MCP prompt picker (/prompt): `server/name (args)` rows.
+    Prompts {
+        /// Prompt rows in inventory order.
+        items: Vec<String>,
+        /// Selected row index.
+        selected: usize,
+    },
     /// Help overlay.
     Help,
 }
@@ -2400,6 +2409,44 @@ async fn app(
                                     _ => {}
                                 }
                             }
+                            Modal::Prompts { items, selected } => match key.code {
+                                KeyCode::Esc => modal = None,
+                                KeyCode::Up => {
+                                    *selected = selected.saturating_sub(1);
+                                }
+                                KeyCode::Down => {
+                                    if *selected + 1 < items.len() {
+                                        *selected += 1;
+                                    }
+                                }
+                                KeyCode::Enter => {
+                                    if let Some(row) = items.get(*selected).cloned() {
+                                        let (spec, args) = parse_prompt_row(&row);
+                                        modal = None;
+                                        if args.is_empty() {
+                                            if let Some((server, name)) = spec {
+                                                let _ = commands
+                                                    .send(Command::CallPrompt {
+                                                        server,
+                                                        name,
+                                                        args: Default::default(),
+                                                    })
+                                                    .await;
+                                                busy = true;
+                                            }
+                                        } else {
+                                            // arg-picking: prefill the input; the
+                                            // user appends key=value pairs
+                                            if let Some((server, name)) = spec {
+                                                input.text =
+                                                    format!("/prompt {server}/{name} ");
+                                                input.cursor = input.text.chars().count();
+                                            }
+                                        }
+                                    }
+                                }
+                                _ => {}
+                            },
                             Modal::Spills { items, selected } => match key.code {
                                 KeyCode::Esc => modal = None,
                                 KeyCode::Up => {
@@ -2805,6 +2852,10 @@ async fn app(
                                             items: spills.clone(),
                                             selected: 0,
                                         },
+                                        ModalKind::Prompts => Modal::Prompts {
+                                            items: sidebar.inventory.prompts.clone(),
+                                            selected: 0,
+                                        },
                                         // Mode borrows the input box (outer
                                         // arm) and Key the outer arm above:
                                         // neither ever becomes a modal
@@ -3130,6 +3181,7 @@ async fn app(
                             Modal::Key(prompt) => {
                                 prompt.input.extend(text.chars().filter(|c| !c.is_whitespace()));
                             }
+                            Modal::Prompts { .. } => {}
                             Modal::Session(picker) => {
                                 picker.filter.extend(text.chars().filter(|c| !c.is_whitespace()));
                             }
@@ -3554,6 +3606,7 @@ fn apply_event(
             mcp,
             agents,
             skills,
+            prompts,
         } => {
             let card = inventory_card(mcp, agents);
             if !card.is_empty() {
@@ -3564,6 +3617,7 @@ fn apply_event(
                 mcp: mcp.clone(),
                 agents: agents.clone(),
                 skills: skills.clone(),
+                prompts: prompts.clone(),
             };
         }
         Event::Title { title } => {
@@ -3612,6 +3666,44 @@ fn inventory_card(mcp: &[ka_protocol::McpSummary], agents: &[String]) -> String 
         rows.push(pack_row("agents", agents, CAP));
     }
     rows.join("\n")
+}
+
+/// Split an inventory prompt row (`server/name (a, b)`) into its
+/// coordinates and argument names.
+fn parse_prompt_row(row: &str) -> (Option<(String, String)>, Vec<String>) {
+    let (spec, args) = match row.find(" (") {
+        Some(p) => (&row[..p], Some(&row[p + 2..])),
+        None => (row, None),
+    };
+    let coords = spec
+        .split_once('/')
+        .map(|(server, name)| (server.to_string(), name.trim_end_matches(')').to_string()));
+    let arg_names = args
+        .map(|a| {
+            a.trim_end_matches(')')
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+    (coords, arg_names)
+}
+
+/// Parse `/prompt server/name k=v k2=v2` into a CallPrompt triple.
+fn parse_prompt_invocation(
+    rest: &str,
+) -> Option<(String, String, std::collections::HashMap<String, String>)> {
+    let mut parts = rest.split_whitespace();
+    let spec = parts.next()?;
+    let (server, name) = spec.split_once('/')?;
+    let mut args = std::collections::HashMap::new();
+    for pair in parts {
+        let (k, v) = pair.split_once('=')?;
+        args.insert(k.to_string(), v.to_string());
+    }
+    Some((server.to_string(), name.to_string(), args))
 }
 
 /// `label: a · b · c`, dropping tail items for a `(+N)` mark once the
@@ -3693,6 +3785,11 @@ pub struct SlashPopup {
 pub fn available_slash_commands() -> Vec<(String, String)> {
     let mut cmds = vec![
         ("/model".to_string(), "pick a model".to_string()),
+        (
+            "/mcp".to_string(),
+            "refresh MCP tool lists (/mcp refresh)".to_string(),
+        ),
+        ("/prompt".to_string(), "run an MCP prompt".to_string()),
         (
             "/provider".to_string(),
             "connect a provider (api key)".to_string(),
@@ -4052,6 +4149,8 @@ pub enum ModalKind {
     Key,
     /// Spill-file viewer.
     Spills,
+    /// MCP prompt picker.
+    Prompts,
     /// Help overlay.
     Help,
 }
@@ -4102,6 +4201,8 @@ fn slash_command(text: &str) -> Option<Slash> {
             | "/fork"
             | "/checkpoint"
             | "/restore"
+            | "/mcp"
+            | "/prompt"
     ) {
         if let Some(body) = custom_command(head, rest) {
             return Some(Slash {
@@ -4307,6 +4408,41 @@ step now; verify each step."
             followup: None,
             modal: Some(ModalKind::Help),
         }),
+        "/mcp" => match rest {
+            Some("refresh") => Some(Slash {
+                note: None,
+                event: Some(Command::RefreshMcp),
+                quit: false,
+                followup: None,
+                modal: None,
+            }),
+            _ => Some(Slash {
+                note: Some("usage: /mcp refresh — re-list tools on every MCP server".into()),
+                event: None,
+                quit: false,
+                followup: None,
+                modal: None,
+            }),
+        },
+        "/prompt" => {
+            let parsed = rest.and_then(parse_prompt_invocation);
+            match parsed {
+                Some((server, name, args)) => Some(Slash {
+                    note: None,
+                    event: Some(Command::CallPrompt { server, name, args }),
+                    quit: false,
+                    followup: None,
+                    modal: None,
+                }),
+                None => Some(Slash {
+                    note: None,
+                    event: None,
+                    quit: false,
+                    followup: None,
+                    modal: Some(ModalKind::Prompts),
+                }),
+            }
+        }
         "/settings" => Some(Slash {
             note: None,
             event: None,
@@ -4818,6 +4954,11 @@ fn render(
             Modal::Spills { .. } => {
                 hint_spans(&[(" ↑↓", "choose"), (" ⏎", "open"), (" esc", "close")])
             }
+            Modal::Prompts { .. } => hint_spans(&[
+                (" ↑↓", "choose"),
+                (" ⏎", "run / fill args"),
+                (" esc", "close"),
+            ]),
             Modal::Key(_) => hint_spans(&[(" type", "value"), (" ⏎", "save"), (" esc", "cancel")]),
             Modal::Help => hint_spans(&[(" ⏎", "close")]),
         }
@@ -5314,6 +5455,41 @@ fn render(
                         Block::default()
                             .borders(Borders::ALL)
                             .title(padded_title("spills"))
+                            .border_style(crate::palette::BORDER_STYLE)
+                            .padding(ratatui::widgets::Padding::new(1, 1, 1, 1)),
+                    )
+                    .style(ratatui::style::Style::new().bg(crate::palette::BG_SURFACE))
+                    .wrap(Wrap { trim: false });
+                frame.render_widget(widget, rect);
+            }
+            Modal::Prompts { items, selected } => {
+                let height = (items.len() as u16 + 5).clamp(7, 21);
+                let width = 68.min(frame.area().width);
+                let rect = centered(width, height, modal_area);
+                let inner_w = width.saturating_sub(4) as usize;
+                let mut text = Vec::new();
+                if items.is_empty() {
+                    text.push(TuiLine::styled(
+                        "(no MCP prompts advertised)",
+                        crate::palette::META,
+                    ));
+                }
+                let cap = (height as usize).saturating_sub(5);
+                for (i, row) in items.iter().take(cap).enumerate() {
+                    if i == *selected {
+                        text.push(TuiLine::styled(
+                            pad_to_width(row.clone(), inner_w),
+                            selection_style(),
+                        ));
+                    } else {
+                        text.push(TuiLine::raw(row.clone()));
+                    }
+                }
+                let widget = Paragraph::new(text)
+                    .block(
+                        Block::default()
+                            .borders(Borders::ALL)
+                            .title(padded_title("prompts"))
                             .border_style(crate::palette::BORDER_STYLE)
                             .padding(ratatui::widgets::Padding::new(1, 1, 1, 1)),
                     )
@@ -7870,6 +8046,7 @@ mod tests {
                 mcp: Vec::new(),
                 agents: Vec::new(),
                 skills: vec!["rust-docs".into()],
+                prompts: Vec::new(),
             },
         );
         // tools and skills live in the sidebar now: nothing in the chat
@@ -7898,6 +8075,7 @@ mod tests {
                 ],
                 agents: Vec::new(),
                 skills: Vec::new(),
+                prompts: Vec::new(),
             },
         );
         let entries = lines.entries();
@@ -7921,6 +8099,7 @@ mod tests {
                 mcp: Vec::new(),
                 agents,
                 skills: vec!["rust-docs".into()],
+                prompts: Vec::new(),
             },
         );
         let entries = lines.entries();
@@ -8230,6 +8409,7 @@ mod tests {
                     },
                 ],
                 skills: vec!["rust-docs".into()],
+                prompts: Vec::new(),
                 ..Default::default()
             },
             ..Default::default()
@@ -8278,6 +8458,7 @@ mod tests {
         let sidebar = SidebarState {
             inventory: Inventory {
                 skills: many,
+                prompts: Vec::new(),
                 ..Default::default()
             },
             ..Default::default()
@@ -8308,6 +8489,7 @@ mod tests {
         let sidebar = SidebarState {
             inventory: Inventory {
                 skills: vec!["a".into(), "b".into(), "c".into()],
+                prompts: Vec::new(),
                 ..Default::default()
             },
             skills_open: false,
@@ -8453,6 +8635,7 @@ mod tests {
                 }],
                 agents: vec!["coder".into()],
                 skills: vec!["rust-docs".into()],
+                prompts: Vec::new(),
             },
             &mut lines,
             &mut busy,
@@ -8655,5 +8838,47 @@ mod tests {
         // the status bar still owns the last row (no bottom margin)
         let last_row: String = (0..120u16).map(|x| buf[(x, 39)].symbol()).collect();
         assert!(last_row.contains("enter"), "status hints on the last row");
+    }
+
+    #[test]
+    fn prompt_row_parser_splits_coords_and_args() {
+        let (spec, args) = parse_prompt_row("review/repo (pr, dry)");
+        assert_eq!(spec, Some(("review".into(), "repo".into())));
+        assert_eq!(args, vec!["pr".to_string(), "dry".to_string()]);
+        let (spec, args) = parse_prompt_row("review/repo");
+        assert_eq!(spec, Some(("review".into(), "repo".into())));
+        assert!(args.is_empty());
+    }
+
+    #[test]
+    fn prompt_invocation_parses_kv_pairs() {
+        let (server, name, args) = parse_prompt_invocation("review/repo pr=42 dry=true").unwrap();
+        assert_eq!(server, "review");
+        assert_eq!(name, "repo");
+        assert_eq!(args.get("pr").map(String::as_str), Some("42"));
+        assert_eq!(args.get("dry").map(String::as_str), Some("true"));
+        assert!(parse_prompt_invocation("noseparator").is_none());
+    }
+
+    #[test]
+    fn slash_mcp_refresh_and_prompt_dispatch() {
+        let slash = slash_command("/mcp refresh").unwrap();
+        assert!(matches!(slash.event, Some(Command::RefreshMcp)));
+        // bare /mcp is a usage note, not an event
+        let slash = slash_command("/mcp").unwrap();
+        assert!(slash.event.is_none());
+        assert!(slash.note.as_deref().is_some_and(|n| n.contains("usage")));
+
+        let slash = slash_command("/prompt review/repo pr=42").unwrap();
+        match slash.event {
+            Some(Command::CallPrompt { server, name, args }) => {
+                assert_eq!((server.as_str(), name.as_str()), ("review", "repo"));
+                assert_eq!(args.get("pr").map(String::as_str), Some("42"));
+            }
+            other => panic!("expected CallPrompt, got {other:?}"),
+        }
+        // bare /prompt opens the picker modal
+        let slash = slash_command("/prompt").unwrap();
+        assert!(matches!(slash.modal, Some(ModalKind::Prompts)));
     }
 }

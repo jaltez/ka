@@ -161,6 +161,18 @@ pub enum Command {
         #[serde(default)]
         images: Vec<ImagePart>,
     },
+    /// Re-run tools/list on every MCP server (watchdog-adjacent).
+    RefreshMcp,
+    /// Fetch an MCP prompt and start a turn with its rendered text.
+    CallPrompt {
+        /// Owning server name.
+        server: String,
+        /// Prompt name on the server.
+        name: String,
+        /// Prompt arguments.
+        #[serde(default)]
+        args: std::collections::HashMap<String, String>,
+    },
     /// Deliver user input mid-turn (steering), between tool batches.
     Interject {
         /// Interjection text.
@@ -420,6 +432,9 @@ pub enum Event {
         agents: Vec<String>,
         /// Discovered skill names.
         skills: Vec<String>,
+        /// Advertised MCP prompts as `server/name (args)` (additive).
+        #[serde(default)]
+        prompts: Vec<String>,
     },
     /// The model's live todo list (the `todo` hand). Whole-list
     /// replacement: each event supersedes the previous one.
@@ -634,6 +649,7 @@ mod tests {
             ],
             agents: vec!["coder".into()],
             skills: vec!["rust-docs".into()],
+            prompts: Vec::new(),
         });
         roundtrip_event(Event::Todos {
             items: vec![
@@ -653,6 +669,7 @@ mod tests {
             mcp: Vec::new(),
             agents: Vec::new(),
             skills: Vec::new(),
+            prompts: Vec::new(),
         });
     }
 
@@ -743,6 +760,7 @@ mod tests {
                 mcp,
                 agents,
                 skills,
+                prompts: _,
             } => {
                 assert_eq!(
                     tools,
@@ -774,6 +792,7 @@ mod tests {
             mcp: Vec::new(),
             agents: Vec::new(),
             skills: Vec::new(),
+            prompts: Vec::new(),
         })
         .unwrap();
         assert!(line.contains("\"type\":\"inventory\""), "got: {line}");

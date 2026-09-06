@@ -443,12 +443,40 @@ async fn run(
         .into_iter()
         .map(|s| s.name)
         .collect();
+    // MCP prompts for the surface's /prompt popup (20s gate like tools)
+    let mut prompts: Vec<String> = Vec::new();
+    for shared in &ctx.mcp_shared {
+        let listed =
+            tokio::time::timeout(std::time::Duration::from_secs(20), shared.list_prompts()).await;
+        if let Ok(Ok(items)) = listed {
+            for p in items {
+                prompts.push(format!(
+                    "{}/{}{}",
+                    p.server,
+                    p.name,
+                    if p.arguments.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" ({})", p.arguments.join(", "))
+                    }
+                ));
+            }
+        }
+    }
+    // browse hand over every server: resources + prompts discovery
+    if !ctx.mcp_shared.is_empty() {
+        ctx.voice
+            .push_hand(std::sync::Arc::new(crate::mcp::McpMetaHand::new(
+                ctx.mcp_shared.clone(),
+            )));
+    }
     ctx.events
         .send(Event::Inventory {
             tools: ctx.voice.hand_names(),
             mcp: mcp_summary,
             agents: agent_names,
             skills: skill_names,
+            prompts,
         })
         .await
         .ok();
@@ -572,6 +600,90 @@ async fn handle_command(
                 settle_context(&mut ctx.voice, &mut ctx.state, &mut ctx.strand, &ctx.events).await;
             }
             ctx.events.send(Event::Idle).await.ok();
+        }
+        Command::RefreshMcp => {
+            for shared in &ctx.mcp_shared {
+                match shared.refresh_and_install().await {
+                    Ok((tools, delta)) => {
+                        if delta != 0 {
+                            let hands: Vec<std::sync::Arc<dyn crate::hands::Hand>> = tools
+                                .iter()
+                                .map(|t| {
+                                    std::sync::Arc::new(crate::mcp::McpHand::new(
+                                        t.clone(),
+                                        shared.clone(),
+                                    )) as _
+                                })
+                                .collect();
+                            ctx.voice.replace_server_hands(shared.name(), hands);
+                        }
+                        ctx.events
+                            .send(Event::Note {
+                                message: format!(
+                                    "mcp {} refreshed ({delta:+} tools)",
+                                    shared.name()
+                                ),
+                            })
+                            .await
+                            .ok();
+                    }
+                    Err(e) => {
+                        ctx.events
+                            .send(Event::Error {
+                                class: ErrorClass::Protocol,
+                                retryable: false,
+                                message: e,
+                            })
+                            .await
+                            .ok();
+                    }
+                }
+            }
+            ctx.events.send(Event::Idle).await.ok();
+        }
+        Command::CallPrompt { server, name, args } => {
+            let Some(shared) = ctx.mcp_shared.iter().find(|s| s.name() == server).cloned() else {
+                ctx.events
+                    .send(Event::Error {
+                        class: ErrorClass::Protocol,
+                        retryable: false,
+                        message: format!("mcp: no such server {server:?}"),
+                    })
+                    .await
+                    .ok();
+                ctx.events.send(Event::Idle).await.ok();
+                return Ok(());
+            };
+            match shared.get_prompt(&name, &args).await {
+                Ok(text) => {
+                    dispatch_turn(
+                        commands,
+                        &ctx.events,
+                        &mut ctx.state,
+                        &mut ctx.voice,
+                        text,
+                        None,
+                        Vec::new(),
+                        &mut ctx.strand,
+                        &ctx.cwd,
+                    )
+                    .await;
+                    settle_context(&mut ctx.voice, &mut ctx.state, &mut ctx.strand, &ctx.events)
+                        .await;
+                    ctx.events.send(Event::Idle).await.ok();
+                }
+                Err(e) => {
+                    ctx.events
+                        .send(Event::Error {
+                            class: ErrorClass::Protocol,
+                            retryable: false,
+                            message: format!("prompt {server}/{name}: {e}"),
+                        })
+                        .await
+                        .ok();
+                    ctx.events.send(Event::Idle).await.ok();
+                }
+            }
         }
         Command::SetModel { selector } => {
             ctx.state.model = Some(selector.clone());
@@ -2467,6 +2579,7 @@ mod tests {
             mcp,
             agents,
             skills,
+            prompts: _,
         } = inventories[0]
         else {
             unreachable!("filtered above")

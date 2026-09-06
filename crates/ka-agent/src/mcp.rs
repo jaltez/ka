@@ -75,6 +75,32 @@ pub struct McpTool {
     pub schema: Value,
 }
 
+/// One resource advertised by a server.
+#[derive(Debug, Clone, PartialEq)]
+pub struct McpResource {
+    /// Resource URI.
+    pub uri: String,
+    /// Display name.
+    pub name: String,
+    /// Human/model-facing description.
+    pub description: String,
+    /// MIME type (best known).
+    pub mime_type: String,
+}
+
+/// One prompt advertised by a server.
+#[derive(Debug, Clone, PartialEq)]
+pub struct McpPrompt {
+    /// Owning server name.
+    pub server: String,
+    /// Raw prompt name.
+    pub name: String,
+    /// Human/model-facing description.
+    pub description: String,
+    /// Argument names the prompt takes.
+    pub arguments: Vec<String>,
+}
+
 /// Protocol version ka speaks (negotiation tolerates others).
 const PROTOCOL_VERSION: &str = "2025-06-18";
 
@@ -434,6 +460,99 @@ impl McpClient {
         Ok(extract_text(&result))
     }
 
+    /// List resources advertised by the server.
+    pub async fn list_resources(&mut self) -> Result<Vec<McpResource>, String> {
+        let result = self.request("resources/list", json!({})).await?;
+        let items = result["resources"].as_array().ok_or_else(|| {
+            "resources/list: no resources array (server may lack resources support)".to_string()
+        })?;
+        Ok(items
+            .iter()
+            .filter_map(|r| {
+                Some(McpResource {
+                    uri: r["uri"].as_str()?.to_string(),
+                    name: r["name"].as_str().unwrap_or("").to_string(),
+                    description: r["description"].as_str().unwrap_or("").to_string(),
+                    mime_type: r["mimeType"].as_str().unwrap_or("text/plain").to_string(),
+                })
+            })
+            .collect())
+    }
+
+    /// Read one resource; returns the concatenated text contents.
+    pub async fn read_resource(&mut self, uri: &str) -> Result<String, String> {
+        let result = self.request("resources/read", json!({"uri": uri})).await?;
+        let parts = result["contents"]
+            .as_array()
+            .ok_or_else(|| "resources/read: no contents array".to_string())?;
+        let text: Vec<&str> = parts.iter().filter_map(|p| p["text"].as_str()).collect();
+        if text.is_empty() {
+            return Err(format!("resources/read {uri}: no text content"));
+        }
+        Ok(text.join("\n"))
+    }
+
+    /// List prompts advertised by the server with their argument names.
+    pub async fn list_prompts(&mut self) -> Result<Vec<McpPrompt>, String> {
+        let result = self.request("prompts/list", json!({})).await?;
+        let items = result["prompts"].as_array().ok_or_else(|| {
+            "prompts/list: no prompts array (server may lack prompts support)".to_string()
+        })?;
+        Ok(items
+            .iter()
+            .filter_map(|p| {
+                Some(McpPrompt {
+                    server: self.server_name.clone(),
+                    name: p["name"].as_str()?.to_string(),
+                    description: p["description"].as_str().unwrap_or("").to_string(),
+                    arguments: p["arguments"]
+                        .as_array()
+                        .map(|a| {
+                            a.iter()
+                                .filter_map(|arg| arg["name"].as_str().map(str::to_string))
+                                .collect()
+                        })
+                        .unwrap_or_default(),
+                })
+            })
+            .collect())
+    }
+
+    /// Fetch a prompt; returns its messages as `role: text` lines.
+    pub async fn get_prompt(
+        &mut self,
+        name: &str,
+        args: &HashMap<String, String>,
+    ) -> Result<String, String> {
+        let result = self
+            .request(
+                "prompts/get",
+                json!({
+                    "name": name,
+                    "arguments": args,
+                }),
+            )
+            .await?;
+        let messages = result["messages"]
+            .as_array()
+            .ok_or_else(|| "prompts/get: no messages array".to_string())?;
+        let rendered: Vec<String> = messages
+            .iter()
+            .map(|m| {
+                let role = m["role"].as_str().unwrap_or("user");
+                let text = m
+                    .pointer("/content/text")
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                format!("{role}: {text}")
+            })
+            .collect();
+        if rendered.is_empty() {
+            return Err(format!("prompts/get {name}: empty"));
+        }
+        Ok(rendered.join("\n\n"))
+    }
+
     /// Whether the server is still reachable: process liveness on
     /// stdio, an MCP `ping` round-trip on HTTP transports.
     pub async fn alive(&mut self) -> bool {
@@ -538,6 +657,54 @@ impl McpShared {
             Some(c) => c.call_tool(tool, args).await,
             None => Err(format!("mcp {}: disconnected", self.cfg.name)),
         }
+    }
+
+    /// List resources through the current client.
+    pub async fn list_resources(&self) -> Result<Vec<McpResource>, String> {
+        let mut guard = self.cell.lock().await;
+        let Some(c) = guard.as_mut() else {
+            return Err(format!("mcp {}: disconnected", self.cfg.name));
+        };
+        c.list_resources().await
+    }
+
+    /// Read one resource through the current client.
+    pub async fn read_resource(&self, uri: &str) -> Result<String, String> {
+        let mut guard = self.cell.lock().await;
+        let Some(c) = guard.as_mut() else {
+            return Err(format!("mcp {}: disconnected", self.cfg.name));
+        };
+        c.read_resource(uri).await
+    }
+
+    /// List prompts across this server.
+    pub async fn list_prompts(&self) -> Result<Vec<McpPrompt>, String> {
+        let mut guard = self.cell.lock().await;
+        let Some(c) = guard.as_mut() else {
+            return Err(format!("mcp {}: disconnected", self.cfg.name));
+        };
+        c.list_prompts().await
+    }
+
+    /// Fetch and render one prompt.
+    pub async fn get_prompt(
+        &self,
+        name: &str,
+        args: &HashMap<String, String>,
+    ) -> Result<String, String> {
+        let mut guard = self.cell.lock().await;
+        let Some(c) = guard.as_mut() else {
+            return Err(format!("mcp {}: disconnected", self.cfg.name));
+        };
+        c.get_prompt(name, args).await
+    }
+
+    /// Explicit tool refresh: re-list, install, and report the delta.
+    pub async fn refresh_and_install(&self) -> Result<(Vec<McpTool>, i64), String> {
+        let tools = self.refresh_tools().await?;
+        let delta = tools.len() as i64 - self.tool_count() as i64;
+        *self.tools.lock() = tools.clone();
+        Ok((tools, delta))
     }
 
     /// List tools through the current client (explicit refresh).
@@ -787,6 +954,151 @@ impl crate::hands::Hand for McpHand {
     }
 }
 
+/// The built-in `mcp` meta-hand: browse server resources and prompts
+/// without burning a model turn on discovery. Read-clearance: listing
+/// and reading never mutate server state.
+pub struct McpMetaHand {
+    servers: Vec<McpShared>,
+}
+
+impl McpMetaHand {
+    /// One hand over every connected server.
+    pub fn new(servers: Vec<McpShared>) -> Self {
+        Self { servers }
+    }
+
+    fn find(&self, server: &str) -> Result<&McpShared, String> {
+        self.servers
+            .iter()
+            .find(|s| s.name() == server)
+            .ok_or_else(|| {
+                format!(
+                    "mcp: no such server {server:?} (have: {})",
+                    self.servers
+                        .iter()
+                        .map(|s| s.name())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            })
+    }
+}
+
+impl crate::hands::Hand for McpMetaHand {
+    fn def(&self) -> crate::hands::HandDef {
+        crate::hands::HandDef {
+            name: "mcp".to_string(),
+            description: "Browse MCP servers: list resources, read one resource, or list                           prompts. Actions: {\"action\": \"resources\", \"server\": \"name\"} |                           {\"action\": \"resource\", \"server\": \"name\", \"uri\": \"...\"} |                           {\"action\": \"prompts\"}."
+                .to_string(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "action": {"type": "string", "enum": ["resources", "resource", "prompts"],
+                               "description": "Which browse operation to run"},
+                    "server": {"type": "string", "description": "Server name (required)"},
+                    "uri": {"type": "string", "description": "Resource URI (resource action)"}
+                },
+                "required": ["action"]
+            }),
+            clearance: crate::hands::Clearance::Read,
+            read_only: true,
+        }
+    }
+
+    fn execute<'a>(
+        &'a self,
+        args: &'a Value,
+        _ctx: &'a crate::hands::HandContext,
+    ) -> std::pin::Pin<Box<dyn Future<Output = crate::hands::ToolOutput> + Send + 'a>> {
+        let servers = self.servers.clone();
+        Box::pin(async move {
+            let action = args["action"].as_str().unwrap_or("");
+            let server = args["server"].as_str().unwrap_or_default().to_string();
+            match action {
+                "resources" => {
+                    let mut out = String::new();
+                    for shared in &servers {
+                        if !server.is_empty() && shared.name() != server {
+                            continue;
+                        }
+                        match shared.list_resources().await {
+                            Ok(items) => {
+                                out.push_str(&format!(
+                                    "{}: {} resource(s)\n",
+                                    shared.name(),
+                                    items.len()
+                                ));
+                                for r in items {
+                                    out.push_str(&format!(
+                                        "  {} — {} ({})\n",
+                                        r.uri,
+                                        if r.name.is_empty() {
+                                            &r.description
+                                        } else {
+                                            &r.name
+                                        },
+                                        r.mime_type
+                                    ));
+                                }
+                            }
+                            Err(e) => out.push_str(&format!("{}: {e}\n", shared.name())),
+                        }
+                    }
+                    if out.is_empty() {
+                        out.push_str("(no servers matched)\n");
+                    }
+                    crate::hands::ToolOutput::ok(out)
+                }
+                "resource" => {
+                    if server.is_empty() {
+                        return crate::hands::ToolOutput::err("resource: 'server' required");
+                    }
+                    let Some(uri) = args["uri"].as_str() else {
+                        return crate::hands::ToolOutput::err("resource: 'uri' required");
+                    };
+                    let shared = match self.find(&server) {
+                        Ok(s) => s,
+                        Err(e) => return crate::hands::ToolOutput::err(e),
+                    };
+                    match shared.read_resource(uri).await {
+                        Ok(text) => crate::hands::ToolOutput::ok(text),
+                        Err(e) => crate::hands::ToolOutput::err(e),
+                    }
+                }
+                "prompts" => {
+                    let mut out = String::new();
+                    for shared in &servers {
+                        match shared.list_prompts().await {
+                            Ok(items) => {
+                                for p in items {
+                                    out.push_str(&format!(
+                                        "{}/{} ({})\n",
+                                        p.server,
+                                        p.name,
+                                        if p.arguments.is_empty() {
+                                            "no args".to_string()
+                                        } else {
+                                            format!("args: {}", p.arguments.join(", "))
+                                        }
+                                    ));
+                                }
+                            }
+                            Err(e) => out.push_str(&format!("{}: {e}\n", shared.name())),
+                        }
+                    }
+                    if out.is_empty() {
+                        out.push_str("(no prompts advertised)\n");
+                    }
+                    crate::hands::ToolOutput::ok(out)
+                }
+                other => crate::hands::ToolOutput::err(format!(
+                    "mcp: unknown action {other:?} (resources | resource | prompts)"
+                )),
+            }
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
@@ -992,6 +1304,27 @@ for line in sys.stdin:
                             });
                             http_ok("application/json", "", &result.to_string())
                         }
+                        Some("resources/list") => {
+                            let result = json!({
+                                "jsonrpc": "2.0",
+                                "id": msg["id"],
+                                "result": {"resources": [
+                                    {"uri": "mem://notes", "name": "notes",
+                                     "description": "server notes", "mimeType": "text/plain"}
+                                ]}
+                            });
+                            http_ok("application/json", "", &result.to_string())
+                        }
+                        Some("resources/read") => {
+                            let result = json!({
+                                "jsonrpc": "2.0",
+                                "id": msg["id"],
+                                "result": {"contents": [
+                                    {"uri": msg["params"]["uri"], "text": "RESOURCE-BODY"}
+                                ]}
+                            });
+                            http_ok("application/json", "", &result.to_string())
+                        }
                         _ => {
                             b"HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
                                 .to_vec()
@@ -1167,6 +1500,29 @@ for line in sys.stdin:
             other => panic!("unexpected maintenance: {other:?}"),
         }
         assert!(shared.alive().await, "reconnected client must serve pings");
+    }
+
+    #[tokio::test]
+    async fn resources_list_and_read_round_trip() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(streamable_server(listener));
+        let cfg = McpServerConfig {
+            name: "http".to_string(),
+            command: None,
+            args: Vec::new(),
+            env: HashMap::new(),
+            url: Some(format!("http://{addr}/mcp")),
+            headers: Vec::new(),
+        };
+        let (client, _tools) = McpClient::spawn_connect(&cfg).await.unwrap();
+        let shared = McpShared::new(cfg, client, Vec::new());
+        let items = shared.list_resources().await.unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].uri, "mem://notes");
+        assert_eq!(items[0].mime_type, "text/plain");
+        let body = shared.read_resource("mem://notes").await.unwrap();
+        assert_eq!(body, "RESOURCE-BODY");
     }
 
     #[test]
