@@ -111,6 +111,18 @@ pub struct Roles {
 pub struct Tools {
     /// Bash tool settings.
     pub bash: BashTools,
+    /// Read tool settings.
+    pub read: ReadTools,
+}
+
+/// Read tool tuning (`[tools.read]`).
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema,
+)]
+#[serde(deny_unknown_fields, default)]
+pub struct ReadTools {
+    /// Image size cap in MB for the read hand (None = 5; 0 = unlimited).
+    pub max_image_mb: Option<u32>,
 }
 
 /// Bash tool tuning (`[tools.bash]`).
@@ -125,6 +137,9 @@ pub struct BashTools {
     /// background.
     pub background_after_ms: Option<u64>,
 }
+
+/// Default image size cap for the read hand (5 MB).
+pub const DEFAULT_MAX_IMAGE_MB: u32 = 5;
 
 /// Default bash auto-background threshold (30s).
 pub const DEFAULT_BACKGROUND_AFTER_MS: u64 = 30_000;
@@ -230,6 +245,9 @@ impl Config {
         if other.tools.bash.background_after_ms.is_some() {
             self.tools.bash.background_after_ms = other.tools.bash.background_after_ms;
         }
+        if other.tools.read.max_image_mb.is_some() {
+            self.tools.read.max_image_mb = other.tools.read.max_image_mb;
+        }
         if !other.fallback.models.is_empty() {
             self.fallback.models = other.fallback.models;
         }
@@ -245,6 +263,10 @@ impl Config {
             .bash
             .background_after_ms
             .unwrap_or(DEFAULT_BACKGROUND_AFTER_MS)
+    }
+    /// Effective read-hand image cap in MB (default 5, 0 = unlimited).
+    pub fn effective_max_image_mb(&self) -> u32 {
+        self.tools.read.max_image_mb.unwrap_or(DEFAULT_MAX_IMAGE_MB)
     }
 
     /// The effective permission mode (free unless set in a layer).

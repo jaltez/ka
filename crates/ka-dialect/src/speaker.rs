@@ -24,7 +24,12 @@ pub struct TurnMessage {
     pub calls: Vec<ToolCall>,
     /// Tool results carried by a `Tool`-role message.
     pub results: Vec<ToolResult>,
+    /// Images attached to this message (user prompts, tool outputs).
+    pub images: Vec<ImagePart>,
 }
+
+/// Attached image (base64 payload + media type).
+pub use ka_protocol::ImagePart;
 
 impl TurnMessage {
     /// A plain user message.
@@ -34,6 +39,18 @@ impl TurnMessage {
             content: content.into(),
             calls: Vec::new(),
             results: Vec::new(),
+            images: Vec::new(),
+        }
+    }
+
+    /// A user message carrying images.
+    pub fn user_with_images(content: impl Into<String>, images: Vec<ImagePart>) -> Self {
+        Self {
+            role: TurnRole::User,
+            content: content.into(),
+            calls: Vec::new(),
+            results: Vec::new(),
+            images,
         }
     }
 
@@ -44,6 +61,7 @@ impl TurnMessage {
             content: content.into(),
             calls: Vec::new(),
             results: Vec::new(),
+            images: Vec::new(),
         }
     }
 
@@ -54,6 +72,7 @@ impl TurnMessage {
             content: content.into(),
             calls,
             results: Vec::new(),
+            images: Vec::new(),
         }
     }
 
@@ -64,6 +83,7 @@ impl TurnMessage {
             content: String::new(),
             calls: Vec::new(),
             results,
+            images: Vec::new(),
         }
     }
 }
@@ -77,6 +97,8 @@ pub struct ToolResult {
     pub content: String,
     /// Whether the tool reported an error.
     pub is_error: bool,
+    /// Images produced by the tool (e.g. the read hand on an image file).
+    pub images: Vec<ImagePart>,
 }
 
 /// Model-facing tool definition.

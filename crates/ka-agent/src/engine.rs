@@ -192,8 +192,10 @@ fn history_from_records(
                             call_id: r.call_id.clone(),
                             content: r.content.clone(),
                             is_error: r.is_error,
+                            images: Vec::new(),
                         })
                         .collect(),
+                    images: Vec::new(),
                 });
             }
             ka_strand::Record::Digest { summary, .. } => {
@@ -338,6 +340,7 @@ async fn run(
     voice.set_hooks(hooks);
     voice.set_bash_background_ms(config.effective_bash_background_after_ms());
     voice.set_fallbacks(config.fallback.models.clone());
+    voice.set_max_image_mb(config.effective_max_image_mb());
     {
         let slot = voice.pathfinder_slot();
         slot.write().catalog = pathfinder_catalog;
@@ -459,7 +462,11 @@ async fn handle_command(
     ctx: &mut Ctx,
 ) -> Result<(), DynError> {
     match cmd {
-        Command::Prompt { text, schema } => {
+        Command::Prompt {
+            text,
+            schema,
+            images,
+        } => {
             dispatch_turn(
                 commands,
                 &ctx.events,
@@ -467,6 +474,7 @@ async fn handle_command(
                 &mut ctx.voice,
                 text,
                 schema,
+                images,
                 &mut ctx.strand,
                 &ctx.cwd,
             )
@@ -484,6 +492,7 @@ async fn handle_command(
                     &mut ctx.voice,
                     deferred,
                     None,
+                    Vec::new(),
                     &mut ctx.strand,
                     &ctx.cwd,
                 )
@@ -1286,6 +1295,7 @@ async fn dispatch_turn(
     voice: &mut Voice,
     text: String,
     schema: Option<serde_json::Value>,
+    images: Vec<ka_dialect::ImagePart>,
     strand: &mut ka_strand::StrandFile,
     cwd: &std::path::Path,
 ) {
@@ -1303,6 +1313,7 @@ async fn dispatch_turn(
                 &mut state.deferrals,
                 &mut state.guards,
                 schema,
+                images,
             )
             .await
     } else {
@@ -1618,6 +1629,7 @@ mod tests {
             .send(Command::Prompt {
                 text: "hi".into(),
                 schema: None,
+                images: Vec::new(),
             })
             .await
             .unwrap();
@@ -1646,6 +1658,7 @@ mod tests {
             .send(Command::Prompt {
                 text: "slow".into(),
                 schema: None,
+                images: Vec::new(),
             })
             .await
             .unwrap();
@@ -1668,6 +1681,7 @@ mod tests {
             .send(Command::Prompt {
                 text: "one".into(),
                 schema: None,
+                images: Vec::new(),
             })
             .await
             .unwrap();
@@ -1720,6 +1734,7 @@ mod tests {
             .send(Command::Prompt {
                 text: "hello there".into(),
                 schema: None,
+                images: Vec::new(),
             })
             .await
             .unwrap();
@@ -1755,6 +1770,7 @@ mod tests {
             .send(Command::Prompt {
                 text: "second question".into(),
                 schema: None,
+                images: Vec::new(),
             })
             .await
             .unwrap();
@@ -1810,6 +1826,7 @@ mod tests {
             .send(Command::Prompt {
                 text: "hi".into(),
                 schema: None,
+                images: Vec::new(),
             })
             .await
             .unwrap();
@@ -1917,6 +1934,7 @@ mod tests {
             .send(Command::Prompt {
                 text: "hello".into(),
                 schema: None,
+                images: Vec::new(),
             })
             .await
             .unwrap();
@@ -1975,6 +1993,7 @@ mod tests {
                 .send(Command::Prompt {
                     text: prompt.into(),
                     schema: None,
+                    images: Vec::new(),
                 })
                 .await
                 .unwrap();
@@ -2030,6 +2049,7 @@ mod tests {
             .send(Command::Prompt {
                 text: "first session question".into(),
                 schema: None,
+                images: Vec::new(),
             })
             .await
             .unwrap();
@@ -2159,6 +2179,7 @@ mod tests {
             .send(Command::Prompt {
                 text: text.to_string(),
                 schema: None,
+                images: Vec::new(),
             })
             .await
             .unwrap();
@@ -2551,6 +2572,7 @@ mod tests {
             .send(Command::Prompt {
                 text: "please fix the parser in src/x.rs".into(),
                 schema: None,
+                images: Vec::new(),
             })
             .await
             .unwrap();
@@ -2589,6 +2611,7 @@ mod tests {
             .send(Command::Prompt {
                 text: "please fix the parser in src/x.rs".into(),
                 schema: None,
+                images: Vec::new(),
             })
             .await
             .unwrap();
@@ -2624,6 +2647,7 @@ mod tests {
             .send(Command::Prompt {
                 text: "please fix the parser in src/x.rs".into(),
                 schema: None,
+                images: Vec::new(),
             })
             .await
             .unwrap();
@@ -2652,6 +2676,7 @@ mod tests {
             .send(Command::Prompt {
                 text: "please fix the parser in src/x.rs".into(),
                 schema: None,
+                images: Vec::new(),
             })
             .await
             .unwrap();
@@ -2683,6 +2708,7 @@ mod tests {
             .send(Command::Prompt {
                 text: "second question".into(),
                 schema: None,
+                images: Vec::new(),
             })
             .await
             .unwrap();

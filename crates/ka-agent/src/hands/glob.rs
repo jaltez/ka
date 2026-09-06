@@ -147,6 +147,7 @@ mod tests {
             )),
             jobs: std::sync::Arc::new(crate::hands::jobs::JobTable::new()),
             bash_background_ms: 0,
+            max_image_mb: 5,
         }
     }
 

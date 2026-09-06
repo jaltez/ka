@@ -177,6 +177,7 @@ fn request(dialect: Dialect, system: &str) -> SpeakRequest {
             content: "hi".to_string(),
             calls: Vec::new(),
             results: Vec::new(),
+            images: Vec::new(),
         }],
         tools: Vec::new(),
         token: Some("k-test-token".to_string()),
@@ -546,8 +547,8 @@ async fn openai_structured_output_attaches_response_format() {
     assert!(events.iter().any(|e| matches!(e, StreamEvent::Text(_))));
 
     let raw = captured.lock().clone().unwrap();
-    let body: serde_json::Value = serde_json::from_str(raw.split("\r\n\r\n").nth(1).unwrap())
-        .unwrap();
+    let body: serde_json::Value =
+        serde_json::from_str(raw.split("\r\n\r\n").nth(1).unwrap()).unwrap();
     let rf = &body["response_format"];
     assert_eq!(rf["type"], "json_schema");
     assert_eq!(rf["json_schema"]["name"], "output");
@@ -564,8 +565,8 @@ async fn responses_structured_output_attaches_text_format() {
     assert!(events.iter().any(|e| matches!(e, StreamEvent::Text(_))));
 
     let raw = captured.lock().clone().unwrap();
-    let body: serde_json::Value = serde_json::from_str(raw.split("\r\n\r\n").nth(1).unwrap())
-        .unwrap();
+    let body: serde_json::Value =
+        serde_json::from_str(raw.split("\r\n\r\n").nth(1).unwrap()).unwrap();
     let fmt = &body["text"]["format"];
     assert_eq!(fmt["type"], "json_schema");
     assert_eq!(fmt["name"], "output");
@@ -612,8 +613,8 @@ async fn anthropic_structured_output_forces_tool_and_parses_args_as_reply() {
     );
 
     let raw = captured.lock().clone().unwrap();
-    let body: serde_json::Value = serde_json::from_str(raw.split("\r\n\r\n").nth(1).unwrap())
-        .unwrap();
+    let body: serde_json::Value =
+        serde_json::from_str(raw.split("\r\n\r\n").nth(1).unwrap()).unwrap();
     let tools = body["tools"].as_array().unwrap();
     let forced = tools
         .iter()
@@ -623,5 +624,102 @@ async fn anthropic_structured_output_forces_tool_and_parses_args_as_reply() {
     assert_eq!(
         body["tool_choice"],
         serde_json::json!({ "type": "tool", "name": "structured_output" })
+    );
+}
+
+const PNG_B64: &str = "iVBORw0KGgoAAAANSUhEUg==";
+
+fn image_request(dialect: Dialect) -> SpeakRequest {
+    let mut req = request(dialect, "look");
+    req.messages[0].images = vec![ka_dialect::ImagePart {
+        data: PNG_B64.into(),
+        media_type: "image/png".into(),
+    }];
+    req
+}
+
+#[tokio::test]
+async fn openai_image_uses_data_url_part() {
+    let (addr, captured) = serve_sse(OPENAI_BASIC).await;
+    let dialect = dialect_for("openai_chat", addr, "input = [\"text\", \"image\"]");
+    let events = collect(&OpenaiChat::new(), image_request(dialect)).await;
+    assert!(events.iter().any(|e| matches!(e, StreamEvent::Text(_))));
+
+    let raw = captured.lock().clone().unwrap();
+    assert!(raw.contains("image_url"), "{raw}");
+    assert!(
+        raw.contains(&format!("data:image/png;base64,{PNG_B64}")),
+        "{raw}"
+    );
+    assert!(raw.contains("\"type\":\"text\""), "{raw}");
+}
+
+#[tokio::test]
+async fn openai_image_without_vision_is_rejected() {
+    let (addr, _cap) = serve_sse(OPENAI_BASIC).await;
+    let dialect = dialect_for("openai_chat", addr, "input = [\"text\"]");
+    let err = collect(&OpenaiChat::new(), image_request(dialect)).await;
+    assert!(matches!(
+        err.last(),
+        Some(StreamEvent::Failed {
+            class: ka_protocol::ErrorClass::Unsupported,
+            ..
+        })
+    ));
+}
+
+const ANTHROPIC_VISION_OK: &str = r#"
+data: {"type":"message_start","message":{"usage":{"input_tokens":10}}}
+
+data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}
+
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"seen"}}
+
+data: {"type":"content_block_stop","index":0}
+
+data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":1}}
+
+data: {"type":"message_stop"}
+
+"#;
+
+#[tokio::test]
+async fn anthropic_image_uses_base64_block() {
+    let (addr, captured) = serve_sse(ANTHROPIC_VISION_OK).await;
+    let dialect = dialect_for("anthropic_messages", addr, "input = [\"text\", \"image\"]");
+    let events = collect(&AnthropicMessages::new(), image_request(dialect)).await;
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, StreamEvent::Text(t) if t == "seen"))
+    );
+
+    let raw = captured.lock().clone().unwrap();
+    let body: serde_json::Value =
+        serde_json::from_str(raw.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+    let content = body["messages"][0]["content"].as_array().unwrap();
+    assert_eq!(content[0]["type"], "image");
+    assert_eq!(content[0]["source"]["type"], "base64");
+    assert_eq!(content[0]["source"]["media_type"], "image/png");
+    assert_eq!(content[0]["source"]["data"], PNG_B64);
+    assert_eq!(content[1]["type"], "text");
+}
+
+#[tokio::test]
+async fn responses_image_uses_input_image() {
+    let (addr, captured) = serve_sse(RESPONSES_BASIC).await;
+    let dialect = dialect_for("openai_responses", addr, "input = [\"text\", \"image\"]");
+    let events = collect(&OpenaiResponses::new(), image_request(dialect)).await;
+    assert!(events.iter().any(|e| matches!(e, StreamEvent::Text(_))));
+
+    let raw = captured.lock().clone().unwrap();
+    let body: serde_json::Value =
+        serde_json::from_str(raw.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+    let content = body["input"][0]["content"].as_array().unwrap();
+    assert_eq!(content[0]["type"], "input_text");
+    assert_eq!(content[1]["type"], "input_image");
+    assert_eq!(
+        content[1]["image_url"],
+        format!("data:image/png;base64,{PNG_B64}")
     );
 }

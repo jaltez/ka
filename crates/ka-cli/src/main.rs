@@ -298,6 +298,7 @@ async fn dispatch(cli: Cli) -> Result<ExitCode, String> {
                 session,
                 trust,
                 schema_value,
+                Vec::new(),
             )
             .await
         }
@@ -375,6 +376,7 @@ async fn run_headless(
     session: Option<String>,
     force_trust: bool,
     schema: Option<serde_json::Value>,
+    images: Vec<ka_protocol::ImagePart>,
 ) -> Result<ExitCode, String> {
     let trust = trust_for_cwd(force_trust);
     warn_untrusted_conventions(&std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
@@ -408,6 +410,7 @@ async fn run_headless(
         .send(Command::Prompt {
             text: prompt,
             schema,
+            images,
         })
         .await
         .map_err(|_| "engine closed before prompt".to_string())?;

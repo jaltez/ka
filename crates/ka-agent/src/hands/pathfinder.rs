@@ -110,6 +110,7 @@ impl Hand for PathfinderHand {
                         &mut deferrals,
                         &mut GuardRuntime::default(),
                         None,
+                        Vec::new(),
                     )
                     .await;
             });

@@ -46,6 +46,8 @@ pub struct ToolOutput {
     pub is_error: bool,
     /// Spill pointer if full output was parked on disk.
     pub spill: Option<String>,
+    /// Images produced by the tool (read hand on an image file).
+    pub images: Vec<ka_protocol::ImagePart>,
 }
 
 impl ToolOutput {
@@ -55,6 +57,7 @@ impl ToolOutput {
             content: content.into(),
             is_error: false,
             spill: None,
+            images: Vec::new(),
         }
     }
 
@@ -64,6 +67,7 @@ impl ToolOutput {
             content: content.into(),
             is_error: true,
             spill: None,
+            images: Vec::new(),
         }
     }
 }
@@ -119,6 +123,8 @@ pub struct HandContext {
     pub jobs: std::sync::Arc<jobs::JobTable>,
     /// Bash auto-background threshold in ms (0 = never background).
     pub bash_background_ms: u64,
+    /// Read-hand image size cap in MB (0 = unlimited).
+    pub max_image_mb: u32,
 }
 
 /// The read ledger: files the model has read, with their stamps. Edits

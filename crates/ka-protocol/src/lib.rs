@@ -79,6 +79,15 @@ pub struct Usage {
     pub cost: f64,
 }
 
+/// One attached image: base64 payload and its IANA media type.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct ImagePart {
+    /// Base64-encoded image bytes.
+    pub data: String,
+    /// Media type, e.g. `image/png`.
+    pub media_type: String,
+}
+
 /// Snapshot of context-window consumption.
 #[derive(
     Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema,
@@ -148,6 +157,9 @@ pub enum Command {
         /// (None = free-form text).
         #[serde(default)]
         schema: Option<serde_json::Value>,
+        /// Images attached to the prompt (base64 data + media type).
+        #[serde(default)]
+        images: Vec<ImagePart>,
     },
     /// Deliver user input mid-turn (steering), between tool batches.
     Interject {
@@ -482,6 +494,7 @@ mod tests {
         roundtrip_command(Command::Prompt {
             text: "hi".into(),
             schema: None,
+            images: Vec::new(),
         });
         roundtrip_command(Command::Interject {
             text: "use tabs".into(),

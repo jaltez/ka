@@ -337,6 +337,7 @@ mod tests {
             )),
             jobs: Arc::new(JobTable::new()),
             bash_background_ms: 0,
+            max_image_mb: 5,
         }
     }
 

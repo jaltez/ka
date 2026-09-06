@@ -105,12 +105,40 @@ async fn speak_openai(
             "json_schema": { "name": "output", "strict": true, "schema": schema },
         });
     }
+    // vision gate: images on the wire require an image-input dialect
+    let has_images = req
+        .messages
+        .iter()
+        .any(|m| !m.images.is_empty() || m.results.iter().any(|r| !r.images.is_empty()));
+    if has_images && !dialect.input.contains(&crate::dialects::Modality::Image) {
+        return Err(WireError {
+            class: ka_protocol::ErrorClass::Unsupported,
+            retryable: false,
+            message: format!("model {} has no vision", req.model_id),
+        });
+    }
+    let image_parts = |images: &[crate::ImagePart]| -> Vec<Value> {
+        images
+            .iter()
+            .map(|img| {
+                json!({
+                    "type": "image_url",
+                    "image_url": { "url": format!("data:{};base64,{}", img.media_type, img.data) }
+                })
+            })
+            .collect()
+    };
     let mut messages = Vec::new();
     if !req.system.is_empty() {
         messages.push(json!({"role": "system", "content": req.system}));
     }
     for m in &req.messages {
         match m.role {
+            crate::speaker::TurnRole::User if !m.images.is_empty() => {
+                let mut parts = vec![json!({"type": "text", "text": m.content})];
+                parts.extend(image_parts(&m.images));
+                messages.push(json!({"role": "user", "content": parts}));
+            }
             crate::speaker::TurnRole::User => {
                 messages.push(json!({"role": "user", "content": m.content}));
             }
@@ -147,6 +175,11 @@ async fn speak_openai(
                         "tool_call_id": r.call_id,
                         "content": r.content,
                     }));
+                    // tool messages take text only on this wire: the
+                    // images ride a user turn right after their result
+                    if !r.images.is_empty() {
+                        messages.push(json!({"role": "user", "content": image_parts(&r.images)}));
+                    }
                 }
             }
         }

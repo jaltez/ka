@@ -189,6 +189,7 @@ impl Voice {
                 )),
                 jobs,
                 bash_background_ms: 0,
+                max_image_mb: 5,
             },
             state: VoiceState::default(),
             max_steps,
@@ -252,6 +253,7 @@ impl Voice {
             )),
             jobs: std::sync::Arc::new(crate::hands::jobs::JobTable::new()),
             bash_background_ms: 0,
+            max_image_mb: 5,
         };
         Self {
             catalog,
@@ -302,6 +304,11 @@ impl Voice {
     /// Set the fallback model chain ([fallback] models; engine bootstrap).
     pub fn set_fallbacks(&mut self, models: Vec<String>) {
         self.fallbacks = models;
+    }
+
+    /// Set the read-hand image size cap in MB (engine bootstrap).
+    pub fn set_max_image_mb(&mut self, mb: u32) {
+        self.hand_ctx.max_image_mb = mb;
     }
 
     /// Set the bash auto-background threshold in ms (engine bootstrap;
@@ -461,6 +468,7 @@ impl Voice {
                     rl
                 })
                 .collect(),
+            images: m.images.clone(),
         }
     }
     /// Summarize the conversation with the active model (same-model
@@ -794,6 +802,7 @@ impl Voice {
         deferrals: &mut VecDeque<String>,
         guards: &mut GuardRuntime,
         schema: Option<serde_json::Value>,
+        images: Vec<ka_dialect::ImagePart>,
     ) -> Usage {
         use ka_dialect::parse_selector;
         let mut parsed = match parse_selector(model_selector) {
@@ -902,7 +911,8 @@ attempt implementation — the user will review and switch to build mode.",
         } else {
             4.0
         };
-        self.history.push(TurnMessage::user(prompt));
+        self.history
+            .push(TurnMessage::user_with_images(prompt, images));
         self.state.loop_counts.clear();
         let mut usage_total = Usage::default();
         let mut assistant_text = String::new();
@@ -1327,6 +1337,7 @@ attempt implementation — the user will review and switch to build mode.",
                         call_id: call.id.clone(),
                         content: output.content,
                         is_error: output.is_error,
+                        images: output.images,
                     }
                 })
                 .collect();
@@ -1407,6 +1418,7 @@ attempt implementation — the user will review and switch to build mode.",
                           times; stop repeating and reconsider"
                     .to_string(),
                 is_error: true,
+                images: Vec::new(),
                 spill: None,
             });
         }
@@ -2082,6 +2094,7 @@ mod tests {
                     &mut deferrals,
                     &mut GuardRuntime::default(),
                     None,
+                    Vec::new(),
                 )
                 .await;
         });
@@ -2201,6 +2214,7 @@ mod tests {
                     &mut deferrals,
                     &mut GuardRuntime::default(),
                     None,
+                    Vec::new(),
                 )
                 .await;
         });
@@ -2245,6 +2259,7 @@ mod tests {
             call_id: "c1".into(),
             content: big.clone(),
             is_error: false,
+            images: Vec::new(),
         }]));
         // recent large exchange: fills the 40k protect window so the old
         // tool result falls outside it
@@ -2292,6 +2307,7 @@ mod tests {
             call_id: "c".into(),
             content: "tiny".to_string(),
             is_error: false,
+            images: Vec::new(),
         }]));
         let saved = voice.prune_tool_outputs(1.0);
         assert_eq!(saved, 0, "tiny outputs must not be pruned");
@@ -2440,6 +2456,7 @@ mod tests {
             call_id: "t9".into(),
             content: "file contents".into(),
             is_error: false,
+            images: Vec::new(),
         }]));
         voice.history.push(TurnMessage::assistant("done with that"));
         voice.history.push(TurnMessage::user("keep me"));
@@ -2578,6 +2595,7 @@ mod tests {
                     &mut deferrals,
                     &mut GuardRuntime::default(),
                     None,
+                    Vec::new(),
                 )
                 .await;
         });
@@ -2675,6 +2693,7 @@ mod tests {
                     &mut deferrals,
                     &mut GuardRuntime::default(),
                     None,
+                    Vec::new(),
                 )
                 .await;
         });
@@ -2750,6 +2769,7 @@ mod tests {
                     &mut d,
                     &mut GuardRuntime::default(),
                     None,
+                    Vec::new(),
                 )
                 .await;
         });
@@ -2971,6 +2991,7 @@ mod tests {
                 &mut deferrals,
                 guards,
                 None,
+                Vec::new(),
             )
             .await;
         // keep the receiver alive until the turn task wraps up
@@ -3045,6 +3066,7 @@ mod tests {
                     &mut deferrals,
                     &mut GuardRuntime::default(),
                     None,
+                    Vec::new(),
                 )
                 .await;
         });
@@ -3423,6 +3445,7 @@ mod tests {
                     &mut deferrals,
                     &mut GuardRuntime::default(),
                     None,
+                    Vec::new(),
                 )
                 .await;
         });
@@ -3542,6 +3565,7 @@ mod tests {
                     &mut deferrals,
                     &mut GuardRuntime::default(),
                     None,
+                    Vec::new(),
                 )
                 .await;
         });
@@ -3685,6 +3709,7 @@ mod tests {
                     &mut deferrals,
                     &mut guards,
                     None,
+                    Vec::new(),
                 )
                 .await
         });
@@ -3794,6 +3819,7 @@ mod tests {
                     &mut deferrals,
                     &mut guards,
                     Some(schema),
+                    Vec::new(),
                 )
                 .await
         });

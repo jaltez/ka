@@ -241,6 +241,7 @@ impl BashHand {
                         ),
                         is_error: false,
                         spill: None,
+                        images: Vec::new(),
                     }
                 }
                 Ok(Phase::Exited(status)) => {
@@ -278,12 +279,14 @@ impl BashHand {
                             ),
                             is_error,
                             spill: capped.pointer,
+                            images: Vec::new(),
                         }
                     } else {
                         ToolOutput {
                             content: format!("{header}{}", capped.text),
                             is_error,
                             spill: None,
+                            images: Vec::new(),
                         }
                     }
                 }
@@ -588,6 +591,7 @@ mod tests {
             )),
             jobs: Arc::new(JobTable::new()),
             bash_background_ms: 0,
+            max_image_mb: 5,
         }
     }
 
