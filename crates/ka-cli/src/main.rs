@@ -662,7 +662,10 @@ async fn run_mcp() -> Result<ExitCode, String> {
         println!(
             "{:<16} {} {}",
             server.name,
-            server.command,
+            server
+                .command
+                .clone()
+                .unwrap_or_else(|| server.url.clone().unwrap_or_default()),
             server.args.join(" ")
         );
         match tokio::time::timeout(

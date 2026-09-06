@@ -309,6 +309,10 @@ struct Ctx {
     state: EngineState,
     voice: Voice,
     strand: ka_strand::StrandFile,
+    /// Shared handles to the connected MCP servers (watchdog + refresh).
+    mcp_shared: Vec<crate::mcp::McpShared>,
+    /// Watchdog/refresh bookkeeping from MCP supervisors.
+    maintenance: mpsc::Receiver<crate::mcp::Maintenance>,
 }
 
 async fn run(
@@ -348,12 +352,15 @@ async fn run(
     let mut state = EngineState::from(config);
     state.roles = roles;
     let strand = attach_strand(&events, &mut state, &mut voice, &cwd, &strand_choice).await?;
+    let (maintenance_tx, maintenance_rx) = mpsc::channel(16);
     let mut ctx = Ctx {
         cwd,
         events,
         state,
         voice,
         strand,
+        mcp_shared: Vec::new(),
+        maintenance: maintenance_rx,
     };
     // markdown agents: .ka/agents/*.md etc. become one `delegate` hand
     let agents = crate::agents::AgentDef::discover(&ctx.cwd);
@@ -377,7 +384,7 @@ async fn run(
         match connected {
             Ok(Ok((client, tools))) => {
                 let tool_count = tools.len();
-                let shared = std::sync::Arc::new(tokio::sync::Mutex::new(client));
+                let shared = crate::mcp::McpShared::new(cfg.clone(), client, tools.clone());
                 for tool in tools {
                     ctx.voice
                         .push_hand(std::sync::Arc::new(crate::mcp::McpHand::new(
@@ -385,6 +392,12 @@ async fn run(
                             shared.clone(),
                         )));
                 }
+                ctx.mcp_shared.push(shared.clone());
+                tokio::spawn(crate::mcp::supervise(
+                    shared,
+                    maintenance_tx.clone(),
+                    crate::mcp::WatchdogTiming::default(),
+                ));
                 mcp_summary.push(McpSummary {
                     name: cfg.name.clone(),
                     ok: true,
@@ -444,8 +457,18 @@ async fn run(
         .send(Event::Todos { items: Vec::new() })
         .await
         .ok();
-    while let Some(cmd) = commands.recv().await {
-        handle_command(cmd, &mut commands, &mut ctx).await?;
+    loop {
+        tokio::select! {
+            maybe = commands.recv() => {
+                let Some(cmd) = maybe else { break };
+                handle_command(cmd, &mut commands, &mut ctx).await?;
+            }
+            maybe = ctx.maintenance.recv() => {
+                if let Some(update) = maybe {
+                    handle_maintenance(update, &mut ctx).await;
+                }
+            }
+        }
     }
     // session shutdown: no backgrounded bash job may outlive the engine
     ctx.voice.jobs().kill_all();
@@ -456,6 +479,55 @@ async fn run(
 /// handled (or explicitly rejected) here — no unreachable arms, no
 /// routing split. Arms that need to poll the surface mid-turn (Prompt)
 /// also receive the receiver.
+/// Apply one MCP supervisor update: swap the server's hands for the
+/// fresh tool set and tell the surface.
+async fn handle_maintenance(update: crate::mcp::Maintenance, ctx: &mut Ctx) {
+    let (server, tools, note) = match update {
+        crate::mcp::Maintenance::McpReconnected {
+            server,
+            tools,
+            gained,
+        } => (
+            server,
+            tools,
+            format!("mcp {{server}} reconnected (+{gained} tools)"),
+        ),
+        crate::mcp::Maintenance::McpRefreshed {
+            server,
+            tools,
+            delta,
+        } => (
+            server,
+            tools,
+            format!("mcp {{server}} refreshed ({delta:+} tools)"),
+        ),
+        crate::mcp::Maintenance::McpGaveUp { server } => {
+            ctx.events
+                .send(Event::Error {
+                    class: ErrorClass::Protocol,
+                    retryable: false,
+                    message: format!("mcp {server}: reconnect failed; tools error until restart"),
+                })
+                .await
+                .ok();
+            return;
+        }
+    };
+    if let Some(shared) = ctx.mcp_shared.iter().find(|s| s.name() == server).cloned() {
+        let hands: Vec<std::sync::Arc<dyn crate::hands::Hand>> = tools
+            .iter()
+            .map(|t| std::sync::Arc::new(crate::mcp::McpHand::new(t.clone(), shared.clone())) as _)
+            .collect();
+        ctx.voice.replace_server_hands(&server, hands);
+    }
+    ctx.events
+        .send(Event::Note {
+            message: note.replace("{server}", &server),
+        })
+        .await
+        .ok();
+}
+
 async fn handle_command(
     cmd: Command,
     commands: &mut mpsc::Receiver<Command>,

@@ -451,6 +451,178 @@ impl McpClient {
     }
 }
 
+/// Long-running MCP bookkeeping messages the engine consumes to keep
+/// its hand registry in step with reconnected/refreshed servers.
+#[derive(Debug)]
+pub enum Maintenance {
+    /// A watchdog reconnected the server; the hand set is replaced.
+    McpReconnected {
+        server: String,
+        tools: Vec<McpTool>,
+        gained: i64,
+    },
+    /// A reconnect attempt chain failed; hands stay erroring.
+    McpGaveUp { server: String },
+    /// An explicit refresh observed a tool-set change.
+    McpRefreshed {
+        server: String,
+        tools: Vec<McpTool>,
+        delta: i64,
+    },
+}
+
+/// Watchdog timing (tests shrink everything).
+#[derive(Debug, Clone)]
+pub struct WatchdogTiming {
+    /// Liveness poll interval.
+    pub poll: std::time::Duration,
+    /// Reconnect backoff steps before giving up.
+    pub backoffs: [std::time::Duration; 3],
+}
+
+impl Default for WatchdogTiming {
+    fn default() -> Self {
+        Self {
+            poll: std::time::Duration::from_secs(30),
+            backoffs: [
+                std::time::Duration::from_secs(2),
+                std::time::Duration::from_secs(8),
+                std::time::Duration::from_secs(32),
+            ],
+        }
+    }
+}
+
+/// Shared, reconnectable handle to one MCP server: hands call through
+/// it and the watchdog swaps the client after a successful reconnect.
+#[derive(Clone)]
+pub struct McpShared {
+    cfg: McpServerConfig,
+    cell: Arc<Mutex<Option<McpClient>>>,
+    tools: Arc<parking_lot::Mutex<Vec<McpTool>>>,
+}
+
+impl McpShared {
+    /// Wrap a freshly connected client and its tool list.
+    pub fn new(cfg: McpServerConfig, client: McpClient, tools: Vec<McpTool>) -> Self {
+        Self {
+            cfg,
+            cell: Arc::new(Mutex::new(Some(client))),
+            tools: Arc::new(parking_lot::Mutex::new(tools)),
+        }
+    }
+
+    /// The configured server name.
+    pub fn name(&self) -> &str {
+        &self.cfg.name
+    }
+
+    /// The current tool list (empty while disconnected).
+    pub fn tools(&self) -> Vec<McpTool> {
+        self.tools.lock().clone()
+    }
+
+    /// Whether the current client answers a liveness probe.
+    pub async fn alive(&self) -> bool {
+        let mut guard = self.cell.lock().await;
+        match guard.as_mut() {
+            Some(c) => c.alive().await,
+            None => false,
+        }
+    }
+
+    /// Invoke a tool through the current client.
+    pub async fn call_tool(&self, tool: &str, args: Value) -> Result<String, String> {
+        let mut guard = self.cell.lock().await;
+        match guard.as_mut() {
+            Some(c) => c.call_tool(tool, args).await,
+            None => Err(format!("mcp {}: disconnected", self.cfg.name)),
+        }
+    }
+
+    /// List tools through the current client (explicit refresh).
+    pub async fn refresh_tools(&self) -> Result<Vec<McpTool>, String> {
+        let mut guard = self.cell.lock().await;
+        let Some(c) = guard.as_mut() else {
+            return Err(format!("mcp {}: disconnected", self.cfg.name));
+        };
+        let result = c.request("tools/list", json!({})).await?;
+        parse_tools(&result, &self.cfg.name)
+    }
+
+    async fn install(&self, client: McpClient, tools: Vec<McpTool>) {
+        *self.cell.lock().await = Some(client);
+        *self.tools.lock() = tools;
+    }
+
+    async fn mark_down(&self) {
+        self.cell.lock().await.take();
+    }
+
+    fn tool_count(&self) -> usize {
+        self.tools.lock().len()
+    }
+
+    /// Kill the current stdio server process (watchdog tests).
+    #[cfg(test)]
+    pub async fn test_kill(&self) {
+        if let Some(c) = self.cell.lock().await.as_mut() {
+            if let Transport::Stdio { child, .. } = &mut c.transport {
+                let _ = child.start_kill();
+            }
+        }
+    }
+}
+
+/// Watch one server: poll liveness on [`WatchdogTiming::poll`]; on
+/// death retry `spawn_connect` through the backoff steps, swapping the
+/// shared client on success and reporting the tool diff. After the
+/// last backoff fails the watchdog gives up (hands stay erroring).
+pub async fn supervise(
+    shared: McpShared,
+    maintenance: mpsc::Sender<Maintenance>,
+    timing: WatchdogTiming,
+) {
+    loop {
+        tokio::time::sleep(timing.poll).await;
+        if shared.alive().await {
+            continue;
+        }
+        shared.mark_down().await;
+        let mut restored = None;
+        for delay in timing.backoffs {
+            tokio::time::sleep(delay).await;
+            if let Ok((client, tools)) = McpClient::spawn_connect(&shared.cfg).await {
+                restored = Some((client, tools));
+                break;
+            }
+        }
+        match restored {
+            Some((client, tools)) => {
+                let gained = tools.len() as i64 - shared.tool_count() as i64;
+                shared.install(client, tools.clone()).await;
+                maintenance
+                    .send(Maintenance::McpReconnected {
+                        server: shared.name().to_string(),
+                        tools,
+                        gained,
+                    })
+                    .await
+                    .ok();
+            }
+            None => {
+                maintenance
+                    .send(Maintenance::McpGaveUp {
+                        server: shared.name().to_string(),
+                    })
+                    .await
+                    .ok();
+                return;
+            }
+        }
+    }
+}
+
 /// Parse a tools/list result into prefixed [`McpTool`]s.
 fn parse_tools(result: &Value, server_name: &str) -> Result<Vec<McpTool>, String> {
     let tools = result["tools"]
@@ -570,13 +742,13 @@ async fn sse_read_loop(
 /// the exec-tier gate: the engine knows nothing about what they do.
 pub struct McpHand {
     tool: McpTool,
-    client: Arc<tokio::sync::Mutex<McpClient>>,
+    shared: McpShared,
 }
 
 impl McpHand {
     /// Wrap one advertised tool.
-    pub fn new(tool: McpTool, client: Arc<tokio::sync::Mutex<McpClient>>) -> Self {
-        Self { tool, client }
+    pub fn new(tool: McpTool, shared: McpShared) -> Self {
+        Self { tool, shared }
     }
 }
 
@@ -602,10 +774,9 @@ impl crate::hands::Hand for McpHand {
     ) -> std::pin::Pin<Box<dyn Future<Output = crate::hands::ToolOutput> + Send + 'a>> {
         let tool = self.tool.raw_name.clone();
         let args = args.clone();
-        let client = self.client.clone();
+        let shared = self.shared.clone();
         Box::pin(async move {
-            let mut guard = client.lock().await;
-            match guard.call_tool(&tool, args).await {
+            match shared.call_tool(&tool, args).await {
                 Ok(text) if text.trim().is_empty() => {
                     crate::hands::ToolOutput::ok("(empty result)".to_string())
                 }
@@ -960,6 +1131,42 @@ for line in sys.stdin:
         let (_client, tools) = McpClient::spawn_connect(&cfg).await.unwrap();
         assert_eq!(tools.len(), 1);
         assert_eq!(tools[0].name, "sse.ping_tool");
+    }
+
+    #[tokio::test]
+    async fn watchdog_reconnects_after_server_death() {
+        if !python3_available() {
+            return;
+        }
+        let cfg = cfg();
+        let (client, tools) = McpClient::spawn_connect(&cfg).await.unwrap();
+        assert_eq!(tools.len(), 1);
+        let shared = McpShared::new(cfg, client, tools);
+        assert!(shared.alive().await);
+        let (mtx, mut mrx) = mpsc::channel(8);
+        let timing = WatchdogTiming {
+            poll: std::time::Duration::from_millis(50),
+            backoffs: [
+                std::time::Duration::from_millis(50),
+                std::time::Duration::from_millis(50),
+                std::time::Duration::from_millis(50),
+            ],
+        };
+        tokio::spawn(supervise(shared.clone(), mtx, timing));
+        // kill the server; the watchdog must notice and reconnect
+        shared.test_kill().await;
+        let update = tokio::time::timeout(std::time::Duration::from_secs(10), mrx.recv())
+            .await
+            .unwrap()
+            .expect("watchdog must report");
+        match update {
+            Maintenance::McpReconnected { server, gained, .. } => {
+                assert_eq!(server, "fake");
+                assert_eq!(gained, 0, "same tool set after reconnect");
+            }
+            other => panic!("unexpected maintenance: {other:?}"),
+        }
+        assert!(shared.alive().await, "reconnected client must serve pings");
     }
 
     #[test]

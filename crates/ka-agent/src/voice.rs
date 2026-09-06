@@ -215,6 +215,28 @@ impl Voice {
         self.hands.push(hand);
     }
 
+    /// Replace one MCP server's hands in registry order (reconnect or
+    /// refresh tool diff). Absent prefixes append at the end.
+    pub fn replace_server_hands(&mut self, server: &str, hands: Vec<std::sync::Arc<dyn Hand>>) {
+        let prefix = format!("{server}.");
+        let mut result: Vec<std::sync::Arc<dyn Hand>> = Vec::with_capacity(self.hands.len());
+        let mut replaced = false;
+        for h in self.hands.drain(..) {
+            if h.def().name.starts_with(&prefix) {
+                if !replaced {
+                    replaced = true;
+                    result.extend(hands.iter().cloned());
+                }
+            } else {
+                result.push(h);
+            }
+        }
+        if !replaced {
+            result.extend(hands);
+        }
+        self.hands = result;
+    }
+
     /// Tool names in registry order (built-ins, then anything pushed at
     /// bootstrap: the delegate hand, MCP hands). Bootstrap inventory.
     pub fn hand_names(&self) -> Vec<String> {
