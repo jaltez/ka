@@ -200,6 +200,8 @@ mod tests {
             snapshots: std::sync::Arc::new(parking_lot::Mutex::new(
                 crate::hands::snapshots::Snapshots::inert(),
             )),
+            jobs: std::sync::Arc::new(crate::hands::jobs::JobTable::new()),
+            bash_background_ms: 0,
         }
     }
 

@@ -282,6 +282,7 @@ async fn run(
     voice.set_rules(rules);
     voice.set_allowed_tools(allowed_tools);
     voice.set_hooks(hooks);
+    voice.set_bash_background_ms(config.effective_bash_background_after_ms());
     {
         let slot = voice.pathfinder_slot();
         slot.write().catalog = pathfinder_catalog;
@@ -300,10 +301,9 @@ async fn run(
     let agent_names: Vec<String> = agents.iter().map(|a| a.name.clone()).collect();
     if !agents.is_empty() {
         let slot = ctx.voice.pathfinder_slot();
-        ctx.voice
-            .push_hand(Box::new(crate::hands::delegate::DelegateHand::new(
-                agents, slot,
-            )));
+        ctx.voice.push_hand(std::sync::Arc::new(
+            crate::hands::delegate::DelegateHand::new(agents, slot),
+        ));
     }
 
     // MCP servers: spawn, handshake, list; each tool becomes a hand at
@@ -321,7 +321,10 @@ async fn run(
                 let shared = std::sync::Arc::new(tokio::sync::Mutex::new(client));
                 for tool in tools {
                     ctx.voice
-                        .push_hand(Box::new(crate::mcp::McpHand::new(tool, shared.clone())));
+                        .push_hand(std::sync::Arc::new(crate::mcp::McpHand::new(
+                            tool,
+                            shared.clone(),
+                        )));
                 }
                 mcp_summary.push(McpSummary {
                     name: cfg.name.clone(),
@@ -382,10 +385,11 @@ async fn run(
         .send(Event::Todos { items: Vec::new() })
         .await
         .ok();
-
     while let Some(cmd) = commands.recv().await {
         handle_command(cmd, &mut commands, &mut ctx).await?;
     }
+    // session shutdown: no backgrounded bash job may outlive the engine
+    ctx.voice.jobs().kill_all();
     Ok(())
 }
 
@@ -2124,6 +2128,10 @@ mod tests {
         ));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(root.join(".ka/agents")).unwrap();
+        // project-scope skills are gated on the trust store: redirect the
+        // store to a fresh file and trust the injected project dir
+        let _trust = crate::trust::test_support::trust_guard();
+        crate::trust::approve(&root);
         std::fs::write(
             root.join(".ka/agents/reviewer.md"),
             "---\nname: reviewer\ndescription: reviews code\n---\nBe harsh.\n",
@@ -2194,10 +2202,12 @@ mod tests {
                 tools: 0,
             }]
         );
-        // 7 built-ins + todo + the delegate hand the discovered agent adds
-        assert_eq!(tools.len(), 9, "tools: {tools:?}");
+        // 7 built-ins + todo + jobs + the delegate hand the discovered
+        // agent adds
+        assert_eq!(tools.len(), 10, "tools: {tools:?}");
         assert!(tools.contains(&"delegate".to_string()), "tools: {tools:?}");
         assert!(tools.contains(&"todo".to_string()), "tools: {tools:?}");
+        assert!(tools.contains(&"jobs".to_string()), "tools: {tools:?}");
         // and the ad-hoc notes stay gone
         assert!(seen.iter().all(
             |e| !matches!(e, Event::Note { message } if message.contains("agents available") || message.contains("tool(s)"))

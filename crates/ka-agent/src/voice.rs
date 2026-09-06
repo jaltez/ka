@@ -126,7 +126,7 @@ fn message_tokens(msg: &TurnMessage, ratio: f64) -> u64 {
 pub struct Voice {
     catalog: Catalog,
     speakers: HashMap<Wire, std::sync::Arc<dyn Speaker>>,
-    hands: Vec<Box<dyn Hand>>,
+    hands: Vec<std::sync::Arc<dyn Hand>>,
     hand_ctx: HandContext,
     pub(crate) state: VoiceState,
     max_steps: u32,
@@ -172,10 +172,11 @@ impl Voice {
             crate::hands::pathfinder::PathfinderSource::default(),
         ));
         let todos = crate::hands::todo::slot();
+        let jobs = std::sync::Arc::new(crate::hands::jobs::JobTable::new());
         Self {
             catalog,
             speakers: Default::default(),
-            hands: registry_with_pathfinder(slot.clone(), todos.clone()),
+            hands: registry_with_pathfinder(slot.clone(), todos.clone(), jobs.clone()),
             hand_ctx: HandContext {
                 cwd: cwd.clone(),
                 ledger: std::sync::Arc::new(parking_lot::Mutex::new(Ledger::default())),
@@ -183,6 +184,8 @@ impl Voice {
                 snapshots: std::sync::Arc::new(parking_lot::Mutex::new(
                     crate::hands::snapshots::Snapshots::open(&cwd),
                 )),
+                jobs,
+                bash_background_ms: 0,
             },
             state: VoiceState::default(),
             max_steps,
@@ -203,7 +206,7 @@ impl Voice {
     }
 
     /// Register an extra tool (MCP hands arrive after async discovery).
-    pub fn push_hand(&mut self, hand: Box<dyn Hand>) {
+    pub fn push_hand(&mut self, hand: std::sync::Arc<dyn Hand>) {
         self.hands.push(hand);
     }
 
@@ -231,7 +234,11 @@ impl Voice {
             crate::hands::pathfinder::PathfinderSource::default(),
         ));
         let todos = crate::hands::todo::slot();
-        let hands = crate::hands::registry_with_pathfinder(slot.clone(), todos.clone());
+        let hands = crate::hands::registry_with_pathfinder(
+            slot.clone(),
+            todos.clone(),
+            std::sync::Arc::new(crate::hands::jobs::JobTable::new()),
+        );
         let hand_ctx = HandContext {
             cwd,
             ledger: std::sync::Arc::new(parking_lot::Mutex::new(Ledger::default())),
@@ -239,6 +246,8 @@ impl Voice {
             snapshots: std::sync::Arc::new(parking_lot::Mutex::new(
                 crate::hands::snapshots::Snapshots::inert(),
             )),
+            jobs: std::sync::Arc::new(crate::hands::jobs::JobTable::new()),
+            bash_background_ms: 0,
         };
         Self {
             catalog,
@@ -285,6 +294,17 @@ impl Voice {
         self.allowed_tools = tools;
     }
 
+    /// Set the bash auto-background threshold in ms (engine bootstrap;
+    /// 0 = never background).
+    pub fn set_bash_background_ms(&mut self, ms: u64) {
+        self.hand_ctx.bash_background_ms = ms;
+    }
+
+    /// Share the auto-backgrounded-jobs table (the engine kills the
+    /// remaining jobs at session shutdown).
+    pub fn jobs(&self) -> std::sync::Arc<crate::hands::jobs::JobTable> {
+        self.hand_ctx.jobs.clone()
+    }
     /// Run matching hooks for one event. Returns Err(reason) when a
     /// pre_tool_use hook blocked the call (exit 2, stderr as reason).
     async fn run_hooks(
@@ -293,53 +313,7 @@ impl Voice {
         tool: &str,
         args: &serde_json::Value,
     ) -> Result<(), String> {
-        use tokio::io::AsyncWriteExt;
-        for hook in &self.hooks_cfg {
-            if hook.event != event {
-                continue;
-            }
-            if let Some(t) = &hook.tool {
-                if t != tool {
-                    continue;
-                }
-            }
-            let payload = serde_json::json!({"tool": tool, "arguments": args});
-            let mut child = match tokio::process::Command::new("sh")
-                .arg("-c")
-                .arg(&hook.command)
-                .current_dir(&self.hand_ctx.cwd)
-                .stdin(std::process::Stdio::piped())
-                .stdout(std::process::Stdio::piped())
-                .stderr(std::process::Stdio::piped())
-                .spawn()
-            {
-                Ok(c) => c,
-                Err(e) => return Err(format!("hook failed to spawn: {e}")),
-            };
-            let stdin_opt = child.stdin.take();
-            if let Some(mut stdin) = stdin_opt {
-                let _ = stdin.write_all(payload.to_string().as_bytes()).await;
-            }
-            let output = match tokio::time::timeout(
-                std::time::Duration::from_secs(30),
-                child.wait_with_output(),
-            )
-            .await
-            {
-                Ok(Ok(o)) => o,
-                Ok(Err(e)) => return Err(format!("hook failed: {e}")),
-                Err(_) => return Err("hook timed out after 30s".to_string()),
-            };
-            if output.status.code() == Some(2) {
-                let reason = String::from_utf8_lossy(&output.stderr).trim().to_string();
-                return Err(if reason.is_empty() {
-                    "blocked by hook".to_string()
-                } else {
-                    reason
-                });
-            }
-        }
-        Ok(())
+        run_hook_scripts(&self.hooks_cfg, event, tool, args, &self.hand_ctx.cwd).await
     }
 
     /// Load resumed history + digest (engine bootstrap).
@@ -1058,66 +1032,167 @@ attempt implementation — the user will review and switch to build mode.",
                 break 'outer;
             }
 
-            // Execute this step's calls; ordered results.
+            // Execute this step's calls. Gating stays sequential —
+            // permission asks must remain one-at-a-time UX — then the
+            // approved calls run concurrently and results are reassembled
+            // in original call order.
             self.history.push(TurnMessage::assistant_with_calls(
                 step_text.clone(),
                 step_calls.clone(),
             ));
-            let mut results: Vec<ToolResult> = Vec::new();
-            for call in &step_calls {
-                let sig = format!("{}|{}", call.tool, call.arguments);
-                *self.state.loop_counts.entry(sig).or_insert(0) += 1;
-                if self.state.loop_counts.values().any(|c| *c >= 4) {
-                    results.push(ToolResult {
-                        call_id: call.id.clone(),
-                        content: "loop guard: this tool was called with identical arguments 4+ \
-                                  times; stop repeating and reconsider"
-                            .to_string(),
-                        is_error: true,
+            let mut slots: Vec<Option<ToolOutput>> = vec![None; step_calls.len()];
+            let mut approved: Vec<(usize, std::sync::Arc<dyn Hand>)> = Vec::new();
+            for (idx, call) in step_calls.iter().enumerate() {
+                match self.admit_call(call, commands, events).await {
+                    Ok(hand) => approved.push((idx, hand)),
+                    Err(output) => slots[idx] = Some(output),
+                }
+            }
+            let mut aborted = false;
+            if !approved.is_empty() {
+                let mut in_flight = tokio::task::JoinSet::new();
+                let mut task_idx: HashMap<tokio::task::Id, usize> = HashMap::new();
+                for (idx, hand) in approved {
+                    let call = step_calls[idx].clone();
+                    let ctx = self.hand_ctx.clone();
+                    let events = events.clone();
+                    let hooks = self.hooks_cfg.clone();
+                    let todo = self.todo.clone();
+                    let handle = in_flight.spawn(async move {
+                        let output = execute_approved(&hand, &hooks, &call, &ctx, &events).await;
+                        // the todo hand owns normalization; surfaces get the
+                        // fresh list as a whole-replacement event
+                        if call.tool == "todo" && !output.is_error {
+                            let items = todo.lock().clone();
+                            events.send(Event::Todos { items }).await.ok();
+                        }
+                        events
+                            .send(Event::CallOutput {
+                                tool: call.tool.clone(),
+                                id: call.id.clone(),
+                                excerpt: truncate_excerpt(&output.content),
+                                is_error: output.is_error,
+                                spill: output.spill.clone(),
+                            })
+                            .await
+                            .ok();
+                        events
+                            .send(Event::CallFinished {
+                                tool: call.tool.clone(),
+                                id: call.id.clone(),
+                                ok: !output.is_error,
+                            })
+                            .await
+                            .ok();
+                        (idx, output)
                     });
+                    task_idx.insert(handle.id(), idx);
+                }
+                let mut mode_change: Option<ka_protocol::Mode> = None;
+                while !in_flight.is_empty() {
+                    tokio::select! {
+                        biased;
+                        // abort cancels the in-flight futures; dropped bash
+                        // children die via their drop guards
+                        maybe_cmd = commands.recv() => match maybe_cmd {
+                            None | Some(Command::Abort) => {
+                                aborted = true;
+                                break;
+                            }
+                            Some(Command::Interject { text }) => interjections.push(text),
+                            Some(Command::Defer { text }) => deferrals.push_back(text),
+                            Some(Command::SetMode { mode }) => mode_change = Some(mode),
+                            Some(_) => {}
+                        },
+                        joined = in_flight.join_next() => match joined {
+                            Some(Ok((idx, output))) => slots[idx] = Some(output),
+                            Some(Err(e)) => {
+                                // a panicking hand must not wedge the step
+                                if let Some(idx) = task_idx.remove(&e.id()) {
+                                    let output =
+                                        ToolOutput::err(format!("tool task failed: {e}"));
+                                    events
+                                        .send(Event::CallOutput {
+                                            tool: step_calls[idx].tool.clone(),
+                                            id: step_calls[idx].id.clone(),
+                                            excerpt: truncate_excerpt(&output.content),
+                                            is_error: true,
+                                            spill: None,
+                                        })
+                                        .await
+                                        .ok();
+                                    events
+                                        .send(Event::CallFinished {
+                                            tool: step_calls[idx].tool.clone(),
+                                            id: step_calls[idx].id.clone(),
+                                            ok: false,
+                                        })
+                                        .await
+                                        .ok();
+                                    slots[idx] = Some(output);
+                                }
+                            }
+                            None => {}
+                        },
+                    }
+                }
+                if let Some(mode) = mode_change {
+                    self.set_mode(mode);
+                }
+            }
+            if aborted {
+                // canceled calls surface as aborted results so history
+                // stays well-formed for the next turn
+                for (idx, slot) in slots.iter_mut().enumerate() {
+                    if slot.is_some() {
+                        continue;
+                    }
+                    let output = ToolOutput::err("aborted");
+                    events
+                        .send(Event::CallOutput {
+                            tool: step_calls[idx].tool.clone(),
+                            id: step_calls[idx].id.clone(),
+                            excerpt: truncate_excerpt(&output.content),
+                            is_error: true,
+                            spill: None,
+                        })
+                        .await
+                        .ok();
                     events
                         .send(Event::CallFinished {
-                            tool: call.tool.clone(),
-                            id: call.id.clone(),
+                            tool: step_calls[idx].tool.clone(),
+                            id: step_calls[idx].id.clone(),
                             ok: false,
                         })
                         .await
                         .ok();
-                    continue;
+                    *slot = Some(output);
                 }
-                let output = self.gate_and_execute(call, commands, events).await;
-                // the todo hand owns normalization; surfaces get the
-                // fresh list as a whole-replacement event
-                if call.tool == "todo" && !output.is_error {
-                    let items = self.todo.lock().clone();
-                    events.send(Event::Todos { items }).await.ok();
-                }
-                events
-                    .send(Event::CallOutput {
-                        tool: call.tool.clone(),
-                        id: call.id.clone(),
-                        excerpt: truncate_excerpt(&output.content),
-                        is_error: output.is_error,
-                        spill: output.spill.clone(),
-                    })
-                    .await
-                    .ok();
-                events
-                    .send(Event::CallFinished {
-                        tool: call.tool.clone(),
-                        id: call.id.clone(),
-                        ok: !output.is_error,
-                    })
-                    .await
-                    .ok();
-                results.push(ToolResult {
-                    call_id: call.id.clone(),
-                    content: output.content,
-                    is_error: output.is_error,
-                });
             }
+            let results: Vec<ToolResult> = slots
+                .into_iter()
+                .zip(step_calls.iter())
+                .map(|(slot, call)| {
+                    let output = slot.unwrap_or_else(|| ToolOutput::err("aborted"));
+                    ToolResult {
+                        call_id: call.id.clone(),
+                        content: output.content,
+                        is_error: output.is_error,
+                    }
+                })
+                .collect();
             self.history.push(TurnMessage::tool(results));
             steps += 1;
+            if aborted {
+                events
+                    .send(Event::TurnFinished {
+                        stop: Stop::Aborted,
+                        usage: Usage::default(),
+                    })
+                    .await
+                    .ok();
+                return Usage::default();
+            }
             if final_stop == Stop::Length {
                 break 'outer;
             }
@@ -1155,16 +1230,46 @@ attempt implementation — the user will review and switch to build mode.",
         usage_total
     }
 
-    /// Clearance gate, then execution. Ask-and-wait for anything not
-    /// auto-allowed; surface answers arrive as `Command::Answer`.
-    async fn gate_and_execute(
+    /// Sequential gating phase for one call: loop guard, pre-tool hooks,
+    /// clearance verdict, and any permission ask (one at a time — the ask
+    /// UX stays exclusive). Returns the approved hand; Err carries the
+    /// decided result (already surfaced to events).
+    async fn admit_call(
         &mut self,
         call: &ToolCall,
         commands: &mut mpsc::Receiver<Command>,
         events: &mpsc::Sender<Event>,
-    ) -> ToolOutput {
-        let Some(hand) = self.hands.iter().find(|h| h.def().name == call.tool) else {
-            return ToolOutput::err(format!("unknown tool {}", call.tool));
+    ) -> Result<std::sync::Arc<dyn Hand>, ToolOutput> {
+        let sig = format!("{}|{}", call.tool, call.arguments);
+        *self.state.loop_counts.entry(sig).or_insert(0) += 1;
+        if self.state.loop_counts.values().any(|c| *c >= 4) {
+            // loop-guard decisions surface as CallFinished only (existing
+            // contract); the result itself still feeds back to the model
+            events
+                .send(Event::CallFinished {
+                    tool: call.tool.clone(),
+                    id: call.id.clone(),
+                    ok: false,
+                })
+                .await
+                .ok();
+            return Err(ToolOutput {
+                content: "loop guard: this tool was called with identical arguments 4+ \
+                          times; stop repeating and reconsider"
+                    .to_string(),
+                is_error: true,
+                spill: None,
+            });
+        }
+        let Some(hand) = self
+            .hands
+            .iter()
+            .find(|h| h.def().name == call.tool)
+            .cloned()
+        else {
+            let output = ToolOutput::err(format!("unknown tool {}", call.tool));
+            self.surface_decided(call, &output, events).await;
+            return Err(output);
         };
         // pre_tool_use hooks: exit 2 blocks before any gate
         if let Err(reason) = self
@@ -1175,13 +1280,18 @@ attempt implementation — the user will review and switch to build mode.",
             )
             .await
         {
-            return ToolOutput::err(format!("blocked by hook: {reason}"));
+            let output = ToolOutput::err(format!("blocked by hook: {reason}"));
+            self.surface_decided(call, &output, events).await;
+            return Err(output);
         }
-        let def = hand.def();
-        let verdict = self.gate(def.clearance, call);
+        let verdict = self.gate(hand.clearance_for(&call.arguments), call);
         match verdict {
             Gate::Allow => {}
-            Gate::Deny { reason } => return ToolOutput::err(reason),
+            Gate::Deny { reason } => {
+                let output = ToolOutput::err(reason);
+                self.surface_decided(call, &output, events).await;
+                return Err(output);
+            }
             Gate::Ask { question } => {
                 self.state.ask_counter += 1;
                 let ask_id = AskId(format!("ask-{}", self.state.ask_counter));
@@ -1198,9 +1308,11 @@ attempt implementation — the user will review and switch to build mode.",
                     }],
                 };
                 if events.send(ask).await.is_err() {
-                    return ToolOutput::err("permission ask failed: surface closed");
+                    let output = ToolOutput::err("permission ask failed: surface closed");
+                    self.surface_decided(call, &output, events).await;
+                    return Err(output);
                 }
-                // wait for the answer (or abort)
+                // wait for the answer (or abort); the ask stays sequential
                 loop {
                     tokio::select! {
                         maybe = commands.recv() => {
@@ -1229,19 +1341,27 @@ attempt implementation — the user will review and switch to build mode.",
                                             break;
                                         }
                                         2 => {
-                                            return ToolOutput::err(format!(
+                                            let output = ToolOutput::err(format!(
                                                 "permission denied by user for {}",
                                                 call.tool
                                             ));
+                                            self.surface_decided(call, &output, events).await;
+                                            return Err(output);
                                         }
                                         _ => break,
                                     }
                                 }
                                 Some(Command::Abort) => {
-                                    return ToolOutput::err("aborted");
+                                    let output = ToolOutput::err("aborted");
+                                    self.surface_decided(call, &output, events).await;
+                                    return Err(output);
                                 }
                                 Some(_) => {}
-                                None => return ToolOutput::err("surface closed during ask"),
+                                None => {
+                                    let output = ToolOutput::err("surface closed during ask");
+                                    self.surface_decided(call, &output, events).await;
+                                    return Err(output);
+                                }
                             }
                         }
                     }
@@ -1262,53 +1382,39 @@ attempt implementation — the user will review and switch to build mode.",
                 })
                 .await
                 .ok();
-            return ToolOutput::err(format!("blocked by pre-tool hook: {reason}"));
+            let output = ToolOutput::err(format!("blocked by pre-tool hook: {reason}"));
+            self.surface_decided(call, &output, events).await;
+            return Err(output);
         }
-        // bash runs long: pump live preview emissions while the child
-        // works. Partials are new-since-last-emission output on the same
-        // call id (is_error=false, spill=None, redacted, hard-capped);
-        // the final CallOutput emission below is untouched.
-        let mut output = if call.tool == "bash" {
-            let tool = call.tool.clone();
-            let id = call.id.clone();
-            let events = events.clone();
-            let progress = move |fresh: String| {
-                let excerpt = crate::hands::bash::cap_preview(&fresh);
-                let excerpt = crate::hands::secrets::redact(&excerpt);
-                if excerpt.is_empty() {
-                    return;
-                }
-                let _ = events.try_send(Event::CallOutput {
-                    tool: tool.clone(),
-                    id: id.clone(),
-                    excerpt,
-                    is_error: false,
-                    spill: None,
-                });
-            };
-            crate::hands::BashHand
-                .execute_streaming(&call.arguments, &self.hand_ctx, &progress)
-                .await
-        } else {
-            hand.execute(&call.arguments, &self.hand_ctx).await
-        };
-        // post_tool_use hooks: exit 2 flags the result as an error
-        if let Err(reason) = self
-            .run_hooks(
-                crate::config::HookEvent::PostToolUse,
-                &call.tool,
-                &call.arguments,
-            )
+        Ok(hand)
+    }
+
+    /// Surface a gate-phase decision (CallOutput + CallFinished) without
+    /// executing the call.
+    async fn surface_decided(
+        &self,
+        call: &ToolCall,
+        output: &ToolOutput,
+        events: &mpsc::Sender<Event>,
+    ) {
+        events
+            .send(Event::CallOutput {
+                tool: call.tool.clone(),
+                id: call.id.clone(),
+                excerpt: truncate_excerpt(&output.content),
+                is_error: output.is_error,
+                spill: None,
+            })
             .await
-        {
-            output.is_error = true;
-            output
-                .content
-                .push_str(&format!("\n[post-tool hook: {reason}]"));
-        }
-        // one-way secret redaction before anything reaches the model
-        output.content = crate::hands::secrets::redact(&output.content);
-        output
+            .ok();
+        events
+            .send(Event::CallFinished {
+                tool: call.tool.clone(),
+                id: call.id.clone(),
+                ok: !output.is_error,
+            })
+            .await
+            .ok();
     }
 
     fn gate(&self, clearance: Clearance, call: &ToolCall) -> Gate {
@@ -1397,6 +1503,124 @@ use /build to switch to implementation"
             }
         }
     }
+}
+
+/// Execution phase for one approved call: post_tool_use hooks, the call
+/// itself (bash streams live previews), and one-way secret redaction.
+/// Runs concurrently for every approved call of a step; each call emits
+/// its own CallOutput/CallFinished as it completes.
+async fn execute_approved(
+    hand: &std::sync::Arc<dyn Hand>,
+    hooks: &[crate::config::Hook],
+    call: &ToolCall,
+    ctx: &HandContext,
+    events: &mpsc::Sender<Event>,
+) -> ToolOutput {
+    // bash runs long: pump live preview emissions while the child
+    // works. Partials are new-since-last-emission output on the same
+    // call id (is_error=false, spill=None, redacted, hard-capped);
+    // the final CallOutput emission is untouched.
+    let mut output = if call.tool == "bash" {
+        let tool = call.tool.clone();
+        let id = call.id.clone();
+        let events = events.clone();
+        let progress = move |fresh: String| {
+            let excerpt = crate::hands::bash::cap_preview(&fresh);
+            let excerpt = crate::hands::secrets::redact(&excerpt);
+            if excerpt.is_empty() {
+                return;
+            }
+            let _ = events.try_send(Event::CallOutput {
+                tool: tool.clone(),
+                id: id.clone(),
+                excerpt,
+                is_error: false,
+                spill: None,
+            });
+        };
+        crate::hands::BashHand
+            .execute_streaming(&call.arguments, ctx, &progress)
+            .await
+    } else {
+        hand.execute(&call.arguments, ctx).await
+    };
+    // post_tool_use hooks: exit 2 flags the result as an error
+    if let Err(reason) = run_hook_scripts(
+        hooks,
+        crate::config::HookEvent::PostToolUse,
+        &call.tool,
+        &call.arguments,
+        &ctx.cwd,
+    )
+    .await
+    {
+        output.is_error = true;
+        output
+            .content
+            .push_str(&format!("\n[post-tool hook: {reason}]"));
+    }
+    // one-way secret redaction before anything reaches the model
+    output.content = crate::hands::secrets::redact(&output.content);
+    output
+}
+
+/// Run matching hook scripts for one event. Returns Err(reason) when a
+/// pre_tool_use hook blocked the call (exit 2, stderr as reason). A free
+/// fn so concurrent per-call tasks can run post_tool_use hooks.
+async fn run_hook_scripts(
+    hooks: &[crate::config::Hook],
+    event: crate::config::HookEvent,
+    tool: &str,
+    args: &serde_json::Value,
+    cwd: &std::path::Path,
+) -> Result<(), String> {
+    use tokio::io::AsyncWriteExt;
+    for hook in hooks {
+        if hook.event != event {
+            continue;
+        }
+        if let Some(t) = &hook.tool {
+            if t != tool {
+                continue;
+            }
+        }
+        let payload = serde_json::json!({"tool": tool, "arguments": args});
+        let mut child = match tokio::process::Command::new("sh")
+            .arg("-c")
+            .arg(&hook.command)
+            .current_dir(cwd)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+        {
+            Ok(c) => c,
+            Err(e) => return Err(format!("hook failed to spawn: {e}")),
+        };
+        let stdin_opt = child.stdin.take();
+        if let Some(mut stdin) = stdin_opt {
+            let _ = stdin.write_all(payload.to_string().as_bytes()).await;
+        }
+        let output = match tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            child.wait_with_output(),
+        )
+        .await
+        {
+            Ok(Ok(o)) => o,
+            Ok(Err(e)) => return Err(format!("hook failed: {e}")),
+            Err(_) => return Err("hook timed out after 30s".to_string()),
+        };
+        if output.status.code() == Some(2) {
+            let reason = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            return Err(if reason.is_empty() {
+                "blocked by hook".to_string()
+            } else {
+                reason
+            });
+        }
+    }
+    Ok(())
 }
 
 /// Automatic retry backoff for retryable turn failures: 5s, 20s, 60s
@@ -1560,6 +1784,8 @@ fn cost_of(usage: &Usage, price: ka_dialect::dialects::Price) -> f64 {
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use std::time::Duration;
 
     use ka_dialect::dialects::{Catalog, Wire};
     use ka_dialect::speaker::{
@@ -2745,5 +2971,352 @@ mod tests {
         assert!(catalog.get("nope/missing").is_none());
         assert!(catalog.get("openai/gpt-5.1").is_some());
         let _ = Wire::OpenaiChat;
+    }
+
+    /// Is `pid` alive? (`kill -0`)
+    fn pid_alive(pid: u32) -> bool {
+        std::process::Command::new("kill")
+            .arg("-0")
+            .arg(pid.to_string())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    }
+
+    /// Three bash calls whose starts/finishes are logged to a shared file:
+    /// concurrent execution shows all S- lines before the first E- line.
+    struct BashTrio {
+        log: std::path::PathBuf,
+    }
+
+    impl Speaker for BashTrio {
+        fn speak<'a>(
+            &'a self,
+            req: SpeakRequest,
+            out: tokio::sync::mpsc::Sender<StreamEvent>,
+        ) -> SpeakFuture<'a> {
+            Box::pin(async move {
+                let has_result = req
+                    .messages
+                    .iter()
+                    .any(|m| m.role == TurnRole::Tool && !m.results.is_empty());
+                if has_result {
+                    out.send(StreamEvent::Text("all done".into())).await.ok();
+                    out.send(StreamEvent::Finished {
+                        stop: ka_protocol::Stop::Done,
+                        usage: Usage::default(),
+                    })
+                    .await
+                    .ok();
+                    return;
+                }
+                let log = self.log.display().to_string();
+                for (i, name) in [(1, "ALPHA"), (2, "BETA"), (3, "GAMMA")] {
+                    out.send(StreamEvent::Call(ToolCall {
+                        id: format!("c{i}"),
+                        tool: "bash".into(),
+                        arguments: serde_json::json!({"command": format!(
+                            "echo S-{i} >> {log}; sleep 0.3; echo E-{i} >> {log}; echo OUT-{name}"
+                        )}),
+                    }))
+                    .await
+                    .ok();
+                }
+                out.send(StreamEvent::Finished {
+                    stop: ka_protocol::Stop::Done,
+                    usage: Usage::default(),
+                })
+                .await
+                .ok();
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn parallel_step_runs_concurrently_and_returns_results_in_call_order() {
+        let dir = std::env::temp_dir().join(format!("ka-voice-par-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("log");
+        let catalog = Catalog::parse(
+            "[dialects.\"test/m\"]\nwire = \"openai_chat\"\nbase_url = \"http://127.0.0.1:1\"\ncontext = 1000\n",
+        )
+        .unwrap();
+        let mut voice = Voice::new(catalog, dir.clone(), ka_protocol::Mode::Free, 5).with_speaker(
+            Wire::OpenaiChat,
+            std::sync::Arc::new(BashTrio { log: log.clone() }),
+        );
+        let mut guards = GuardRuntime::default();
+        let (_events, _) = drive_turn(&mut voice, &mut guards, "run the trio", None).await;
+
+        // results fed back in ORIGINAL call order with matching call ids
+        let tool_msg = voice
+            .history
+            .iter()
+            .find(|m| m.role == TurnRole::Tool)
+            .unwrap();
+        let results = &tool_msg.results;
+        for ((i, result), marker) in results.iter().enumerate().zip(["ALPHA", "BETA", "GAMMA"]) {
+            assert_eq!(result.call_id, format!("c{}", i + 1), "{results:?}");
+            assert!(
+                result.content.contains(&format!("OUT-{marker}")),
+                "result {i} must carry its own output: {}",
+                result.content
+            );
+            assert!(!result.is_error);
+        }
+        // concurrency proof: every call started before any finished
+        let lines: Vec<String> = std::fs::read_to_string(&log)
+            .unwrap()
+            .lines()
+            .map(str::to_string)
+            .collect();
+        let last_start = lines
+            .iter()
+            .rposition(|l| l.starts_with("S-"))
+            .expect("starts logged");
+        let first_end = lines
+            .iter()
+            .position(|l| l.starts_with("E-"))
+            .expect("finishes logged");
+        assert!(
+            last_start < first_end,
+            "calls must overlap, not serialize: {lines:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// One long-running bash call; the abort arrives mid-step.
+    struct LongBash {
+        pidfile: std::path::PathBuf,
+    }
+
+    impl Speaker for LongBash {
+        fn speak<'a>(
+            &'a self,
+            _req: SpeakRequest,
+            out: tokio::sync::mpsc::Sender<StreamEvent>,
+        ) -> SpeakFuture<'a> {
+            Box::pin(async move {
+                out.send(StreamEvent::Call(ToolCall {
+                    id: "b1".into(),
+                    tool: "bash".into(),
+                    arguments: serde_json::json!({"command": format!(
+                        "sleep 30 & echo $! > {}; wait",
+                        self.pidfile.display()
+                    )}),
+                }))
+                .await
+                .ok();
+                out.send(StreamEvent::Finished {
+                    stop: ka_protocol::Stop::Done,
+                    usage: Usage::default(),
+                })
+                .await
+                .ok();
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn abort_mid_step_cancels_in_flight_and_kills_children() {
+        let dir = std::env::temp_dir().join(format!("ka-voice-abort-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let pidfile = dir.join("sleeper.pid");
+        let catalog = Catalog::parse(
+            "[dialects.\"test/m\"]\nwire = \"openai_chat\"\nbase_url = \"http://127.0.0.1:1\"\ncontext = 1000\n",
+        )
+        .unwrap();
+        let mut voice = Voice::new(catalog, dir.clone(), ka_protocol::Mode::Free, 5).with_speaker(
+            Wire::OpenaiChat,
+            std::sync::Arc::new(LongBash {
+                pidfile: pidfile.clone(),
+            }),
+        );
+
+        let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::channel(16);
+        let (evt_tx, mut evt_rx) = tokio::sync::mpsc::channel(256);
+        let mut interjections = Vec::new();
+        let mut deferrals = std::collections::VecDeque::new();
+        let handle = tokio::spawn(async move {
+            voice
+                .turn(
+                    "test/m",
+                    "start the sleeper".into(),
+                    &mut cmd_rx,
+                    &evt_tx,
+                    &mut interjections,
+                    &mut deferrals,
+                    &mut GuardRuntime::default(),
+                )
+                .await;
+        });
+        let mut aborted = false;
+        while let Some(evt) = evt_rx.recv().await {
+            match evt {
+                Event::CallStarted { .. } => {
+                    // wait for the child to publish its pid, then abort
+                    for _ in 0..100 {
+                        if pidfile.exists() {
+                            break;
+                        }
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                    }
+                    cmd_tx.send(Command::Abort).await.ok();
+                }
+                Event::TurnFinished { stop, .. } => {
+                    aborted = stop == Stop::Aborted;
+                    break;
+                }
+                _ => {}
+            }
+        }
+        handle.await.unwrap();
+        assert!(aborted, "mid-step abort must finish the turn aborted");
+
+        // the in-flight child must be dead shortly after the cancel
+        let sleeper: u32 = std::fs::read_to_string(&pidfile)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        for _ in 0..100 {
+            if !pid_alive(sleeper) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert!(
+            !pid_alive(sleeper),
+            "aborted bash child (pid {sleeper}) must be killed, not orphaned"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// bash (auto-backgrounds) → jobs list → jobs kill → done.
+    struct BgScript;
+
+    impl Speaker for BgScript {
+        fn speak<'a>(
+            &'a self,
+            req: SpeakRequest,
+            out: tokio::sync::mpsc::Sender<StreamEvent>,
+        ) -> SpeakFuture<'a> {
+            Box::pin(async move {
+                let results = req.messages.iter().flat_map(|m| &m.results).count();
+                if results >= 3 {
+                    out.send(StreamEvent::Text("wrapped up".into())).await.ok();
+                    out.send(StreamEvent::Finished {
+                        stop: ka_protocol::Stop::Done,
+                        usage: Usage::default(),
+                    })
+                    .await
+                    .ok();
+                    return;
+                }
+                let (tool, id, call) = match results {
+                    0 => (
+                        "bash",
+                        "b1",
+                        serde_json::json!({"command": "echo bg-running; sleep 30"}),
+                    ),
+                    1 => ("jobs", "j1", serde_json::json!({})),
+                    _ => ("jobs", "j2", serde_json::json!({"action": "kill", "id": 1})),
+                };
+                out.send(StreamEvent::Call(ToolCall {
+                    id: id.into(),
+                    tool: tool.into(),
+                    arguments: call,
+                }))
+                .await
+                .ok();
+                out.send(StreamEvent::Finished {
+                    stop: ka_protocol::Stop::Done,
+                    usage: Usage::default(),
+                })
+                .await
+                .ok();
+            })
+        }
+    }
+    #[tokio::test]
+    async fn background_threshold_promotes_and_jobs_hand_polls_and_kills() {
+        let _ = std::fs::remove_dir_all(std::env::temp_dir().join("ka-voice-bg-spills"));
+        let catalog = Catalog::parse(
+            "[dialects.\"test/m\"]\nwire = \"openai_chat\"\nbase_url = \"http://127.0.0.1:1\"\ncontext = 1000\n",
+        )
+        .unwrap();
+        let mut voice = Voice::new(catalog, std::env::temp_dir(), ka_protocol::Mode::Free, 5)
+            .with_speaker(Wire::OpenaiChat, std::sync::Arc::new(BgScript));
+        voice.set_bash_background_ms(60);
+        // capture before the voice moves into the turn task
+        let jobs = voice.jobs();
+
+        let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::channel(16);
+        let (evt_tx, mut evt_rx) = tokio::sync::mpsc::channel(256);
+        let mut interjections = Vec::new();
+        let mut deferrals = std::collections::VecDeque::new();
+        let handle = tokio::spawn(async move {
+            voice
+                .turn(
+                    "test/m",
+                    "run long".into(),
+                    &mut cmd_rx,
+                    &evt_tx,
+                    &mut interjections,
+                    &mut deferrals,
+                    &mut GuardRuntime::default(),
+                )
+                .await;
+        });
+        let mut outputs: Vec<String> = Vec::new();
+        while let Some(evt) = evt_rx.recv().await {
+            if let Event::CallOutput { excerpt, .. } = &evt {
+                outputs.push(excerpt.clone());
+            }
+            if matches!(evt, Event::TurnFinished { .. }) {
+                break;
+            }
+        }
+        drop(cmd_tx);
+        handle.await.unwrap();
+        let promotion = outputs
+            .iter()
+            .find(|o| o.contains("backgrounded as job 1"))
+            .expect("promotion result must reach the surface");
+        assert!(promotion.contains("poll with jobs"), "{promotion}");
+        let listing = outputs
+            .iter()
+            .find(|o| o.contains("job 1") && !o.contains("backgrounded as job"))
+            .expect("jobs list output");
+        assert!(listing.contains("running"), "{listing}");
+        assert!(listing.contains("sleep 30"), "{listing}");
+        assert!(
+            listing.contains("bg-running"),
+            "tail must show streamed output: {listing}"
+        );
+        let kill = outputs
+            .iter()
+            .find(|o| o.contains("killing job 1"))
+            .expect("kill output");
+        assert!(!kill.is_empty(), "{kill}");
+        // the kill watcher records the terminal state in the table
+        for _ in 0..100 {
+            if jobs.snapshot()[0].state != crate::hands::jobs::JobState::Running {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert!(
+            matches!(
+                jobs.snapshot()[0].state,
+                crate::hands::jobs::JobState::Exited(_)
+            ),
+            "killed job must land exited: {:?}",
+            jobs.snapshot()[0].state
+        );
     }
 }

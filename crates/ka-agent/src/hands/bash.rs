@@ -3,9 +3,10 @@
 //! engine (see `bashp`); this hand only executes what was approved.
 
 use std::future::Future;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 use tokio::process::Command;
@@ -73,6 +74,11 @@ impl BashHand {
     /// [`PREVIEW_TICK_MS`] (ANSI-stripped, capped, one final drain at exit).
     /// The returned [`ToolOutput`] and all caps/spill/kill behavior are
     /// identical to the plain [`Hand::execute`] path.
+    ///
+    /// A command still running after `ctx.bash_background_ms` (> 0) is
+    /// promoted to a job in the shared [`crate::hands::jobs::JobTable`]:
+    /// it keeps running, its output streams into a spill file, and a
+    /// normal tool result points the model at the `jobs` tool.
     pub fn execute_streaming<'a, P>(
         &'a self,
         args: &'a Value,
@@ -109,128 +115,276 @@ impl BashHand {
                 Err(e) => return ToolOutput::err(format!("bash spawn: {e}")),
             };
             let pid = child.id();
+            let started = Instant::now();
+            // Abort safety: if this future is dropped mid-flight (a turn
+            // abort cancels in-flight tool futures), the drop guard kills
+            // the whole process tree.
+            let mut guard = KillGuard { pid, armed: true };
 
             // shared pending buffer: both stream pumps append freshly read
             // output here; the ticker drains it as preview excerpts
             let pending: Arc<parking_lot::Mutex<String>> = Arc::default();
-            let collect = async {
-                let stdout = child.stdout.take();
-                let stderr = child.stderr.take();
-                let p_out = pending.clone();
-                let out_task = tokio::spawn(async move {
-                    use tokio::io::AsyncReadExt;
-                    let mut buf = Vec::new();
-                    if let Some(mut s) = stdout {
-                        let mut chunk = [0u8; 4096];
-                        loop {
-                            match s.read(&mut chunk).await {
-                                Ok(0) | Err(_) => break,
-                                Ok(n) => {
-                                    buf.extend_from_slice(&chunk[..n]);
-                                    p_out.lock().push_str(&String::from_utf8_lossy(&chunk[..n]));
-                                }
+            let stdout = child.stdout.take();
+            let stderr = child.stderr.take();
+            let p_out = pending.clone();
+            let out_task = tokio::spawn(async move {
+                use tokio::io::AsyncReadExt;
+                let mut buf = Vec::new();
+                if let Some(mut s) = stdout {
+                    let mut chunk = [0u8; 4096];
+                    loop {
+                        match s.read(&mut chunk).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => {
+                                buf.extend_from_slice(&chunk[..n]);
+                                p_out.lock().push_str(&String::from_utf8_lossy(&chunk[..n]));
                             }
                         }
                     }
-                    buf
-                });
-                let p_err = pending.clone();
-                let err_task = tokio::spawn(async move {
-                    use tokio::io::AsyncReadExt;
-                    let mut buf = Vec::new();
-                    if let Some(mut s) = stderr {
-                        let mut chunk = [0u8; 4096];
-                        loop {
-                            match s.read(&mut chunk).await {
-                                Ok(0) | Err(_) => break,
-                                Ok(n) => {
-                                    buf.extend_from_slice(&chunk[..n]);
-                                    p_err.lock().push_str(&String::from_utf8_lossy(&chunk[..n]));
-                                }
+                }
+                buf
+            });
+            let p_err = pending.clone();
+            let err_task = tokio::spawn(async move {
+                use tokio::io::AsyncReadExt;
+                let mut buf = Vec::new();
+                if let Some(mut s) = stderr {
+                    let mut chunk = [0u8; 4096];
+                    loop {
+                        match s.read(&mut chunk).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => {
+                                buf.extend_from_slice(&chunk[..n]);
+                                p_err.lock().push_str(&String::from_utf8_lossy(&chunk[..n]));
                             }
                         }
                     }
-                    buf
-                });
-                let out = out_task.await.unwrap_or_default();
-                let err = err_task.await.unwrap_or_default();
-                let status = child.wait().await.ok();
-                (out, err, status)
-            };
+                }
+                buf
+            });
 
-            let result = tokio::time::timeout(Duration::from_millis(timeout_ms), async {
-                tokio::pin!(collect);
+            // Run: preview ticks vs child exit vs the auto-background
+            // threshold, all under the hard timeout.
+            enum Phase {
+                Exited(Option<std::process::ExitStatus>),
+                Promote,
+            }
+            let background_ms = ctx.bash_background_ms;
+            let run = async {
                 let mut ticker = tokio::time::interval(Duration::from_millis(PREVIEW_TICK_MS));
                 ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                let bg = tokio::time::sleep(Duration::from_millis(background_ms));
+                tokio::pin!(bg);
                 loop {
                     tokio::select! {
-                        _ = ticker.tick() => {
-                            emit_progress(&pending, progress);
-                        }
-                        r = &mut collect => break r,
+                        _ = ticker.tick() => emit_progress(&pending, progress),
+                        status = child.wait() => break Phase::Exited(status.ok()),
+                        _ = &mut bg, if background_ms > 0 => break Phase::Promote,
                     }
                 }
-            })
-            .await;
-            let (stdout, stderr, status) = match result {
-                Ok(r) => {
+            };
+            // bind first: the timeout future must drop before an arm can
+            // move the child into a watcher
+            let outcome = tokio::time::timeout(Duration::from_millis(timeout_ms), run).await;
+            match outcome {
+                // hard timeout: the still-armed drop guard kills the tree
+                Err(_) => {
+                    ctx.ledger.lock().invalidate_all();
+                    // the still-armed drop guard kills the tree
+                    ToolOutput::err(format!(
+                        "bash: timed out after {timeout_ms}ms (killed):\n{command}"
+                    ))
+                }
+                Ok(Phase::Promote) => {
+                    let (spill_path, _ptr) = match ctx.spill.slot() {
+                        Ok(s) => s,
+                        // nowhere to stream into: kill rather than orphan
+                        // an untracked child (the armed guard does it)
+                        Err(e) => {
+                            ctx.ledger.lock().invalidate_all();
+                            return ToolOutput::err(format!(
+                                "bash: cannot park background output: {e}\n{command}"
+                            ));
+                        }
+                    };
+                    // fresh bytes go into the spill file BEFORE the final
+                    // preview flush, which would otherwise consume them
+                    // into the live band and lose them; the TUI live band
+                    // simply closes when this call returns
+                    append_pending(&pending, &spill_path);
+                    emit_progress(&pending, progress);
+                    let (kill_tx, kill_rx) = tokio::sync::mpsc::unbounded_channel();
+                    let id = ctx.jobs.register(
+                        command.to_string(),
+                        started,
+                        spill_path.clone(),
+                        pid,
+                        kill_tx,
+                    );
+                    // the watcher owns the child from here; stand down
+                    guard.disarm();
+                    supervise(
+                        child,
+                        out_task,
+                        err_task,
+                        pending,
+                        spill_path,
+                        pid,
+                        kill_rx,
+                        id,
+                        ctx.jobs.clone(),
+                    );
+                    ctx.ledger.lock().invalidate_all();
+                    ToolOutput {
+                        content: format!(
+                            "backgrounded as job {id} — still running; poll with jobs"
+                        ),
+                        is_error: false,
+                        spill: None,
+                    }
+                }
+                Ok(Phase::Exited(status)) => {
+                    guard.disarm();
                     // final drain: output produced since the last tick
                     emit_progress(&pending, progress);
-                    r
-                }
-                Err(_) => {
-                    // kill the whole process group, then reap
-                    if let Some(pid) = pid {
-                        #[cfg(unix)]
-                        {
-                            kill_tree(pid);
+                    let stdout = out_task.await.unwrap_or_default();
+                    let stderr = err_task.await.unwrap_or_default();
+                    ctx.ledger.lock().invalidate_all();
+                    let mut combined = String::from_utf8_lossy(&stdout).into_owned();
+                    if !stderr.is_empty() {
+                        let err_text = String::from_utf8_lossy(&stderr).into_owned();
+                        if !combined.is_empty() {
+                            combined.push('\n');
+                        }
+                        combined.push_str("(stderr)\n");
+                        combined.push_str(&err_text);
+                    }
+
+                    let code = status.and_then(|s| s.code());
+                    let is_error = code.map(|c| c != 0).unwrap_or(true);
+                    let capped = cap_output(ctx, &combined);
+                    let exit_note = match code {
+                        Some(0) => String::new(),
+                        Some(c) => format!("(exit {c})\n"),
+                        None => "(no exit status)\n".to_string(),
+                    };
+                    let header = format!("{exit_note}$ {command}\n");
+                    if capped.spilled {
+                        let pointer = capped.pointer.clone().unwrap_or_default();
+                        ToolOutput {
+                            content: format!(
+                                "{header}{}[output capped; full output at {pointer}]",
+                                capped.text
+                            ),
+                            is_error,
+                            spill: capped.pointer,
+                        }
+                    } else {
+                        ToolOutput {
+                            content: format!("{header}{}", capped.text),
+                            is_error,
+                            spill: None,
                         }
                     }
-                    let _ = child.start_kill();
-                    ctx.ledger.lock().invalidate_all();
-                    return ToolOutput::err(format!(
-                        "bash: timed out after {timeout_ms}ms (killed):\n{command}"
-                    ));
-                }
-            };
-            ctx.ledger.lock().invalidate_all();
-            let mut combined = String::from_utf8_lossy(&stdout).into_owned();
-            if !stderr.is_empty() {
-                let err_text = String::from_utf8_lossy(&stderr).into_owned();
-                if !combined.is_empty() {
-                    combined.push('\n');
-                }
-                combined.push_str("(stderr)\n");
-                combined.push_str(&err_text);
-            }
-
-            let code = status.and_then(|s| s.code());
-            let is_error = code.map(|c| c != 0).unwrap_or(true);
-            let capped = cap_output(ctx, &combined);
-            let exit_note = match code {
-                Some(0) => String::new(),
-                Some(c) => format!("(exit {c})\n"),
-                None => "(no exit status)\n".to_string(),
-            };
-            let header = format!("{exit_note}$ {command}\n");
-            if capped.spilled {
-                let pointer = capped.pointer.clone().unwrap_or_default();
-                ToolOutput {
-                    content: format!(
-                        "{header}{}[output capped; full output at {pointer}]",
-                        capped.text
-                    ),
-                    is_error,
-                    spill: capped.pointer,
-                }
-            } else {
-                ToolOutput {
-                    content: format!("{header}{}", capped.text),
-                    is_error,
-                    spill: None,
                 }
             }
         })
+    }
+}
+
+/// Drop guard for a spawned child: while armed, dropping kills the whole
+/// process tree. Covers every early return and — crucially — the abort
+/// path, where the awaiting future is dropped mid-flight and nothing
+/// else would reap the child.
+struct KillGuard {
+    pid: Option<u32>,
+    armed: bool,
+}
+
+impl KillGuard {
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for KillGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        if let Some(pid) = self.pid {
+            #[cfg(unix)]
+            kill_tree(pid);
+        }
+    }
+}
+
+/// Own a promoted background child until it exits (or the jobs table
+/// kills it): stream fresh output into the spill file, then replace the
+/// file with the full combined output and record the exit code.
+#[allow(clippy::too_many_arguments)]
+fn supervise(
+    mut child: tokio::process::Child,
+    out_task: tokio::task::JoinHandle<Vec<u8>>,
+    err_task: tokio::task::JoinHandle<Vec<u8>>,
+    pending: Arc<parking_lot::Mutex<String>>,
+    spill: PathBuf,
+    pid: Option<u32>,
+    mut kill_rx: tokio::sync::mpsc::UnboundedReceiver<()>,
+    id: u64,
+    jobs: Arc<crate::hands::jobs::JobTable>,
+) {
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(Duration::from_millis(PREVIEW_TICK_MS));
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let status = loop {
+            tokio::select! {
+                _ = kill_rx.recv() => {
+                    // a jobs kill, or the table went away (session over):
+                    // either way the tree must die
+                    if let Some(pid) = pid {
+                        #[cfg(unix)]
+                        kill_tree(pid);
+                    }
+                    let _ = child.start_kill();
+                    break child.wait().await.ok();
+                }
+                status = child.wait() => break status.ok(),
+                _ = ticker.tick() => append_pending(&pending, &spill),
+            }
+        };
+        let stdout = out_task.await.unwrap_or_default();
+        let stderr = err_task.await.unwrap_or_default();
+        append_pending(&pending, &spill);
+        // the authoritative full output replaces the streamed tail
+        let mut combined = String::from_utf8_lossy(&stdout).into_owned();
+        if !stderr.is_empty() {
+            let err_text = String::from_utf8_lossy(&stderr).into_owned();
+            if !combined.is_empty() {
+                combined.push('\n');
+            }
+            combined.push_str("(stderr)\n");
+            combined.push_str(&err_text);
+        }
+        let _ = std::fs::write(&spill, combined.as_bytes());
+        jobs.finish(id, status.and_then(|s| s.code()));
+    });
+}
+
+/// Drain the pending buffer and append it to `path` (the streamed spill
+/// file of a backgrounded job).
+fn append_pending(pending: &parking_lot::Mutex<String>, path: &Path) {
+    let fresh = std::mem::take(&mut *pending.lock());
+    if fresh.is_empty() {
+        return;
+    }
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        use std::io::Write;
+        let _ = f.write_all(fresh.as_bytes());
     }
 }
 
@@ -303,8 +457,7 @@ pub fn cap_preview(raw: &str) -> String {
     text
 }
 
-#[cfg(unix)]
-fn kill_tree(pid: u32) {
+pub(crate) fn kill_tree(pid: u32) {
     // Positive-pid kills only: negative-pid (process-group) kills proved
     // unsafe on some hosts (can signal the caller's own group). We kill
     // direct children first, then the shell itself. `sh -c` execs single
@@ -422,6 +575,7 @@ mod tests {
     use parking_lot::Mutex;
 
     use super::*;
+    use crate::hands::jobs::JobTable;
     use crate::hands::{Ledger, Spill};
 
     fn ctx_for(dir: &std::path::Path) -> HandContext {
@@ -432,6 +586,8 @@ mod tests {
             snapshots: Arc::new(parking_lot::Mutex::new(
                 crate::hands::snapshots::Snapshots::inert(),
             )),
+            jobs: Arc::new(JobTable::new()),
+            bash_background_ms: 0,
         }
     }
 
@@ -501,6 +657,135 @@ mod tests {
         assert!(
             ctx.ledger.lock().is_empty(),
             "any bash run must invalidate the ledger"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Is `pid` alive? (`kill -0`)
+    fn pid_alive(pid: u32) -> bool {
+        std::process::Command::new("kill")
+            .arg("-0")
+            .arg(pid.to_string())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    }
+
+    /// Poll until `pred` holds (or `secs` elapse).
+    async fn wait_for(pred: impl Fn() -> bool, secs: u64) -> bool {
+        let deadline = std::time::Instant::now() + Duration::from_secs(secs);
+        while std::time::Instant::now() < deadline {
+            if pred() {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        pred()
+    }
+
+    #[tokio::test]
+    async fn drop_guard_kills_child_when_future_dropped() {
+        let dir = std::env::temp_dir().join(format!("ka-bash-drop-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let ctx = ctx_for(&dir);
+        let pidfile = dir.join("sleeper.pid");
+        let cmd = format!("sleep 30 & echo $! > {}; wait", pidfile.display());
+        let hand = BashHand;
+        let args = json!({"command": cmd});
+        let noop = |_: String| {};
+        let task = tokio::spawn(async move { hand.execute_streaming(&args, &ctx, &noop).await });
+        // wait for the sleeper to publish its pid
+        assert!(
+            wait_for(|| pidfile.metadata().is_ok(), 5).await,
+            "sleeper must start"
+        );
+        let sleeper: u32 = std::fs::read_to_string(&pidfile)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        assert!(pid_alive(sleeper));
+        // drop the awaiting future: the guard must kill the whole tree
+        task.abort();
+        let _ = task.await;
+        assert!(
+            wait_for(|| !pid_alive(sleeper), 5).await,
+            "dropped bash future must not orphan the child (pid {sleeper})"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn background_promotes_running_command_into_a_job() {
+        let dir = std::env::temp_dir().join(format!("ka-bash-bg-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut ctx = ctx_for(&dir);
+        ctx.bash_background_ms = 80;
+        let jobs = ctx.jobs.clone();
+
+        let out = BashHand
+            .execute(&json!({"command": "echo started; sleep 30"}), &ctx)
+            .await;
+        assert!(!out.is_error, "{}", out.content);
+        assert!(
+            out.content.contains("backgrounded as job 1"),
+            "{}",
+            out.content
+        );
+        assert!(out.content.contains("poll with jobs"), "{}", out.content);
+        // the call returned well before the 30s child finished
+        let snap = jobs.snapshot();
+        assert_eq!(snap.len(), 1, "exactly one job registered");
+        assert_eq!(snap[0].id, 1);
+        assert_eq!(snap[0].state, crate::hands::jobs::JobState::Running);
+        assert_eq!(snap[0].cmd, "echo started; sleep 30");
+        // output streams into the spill file
+        assert!(
+            wait_for(
+                || {
+                    std::fs::read_to_string(&snap[0].spill)
+                        .map(|s| s.contains("started"))
+                        .unwrap_or(false)
+                },
+                5
+            )
+            .await,
+            "spill file must carry streamed output"
+        );
+
+        // jobs kill tears the promoted child down; the watcher records exit
+        assert!(jobs.kill(1).is_ok());
+        assert!(
+            wait_for(
+                || jobs.snapshot()[0].state != crate::hands::jobs::JobState::Running,
+                5
+            )
+            .await,
+            "killed job must reach a terminal state"
+        );
+        assert!(matches!(
+            jobs.snapshot()[0].state,
+            crate::hands::jobs::JobState::Exited(_)
+        ));
+        assert!(jobs.kill(1).is_err(), "double kill must be an error");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn background_off_by_default_and_fast_commands_never_promote() {
+        let dir = std::env::temp_dir().join(format!("ka-bash-bg0-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let ctx = ctx_for(&dir);
+        let out = BashHand
+            .execute(&json!({"command": "echo quick"}), &ctx)
+            .await;
+        assert!(!out.is_error, "{}", out.content);
+        assert!(out.content.contains("quick"));
+        assert!(
+            ctx.jobs.snapshot().is_empty(),
+            "threshold 0 disables backgrounding"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

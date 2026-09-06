@@ -103,6 +103,32 @@ pub struct Roles {
     pub fast: Option<String>,
 }
 
+/// Per-tool settings (`[tools]` in a ka.toml layer).
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema,
+)]
+#[serde(deny_unknown_fields, default)]
+pub struct Tools {
+    /// Bash tool settings.
+    pub bash: BashTools,
+}
+
+/// Bash tool tuning (`[tools.bash]`).
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema,
+)]
+#[serde(deny_unknown_fields, default)]
+pub struct BashTools {
+    /// Auto-background a bash command still running after this many
+    /// milliseconds: it keeps running, the model gets a normal result
+    /// pointing at the `jobs` tool. None = the default (30000); 0 = never
+    /// background.
+    pub background_after_ms: Option<u64>,
+}
+
+/// Default bash auto-background threshold (30s).
+pub const DEFAULT_BACKGROUND_AFTER_MS: u64 = 30_000;
+
 /// Engine configuration. All fields optional at the data level; resolution
 /// order is applied by [`Config::overlay`] consumers.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
@@ -138,6 +164,9 @@ pub struct Config {
     /// Spend/context guard thresholds ([guards]; both default off).
     #[serde(default)]
     pub guards: Guards,
+    /// Per-tool settings ([tools]).
+    #[serde(default)]
+    pub tools: Tools,
 }
 
 impl Config {
@@ -178,19 +207,27 @@ impl Config {
         if !other.permissions.allow.is_empty() {
             self.permissions.allow = other.permissions.allow;
         }
-        if other.guards.spend_usd.is_some() {
-            self.guards.spend_usd = other.guards.spend_usd;
-        }
         if other.guards.context_pct.is_some() {
             self.guards.context_pct = other.guards.context_pct;
         }
         if !other.mcp.is_empty() {
             self.mcp = other.mcp;
         }
+        if other.tools.bash.background_after_ms.is_some() {
+            self.tools.bash.background_after_ms = other.tools.bash.background_after_ms;
+        }
     }
     /// Effective step cap (default 20).
     pub fn effective_max_steps(&self) -> u32 {
         self.max_steps.unwrap_or(20)
+    }
+
+    /// Effective bash auto-background threshold (default 30000, 0 = off).
+    pub fn effective_bash_background_after_ms(&self) -> u64 {
+        self.tools
+            .bash
+            .background_after_ms
+            .unwrap_or(DEFAULT_BACKGROUND_AFTER_MS)
     }
 
     /// The effective permission mode (free unless set in a layer).
@@ -453,5 +490,43 @@ mod tests {
     fn schema_emits() {
         let schema = Config::schema_json().unwrap();
         assert!(schema.contains("\"Config\""), "got: {schema}");
+    }
+
+    #[test]
+    fn bash_background_threshold_defaults_overlays_and_rejects_unknown() {
+        // default 30000 when absent everywhere
+        assert_eq!(
+            Config::default().effective_bash_background_after_ms(),
+            DEFAULT_BACKGROUND_AFTER_MS
+        );
+        // set + layered overlay (set fields win)
+        let mut base =
+            Config::parse_layer("[tools.bash]\nbackground_after_ms = 1000\n", "base").unwrap();
+        assert_eq!(base.effective_bash_background_after_ms(), 1000);
+        let over =
+            Config::parse_layer("[tools.bash]\nbackground_after_ms = 250\n", "over").unwrap();
+        base.overlay(over);
+        assert_eq!(base.effective_bash_background_after_ms(), 250);
+        // unset upper layer keeps the lower layer's value
+        let lower =
+            Config::parse_layer("[tools.bash]\nbackground_after_ms = 1000\n", "lower").unwrap();
+        let mut merged = Config::default();
+        merged.overlay(lower);
+        assert_eq!(merged.effective_bash_background_after_ms(), 1000);
+        // unknown keys still hard-error
+        let err = Config::parse_layer("[tools.bash]\nbackground_after_sec = 1\n", "user")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("background_after_sec"), "got: {err}");
+        let err = Config::parse_layer("[tools]\nbashh = {}\n", "user")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("bashh"), "got: {err}");
+    }
+
+    #[test]
+    fn schema_contains_background_after_ms() {
+        let schema = Config::schema_json().unwrap();
+        assert!(schema.contains("background_after_ms"), "got: {schema}");
     }
 }
