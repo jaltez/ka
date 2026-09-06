@@ -99,6 +99,12 @@ async fn speak_openai(
             .collect();
         body["tools"] = Value::Array(tools);
     }
+    if let Some(schema) = &req.schema {
+        body["response_format"] = json!({
+            "type": "json_schema",
+            "json_schema": { "name": "output", "strict": true, "schema": schema },
+        });
+    }
     let mut messages = Vec::new();
     if !req.system.is_empty() {
         messages.push(json!({"role": "system", "content": req.system}));

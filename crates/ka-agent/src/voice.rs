@@ -504,6 +504,7 @@ impl Voice {
             tools: Vec::new(),
             token,
             cache_key: None,
+            schema: None,
         };
         let speaker = self.speaker(dialect.wire);
         let (tx, mut rx) = mpsc::channel::<StreamEvent>(256);
@@ -588,6 +589,7 @@ impl Voice {
             tools: Vec::new(),
             token,
             cache_key: None,
+            schema: None,
         };
         let speaker = self.speaker(wire);
         let (tx, mut rx) = mpsc::channel::<StreamEvent>(256);
@@ -791,6 +793,7 @@ impl Voice {
         interjections: &mut Vec<String>,
         deferrals: &mut VecDeque<String>,
         guards: &mut GuardRuntime,
+        schema: Option<serde_json::Value>,
     ) -> Usage {
         use ka_dialect::parse_selector;
         let mut parsed = match parse_selector(model_selector) {
@@ -811,6 +814,17 @@ impl Voice {
                 .await;
             }
         };
+        if schema.is_some() && !dialect.flags.structured {
+            return finish_after_error(
+                events,
+                ErrorClass::Unsupported,
+                &format!(
+                    "model {model_id:?} does not support structured output \
+                     (no `structured` support; drop --schema or pick a model that has it)"
+                ),
+            )
+            .await;
+        }
         let mut price = dialect.price;
         let mut ratio = if dialect.ratio > 0.0 {
             dialect.ratio
@@ -907,6 +921,7 @@ attempt implementation — the user will review and switch to build mode.",
                 tools: self.specs(),
                 token: token.clone(),
                 cache_key: None,
+                schema: schema.clone(),
             };
             let speaker = self.speaker(dialect.wire);
             let (tx, mut rx) = mpsc::channel::<StreamEvent>(256);
@@ -2066,6 +2081,7 @@ mod tests {
                     &mut interjections,
                     &mut deferrals,
                     &mut GuardRuntime::default(),
+                    None,
                 )
                 .await;
         });
@@ -2184,6 +2200,7 @@ mod tests {
                     &mut interjections,
                     &mut deferrals,
                     &mut GuardRuntime::default(),
+                    None,
                 )
                 .await;
         });
@@ -2560,6 +2577,7 @@ mod tests {
                     &mut interjections,
                     &mut deferrals,
                     &mut GuardRuntime::default(),
+                    None,
                 )
                 .await;
         });
@@ -2656,6 +2674,7 @@ mod tests {
                     &mut interjections,
                     &mut deferrals,
                     &mut GuardRuntime::default(),
+                    None,
                 )
                 .await;
         });
@@ -2730,6 +2749,7 @@ mod tests {
                     &mut i,
                     &mut d,
                     &mut GuardRuntime::default(),
+                    None,
                 )
                 .await;
         });
@@ -2950,6 +2970,7 @@ mod tests {
                 &mut interjections,
                 &mut deferrals,
                 guards,
+                None,
             )
             .await;
         // keep the receiver alive until the turn task wraps up
@@ -3023,6 +3044,7 @@ mod tests {
                     &mut interjections,
                     &mut deferrals,
                     &mut GuardRuntime::default(),
+                    None,
                 )
                 .await;
         });
@@ -3400,6 +3422,7 @@ mod tests {
                     &mut interjections,
                     &mut deferrals,
                     &mut GuardRuntime::default(),
+                    None,
                 )
                 .await;
         });
@@ -3518,6 +3541,7 @@ mod tests {
                     &mut interjections,
                     &mut deferrals,
                     &mut GuardRuntime::default(),
+                    None,
                 )
                 .await;
         });
@@ -3660,6 +3684,7 @@ mod tests {
                     &mut interjections,
                     &mut deferrals,
                     &mut guards,
+                    None,
                 )
                 .await
         });
@@ -3735,5 +3760,61 @@ mod tests {
                 .any(|(c, _)| *c == ka_protocol::ErrorClass::Auth)
         );
         assert!(finished);
+    }
+
+    #[tokio::test]
+    async fn schema_on_non_structured_model_errors_instructively() {
+        let catalog = Catalog::parse(
+            "[dialects.\"test/ns\"]\nwire = \"openai_chat\"\nbase_url = \"http://127.0.0.1:1\"\ncontext = 1000\n\n[dialects.\"test/ns\".flags]\nstructured = false\n",
+        )
+        .unwrap();
+        let seen = std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let mut voice = Voice::new(catalog, std::env::temp_dir(), ka_protocol::Mode::Free, 5)
+            .with_speaker(
+                Wire::OpenaiChat,
+                std::sync::Arc::new(AuthFailSpeaker {
+                    seen: seen.clone(),
+                    fail_for: Vec::new(),
+                }),
+            );
+        let (_cmd_tx, mut cmd_rx) = mpsc::channel(16);
+        let (evt_tx, mut evt_rx) = mpsc::channel(256);
+        let mut interjections = Vec::new();
+        let mut deferrals = std::collections::VecDeque::new();
+        let mut guards = GuardRuntime::default();
+        let schema = serde_json::json!({"type": "object"});
+        let handle = tokio::spawn(async move {
+            voice
+                .turn(
+                    "test/ns",
+                    "hi".into(),
+                    &mut cmd_rx,
+                    &evt_tx,
+                    &mut interjections,
+                    &mut deferrals,
+                    &mut guards,
+                    Some(schema),
+                )
+                .await
+        });
+        let mut saw_unsupported = false;
+        while let Some(evt) = evt_rx.recv().await {
+            if let Event::Error {
+                class: ka_protocol::ErrorClass::Unsupported,
+                message,
+                ..
+            } = evt
+            {
+                assert!(message.contains("structured output"), "{message}");
+                saw_unsupported = true;
+                break;
+            }
+        }
+        assert!(saw_unsupported, "expected an Unsupported error event");
+        let _ = handle.await.unwrap();
+        assert!(
+            seen.lock().is_empty(),
+            "the speaker must not be reached for unsupported schemas"
+        );
     }
 }

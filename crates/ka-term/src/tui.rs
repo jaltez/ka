@@ -2693,7 +2693,7 @@ async fn app(
                                     // retry = a fresh turn with the same prompt
                                     transcript.push_separated(Line::User(p.clone()));
                                     busy = true;
-                                    let _ = commands.send(Command::Prompt { text: p }).await;
+                                    let _ = commands.send(Command::Prompt { text: p, schema: None }).await;
                                 } else {
                                     transcript.push_separated(Line::Note("nothing to retry yet".into()));
                                 }
@@ -2825,7 +2825,7 @@ async fn app(
                                     transcript.push_separated(Line::Note("(mode set; starting)".into()));
                                     busy = true;
                                     let _ = commands
-                                        .send(Command::Prompt { text: follow })
+                                        .send(Command::Prompt { text: follow, schema: None })
                                         .await;
                                 }
                                 if cmd.quit {
@@ -2858,7 +2858,7 @@ async fn app(
                             } else {
                                 // plain new turn: the /retry target
                                 last_user = Some(text.clone());
-                                Command::Prompt { text }
+                                Command::Prompt { text, schema: None }
                             };
                             busy = true;
                             let _ = commands.send(cmd).await;
@@ -3259,7 +3259,7 @@ async fn app(
                                     transcript.push_separated(Line::User(next.clone()));
                                     last_user = Some(next.clone());
                                     busy = true;
-                                    let _ = commands.send(Command::Prompt { text: next }).await;
+                                    let _ = commands.send(Command::Prompt { text: next, schema: None }).await;
                                 }
                             }
                         }
@@ -4106,7 +4106,10 @@ fn slash_command(text: &str) -> Option<Slash> {
         if let Some(body) = custom_command(head, rest) {
             return Some(Slash {
                 note: None,
-                event: Some(Command::Prompt { text: body }),
+                event: Some(Command::Prompt {
+                    text: body,
+                    schema: None,
+                }),
                 quit: false,
                 followup: None,
                 modal: None,

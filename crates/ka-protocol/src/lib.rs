@@ -144,6 +144,10 @@ pub enum Command {
     Prompt {
         /// Prompt text.
         text: String,
+        /// Structured-output JSON schema the reply must satisfy
+        /// (None = free-form text).
+        #[serde(default)]
+        schema: Option<serde_json::Value>,
     },
     /// Deliver user input mid-turn (steering), between tool batches.
     Interject {
@@ -475,7 +479,10 @@ mod tests {
 
     #[test]
     fn commands_roundtrip() {
-        roundtrip_command(Command::Prompt { text: "hi".into() });
+        roundtrip_command(Command::Prompt {
+            text: "hi".into(),
+            schema: None,
+        });
         roundtrip_command(Command::Interject {
             text: "use tabs".into(),
         });

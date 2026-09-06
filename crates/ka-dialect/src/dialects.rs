@@ -105,6 +105,13 @@ pub struct Flags {
     /// Request field for output-token cap (None = `max_tokens`).
     #[serde(default)]
     pub max_tokens_field: Option<String>,
+    /// Whether the model accepts a structured-output schema. Defaults to
+    /// true on parsed rows: every wire ka speaks today carries schema
+    /// support; opt out per row with `structured = false`.
+    /// [`Flags::default`] (discovery rows) is false — local models stay
+    /// conservative.
+    #[serde(default = "default_true")]
+    pub structured: bool,
     /// Whether the model accepts tool calls on the wire (sniffed for
     /// discovered local models; `false` = unknown or absent).
     #[serde(default)]
@@ -166,6 +173,10 @@ pub struct Dialect {
     /// Behavioral flags.
     #[serde(default)]
     pub flags: Flags,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 fn default_max_output() -> u32 {

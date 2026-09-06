@@ -459,13 +459,14 @@ async fn handle_command(
     ctx: &mut Ctx,
 ) -> Result<(), DynError> {
     match cmd {
-        Command::Prompt { text } => {
+        Command::Prompt { text, schema } => {
             dispatch_turn(
                 commands,
                 &ctx.events,
                 &mut ctx.state,
                 &mut ctx.voice,
                 text,
+                schema,
                 &mut ctx.strand,
                 &ctx.cwd,
             )
@@ -482,6 +483,7 @@ async fn handle_command(
                     &mut ctx.state,
                     &mut ctx.voice,
                     deferred,
+                    None,
                     &mut ctx.strand,
                     &ctx.cwd,
                 )
@@ -1276,13 +1278,14 @@ fn voice_ratio(voice: &Voice) -> f64 {
 }
 
 /// Route one prompt through the live voice when a model is configured,
-/// else the canned speaker.
+#[allow(clippy::too_many_arguments)]
 async fn dispatch_turn(
     commands: &mut mpsc::Receiver<Command>,
     events: &mpsc::Sender<Event>,
     state: &mut EngineState,
     voice: &mut Voice,
     text: String,
+    schema: Option<serde_json::Value>,
     strand: &mut ka_strand::StrandFile,
     cwd: &std::path::Path,
 ) {
@@ -1299,6 +1302,7 @@ async fn dispatch_turn(
                 &mut state.interjections,
                 &mut state.deferrals,
                 &mut state.guards,
+                schema,
             )
             .await
     } else {
@@ -1611,7 +1615,10 @@ mod tests {
         let mut handle = spawn(Config::default());
         handle
             .commands
-            .send(Command::Prompt { text: "hi".into() })
+            .send(Command::Prompt {
+                text: "hi".into(),
+                schema: None,
+            })
             .await
             .unwrap();
         let seen = drain_until_finished(&mut handle.events).await;
@@ -1638,6 +1645,7 @@ mod tests {
             .commands
             .send(Command::Prompt {
                 text: "slow".into(),
+                schema: None,
             })
             .await
             .unwrap();
@@ -1657,7 +1665,10 @@ mod tests {
         let mut handle = spawn(Config::default());
         handle
             .commands
-            .send(Command::Prompt { text: "one".into() })
+            .send(Command::Prompt {
+                text: "one".into(),
+                schema: None,
+            })
             .await
             .unwrap();
         handle
@@ -1708,6 +1719,7 @@ mod tests {
         h1.commands
             .send(Command::Prompt {
                 text: "hello there".into(),
+                schema: None,
             })
             .await
             .unwrap();
@@ -1742,6 +1754,7 @@ mod tests {
         h2.commands
             .send(Command::Prompt {
                 text: "second question".into(),
+                schema: None,
             })
             .await
             .unwrap();
@@ -1794,7 +1807,10 @@ mod tests {
             StrandChoice::New,
         );
         h.commands
-            .send(Command::Prompt { text: "hi".into() })
+            .send(Command::Prompt {
+                text: "hi".into(),
+                schema: None,
+            })
             .await
             .unwrap();
         while let Some(evt) = h.events.recv().await {
@@ -1900,6 +1916,7 @@ mod tests {
         h2.commands
             .send(Command::Prompt {
                 text: "hello".into(),
+                schema: None,
             })
             .await
             .unwrap();
@@ -1957,6 +1974,7 @@ mod tests {
             h.commands
                 .send(Command::Prompt {
                     text: prompt.into(),
+                    schema: None,
                 })
                 .await
                 .unwrap();
@@ -2011,6 +2029,7 @@ mod tests {
             .commands
             .send(Command::Prompt {
                 text: "first session question".into(),
+                schema: None,
             })
             .await
             .unwrap();
@@ -2139,6 +2158,7 @@ mod tests {
             .commands
             .send(Command::Prompt {
                 text: text.to_string(),
+                schema: None,
             })
             .await
             .unwrap();
@@ -2530,6 +2550,7 @@ mod tests {
         h.commands
             .send(Command::Prompt {
                 text: "please fix the parser in src/x.rs".into(),
+                schema: None,
             })
             .await
             .unwrap();
@@ -2567,6 +2588,7 @@ mod tests {
         h.commands
             .send(Command::Prompt {
                 text: "please fix the parser in src/x.rs".into(),
+                schema: None,
             })
             .await
             .unwrap();
@@ -2601,6 +2623,7 @@ mod tests {
         h.commands
             .send(Command::Prompt {
                 text: "please fix the parser in src/x.rs".into(),
+                schema: None,
             })
             .await
             .unwrap();
@@ -2628,6 +2651,7 @@ mod tests {
         h1.commands
             .send(Command::Prompt {
                 text: "please fix the parser in src/x.rs".into(),
+                schema: None,
             })
             .await
             .unwrap();
@@ -2658,6 +2682,7 @@ mod tests {
         h2.commands
             .send(Command::Prompt {
                 text: "second question".into(),
+                schema: None,
             })
             .await
             .unwrap();

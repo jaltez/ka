@@ -109,6 +109,16 @@ async fn speak_anthropic(
             .collect();
         body["tools"] = Value::Array(tools);
     }
+    if let Some(schema) = &req.schema {
+        let mut tools: Vec<Value> = body["tools"].as_array().cloned().unwrap_or_default();
+        tools.push(json!({
+            "name": "structured_output",
+            "description": "Reply with the final answer as JSON matching the given schema.",
+            "input_schema": schema,
+        }));
+        body["tools"] = Value::Array(tools);
+        body["tool_choice"] = json!({ "type": "tool", "name": "structured_output" });
+    }
     let mut messages = Vec::new();
     for m in &req.messages {
         match m.role {
@@ -276,13 +286,19 @@ async fn speak_anthropic(
                     if index < blocks.len() && blocks[index].kind == "tool_use" {
                         let b = &blocks[index];
                         if !b.tool.is_empty() {
-                            out.send(StreamEvent::Call(ToolCall {
-                                id: b.id.clone(),
-                                tool: b.tool.clone(),
-                                arguments: repair_json(&b.args),
-                            }))
-                            .await
-                            .ok();
+                            // a structured-output request surfaces the forced
+                            // tool's arguments as the reply text
+                            if b.tool == "structured_output" {
+                                out.send(StreamEvent::Text(b.args.clone())).await.ok();
+                            } else {
+                                out.send(StreamEvent::Call(ToolCall {
+                                    id: b.id.clone(),
+                                    tool: b.tool.clone(),
+                                    arguments: repair_json(&b.args),
+                                }))
+                                .await
+                                .ok();
+                            }
                         }
                     }
                 }

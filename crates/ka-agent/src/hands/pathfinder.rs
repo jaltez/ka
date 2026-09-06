@@ -109,6 +109,7 @@ impl Hand for PathfinderHand {
                         &mut interjections,
                         &mut deferrals,
                         &mut GuardRuntime::default(),
+                        None,
                     )
                     .await;
             });

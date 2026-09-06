@@ -143,6 +143,11 @@ async fn speak_responses(
     if dialect.max_output > 0 {
         body["max_output_tokens"] = json!(dialect.max_output);
     }
+    if let Some(schema) = &req.schema {
+        body["text"] = json!({
+            "format": { "type": "json_schema", "name": "output", "strict": true, "schema": schema }
+        });
+    }
     if let Some(effort) = req.effort.clone() {
         body["reasoning"] = json!({"effort": effort});
     }

@@ -76,6 +76,9 @@ enum CliCommand {
         /// Trust this directory's .ka/ka.toml (stores the decision)
         #[arg(long)]
         trust: bool,
+        /// JSON-schema file the reply must satisfy (structured output)
+        #[arg(long, value_name = "PATH")]
+        schema: Option<PathBuf>,
     },
     /// List known models (embedded catalog + local discovery)
     Models {
@@ -272,7 +275,18 @@ async fn dispatch(cli: Cli) -> Result<ExitCode, String> {
             continue_latest,
             session,
             trust,
+            schema,
         }) => {
+            let schema_value = match schema {
+                Some(path) => {
+                    let text = std::fs::read_to_string(&path)
+                        .map_err(|e| format!("schema {}: {e}", path.display()))?;
+                    let value: serde_json::Value = serde_json::from_str(&text)
+                        .map_err(|e| format!("schema {}: invalid JSON: {e}", path.display()))?;
+                    Some(value)
+                }
+                None => None,
+            };
             run_headless(
                 prompt,
                 model,
@@ -283,6 +297,7 @@ async fn dispatch(cli: Cli) -> Result<ExitCode, String> {
                 continue_latest,
                 session,
                 trust,
+                schema_value,
             )
             .await
         }
@@ -348,7 +363,6 @@ async fn dispatch(cli: Cli) -> Result<ExitCode, String> {
         }
     }
 }
-
 #[allow(clippy::too_many_arguments)]
 async fn run_headless(
     prompt: Option<String>,
@@ -360,6 +374,7 @@ async fn run_headless(
     continue_latest: bool,
     session: Option<String>,
     force_trust: bool,
+    schema: Option<serde_json::Value>,
 ) -> Result<ExitCode, String> {
     let trust = trust_for_cwd(force_trust);
     warn_untrusted_conventions(&std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
@@ -390,7 +405,10 @@ async fn run_headless(
     let mut handle = spawn_full(cfg, catalog, choice);
     handle
         .commands
-        .send(Command::Prompt { text: prompt })
+        .send(Command::Prompt {
+            text: prompt,
+            schema,
+        })
         .await
         .map_err(|_| "engine closed before prompt".to_string())?;
 

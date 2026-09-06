@@ -144,6 +144,8 @@ pub struct SpeakRequest {
     pub token: Option<String>,
     /// Cache key for providers that take one.
     pub cache_key: Option<String>,
+    /// Structured-output schema the reply must satisfy (None = free-form).
+    pub schema: Option<serde_json::Value>,
 }
 
 /// Normalized streaming events emitted by any wire.
