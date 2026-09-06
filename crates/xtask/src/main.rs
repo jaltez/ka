@@ -20,6 +20,9 @@ fn main() {
         "ci" => ci(),
         "size" => size(),
         "models-sync" => models_sync(),
+        "keygen" => keygen(&rest),
+        "sign" => sign(&rest),
+        "release" => release(),
         "help" | "--help" | "-h" => {
             print_help();
             0
@@ -44,6 +47,10 @@ fn print_help() {
             (hint: KA_DATA_DIR=/tmp/ka-dev cargo xtask dev -- models)
   ci        fmt --check + clippy -D warnings + tests (what CI runs)
   models-sync  regenerate crates/ka-dialect/models-dev.toml from models.dev
+  keygen    generate ka-release.key/.pub (ed25519, refused if keys exist;
+            --force overwrites)
+  sign <file>  sign with ka-release.key (or $KA_SIGNING_KEY base64) -> <file>.sig
+  release   build musl release, tar.gz it, sign, print artifact paths
   help      this message"
     );
 }
@@ -201,6 +208,191 @@ fn size() -> i32 {
         mb, SIZE_BUDGET_MB
     );
     if mb <= SIZE_BUDGET_MB { 0 } else { 1 }
+}
+
+/// Base64 (standard alphabet) encoder — keeps xtask dependency-light.
+fn b64(data: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
+    for chunk in data.chunks(3) {
+        let n = ((chunk[0] as u32) << 16)
+            | ((*chunk.get(1).unwrap_or(&0) as u32) << 8)
+            | (*chunk.get(2).unwrap_or(&0) as u32);
+        out.push(TABLE[(n >> 18) as usize & 63] as char);
+        out.push(TABLE[(n >> 12) as usize & 63] as char);
+        out.push(if chunk.len() > 1 {
+            TABLE[(n >> 6) as usize & 63] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            TABLE[n as usize & 63] as char
+        } else {
+            '='
+        });
+    }
+    out
+}
+
+/// Base64 decode (ignores whitespace and '=' padding).
+fn unb64(text: &str) -> Option<Vec<u8>> {
+    fn val(c: u8) -> Option<u32> {
+        match c {
+            b'A'..=b'Z' => Some((c - b'A') as u32),
+            b'a'..=b'z' => Some((c - b'a' + 26) as u32),
+            b'0'..=b'9' => Some((c - b'0' + 52) as u32),
+            b'+' => Some(62),
+            b'/' => Some(63),
+            _ => None,
+        }
+    }
+    let cleaned: Vec<u8> = text
+        .bytes()
+        .filter(|b| !b.is_ascii_whitespace() && *b != b'=')
+        .collect();
+    let mut out = Vec::with_capacity(cleaned.len() * 3 / 4);
+    for chunk in cleaned.chunks(4) {
+        if chunk.len() == 1 {
+            return None;
+        }
+        let mut n = 0u32;
+        for (i, c) in chunk.iter().enumerate() {
+            n |= val(*c)? << (18 - 6 * i);
+        }
+        out.push((n >> 16) as u8);
+        if chunk.len() > 2 {
+            out.push((n >> 8) as u8);
+        }
+        if chunk.len() > 3 {
+            out.push(n as u8);
+        }
+    }
+    Some(out)
+}
+
+/// 32 random bytes from the OS (keygen only needs /dev/urandom).
+fn os_random_32() -> Option<[u8; 32]> {
+    use std::io::Read;
+    let mut key = [0u8; 32];
+    std::fs::File::open("/dev/urandom")
+        .ok()?
+        .read_exact(&mut key)
+        .ok()?;
+    Some(key)
+}
+
+fn key_paths() -> (PathBuf, PathBuf) {
+    (
+        repo_root().join("ka-release.key"),
+        repo_root().join("ka-release.pub"),
+    )
+}
+
+/// `xtask keygen [--force]`: write ka-release.key/.pub (base64), print pub.
+fn keygen(rest: &[String]) -> i32 {
+    let force = rest.iter().any(|a| a == "--force");
+    let (key_path, pub_path) = key_paths();
+    if !force && (key_path.exists() || pub_path.exists()) {
+        eprintln!(
+            "xtask: {} already exists (use --force to overwrite)",
+            key_path.display()
+        );
+        return 2;
+    }
+    let Some(seed) = os_random_32() else {
+        eprintln!("xtask: cannot read /dev/urandom");
+        return 2;
+    };
+    let signing = ed25519_dalek::SigningKey::from_bytes(&seed);
+    let secret = b64(signing.as_bytes());
+    let public = b64(signing.verifying_key().as_bytes());
+    if let Err(e) = std::fs::write(&key_path, secret + "\n") {
+        eprintln!("xtask: write {}: {e}", key_path.display());
+        return 2;
+    }
+    if let Err(e) = std::fs::write(&pub_path, public.clone() + "\n") {
+        eprintln!("xtask: write {}: {e}", pub_path.display());
+        return 2;
+    }
+    println!("wrote {} and {}", key_path.display(), pub_path.display());
+    println!("public key: {public}");
+    println!(
+        "keep the .key private; set KA_SIGNING_KEY or leave the file at the repo root to sign"
+    );
+    0
+}
+
+/// The signing key: $KA_SIGNING_KEY (base64) or ka-release.key at the root.
+fn load_signing_key() -> Option<ed25519_dalek::SigningKey> {
+    let text = match env::var("KA_SIGNING_KEY") {
+        Ok(k) if !k.trim().is_empty() => k,
+        _ => std::fs::read_to_string(key_paths().0).ok()?,
+    };
+    let seed: [u8; 32] = unb64(text.trim())?.try_into().ok()?;
+    Some(ed25519_dalek::SigningKey::from_bytes(&seed))
+}
+
+/// `xtask sign <file>`: write <file>.sig (base64 ed25519 signature).
+fn sign(rest: &[String]) -> i32 {
+    let Some(file) = rest.first() else {
+        eprintln!("xtask: sign <file> required");
+        return 2;
+    };
+    let Some(signing) = load_signing_key() else {
+        eprintln!("xtask: no signing key (set KA_SIGNING_KEY or run `cargo xtask keygen`)");
+        return 2;
+    };
+    let Ok(bytes) = std::fs::read(file) else {
+        eprintln!("xtask: cannot read {file}");
+        return 2;
+    };
+    use ed25519_dalek::Signer;
+    let sig = signing.sign(&bytes);
+    let sig_path = format!("{file}.sig");
+    if let Err(e) = std::fs::write(&sig_path, b64(&sig.to_bytes()) + "\n") {
+        eprintln!("xtask: write {sig_path}: {e}");
+        return 2;
+    }
+    println!("signed {file} -> {sig_path}");
+    0
+}
+
+/// `xtask release`: musl build -> tar.gz -> signature -> print artifacts.
+fn release() -> i32 {
+    let target = "x86_64-unknown-linux-musl";
+    let code = run(Command::new(cargo_bin_dir().join("cargo"))
+        .args(["build", "-p", "ka-cli", "--release", "--target", target])
+        .current_dir(repo_root()));
+    if code != 0 {
+        return code;
+    }
+    let bin = repo_root()
+        .join("target")
+        .join(target)
+        .join("release")
+        .join("ka");
+    let artifact = format!("ka-{target}.tar.gz");
+    let code = run(Command::new("tar")
+        .args([
+            "czf",
+            &artifact,
+            "-C",
+            bin.parent().and_then(Path::to_str).unwrap_or("."),
+            "ka",
+        ])
+        .current_dir(repo_root()));
+    if code != 0 {
+        return code;
+    }
+    let code = sign(std::slice::from_ref(&artifact));
+    if code != 0 {
+        return code;
+    }
+    println!("artifacts: {artifact} ({artifact}.sig)");
+    println!(
+        "CI release job embeds KA_PUBKEY into the binary so `ka update` verifies {artifact}.sig"
+    );
+    0
 }
 
 /// Regenerate `crates/ka-dialect/models-dev.toml` from https://models.dev.

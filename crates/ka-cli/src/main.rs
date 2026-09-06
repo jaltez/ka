@@ -140,6 +140,10 @@ enum ConfigCommand {
     },
 }
 
+/// Ed25519 public key embedded at build time (`KA_PUBKEY=<base64>`); the
+/// presence marks a signed build and lets `ka update` verify artifacts.
+pub const PUBLIC_KEY: Option<&str> = option_env!("KA_PUBKEY");
+
 fn main() -> ExitCode {
     let cli = Cli::parse();
     let runtime = tokio::runtime::Builder::new_current_thread()

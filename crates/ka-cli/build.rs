@@ -10,6 +10,11 @@ fn main() {
         None => pkg,
     };
     println!("cargo:rustc-env=KA_VERSION={full}");
+    // release signing pubkey: `KA_PUBKEY=<base64> cargo build` embeds it so
+    // `ka update` can verify release signatures (absent = unsigned build)
+    if let Ok(pubkey) = std::env::var("KA_PUBKEY") {
+        println!("cargo:rustc-env=KA_PUBKEY={pubkey}");
+    }
     println!(
         "cargo:rerun-if-changed={}",
         root.join(".git/HEAD").display()

@@ -30,6 +30,7 @@ unicode-width = "0.2"
 tokio-stream = "0.1"
 schemars = "1"
 keyring = { version = "3", default-features = false, features = ["apple-native", "windows-native", "linux-native"] }
+ed25519-dalek = { version = "2", default-features = false, features = ["fast"] }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
