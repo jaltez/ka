@@ -129,6 +129,17 @@ pub struct BashTools {
 /// Default bash auto-background threshold (30s).
 pub const DEFAULT_BACKGROUND_AFTER_MS: u64 = 30_000;
 
+/// Fallback model chain ([fallback]). When a turn fails on the active
+/// model with a provider/auth error after retries are exhausted, the
+/// engine re-dispatches the same messages on the next entry.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields, default)]
+pub struct Fallback {
+    /// Fallback selectors (`vendor/model[:effort]`) in try-order; at
+    /// most 2 hops are taken per turn.
+    pub models: Vec<String>,
+}
+
 /// Engine configuration. All fields optional at the data level; resolution
 /// order is applied by [`Config::overlay`] consumers.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
@@ -164,6 +175,9 @@ pub struct Config {
     /// Spend/context guard thresholds ([guards]; both default off).
     #[serde(default)]
     pub guards: Guards,
+    /// Fallback model chain ([fallback]).
+    #[serde(default)]
+    pub fallback: Fallback,
     /// Per-tool settings ([tools]).
     #[serde(default)]
     pub tools: Tools,
@@ -215,6 +229,9 @@ impl Config {
         }
         if other.tools.bash.background_after_ms.is_some() {
             self.tools.bash.background_after_ms = other.tools.bash.background_after_ms;
+        }
+        if !other.fallback.models.is_empty() {
+            self.fallback.models = other.fallback.models;
         }
     }
     /// Effective step cap (default 20).

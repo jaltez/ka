@@ -152,6 +152,9 @@ pub struct Voice {
     /// Persistent allowlist from `[permissions] allow` (tools that skip
     /// the ask entirely).
     allowed_tools: Vec<String>,
+    /// Fallback model chain ([fallback] models; tried in order on
+    /// provider/auth failure, max 2 hops per turn).
+    fallbacks: Vec<String>,
     /// Pathfinder bootstrap slot shared with the hand.
     pathfinder_slot:
         std::sync::Arc<parking_lot::RwLock<crate::hands::pathfinder::PathfinderSource>>,
@@ -197,6 +200,7 @@ impl Voice {
             last_context: 0,
             digest_revision: 0,
             last_digest: None,
+            fallbacks: Vec::new(),
             rules_cfg: Vec::new(),
             hooks_cfg: Vec::new(),
             allowed_tools: Vec::new(),
@@ -267,6 +271,7 @@ impl Voice {
             last_context: 0,
             digest_revision: 0,
             last_digest: None,
+            fallbacks: Vec::new(),
             pathfinder_slot: slot,
             todo: todos,
         }
@@ -292,6 +297,11 @@ impl Voice {
     /// Set the persistent tool allowlist (`[permissions] allow`).
     pub fn set_allowed_tools(&mut self, tools: Vec<String>) {
         self.allowed_tools = tools;
+    }
+
+    /// Set the fallback model chain ([fallback] models; engine bootstrap).
+    pub fn set_fallbacks(&mut self, models: Vec<String>) {
+        self.fallbacks = models;
     }
 
     /// Set the bash auto-background threshold in ms (engine bootstrap;
@@ -783,33 +793,37 @@ impl Voice {
         guards: &mut GuardRuntime,
     ) -> Usage {
         use ka_dialect::parse_selector;
-
-        let parsed = match parse_selector(model_selector) {
+        let mut parsed = match parse_selector(model_selector) {
             Ok(p) => p,
             Err(e) => {
                 return finish_after_error(events, ErrorClass::Protocol, &e.to_string()).await;
             }
         };
-        let model_id = parsed.model_id();
-        let Some(dialect) = self.catalog.get(&model_id).cloned() else {
-            return finish_after_error(
-                events,
-                ErrorClass::Protocol,
-                &format!("unknown model {model_id:?} (not in catalog; add a dialect overlay)"),
-            )
-            .await;
+        let mut model_id = parsed.model_id();
+        let mut dialect = match self.catalog.get(&model_id).cloned() {
+            Some(d) => d,
+            None => {
+                return finish_after_error(
+                    events,
+                    ErrorClass::Protocol,
+                    &format!("unknown model {model_id:?} (not in catalog; add a dialect overlay)"),
+                )
+                .await;
+            }
         };
-        let price = dialect.price;
-        let ratio = if dialect.ratio > 0.0 {
+        let mut price = dialect.price;
+        let mut ratio = if dialect.ratio > 0.0 {
             dialect.ratio
         } else {
             4.0
         };
-        let token = dialect
+        let mut token = dialect
             .api_key_env
             .as_deref()
             .and_then(ka_dialect::auth::resolve_token);
-        let window = dialect.context as u64;
+        let mut window = dialect.context as u64;
+        let mut fallback_cursor: usize = 0;
+        let mut fallback_hops: usize = 0;
 
         let est_in = (prompt.len() as f64 / ratio as f64).ceil() as u64;
         events
@@ -1082,6 +1096,58 @@ attempt implementation — the user will review and switch to build mode.",
                             .await
                             .ok();
                     } else {
+                        continue 'outer;
+                    }
+                }
+                // Fallback chain: provider/auth failure with per-wire
+                // retries exhausted → re-dispatch the same messages on
+                // the next configured model (max 2 hops per turn). The
+                // switch is transient: the rest of this turn rides the
+                // fallback, no strand Change is recorded, and the next
+                // turn starts from the requested selector again.
+                if matches!(
+                    class,
+                    ErrorClass::Auth
+                        | ErrorClass::RateLimit
+                        | ErrorClass::Network
+                        | ErrorClass::Internal
+                ) && fallback_hops < 2
+                {
+                    let mut hop: Option<(String, ka_dialect::Selector, ka_dialect::Dialect)> = None;
+                    while let Some(sel) = self.fallbacks.get(fallback_cursor) {
+                        fallback_cursor += 1;
+                        if let Ok(p) = parse_selector(sel) {
+                            if let Some(d) = self.catalog.get(&p.model_id()).cloned() {
+                                hop = Some((sel.clone(), p, d));
+                                break;
+                            }
+                        }
+                    }
+                    if let Some((sel, p, d)) = hop {
+                        fallback_hops += 1;
+                        events
+                            .send(Event::Note {
+                                message: format!("fallback → {sel}"),
+                            })
+                            .await
+                            .ok();
+                        parsed = p;
+                        model_id = parsed.model_id();
+                        dialect = d;
+                        price = dialect.price;
+                        ratio = if dialect.ratio > 0.0 {
+                            dialect.ratio
+                        } else {
+                            4.0
+                        };
+                        token = dialect
+                            .api_key_env
+                            .as_deref()
+                            .and_then(ka_dialect::auth::resolve_token);
+                        window = dialect.context as u64;
+                        retry_attempt = 0;
+                        self.model_selector = Some(sel);
+                        self.ratio = ratio as f64;
                         continue 'outer;
                     }
                 }
@@ -3501,5 +3567,173 @@ mod tests {
             "killed job must land exited: {:?}",
             jobs.snapshot()[0].state
         );
+    }
+
+    /// Fails with a non-retryable auth error for the listed model ids,
+    /// otherwise finishes with text. Records every request's model id.
+    struct AuthFailSpeaker {
+        seen: std::sync::Arc<parking_lot::Mutex<Vec<String>>>,
+        fail_for: Vec<String>,
+    }
+
+    impl Speaker for AuthFailSpeaker {
+        fn speak<'a>(
+            &'a self,
+            req: SpeakRequest,
+            out: mpsc::Sender<StreamEvent>,
+        ) -> SpeakFuture<'a> {
+            let seen = self.seen.clone();
+            Box::pin(async move {
+                seen.lock().push(req.model_id.clone());
+                if self.fail_for.contains(&req.model_id) {
+                    out.send(StreamEvent::Failed {
+                        class: ka_protocol::ErrorClass::Auth,
+                        retryable: false,
+                        message: "auth boom".into(),
+                    })
+                    .await
+                    .ok();
+                } else {
+                    out.send(StreamEvent::Text("ok".into())).await.ok();
+                    out.send(StreamEvent::Finished {
+                        stop: ka_protocol::Stop::Done,
+                        usage: ka_protocol::Usage::default(),
+                    })
+                    .await
+                    .ok();
+                }
+            })
+        }
+    }
+
+    /// Catalog covering the fallback test models.
+    fn fallback_catalog() -> Catalog {
+        Catalog::parse(
+            "[dialects.\"test/a\"]\nwire = \"openai_chat\"\nbase_url = \"http://127.0.0.1:1\"\ncontext = 1000\n\
+             [dialects.\"test/b\"]\nwire = \"openai_chat\"\nbase_url = \"http://127.0.0.1:1\"\ncontext = 1000\n\
+             [dialects.\"test/c\"]\nwire = \"openai_chat\"\nbase_url = \"http://127.0.0.1:1\"\ncontext = 1000\n\
+             [dialects.\"test/d\"]\nwire = \"openai_chat\"\nbase_url = \"http://127.0.0.1:1\"\ncontext = 1000\n",
+        )
+        .unwrap()
+    }
+
+    /// Drive one turn on `start` with `fallbacks`, returning the notes,
+    /// errors, finish flag and the model ids the speaker saw.
+    async fn drive_fallback_turn(
+        fail_for: Vec<String>,
+        fallbacks: Vec<String>,
+        start: &str,
+    ) -> (
+        Vec<String>,
+        Vec<(ka_protocol::ErrorClass, String)>,
+        bool,
+        Vec<String>,
+    ) {
+        let seen = std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let mut voice = Voice::new(
+            fallback_catalog(),
+            std::env::temp_dir(),
+            ka_protocol::Mode::Free,
+            5,
+        )
+        .with_speaker(
+            Wire::OpenaiChat,
+            std::sync::Arc::new(AuthFailSpeaker {
+                seen: seen.clone(),
+                fail_for,
+            }),
+        );
+        voice.set_fallbacks(fallbacks);
+        let (cmd_tx, mut cmd_rx) = mpsc::channel(16);
+        let (evt_tx, mut evt_rx) = mpsc::channel(256);
+        let mut interjections = Vec::new();
+        let mut deferrals = std::collections::VecDeque::new();
+        let mut guards = GuardRuntime::default();
+        let start = start.to_string();
+        let handle = tokio::spawn(async move {
+            voice
+                .turn(
+                    &start,
+                    "hi".into(),
+                    &mut cmd_rx,
+                    &evt_tx,
+                    &mut interjections,
+                    &mut deferrals,
+                    &mut guards,
+                )
+                .await
+        });
+        let mut notes = Vec::new();
+        let mut errors = Vec::new();
+        let mut finished = false;
+        while let Some(evt) = evt_rx.recv().await {
+            match evt {
+                Event::Note { message } => notes.push(message),
+                Event::Error { class, message, .. } => errors.push((class, message)),
+                Event::TurnFinished { .. } => {
+                    finished = true;
+                    break;
+                }
+                _ => {}
+            }
+        }
+        let _ = handle.await.unwrap();
+        drop(cmd_tx);
+        let ids = seen.lock().clone();
+        (notes, errors, finished, ids)
+    }
+
+    #[tokio::test]
+    async fn fallback_hops_to_next_model_on_auth_failure() {
+        let (notes, errors, finished, ids) =
+            drive_fallback_turn(vec!["test/a".into()], vec!["test/b".into()], "test/a").await;
+        assert_eq!(ids, vec!["test/a".to_string(), "test/b".to_string()]);
+        assert!(
+            notes.iter().any(|n| n.contains("fallback → test/b")),
+            "{notes:?}"
+        );
+        assert!(errors.is_empty(), "{errors:?}");
+        assert!(finished);
+    }
+
+    #[tokio::test]
+    async fn fallback_stops_after_two_hops() {
+        // a, b, c all fail; d is healthy but unreachable: the 2-hop cap
+        // fires first and the original error surfaces
+        let (notes, errors, finished, ids) = drive_fallback_turn(
+            vec!["test/a".into(), "test/b".into(), "test/c".into()],
+            vec!["test/b".into(), "test/c".into(), "test/d".into()],
+            "test/a",
+        )
+        .await;
+        assert_eq!(
+            ids,
+            vec![
+                "test/a".to_string(),
+                "test/b".to_string(),
+                "test/c".to_string()
+            ]
+        );
+        assert_eq!(notes.iter().filter(|n| n.contains("fallback →")).count(), 2);
+        assert!(
+            errors
+                .iter()
+                .any(|(c, m)| *c == ka_protocol::ErrorClass::Auth && m == "auth boom")
+        );
+        assert!(finished, "turn must end with TurnFinished after the error");
+    }
+
+    #[tokio::test]
+    async fn empty_fallback_chain_fails_directly() {
+        let (notes, errors, finished, ids) =
+            drive_fallback_turn(vec!["test/a".into()], Vec::new(), "test/a").await;
+        assert_eq!(ids, vec!["test/a".to_string()]);
+        assert!(!notes.iter().any(|n| n.contains("fallback")));
+        assert!(
+            errors
+                .iter()
+                .any(|(c, _)| *c == ka_protocol::ErrorClass::Auth)
+        );
+        assert!(finished);
     }
 }

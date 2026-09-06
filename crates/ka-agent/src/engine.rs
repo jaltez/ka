@@ -337,6 +337,7 @@ async fn run(
     voice.set_allowed_tools(allowed_tools);
     voice.set_hooks(hooks);
     voice.set_bash_background_ms(config.effective_bash_background_after_ms());
+    voice.set_fallbacks(config.fallback.models.clone());
     {
         let slot = voice.pathfinder_slot();
         slot.write().catalog = pathfinder_catalog;
