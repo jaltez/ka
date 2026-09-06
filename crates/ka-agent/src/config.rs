@@ -446,6 +446,35 @@ mod tests {
             .to_string();
         assert!(err.contains("defualt"), "got: {err}");
     }
+    #[test]
+    fn roles_parse_overlay_and_land_in_schema() {
+        // both role selectors parse
+        let c = Config::parse_layer("[roles]\ndefault = \"a/x\"\nfast = \"b/y@low\"\n", "user")
+            .unwrap();
+        assert_eq!(c.roles.default.as_deref(), Some("a/x"));
+        assert_eq!(c.roles.fast.as_deref(), Some("b/y@low"));
+        // empty table is valid: roles default to None
+        let empty = Config::parse_layer("[roles]\n", "user").unwrap();
+        assert_eq!(empty.roles, Roles::default());
+        // layered overlay: set fields win, unset fields keep
+        let mut base =
+            Config::parse_layer("[roles]\ndefault = \"a/x\"\nfast = \"b/y\"\n", "base").unwrap();
+        let over = Config::parse_layer("[roles]\nfast = \"c/z\"\n", "over").unwrap();
+        base.overlay(over);
+        assert_eq!(base.roles.default.as_deref(), Some("a/x"));
+        assert_eq!(base.roles.fast.as_deref(), Some("c/z"));
+        // unknown keys under [roles] hard-error (typo safety)
+        let err = Config::parse_layer("[roles]\nfassst = \"b/y\"\n", "user")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("fassst"), "got: {err}");
+        // the editor schema exposes the roles table with both keys
+        let schema = Config::schema_json().unwrap();
+        assert!(schema.contains("\"Roles\""), "got: {schema}");
+        let roles_part = schema.split("\"Roles\"").nth(1).expect("Roles definition");
+        assert!(roles_part.contains("default"), "got: {roles_part}");
+        assert!(roles_part.contains("fast"), "got: {roles_part}");
+    }
 
     #[test]
     fn env_shaped_layer_parses() {

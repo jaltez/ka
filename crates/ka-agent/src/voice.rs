@@ -543,6 +543,74 @@ impl Voice {
         }
         (!summary.trim().is_empty()).then_some(summary)
     }
+    /// Output-token ceiling for auxiliary role calls (auto-titles and
+    /// later cheap chores): a few words never need more.
+    pub const ROLE_MAX_OUTPUT: u32 = 256;
+
+    /// One short auxiliary completion against a role selector already
+    /// resolved to a catalog id (`vendor/model`). No tools, capped
+    /// output, the same auth/retry plumbing as main-line calls (it rides
+    /// the dialect's wire speaker). Returns `None` on unknown model,
+    /// transport failure, timeout, or an empty/unstreamed reply — callers
+    /// must degrade silently; this is a best-effort channel.
+    pub async fn role_complete(
+        &mut self,
+        model_id: &str,
+        system: &str,
+        prompt: &str,
+        deadline: std::time::Duration,
+    ) -> Option<String> {
+        let mut dialect = self.catalog.get(model_id)?.clone();
+        if dialect.max_output == 0 || dialect.max_output > Self::ROLE_MAX_OUTPUT {
+            dialect.max_output = Self::ROLE_MAX_OUTPUT;
+        }
+        let token = dialect
+            .api_key_env
+            .as_deref()
+            .and_then(ka_dialect::auth::resolve_token);
+        let wire = dialect.wire;
+        let req = SpeakRequest {
+            model_id: model_id.to_string(),
+            dialect,
+            effort: None,
+            system: system.to_string(),
+            messages: vec![TurnMessage::user(prompt)],
+            tools: Vec::new(),
+            token,
+            cache_key: None,
+        };
+        let speaker = self.speaker(wire);
+        let (tx, mut rx) = mpsc::channel::<StreamEvent>(256);
+        {
+            let speaker = speaker.clone();
+            tokio::spawn(async move {
+                speaker.speak(req, tx).await;
+            });
+        }
+        let mut text = String::new();
+        let mut finished = false;
+        let _ = tokio::time::timeout(deadline, async {
+            while let Some(evt) = rx.recv().await {
+                match evt {
+                    StreamEvent::Text(t) => text.push_str(&t),
+                    StreamEvent::Finished { .. } => {
+                        finished = true;
+                        break;
+                    }
+                    // a failed stream never yields a trustworthy answer;
+                    // partial text before the failure is discarded
+                    StreamEvent::Failed { .. } => break,
+                    _ => {}
+                }
+            }
+        })
+        .await;
+        if !finished {
+            return None;
+        }
+        let trimmed = text.trim();
+        (!trimmed.is_empty()).then(|| trimmed.to_string())
+    }
 
     /// Replace history with the digest summary + kept tail. Returns the
     /// kept index into the OLD history (for Digest-record persistence).
@@ -2146,7 +2214,122 @@ mod tests {
         assert_eq!(saved, 0, "tiny outputs must not be pruned");
         assert_eq!(voice.history[2].results[0].content, "tiny");
     }
+    use std::sync::Arc;
+    use tokio::sync::mpsc;
 
+    /// Records requests, replies with one trimmed text delta.
+    struct TitleSpeaker {
+        seen: std::sync::Arc<parking_lot::Mutex<Vec<SpeakRequest>>>,
+    }
+    impl Speaker for TitleSpeaker {
+        fn speak<'a>(
+            &'a self,
+            req: SpeakRequest,
+            out: mpsc::Sender<StreamEvent>,
+        ) -> SpeakFuture<'a> {
+            self.seen.lock().push(req);
+            Box::pin(async move {
+                out.send(StreamEvent::Text("  Fix the Parser \n".into()))
+                    .await
+                    .ok();
+                out.send(StreamEvent::Finished {
+                    stop: Stop::Done,
+                    usage: Usage::default(),
+                })
+                .await
+                .ok();
+            })
+        }
+    }
+
+    /// Streams partial text, then fails: the partial must be discarded.
+    struct FailingSpeaker;
+    impl Speaker for FailingSpeaker {
+        fn speak<'a>(
+            &'a self,
+            _req: SpeakRequest,
+            out: mpsc::Sender<StreamEvent>,
+        ) -> SpeakFuture<'a> {
+            Box::pin(async move {
+                out.send(StreamEvent::Text("partial".into())).await.ok();
+                out.send(StreamEvent::Failed {
+                    class: ka_protocol::ErrorClass::Network,
+                    retryable: false,
+                    message: "boom".into(),
+                })
+                .await
+                .ok();
+            })
+        }
+    }
+
+    fn fast_voice(
+        speaker: std::sync::Arc<dyn Speaker>,
+    ) -> (Voice, std::sync::Arc<parking_lot::Mutex<Vec<SpeakRequest>>>) {
+        let seen = std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let catalog = Catalog::parse(
+            "[dialects.\"test/fast\"]\nwire = \"openai_chat\"\nbase_url = \"http://127.0.0.1:1\"\ncontext = 1000\n",
+        )
+        .unwrap();
+        let seen2 = seen.clone();
+        (
+            Voice::new(catalog, std::env::temp_dir(), ka_protocol::Mode::Free, 5)
+                .with_speaker(Wire::OpenaiChat, speaker),
+            seen2,
+        )
+    }
+
+    #[tokio::test]
+    async fn role_complete_trims_caps_and_records_the_request() {
+        let seen = std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let (mut voice, _) = fast_voice(Arc::new(TitleSpeaker { seen: seen.clone() }));
+        let out = voice
+            .role_complete(
+                "test/fast",
+                "titles",
+                "make a title",
+                Duration::from_secs(5),
+            )
+            .await;
+        assert_eq!(out.as_deref(), Some("Fix the Parser"));
+        let reqs = seen.lock();
+        assert_eq!(reqs.len(), 1);
+        let req = &reqs[0];
+        assert_eq!(req.model_id, "test/fast");
+        assert!(req.tools.is_empty(), "role calls never carry tools");
+        assert_eq!(req.effort, None);
+        assert_eq!(
+            req.dialect.max_output,
+            Voice::ROLE_MAX_OUTPUT,
+            "output capped for the cheap role"
+        );
+        assert_eq!(req.system, "titles");
+        assert_eq!(req.messages.len(), 1);
+        assert_eq!(req.messages[0].role, TurnRole::User);
+        assert_eq!(req.messages[0].content, "make a title");
+    }
+
+    #[tokio::test]
+    async fn role_complete_degrades_silently() {
+        // unknown selector → None
+        let (mut voice, _) = fast_voice(Arc::new(TitleSpeaker {
+            seen: std::sync::Arc::new(parking_lot::Mutex::new(Vec::new())),
+        }));
+        assert!(
+            voice
+                .role_complete("nope/missing", "s", "p", Duration::from_secs(1))
+                .await
+                .is_none()
+        );
+        // failed stream: even partial text is discarded
+        let (mut voice, _) = fast_voice(Arc::new(FailingSpeaker));
+        assert!(
+            voice
+                .role_complete("test/fast", "s", "p", Duration::from_secs(1))
+                .await
+                .is_none()
+        );
+    }
     #[test]
     fn apply_digest_cuts_at_user_boundary_and_keeps_tail() {
         use ka_dialect::speaker::{ToolCall, ToolResult, TurnMessage, TurnRole};

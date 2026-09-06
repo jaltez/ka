@@ -39,6 +39,49 @@ pub enum StrandChoice {
     Path(std::path::PathBuf),
 }
 
+/// Role selectors resolved against the engine's catalog at startup.
+/// Roles are separate from the interactive default model (`/model`
+/// keeps touching only `state.model`).
+#[derive(Debug, Default, Clone)]
+struct EngineRoles {
+    /// Main-line selector (`[roles] default`, falling back to the
+    /// configured model). Resolved (validated against the catalog) at
+    /// startup alongside `fast`; the first non-title role consumers
+    /// will read it.
+    #[allow(dead_code)]
+    default: Option<String>,
+    /// Cheap/fast selector (`[roles] fast`); `None` degrades every
+    /// fast-role consumer (auto-titles today) to its fallback.
+    fast: Option<String>,
+}
+
+/// Resolve one role selector through the same catalog path as the main
+/// model: it must parse, and its `vendor/model` must exist in the
+/// catalog (locals arrive via the discovery overlay before the engine
+/// starts). Unresolvable → `None`.
+fn resolve_role(catalog: &ka_dialect::Catalog, selector: &str) -> Option<String> {
+    let id = ka_dialect::parse_selector(selector).ok()?.model_id();
+    catalog.get(&id).is_some().then_some(id)
+}
+
+/// Resolve the `[roles]` table against the catalog. `default` falls
+/// back to the configured model; a missing/invalid `fast` simply stays
+/// `None` (fast-role-gated features degrade gracefully).
+fn resolve_roles(
+    catalog: &ka_dialect::Catalog,
+    roles: &crate::config::Roles,
+    fallback_default: Option<&str>,
+) -> EngineRoles {
+    EngineRoles {
+        default: roles
+            .default
+            .as_deref()
+            .or(fallback_default)
+            .and_then(|s| resolve_role(catalog, s)),
+        fast: roles.fast.as_deref().and_then(|s| resolve_role(catalog, s)),
+    }
+}
+
 /// Spawn the engine with the embedded catalog. Must be called inside a
 /// tokio runtime (the CLI provides one).
 pub fn spawn(config: Config) -> EngineHandle {
@@ -227,6 +270,12 @@ struct EngineState {
     checkpoints: Vec<(String, String)>,
     /// Spend/context guard thresholds + latches for this session.
     guards: crate::voice::GuardRuntime,
+    /// Role selectors resolved against the catalog at engine start.
+    roles: EngineRoles,
+    /// Fresh strand awaiting its first completed turn: the auto-title
+    /// fires once after that turn (fast role configured); resumed
+    /// strands never re-title.
+    needs_title: bool,
 }
 
 impl From<Config> for EngineState {
@@ -241,6 +290,8 @@ impl From<Config> for EngineState {
             record_ids: Vec::new(),
             checkpoints: Vec::new(),
             guards: crate::voice::GuardRuntime::new(c.guards.spend_usd, c.guards.context_pct),
+            roles: EngineRoles::default(),
+            needs_title: false,
         }
     }
 }
@@ -277,6 +328,9 @@ async fn run(
     let rules = config.rules.clone();
     let allowed_tools = config.permissions.allow.clone();
     let hooks = config.hooks.clone();
+    // roles resolve once at engine start, through the same catalog the
+    // main model uses (discovery overlays already applied by the caller)
+    let roles = resolve_roles(&catalog, &config.roles, config.model.as_deref());
     let pathfinder_catalog = catalog.clone();
     let mut voice = Voice::new(catalog, cwd.clone(), mode, max_steps);
     voice.set_rules(rules);
@@ -288,6 +342,7 @@ async fn run(
         slot.write().catalog = pathfinder_catalog;
     }
     let mut state = EngineState::from(config);
+    state.roles = roles;
     let strand = attach_strand(&events, &mut state, &mut voice, &cwd, &strand_choice).await?;
     let mut ctx = Ctx {
         cwd,
@@ -415,6 +470,9 @@ async fn handle_command(
             )
             .await;
             settle_context(&mut ctx.voice, &mut ctx.state, &mut ctx.strand, &ctx.events).await;
+            // auto-title once, right after the first completed turn of a
+            // fresh strand (deferral follow-on turns are later turns)
+            maybe_auto_title(&mut ctx.voice, &mut ctx.state, &mut ctx.strand, &ctx.events).await;
             // Settling: drain deferrals as follow-on turns.
             while let Some(deferred) = ctx.state.deferrals.pop_front() {
                 dispatch_turn(
@@ -957,6 +1015,17 @@ async fn attach_strand(
     let (history, ids, digest) = history_from_records(strand.records());
     voice.load_history(history, digest);
     state.record_ids = ids;
+    // a fresh strand (no prior user turns) may earn an auto-title after
+    // its first completed turn; resumed strands never re-title
+    state.needs_title = !strand.records().iter().any(|r| {
+        matches!(
+            r,
+            ka_strand::Record::Message {
+                role: ka_strand::Role::User,
+                ..
+            }
+        )
+    });
     if let Some(path) = strand.path() {
         write_waypoint(cwd, path);
     }
@@ -988,6 +1057,13 @@ async fn attach_strand(
         .send(Event::ModeChanged { mode: state.mode })
         .await
         .ok();
+    // one source of truth for titles: `ka_strand::title_of` over the
+    // records. Surfaces learn the stored/heuristic title at bootstrap;
+    // a live auto-title arrives as its own Title event later.
+    let title = ka_strand::title_of(strand.records());
+    if title != "(empty)" {
+        events.send(Event::Title { title }).await.ok();
+    }
     // replay resumed history so surfaces can rebuild the transcript;
     // emit unconditionally — an empty replay tells surfaces to clear
     // (fresh strands via /new rely on this to reset the transcript)
@@ -1005,6 +1081,96 @@ async fn attach_strand(
         .collect();
     events.send(Event::Replay { messages }).await.ok();
     Ok(strand)
+}
+
+/// Auto-title budget: one short fast-role call, hard-capped.
+const TITLE_TIMEOUT: Duration = Duration::from_secs(10);
+const TITLE_SYSTEM: &str = "You write terse conversation titles.";
+/// Chars of each side fed to the title prompt.
+const TITLE_SIDE_CAP: usize = 2_000;
+
+/// After the first completed turn of a fresh strand, ask the fast role
+/// (when configured) for a 3-6 word title, persist it as a
+/// [`ka_strand::Record::Title`], and announce it via `Event::Title` so
+/// the running surface relabels the session live. Every failure path is
+/// silent: the existing first-user-message heuristic stays, and no
+/// error ever reaches the transcript. One attempt per strand.
+async fn maybe_auto_title(
+    voice: &mut Voice,
+    state: &mut EngineState,
+    strand: &mut ka_strand::StrandFile,
+    events: &mpsc::Sender<Event>,
+) {
+    if !state.needs_title {
+        return;
+    }
+    // a completed turn has an assistant reply; without one (error/abort
+    // before any text) the turn is not complete enough to title
+    let Some(reply) = voice
+        .history
+        .iter()
+        .rev()
+        .find(|m| {
+            m.role == ka_dialect::speaker::TurnRole::Assistant && !m.content.trim().is_empty()
+        })
+        .map(|m| side_view(&m.content))
+    else {
+        return;
+    };
+    // one attempt, ever — success or failure, the heuristic takes over
+    state.needs_title = false;
+    let Some(fast) = state.roles.fast.clone() else {
+        return; // fast unconfigured: the first-user-message heuristic stays
+    };
+    let Some(user) = voice
+        .history
+        .iter()
+        .find(|m| m.role == ka_dialect::speaker::TurnRole::User)
+        .map(|m| side_view(&m.content))
+    else {
+        return;
+    };
+    let prompt = format!(
+        "Generate a 3-6 word title for this conversation. Reply with only the title.\n\n\
+         <user>\n{user}\n</user>\n\n<assistant>\n{reply}\n</assistant>"
+    );
+    let Some(raw) = voice
+        .role_complete(&fast, TITLE_SYSTEM, &prompt, TITLE_TIMEOUT)
+        .await
+    else {
+        return; // failed/timed out: silent fallback
+    };
+    let title = clean_title(&raw);
+    if title.is_empty() {
+        return;
+    }
+    let _ = strand.append(ka_strand::Record::Title {
+        id: ka_strand::new_record_id(),
+        title: title.clone(),
+    });
+    events.send(Event::Title { title }).await.ok();
+}
+
+/// Cap one side of the title prompt.
+fn side_view(s: &str) -> String {
+    s.chars().take(TITLE_SIDE_CAP).collect()
+}
+
+/// Normalize a model-proposed title: first non-empty line, wrapping
+/// quotes/markup stripped, whitespace collapsed, capped at the same 60
+/// chars [`ka_strand::title_of`] uses.
+fn clean_title(raw: &str) -> String {
+    let line = raw
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .unwrap_or("");
+    let line = line
+        .trim_matches(|c: char| matches!(c, '"' | '\'' | '`' | '*' | '#'))
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    line.chars().take(60).collect()
 }
 
 /// Post-turn context maintenance: prune old tool outputs, digest while
@@ -2212,5 +2378,304 @@ mod tests {
         assert!(seen.iter().all(
             |e| !matches!(e, Event::Note { message } if message.contains("agents available") || message.contains("tool(s)"))
         ));
+    }
+    // ── auto-titles ([roles] fast) ────────────────────────────────────
+
+    const TURN_SSE: &str = concat!(
+        "data: {\"choices\":[{\"delta\":{\"role\":\"assistant\",\"content\":\"Sure thing.\"}}]}\n\n",
+        "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+        "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":2}}\n\n",
+        "data: [DONE]\n\n",
+    );
+    const TITLE_SSE: &str = concat!(
+        "data: {\"choices\":[{\"delta\":{\"content\":\"Fix the parser\"}}]}\n\n",
+        "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+        "data: [DONE]\n\n",
+    );
+
+    /// Serve a queue of canned SSE bodies over a blocking-socket listener;
+    /// each HTTP request pops the next body and is captured.
+    fn serve_sse(
+        bodies: Vec<&'static str>,
+        captured: std::sync::Arc<parking_lot::Mutex<Vec<String>>>,
+    ) -> std::net::SocketAddr {
+        use std::io::{Read as _, Write as _};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            for body in bodies {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    return;
+                };
+                let mut buf: Vec<u8> = Vec::new();
+                let mut tmp = [0u8; 8192];
+                loop {
+                    match stream.read(&mut tmp) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => {
+                            buf.extend_from_slice(&tmp[..n]);
+                            if request_complete(&buf) {
+                                break;
+                            }
+                        }
+                    }
+                }
+                captured
+                    .lock()
+                    .push(String::from_utf8_lossy(&buf).into_owned());
+                let http = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: \
+                     close\r\n\r\n{body}"
+                );
+                let _ = stream.write_all(http.as_bytes());
+                let _ = stream.shutdown(std::net::Shutdown::Both);
+            }
+        });
+        addr
+    }
+
+    fn request_complete(buf: &[u8]) -> bool {
+        let Ok(s) = std::str::from_utf8(buf) else {
+            return false;
+        };
+        let Some(pos) = s.find("\r\n\r\n") else {
+            return false;
+        };
+        s.to_ascii_lowercase()
+            .lines()
+            .find_map(|l| l.strip_prefix("content-length:"))
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .is_none_or(|cl| buf.len() >= pos + 4 + cl)
+    }
+
+    fn live_catalog(
+        main_addr: std::net::SocketAddr,
+        fast_addr: Option<std::net::SocketAddr>,
+    ) -> ka_dialect::Catalog {
+        let mut text = format!(
+            "[dialects.\"test/main\"]\nwire = \"openai_chat\"\nbase_url = \
+             \"http://{main_addr}/v1\"\ncontext = 100000\n"
+        );
+        if let Some(fast) = fast_addr {
+            text.push_str(&format!(
+                "\n[dialects.\"test/fast\"]\nwire = \"openai_chat\"\nbase_url = \
+                 \"http://{fast}/v1\"\ncontext = 100000\n"
+            ));
+        }
+        ka_dialect::Catalog::parse(&text).unwrap()
+    }
+
+    fn title_workdir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "ka-eng-title-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn title_cfg(work: &std::path::Path, fast: Option<&str>) -> Config {
+        Config {
+            model: Some("test/main".into()),
+            roles: crate::config::Roles {
+                default: None,
+                fast: fast.map(str::to_string),
+            },
+            cwd: Some(work.display().to_string()),
+            ..Config::default()
+        }
+    }
+
+    fn title_events(events: &[Event]) -> Vec<&str> {
+        events
+            .iter()
+            .filter_map(|e| match e {
+                Event::Title { title } => Some(title.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn stored_titles(work: &std::path::Path) -> Vec<String> {
+        let sessions = ka_strand::list(work).unwrap();
+        sessions
+            .first()
+            .map(|s| {
+                ka_strand::read(&s.path)
+                    .unwrap()
+                    .iter()
+                    .filter_map(|r| match r {
+                        ka_strand::Record::Title { title, .. } => Some(title.clone()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default()
+    }
+
+    #[tokio::test]
+    async fn auto_title_generated_via_fast_role_and_persisted() {
+        use crate::engine::{StrandChoice, spawn_full};
+        let captured = std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let addr = serve_sse(vec![TURN_SSE, TITLE_SSE], captured.clone());
+        let work = title_workdir("ok");
+        let cfg = title_cfg(&work, Some("test/main"));
+        let mut h = spawn_full(cfg, live_catalog(addr, None), StrandChoice::New);
+        h.commands
+            .send(Command::Prompt {
+                text: "please fix the parser in src/x.rs".into(),
+            })
+            .await
+            .unwrap();
+        let events = drain_to_idle(&mut h).await;
+        assert_eq!(
+            title_events(&events),
+            vec!["Fix the parser"],
+            "one cleaned title event: {events:?}"
+        );
+        assert!(
+            events.iter().all(|e| !matches!(e, Event::Error { .. })),
+            "title flow must never surface errors: {events:?}"
+        );
+        // exactly two wire calls: the turn, then the title
+        assert_eq!(captured.lock().len(), 2, "requests: {:?}", captured.lock());
+        // the record is persisted and the summary reads it back
+        assert_eq!(stored_titles(&work), vec!["Fix the parser".to_string()]);
+        let sessions = ka_strand::list(&work).unwrap();
+        assert_eq!(sessions[0].title, "Fix the parser");
+        let _ = std::fs::remove_dir_all(&work);
+    }
+
+    #[tokio::test]
+    async fn auto_title_failure_is_silent_and_keeps_heuristic() {
+        use crate::engine::{StrandChoice, spawn_full};
+        let captured = std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let addr = serve_sse(vec![TURN_SSE], captured.clone());
+        // a port with no listener: the fast call fails to connect
+        let dead = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let dead_addr = dead.local_addr().unwrap();
+        drop(dead);
+        let work = title_workdir("fail");
+        let cfg = title_cfg(&work, Some("test/fast"));
+        let mut h = spawn_full(cfg, live_catalog(addr, Some(dead_addr)), StrandChoice::New);
+        h.commands
+            .send(Command::Prompt {
+                text: "please fix the parser in src/x.rs".into(),
+            })
+            .await
+            .unwrap();
+        let events = drain_to_idle(&mut h).await;
+        assert!(
+            title_events(&events).is_empty(),
+            "failed title must stay silent: {events:?}"
+        );
+        assert!(
+            events.iter().all(|e| !matches!(e, Event::Error { .. })),
+            "title failures never reach the transcript: {events:?}"
+        );
+        assert_eq!(captured.lock().len(), 1, "only the turn ran");
+        assert!(
+            stored_titles(&work).is_empty(),
+            "no Title record on failure"
+        );
+        // the heuristic survives: summary title = first user message
+        let sessions = ka_strand::list(&work).unwrap();
+        assert!(sessions[0].title.starts_with("please fix the parser"));
+        let _ = std::fs::remove_dir_all(&work);
+    }
+
+    #[tokio::test]
+    async fn auto_title_unconfigured_keeps_heuristic() {
+        use crate::engine::{StrandChoice, spawn_full};
+        let captured = std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let addr = serve_sse(vec![TURN_SSE], captured.clone());
+        let work = title_workdir("nofast");
+        let cfg = title_cfg(&work, None);
+        let mut h = spawn_full(cfg, live_catalog(addr, None), StrandChoice::New);
+        h.commands
+            .send(Command::Prompt {
+                text: "please fix the parser in src/x.rs".into(),
+            })
+            .await
+            .unwrap();
+        let events = drain_to_idle(&mut h).await;
+        assert!(
+            title_events(&events).is_empty(),
+            "no title without [roles] fast: {events:?}"
+        );
+        assert_eq!(captured.lock().len(), 1, "only the turn ran");
+        assert!(stored_titles(&work).is_empty());
+        let sessions = ka_strand::list(&work).unwrap();
+        assert!(sessions[0].title.starts_with("please fix the parser"));
+        let _ = std::fs::remove_dir_all(&work);
+    }
+
+    #[tokio::test]
+    async fn auto_title_never_refires_on_resume() {
+        use crate::engine::{StrandChoice, spawn_full};
+        let work = title_workdir("resume");
+        // session 1: the title fires (turn + title calls)
+        let cap_a = std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let addr_a = serve_sse(vec![TURN_SSE, TITLE_SSE], cap_a.clone());
+        let cfg = title_cfg(&work, Some("test/main"));
+        let mut h1 = spawn_full(cfg.clone(), live_catalog(addr_a, None), StrandChoice::New);
+        h1.commands
+            .send(Command::Prompt {
+                text: "please fix the parser in src/x.rs".into(),
+            })
+            .await
+            .unwrap();
+        let first = drain_to_idle(&mut h1).await;
+        assert_eq!(title_events(&first), vec!["Fix the parser"]);
+        drop(h1);
+        // session 2 (resume): the stored title is announced once at
+        // bootstrap, no second call ever fires
+        let cap_b = std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let addr_b = serve_sse(vec![TURN_SSE], cap_b.clone());
+        let mut h2 = spawn_full(cfg, live_catalog(addr_b, None), StrandChoice::Latest);
+        // bootstrap ends at Replay; the stored title must echo there
+        let mut bootstrap = Vec::new();
+        while let Ok(Some(evt)) =
+            tokio::time::timeout(Duration::from_secs(5), h2.events.recv()).await
+        {
+            let done = matches!(evt, Event::Replay { .. });
+            bootstrap.push(evt);
+            if done {
+                break;
+            }
+        }
+        assert_eq!(
+            title_events(&bootstrap),
+            vec!["Fix the parser"],
+            "bootstrap carries the stored title: {bootstrap:?}"
+        );
+        h2.commands
+            .send(Command::Prompt {
+                text: "second question".into(),
+            })
+            .await
+            .unwrap();
+        let second = drain_to_idle(&mut h2).await;
+        assert!(
+            title_events(&second).is_empty(),
+            "resume must not re-title: {second:?}"
+        );
+        assert_eq!(
+            cap_b.lock().len(),
+            1,
+            "only the second turn ran: {:?}",
+            cap_b.lock()
+        );
+        assert_eq!(
+            stored_titles(&work),
+            vec!["Fix the parser".to_string()],
+            "exactly one Title record, ever"
+        );
+        let _ = std::fs::remove_dir_all(&work);
     }
 }

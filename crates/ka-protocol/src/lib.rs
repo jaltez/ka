@@ -306,6 +306,16 @@ pub enum Event {
         /// Active strand id.
         id: String,
     },
+    /// The strand's display title (stored `Record::Title` or the
+    /// auto-generated one). Emitted at bootstrap when the strand already
+    /// has a title and after a live auto-title lands, so surfaces can
+    /// relabel the session without replay. Additive: absent `title`
+    /// deserializes empty (surfaces ignore empty titles).
+    Title {
+        /// The display title.
+        #[serde(default)]
+        title: String,
+    },
     /// A turn began.
     TurnStarted {
         /// Context consumption snapshot.
@@ -567,6 +577,9 @@ mod tests {
                 cost: 0.001,
             },
         });
+        roundtrip_event(Event::Title {
+            title: "fix the parser".into(),
+        });
         roundtrip_event(Event::DigestStarted);
         roundtrip_event(Event::DigestFinished {
             kept: RecordId("r4".into()),
@@ -633,6 +646,20 @@ mod tests {
                 assert!(detail.is_empty(), "absent detail must default empty");
             }
             other => panic!("wrong event: {other:?}"),
+        }
+    }
+    #[test]
+    fn title_defaults_when_absent_and_tags_snake_case() {
+        let line = to_line(&Event::Title {
+            title: "fix the parser".into(),
+        })
+        .unwrap();
+        assert!(line.contains("\"type\":\"title\""), "got: {line}");
+        // pre-title senders: the additive field must deserialize empty
+        let back: Event = from_line(r#"{"type":"title"}"#).unwrap();
+        match back {
+            Event::Title { title } => assert!(title.is_empty()),
+            other => panic!("expected title, got {other:?}"),
         }
     }
 

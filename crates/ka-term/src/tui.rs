@@ -1057,7 +1057,6 @@ pub struct Inventory {
 
 /// Everything the right sidebar displays. Session figures come from the
 /// footer meters at render time; this state carries the rest.
-#[derive(Debug, Clone)]
 pub struct SidebarState {
     /// Bootstrap inventory.
     pub inventory: Inventory,
@@ -1072,6 +1071,9 @@ pub struct SidebarState {
     pub skills_open: bool,
     /// Cursor is over the skills header (drives the hover affordance).
     pub skills_hover: bool,
+    /// The active session's display title ([`Event::Title`]; stored
+    /// record or auto-generated). None until the engine announces one.
+    pub title: Option<String>,
 }
 
 impl Default for SidebarState {
@@ -1083,6 +1085,7 @@ impl Default for SidebarState {
             branch: None,
             skills_open: true,
             skills_hover: false,
+            title: None,
         }
     }
 }
@@ -1229,6 +1232,11 @@ fn sidebar_rows(
         format!("ctx {used}")
     };
     for row in [
+        sidebar
+            .title
+            .as_deref()
+            .filter(|t| !t.is_empty())
+            .map(str::to_string),
         (!meters.model.is_empty()).then(|| format!("model {}", meters.model)),
         (!meters.mode.is_empty()).then(|| format!("mode {}", meters.mode)),
         (!meters.effort.is_empty()).then(|| format!("effort {}", meters.effort)),
@@ -3223,6 +3231,23 @@ async fn app(
                             &mut spills,
                             &mut sidebar,
                         );
+                        // a live title lands while the session picker is
+                        // open: patch its row too (the picker otherwise
+                        // reloads from the strand on every open, and the
+                        // Title record is already persisted by then)
+                        if let Event::Title { title } = &evt {
+                            if !title.is_empty() {
+                                if let Some(Modal::Session(picker)) = modal.as_mut() {
+                                    if let Some(s) = picker
+                                        .sessions
+                                        .iter_mut()
+                                        .find(|s| s.id == meters.session)
+                                    {
+                                        s.title = title.clone();
+                                    }
+                                }
+                            }
+                        }
                         if matches!(evt, Event::TurnFinished { .. }) {
                             turn_ended = true;
                             // one queued item per settle: the head becomes
@@ -3540,6 +3565,11 @@ fn apply_event(
                 agents: agents.clone(),
                 skills: skills.clone(),
             };
+        }
+        Event::Title { title } => {
+            if !title.is_empty() {
+                sidebar.title = Some(title.clone());
+            }
         }
         Event::Todos { items } => sidebar.todos = items.clone(),
         // the engine sends Idle after every non-turn command; without
@@ -8484,6 +8514,74 @@ mod tests {
             &mut sidebar,
         );
         assert!(sidebar.todos.is_empty());
+    }
+    #[test]
+    fn apply_event_title_sets_sidebar_session_title() {
+        let mut lines = Transcript::default();
+        let mut busy = false;
+        let mut busy_since = None;
+        let mut meters = Meters::default();
+        let mut pending = None;
+        let mut turn_produced = false;
+        let mut usage = None;
+        let mut a = String::new();
+        let mut t = String::new();
+        let mut tool = String::new();
+        let mut live_tool: Option<LiveTool> = None;
+        let mut last_user: Option<String> = None;
+        let mut last_error: Option<String> = None;
+        let mut spills: Vec<String> = Vec::new();
+        let mut sidebar = SidebarState::default();
+        let mut feed = |evt: &Event, sidebar: &mut SidebarState| {
+            apply_event(
+                evt,
+                &mut lines,
+                &mut busy,
+                &mut busy_since,
+                &mut meters,
+                &mut pending,
+                &mut turn_produced,
+                &mut usage,
+                &mut a,
+                &mut t,
+                &mut tool,
+                &mut live_tool,
+                &mut last_user,
+                &mut last_error,
+                &mut spills,
+                sidebar,
+            );
+        };
+
+        feed(
+            &Event::Title {
+                title: "Fix the parser".into(),
+            },
+            &mut sidebar,
+        );
+        assert_eq!(sidebar.title.as_deref(), Some("Fix the parser"));
+        // empty titles (additive default) never blank a real one
+        feed(
+            &Event::Title {
+                title: String::new(),
+            },
+            &mut sidebar,
+        );
+        assert_eq!(sidebar.title.as_deref(), Some("Fix the parser"));
+
+        // the title renders as the first fact row of the session section
+        let rendered = plain_text(&sidebar_rows(&sidebar, &meters, 26, 40, None));
+        assert!(
+            rendered.iter().any(|r| r.contains("Fix the parser")),
+            "got: {rendered:?}"
+        );
+    }
+
+    #[test]
+    fn sidebar_without_title_shows_no_title_row() {
+        let sidebar = SidebarState::default();
+        let rows = sidebar_rows(&sidebar, &Meters::default(), 26, 40, None);
+        assert!(rows.is_empty(), "no title → session section starts empty");
     }
 
     #[test]
