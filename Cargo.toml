@@ -45,7 +45,7 @@ todo = "deny"
 unimplemented = "deny"
 
 [profile.release]
-lto = "thin"
+lto = "fat"
 strip = true
 panic = "abort"
 codegen-units = 1

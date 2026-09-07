@@ -278,8 +278,10 @@ struct EngineState {
     /// fires once after that turn (fast role configured); resumed
     /// strands never re-title.
     needs_title: bool,
+    /// `[git] auto_commit`: stage + commit tracked changes after each
+    /// completed turn.
+    auto_commit: bool,
 }
-
 impl From<Config> for EngineState {
     fn from(c: Config) -> Self {
         let mode = c.effective_mode();
@@ -294,6 +296,7 @@ impl From<Config> for EngineState {
             guards: crate::voice::GuardRuntime::new(c.guards.spend_usd, c.guards.context_pct),
             roles: EngineRoles::default(),
             needs_title: false,
+            auto_commit: c.git.auto_commit,
         }
     }
 }
@@ -1561,7 +1564,7 @@ async fn dispatch_turn(
             .await
     } else {
         let mut history = std::mem::take(&mut voice.history);
-        let usage = turn_canned(commands, events, state, &mut history, text).await;
+        let usage = turn_canned(commands, events, state, &mut history, text, cwd).await;
         voice.history = history;
         usage
     };
@@ -1775,6 +1778,7 @@ async fn turn_canned(
     state: &mut EngineState,
     history: &mut Vec<ka_dialect::speaker::TurnMessage>,
     text: String,
+    cwd: &std::path::Path,
 ) -> Usage {
     let est_in = (text.len() as u64).div_ceil(4);
     events
@@ -1846,6 +1850,9 @@ async fn turn_canned(
         .sum::<u64>()
         .div_ceil(4);
     history.push(ka_dialect::speaker::TurnMessage::assistant(chunks.concat()));
+    if state.auto_commit {
+        auto_commit(events, cwd, &text).await;
+    }
     let usage = Usage {
         input: est_in,
         output: est_out,
@@ -1859,6 +1866,89 @@ async fn turn_canned(
         .await
         .ok();
     usage
+}
+
+/// `[git] auto_commit`: stage everything and commit tracked changes
+/// with a deterministic one-line message (`ka: <first prompt line>`, 72
+/// chars max — no model roundtrip). Outside a repo: silent no-op. Any
+/// git failure is an advisory note, never a turn failure.
+async fn auto_commit(events: &mpsc::Sender<Event>, cwd: &std::path::Path, prompt: &str) {
+    let git = |args: &[&str]| {
+        std::process::Command::new("git")
+            .args(args)
+            .current_dir(cwd)
+            .output()
+    };
+    let in_repo = match git(&["rev-parse", "--is-inside-work-tree"]) {
+        Ok(out) if String::from_utf8_lossy(&out.stdout).trim() == "true" => true,
+        _ => return,
+    };
+    let _ = in_repo;
+    let dirty = git(&["status", "--porcelain"])
+        .map(|out| !out.stdout.is_empty())
+        .unwrap_or(false);
+    if !dirty {
+        return;
+    }
+    if let Err(e) = git(&["add", "-A"]) {
+        events
+            .send(Event::Note {
+                message: format!("auto-commit: {e}"),
+            })
+            .await
+            .ok();
+        return;
+    }
+    let first_line: String = prompt
+        .lines()
+        .next()
+        .unwrap_or("")
+        .chars()
+        .take(72)
+        .collect();
+    let msg: String = format!("ka: {first_line}").chars().take(72).collect();
+    match git(&[
+        "-c",
+        "user.name=ka",
+        "-c",
+        "user.email=ka@local",
+        "commit",
+        "-m",
+        &msg,
+    ]) {
+        Ok(out) if out.status.success() => {
+            let id = git(&["rev-parse", "--short", "HEAD"])
+                .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+                .unwrap_or_default();
+            events
+                .send(Event::Note {
+                    message: format!("auto-commit {id}: {msg}"),
+                })
+                .await
+                .ok();
+        }
+        Ok(out) => {
+            let tail = String::from_utf8_lossy(&out.stderr)
+                .lines()
+                .last()
+                .unwrap_or("git commit failed")
+                .to_string();
+            events
+                .send(Event::Note {
+                    message: format!("auto-commit failed: {tail}"),
+                })
+                .await
+                .ok();
+        }
+        Err(e) => {
+            events
+                .send(Event::Note {
+                    message: format!("auto-commit: {e}"),
+                })
+                .await
+                .ok();
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1934,6 +2024,129 @@ mod tests {
             } => {}
             other => panic!("expected aborted finish, got {other:?}"),
         }
+    }
+
+    fn git_in(dir: &std::path::Path, args: &[&str]) -> std::process::Output {
+        std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .unwrap()
+    }
+
+    /// A git repo with one baseline commit plus unstaged tracked and
+    /// untracked changes.
+    fn dirty_repo(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("ka-autocmt-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        assert!(git_in(&dir, &["init"]).status.success());
+        git_in(&dir, &["config", "user.email", "t@t"]);
+        git_in(&dir, &["config", "user.name", "t"]);
+        std::fs::write(dir.join("tracked.txt"), "one\n").unwrap();
+        git_in(&dir, &["add", "."]);
+        assert!(git_in(&dir, &["commit", "-m", "init"]).status.success());
+        std::fs::write(dir.join("tracked.txt"), "two\n").unwrap();
+        std::fs::write(dir.join("extra.txt"), "new\n").unwrap();
+        dir
+    }
+
+    fn head_count(dir: &std::path::Path) -> usize {
+        String::from_utf8_lossy(&git_in(dir, &["rev-list", "--count", "HEAD"]).stdout)
+            .trim()
+            .parse()
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn auto_commit_makes_exactly_one_ka_commit_per_turn() {
+        let dir = dirty_repo("on");
+        let mut handle = spawn(Config {
+            cwd: Some(dir.display().to_string()),
+            git: crate::config::Git { auto_commit: true },
+            ..Default::default()
+        });
+        handle
+            .commands
+            .send(Command::Prompt {
+                text: "hello".into(),
+                schema: None,
+                images: Vec::new(),
+            })
+            .await
+            .unwrap();
+        let seen = drain_until_finished(&mut handle.events).await;
+        assert!(matches!(
+            seen.last(),
+            Some(Event::TurnFinished {
+                stop: Stop::Done,
+                ..
+            })
+        ));
+        assert_eq!(head_count(&dir), 2, "exactly one new commit");
+        let msg = String::from_utf8_lossy(&git_in(&dir, &["log", "-1", "--format=%s"]).stdout)
+            .trim()
+            .to_string();
+        assert_eq!(msg, "ka: hello");
+        let status = git_in(&dir, &["status", "--porcelain"]);
+        let status_text = String::from_utf8_lossy(&status.stdout);
+        let dirty: Vec<&str> = status_text
+            .lines()
+            .filter(|l| !l.contains(".ka/"))
+            .collect();
+        assert!(dirty.is_empty(), "dirty outside .ka/: {dirty:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn auto_commit_off_by_default_leaves_the_repo_untouched() {
+        let dir = dirty_repo("off");
+        let mut handle = spawn(Config {
+            cwd: Some(dir.display().to_string()),
+            ..Default::default()
+        });
+        handle
+            .commands
+            .send(Command::Prompt {
+                text: "hello".into(),
+                schema: None,
+                images: Vec::new(),
+            })
+            .await
+            .unwrap();
+        drain_until_finished(&mut handle.events).await;
+        assert_eq!(head_count(&dir), 1, "no commit without the flag");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn auto_commit_outside_a_repo_is_a_silent_noop() {
+        let dir = std::env::temp_dir().join(format!("ka-autocmt-norepo-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut handle = spawn(Config {
+            cwd: Some(dir.display().to_string()),
+            git: crate::config::Git { auto_commit: true },
+            ..Default::default()
+        });
+        handle
+            .commands
+            .send(Command::Prompt {
+                text: "hello".into(),
+                schema: None,
+                images: Vec::new(),
+            })
+            .await
+            .unwrap();
+        let seen = drain_until_finished(&mut handle.events).await;
+        assert!(matches!(
+            seen.last(),
+            Some(Event::TurnFinished {
+                stop: Stop::Done,
+                ..
+            })
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]

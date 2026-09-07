@@ -97,6 +97,17 @@ pub struct Guards {
     pub context_pct: Option<u64>,
 }
 
+/// Git automation settings.
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema,
+)]
+#[serde(deny_unknown_fields, default)]
+pub struct Git {
+    /// Commit tracked changes after each completed engine turn
+    /// (stop = done). Off by default.
+    pub auto_commit: bool,
+}
+
 /// Role → model-selector mappings.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields, default)]
@@ -281,6 +292,9 @@ pub struct Config {
     /// Per-tool settings ([tools]).
     #[serde(default)]
     pub tools: Tools,
+    /// Git automation ([git]).
+    #[serde(default)]
+    pub git: Git,
 }
 
 impl Config {
