@@ -1659,6 +1659,7 @@ async fn engine_ask(
             questions: vec![AskQuestion {
                 text: question,
                 options,
+                detail: None,
             }],
         })
         .await

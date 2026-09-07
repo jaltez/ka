@@ -143,6 +143,10 @@ pub struct AskQuestion {
     pub text: String,
     /// Selectable answers (index-referenced in [`Command::Answer`]).
     pub options: Vec<String>,
+    /// Optional rendered detail (e.g. a unified diff) shown above the
+    /// options. Additive: absent in older strands, never required.
+    #[serde(default)]
+    pub detail: Option<String>,
 }
 
 /// Surface → engine commands.
@@ -604,6 +608,7 @@ mod tests {
             questions: vec![AskQuestion {
                 text: "Proceed?".into(),
                 options: vec!["yes".into(), "no".into()],
+                detail: Some("--- a/f.rs\n+++ b/f.rs\n@@\n".into()),
             }],
         });
         roundtrip_event(Event::TurnFinished {

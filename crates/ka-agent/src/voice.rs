@@ -1675,6 +1675,42 @@ attempt implementation — the user will review and switch to build mode.",
         usage_total
     }
 
+    /// Rendered unified-diff preview for an edit/write ask (None when
+    /// the call is not a file mutation or the preview cannot be
+    /// computed). Read failures and match counts the tool would reject
+    /// (0 matches; ambiguous multi-match without replace_all) skip the
+    /// preview silently — the tool run reports authoritatively.
+    fn ask_detail(&self, call: &ToolCall) -> Option<String> {
+        if call.tool != "edit" && call.tool != "write" {
+            return None;
+        }
+        let path = call.arguments.get("path")?.as_str()?;
+        let full = crate::hands::read::resolve(&self.hand_ctx, path);
+        let old = std::fs::read_to_string(&full).unwrap_or_default();
+        let new = match call.tool.as_str() {
+            "write" => call.arguments.get("content")?.as_str()?.to_string(),
+            _ => {
+                let old_str = call.arguments.get("old")?.as_str()?;
+                let new_str = call.arguments.get("new")?.as_str()?;
+                let replace_all = call
+                    .arguments
+                    .get("replace_all")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false);
+                let count = old.matches(old_str).count();
+                if count == 0 || (count > 1 && !replace_all) {
+                    return None;
+                }
+                if replace_all {
+                    old.replace(old_str, new_str)
+                } else {
+                    old.replacen(old_str, new_str, 1)
+                }
+            }
+        };
+        let diff = crate::hands::unified_diff(path, &old, &new, 24);
+        (!diff.is_empty()).then_some(diff)
+    }
     /// Sequential gating phase for one call: loop guard, pre-tool hooks,
     /// clearance verdict, and any permission ask (one at a time — the ask
     /// UX stays exclusive). Returns the approved hand; Err carries the
@@ -1741,6 +1777,7 @@ attempt implementation — the user will review and switch to build mode.",
             Gate::Ask { question } => {
                 self.state.ask_counter += 1;
                 let ask_id = AskId(format!("ask-{}", self.state.ask_counter));
+                let detail = self.ask_detail(call);
                 let options = vec![
                     "allow".to_string(),
                     "always".to_string(),
@@ -1751,6 +1788,7 @@ attempt implementation — the user will review and switch to build mode.",
                     questions: vec![AskQuestion {
                         text: question,
                         options,
+                        detail,
                     }],
                 };
                 if events.send(ask).await.is_err() {
@@ -2218,6 +2256,7 @@ async fn ask_continue_or_stop(
             questions: vec![AskQuestion {
                 text: question,
                 options: vec!["continue".to_string(), "stop".to_string()],
+                detail: None,
             }],
         })
         .await
@@ -3636,6 +3675,75 @@ mod tests {
                 ..
             })
         ));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn write_ask_carries_a_diff_detail() {
+        let dir = std::env::temp_dir().join(format!("ka-diff-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("diff-target.txt"), "keep\nchange me\n").unwrap();
+
+        struct OneWrite;
+        impl Speaker for OneWrite {
+            fn speak<'a>(
+                &'a self,
+                req: SpeakRequest,
+                out: tokio::sync::mpsc::Sender<StreamEvent>,
+            ) -> SpeakFuture<'a> {
+                Box::pin(async move {
+                    let results = req.messages.iter().flat_map(|m| &m.results).count();
+                    if results == 0 {
+                        out.send(StreamEvent::Call(ToolCall {
+                            id: "w1".into(),
+                            tool: "write".into(),
+                            arguments: serde_json::json!({
+                                "path": "diff-target.txt",
+                                "content": "keep\nchanged\n"
+                            }),
+                        }))
+                        .await
+                        .ok();
+                        out.send(StreamEvent::Finished {
+                            stop: ka_protocol::Stop::Done,
+                            usage: Usage::default(),
+                        })
+                        .await
+                        .ok();
+                    } else {
+                        out.send(StreamEvent::Text("done".into())).await.ok();
+                        out.send(StreamEvent::Finished {
+                            stop: ka_protocol::Stop::Done,
+                            usage: Usage::default(),
+                        })
+                        .await
+                        .ok();
+                    }
+                })
+            }
+        }
+        let catalog = Catalog::parse(
+            "[dialects.\"test/m\"]\nwire = \"openai_chat\"\nbase_url = \"http://127.0.0.1:1\"\ncontext = 1000\n",
+        )
+        .unwrap();
+        let mut voice = Voice::new(catalog, dir.clone(), ka_protocol::Mode::Guarded, 5)
+            .with_speaker(Wire::OpenaiChat, std::sync::Arc::new(OneWrite));
+        let mut guards = GuardRuntime::default();
+        let (events, _) = drive_turn(&mut voice, &mut guards, "rewrite it", Some(0)).await;
+        let asks: Vec<_> = events
+            .iter()
+            .filter_map(|e| match e {
+                Event::Ask { questions, .. } => questions.first().map(|q| q.detail.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(asks.len(), 1, "one guarded write ask: {events:?}");
+        let detail = asks[0].as_ref().expect("write ask must carry a diff");
+        assert!(detail.contains("--- a/diff-target.txt"), "{detail}");
+        assert!(detail.contains("+++ b/diff-target.txt"), "{detail}");
+        assert!(detail.contains("-change me"), "{detail}");
+        assert!(detail.contains("+changed"), "{detail}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

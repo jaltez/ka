@@ -73,6 +73,125 @@ impl ToolOutput {
     }
 }
 
+/// A unified diff between the old and new content of `path`, capped at
+/// `max_lines` rendered lines (a `… N more lines` trailer notes the
+/// remainder). Either side over 2000 lines diffs only its first 2000
+/// lines, noting the truncation. Unchanged content → empty string.
+pub fn unified_diff(path: &str, old: &str, new: &str, max_lines: usize) -> String {
+    /// Sides are truncated to this many lines before diffing (LCS is
+    /// quadratic in side length).
+    const SIDE_CAP: usize = 2000;
+    /// Context lines shown around each change run.
+    const CONTEXT: usize = 3;
+
+    let a: Vec<&str> = old.lines().collect();
+    let b: Vec<&str> = new.lines().collect();
+    let a_trunc = a.len() > SIDE_CAP;
+    let b_trunc = b.len() > SIDE_CAP;
+    let a = &a[..a.len().min(SIDE_CAP)];
+    let b = &b[..b.len().min(SIDE_CAP)];
+    let (n, m) = (a.len(), b.len());
+    if a == b && !a_trunc && !b_trunc {
+        return String::new();
+    }
+
+    // LCS table (flat, row-major; (n+1)*(m+1) cells)
+    let mut lcs = vec![0u32; (n + 1) * (m + 1)];
+    let at = |i: usize, j: usize| i * (m + 1) + j;
+    for i in (0..n).rev() {
+        for j in (0..m).rev() {
+            lcs[at(i, j)] = if a[i] == b[j] {
+                lcs[at(i + 1, j + 1)] + 1
+            } else {
+                lcs[at(i + 1, j)].max(lcs[at(i, j + 1)])
+            };
+        }
+    }
+
+    // walk to per-line ops: (tag, a-index, b-index)
+    let mut ops: Vec<(char, usize, usize)> = Vec::new();
+    let (mut i, mut j) = (0, 0);
+    while i < n && j < m {
+        if a[i] == b[j] {
+            ops.push((' ', i, j));
+            i += 1;
+            j += 1;
+        } else if lcs[at(i + 1, j)] >= lcs[at(i, j + 1)] {
+            ops.push(('-', i, j));
+            i += 1;
+        } else {
+            ops.push(('+', i, j));
+            j += 1;
+        }
+    }
+    while i < n {
+        ops.push(('-', i, j));
+        i += 1;
+    }
+    while j < m {
+        ops.push(('+', i, j));
+        j += 1;
+    }
+
+    let mut out = format!("--- a/{path}\n+++ b/{path}\n");
+    // change op indices grouped into hunks whenever their gaps are
+    // within 2*CONTEXT+1 ops of each other
+    let changed: Vec<usize> = ops
+        .iter()
+        .enumerate()
+        .filter(|(_, (tag, _, _))| *tag != ' ')
+        .map(|(idx, _)| idx)
+        .collect();
+    if changed.is_empty() {
+        // sides differ only beyond the side cap: no line-level hunks
+        out.push_str(&format!(
+            "@@ … sides over {SIDE_CAP} lines; diff truncated\n"
+        ));
+        return out;
+    }
+    let mut groups: Vec<(usize, usize)> = Vec::new();
+    let mut start = changed[0];
+    let mut prev = changed[0];
+    for &idx in &changed[1..] {
+        if idx - prev > 2 * CONTEXT + 1 {
+            groups.push((start, prev));
+            start = idx;
+        }
+        prev = idx;
+    }
+    groups.push((start, prev));
+
+    let mut lines_out: Vec<String> = Vec::new();
+    for (first, last) in groups {
+        let lo = first.saturating_sub(CONTEXT);
+        let hi = (last + CONTEXT).min(ops.len() - 1);
+        let a_len = ops[lo..=hi].iter().filter(|(t, _, _)| *t != '+').count();
+        let b_len = ops[lo..=hi].iter().filter(|(t, _, _)| *t != '-').count();
+        let a_start = if n == 0 { 0 } else { ops[lo].1 + 1 };
+        let b_start = if m == 0 { 0 } else { ops[lo].2 + 1 };
+        lines_out.push(format!("@@ -{a_start},{a_len} +{b_start},{b_len} @@"));
+        for (tag, ai, bi) in &ops[lo..=hi] {
+            let text = match tag {
+                '-' => a[*ai],
+                '+' => b[*bi],
+                _ => a[*ai],
+            };
+            lines_out.push(format!("{tag}{text}"));
+        }
+    }
+    if a_trunc || b_trunc {
+        lines_out.push(format!("… sides over {SIDE_CAP} lines; diff truncated"));
+    }
+    if lines_out.len() > max_lines {
+        let more = lines_out.len() - max_lines;
+        lines_out.truncate(max_lines);
+        lines_out.push(format!("… {more} more lines"));
+    }
+    out.push_str(&lines_out.join("\n"));
+    out.push('\n');
+    out
+}
+
 /// Static definition of a hand (model-facing contract).
 #[derive(Debug, Clone)]
 pub struct HandDef {
@@ -294,6 +413,71 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use super::*;
+
+    #[test]
+    fn unified_diff_empty_when_unchanged() {
+        assert_eq!(unified_diff("f.rs", "a\nb\n", "a\nb\n", 24), "");
+        assert_eq!(unified_diff("f.rs", "", "", 24), "");
+    }
+
+    #[test]
+    fn unified_diff_renders_a_single_change_with_context() {
+        let d = unified_diff("f.rs", "one\ntwo\nthree", "one\ntwo\nthree!", 24);
+        assert_eq!(
+            d,
+            "--- a/f.rs\n+++ b/f.rs\n@@ -1,3 +1,3 @@\n one\n two\n-three\n+three!\n"
+        );
+    }
+
+    #[test]
+    fn unified_diff_new_file_and_removal_headers() {
+        // empty old side: -0,0 start like git
+        let d = unified_diff("n.rs", "", "hello\n", 24);
+        assert!(
+            d.starts_with("--- a/n.rs\n+++ b/n.rs\n@@ -0,0 +1,1 @@\n+hello\n"),
+            "{d}"
+        );
+        // empty new side: deletion hunk
+        let d = unified_diff("n.rs", "hello\n", "", 24);
+        assert!(
+            d.starts_with("--- a/n.rs\n+++ b/n.rs\n@@ -1,1 +0,0 @@\n-hello\n"),
+            "{d}"
+        );
+    }
+
+    #[test]
+    fn unified_diff_hunks_merge_only_near_changes() {
+        // two changes 10 lines apart → two hunks
+        let old: String = (0..20).map(|i| format!("line{i}\n")).collect();
+        let mut new_lines: Vec<String> = (0..20).map(|i| format!("line{i}")).collect();
+        new_lines[0].push('!');
+        new_lines[19].push('!');
+        let new: String = new_lines.iter().map(|l| l.clone() + "\n").collect();
+        let d = unified_diff("f.txt", &old, &new, 64);
+        assert_eq!(d.lines().filter(|l| l.starts_with("@@")).count(), 2, "{d}");
+        // a second change 4 lines from the first merges into one hunk
+        let mut near: Vec<String> = (0..20).map(|i| format!("line{i}")).collect();
+        near[0].push('!');
+        near[4].push('!');
+        let new: String = near.into_iter().map(|l| l + "\n").collect();
+        let d = unified_diff("f.txt", &old, &new, 64);
+        assert_eq!(d.lines().filter(|l| l.starts_with("@@")).count(), 1, "{d}");
+    }
+
+    #[test]
+    fn unified_diff_caps_rendered_lines_and_notes_side_truncation() {
+        let old: String = (0..50).map(|i| format!("line{i}\n")).collect();
+        let new: String = (0..50).map(|i| format!("ln{i}\n")).collect();
+        let d = unified_diff("f.txt", &old, &new, 10);
+        // the two file-header lines stay uncapped; hunk lines fit the budget
+        let body = d.lines().skip(2).count();
+        assert!(body <= 11, "{body} lines: {d}");
+        assert!(d.contains("more lines"), "{d}");
+        // sides over the 2000-line cap truncate with a note, never hang
+        let big: String = std::iter::repeat_n("x\n", 3000).collect();
+        let d = unified_diff("f.txt", &big, &big, 24);
+        assert!(d.contains("diff truncated"), "{d}");
+    }
 
     #[test]
     fn ledger_roundtrip_and_staleness() {

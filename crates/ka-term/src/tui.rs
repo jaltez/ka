@@ -878,10 +878,54 @@ fn input_height(row_count: usize) -> u16 {
 /// and the /mode picker borrows it for its four tier rows.
 fn input_area_rows(ask: Option<&PendingAsk>, picker: Option<&ModePicker>, draft: &str) -> usize {
     match ask {
-        Some(a) => a.question.split('\n').count() + 1,
+        Some(a) => {
+            a.question.split('\n').count()
+                + 1
+                + a.detail
+                    .as_ref()
+                    .map_or(0, |d| ask_detail_rows(d, ASK_DETAIL_MAX).len())
+        }
         None if picker.is_some() => MODE_CHOICES.len(),
         None => draft.split('\n').count(),
     }
+}
+
+/// Max rows of diff detail shown in an ask form (the form borrows the
+/// input box; uncapped diffs would crowd out the choice).
+const ASK_DETAIL_MAX: usize = 8;
+
+/// Colorized rows for an ask's diff detail: additions in OK, removals
+/// in ERR, hunk headers in META, file headers in FAINT, context plain.
+/// Clamped to `max` rows with a `… N more` trailer.
+fn ask_detail_rows(detail: &str, max: usize) -> Vec<ratatui::text::Line<'static>> {
+    use ratatui::style::Style;
+    use ratatui::text::Span;
+    let mut rows: Vec<ratatui::text::Line<'static>> = detail
+        .lines()
+        .map(|l| {
+            let style = if l.starts_with("+++") || l.starts_with("---") {
+                Style::new().fg(crate::palette::FAINT)
+            } else if l.starts_with("@@") {
+                Style::new().fg(crate::palette::META)
+            } else if l.starts_with('+') {
+                Style::new().fg(crate::palette::OK)
+            } else if l.starts_with('-') {
+                Style::new().fg(crate::palette::ERR)
+            } else {
+                Style::new()
+            };
+            ratatui::text::Line::from(vec![ratatui::text::Span::styled(l.to_string(), style)])
+        })
+        .collect();
+    if rows.len() > max {
+        let more = rows.len() - max;
+        rows.truncate(max);
+        rows.push(ratatui::text::Line::from(vec![Span::styled(
+            format!("… {more} more"),
+            Style::new().fg(crate::palette::FAINT),
+        )]));
+    }
+    rows
 }
 
 /// The input title while busy: only the queue hint — the action hints
@@ -1490,6 +1534,8 @@ pub struct PendingAsk {
     pub options: Vec<String>,
     /// Selected option index.
     pub selected: usize,
+    /// Optional rendered detail (e.g. a unified diff) above the options.
+    pub detail: Option<String>,
 }
 
 /// Agent summaries injected by the CLI for `/agents` (ka-term stays
@@ -3897,6 +3943,7 @@ fn apply_event(
                     id: id.clone(),
                     question: q.text.clone(),
                     options: q.options.clone(),
+                    detail: q.detail.clone(),
                     selected: 0,
                 });
             }
@@ -5721,6 +5768,9 @@ fn render(
         // inverse video, every option carries a single leading space so
         // the text never shifts when the selection moves
         let mut rows = vec![TuiLine::from(ask.question.as_str())];
+        if let Some(detail) = &ask.detail {
+            rows.extend(ask_detail_rows(detail, ASK_DETAIL_MAX));
+        }
         let mut opts: Vec<Span> = Vec::new();
         for (i, opt) in ask.options.iter().enumerate() {
             if i == ask.selected {
@@ -7679,6 +7729,7 @@ mod tests {
             id: ka_protocol::AskId("a".into()),
             question: "allow?".into(),
             options: vec!["yes".into()],
+            detail: None,
             selected: 0,
         };
         let row = working_row(Some(&ask), Some(t0), now);
@@ -9478,6 +9529,7 @@ mod tests {
             id: AskId("a".into()),
             question: "two\nlines".into(),
             options: vec!["allow".into(), "deny".into()],
+            detail: None,
             selected: 0,
         };
         // question lines + one options row, draft ignored while pending
@@ -9493,6 +9545,39 @@ mod tests {
             ),
             4
         );
+    }
+
+    #[test]
+    fn ask_detail_rows_colorize_and_clamp() {
+        let rows = ask_detail_rows(
+            "--- a/f.rs\n+++ b/f.rs\n@@ -1,3 +1,3 @@\n context\n-removed\n+added\n",
+            8,
+        );
+        let fg = |l: &ratatui::text::Line<'static>| l.spans[0].style.fg;
+        assert_eq!(rows[0].spans[0].content.as_ref(), "--- a/f.rs");
+        assert_eq!(fg(&rows[0]), Some(crate::palette::FAINT));
+        assert_eq!(fg(&rows[1]), Some(crate::palette::FAINT));
+        assert_eq!(fg(&rows[2]), Some(crate::palette::META));
+        assert_eq!(fg(&rows[3]), None, "context stays default");
+        assert_eq!(fg(&rows[4]), Some(crate::palette::ERR));
+        assert_eq!(fg(&rows[5]), Some(crate::palette::OK));
+        // clamp keeps the budget and notes the remainder
+        let clamped = ask_detail_rows("ctx\n+added\n-removed\n", 2);
+        assert_eq!(clamped.len(), 3);
+        assert!(
+            clamped[2].spans[0].content.contains("1 more"),
+            "{:?}",
+            clamped[2].spans[0].content
+        );
+        // the ask form reserves rows for the detail block
+        let ask = PendingAsk {
+            id: AskId("a".into()),
+            question: "allow?".into(),
+            options: vec!["allow".into()],
+            selected: 0,
+            detail: Some("ctx\n+added\n".into()),
+        };
+        assert_eq!(input_area_rows(Some(&ask), None, ""), 4);
     }
     // ── sidebar ──────────────────────────────────────────────────
     use unicode_width::UnicodeWidthStr;
