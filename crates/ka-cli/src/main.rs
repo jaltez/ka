@@ -84,6 +84,8 @@ enum CliCommand {
         #[arg(long, default_value = "text")]
         print: String,
     },
+    /// Serve the Agent Client Protocol on stdin/stdout
+    Acp,
     /// Environment health checks
     Doctor {
         /// Probe provider + MCP reachability
@@ -166,6 +168,7 @@ enum ConfigCommand {
 /// presence marks a signed build and lets `ka update` verify artifacts.
 pub const PUBLIC_KEY: Option<&str> = option_env!("KA_PUBKEY");
 
+mod acp;
 mod doctor;
 mod update;
 
@@ -333,6 +336,7 @@ async fn dispatch(cli: Cli) -> Result<ExitCode, String> {
             )
             .await
         }
+        Some(CliCommand::Acp) => acp::run().await,
         Some(CliCommand::Doctor { net, json }) => doctor::run(net, json).await,
         Some(CliCommand::Update { channel, check }) => {
             let trust = trust_for_cwd(false);
