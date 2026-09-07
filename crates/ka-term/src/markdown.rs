@@ -549,11 +549,17 @@ pub fn inline_spans(s: &str) -> Vec<Span<'static>> {
         if c == '~' && chars.get(i + 1) == Some(&'~') {
             if let Some(end) = find_double(&chars, i + 2, '~') {
                 flush(&mut plain, &mut spans);
-                let struck: String = chars[i + 2..end].iter().collect();
-                spans.push(Span::styled(
-                    struck,
-                    Style::default().add_modifier(Modifier::CROSSED_OUT),
-                ));
+                let struck: String = chars[i + 2..end]
+                    .iter()
+                    .collect::<String>()
+                    .trim()
+                    .to_string();
+                if !struck.is_empty() {
+                    spans.push(Span::styled(
+                        struck,
+                        Style::default().add_modifier(Modifier::CROSSED_OUT),
+                    ));
+                }
                 i = end + 2;
                 continue;
             }
@@ -561,11 +567,14 @@ pub fn inline_spans(s: &str) -> Vec<Span<'static>> {
         if c == '`' {
             if let Some(end) = chars[i + 1..].iter().position(|&x| x == '`') {
                 flush(&mut plain, &mut spans);
-                let code: String = chars[i + 1..i + 1 + end].iter().collect();
-                spans.push(Span::styled(
-                    format!(" {code} "),
-                    Style::new().fg(palette::CODE_INLINE),
-                ));
+                let code: String = chars[i + 1..i + 1 + end]
+                    .iter()
+                    .collect::<String>()
+                    .trim()
+                    .to_string();
+                if !code.is_empty() {
+                    spans.push(Span::styled(code, Style::new().fg(palette::CODE_INLINE)));
+                }
                 i += end + 2;
                 continue;
             }
@@ -573,11 +582,17 @@ pub fn inline_spans(s: &str) -> Vec<Span<'static>> {
         if c == '*' && i + 1 < chars.len() && chars[i + 1] == '*' {
             if let Some(end) = find_double(&chars, i + 2, '*') {
                 flush(&mut plain, &mut spans);
-                let bold: String = chars[i + 2..end].iter().collect();
-                spans.push(Span::styled(
-                    bold,
-                    Style::default().add_modifier(Modifier::BOLD),
-                ));
+                let bold: String = chars[i + 2..end]
+                    .iter()
+                    .collect::<String>()
+                    .trim()
+                    .to_string();
+                if !bold.is_empty() {
+                    spans.push(Span::styled(
+                        bold,
+                        Style::default().add_modifier(Modifier::BOLD),
+                    ));
+                }
                 i = end + 2;
                 continue;
             }
@@ -585,11 +600,17 @@ pub fn inline_spans(s: &str) -> Vec<Span<'static>> {
         if c == '*' && i + 1 < chars.len() && chars[i + 1] != ' ' {
             if let Some(end) = chars[i + 1..].iter().position(|&x| x == '*') {
                 flush(&mut plain, &mut spans);
-                let italic: String = chars[i + 1..i + 1 + end].iter().collect();
-                spans.push(Span::styled(
-                    italic,
-                    Style::default().add_modifier(Modifier::ITALIC),
-                ));
+                let italic: String = chars[i + 1..i + 1 + end]
+                    .iter()
+                    .collect::<String>()
+                    .trim()
+                    .to_string();
+                if !italic.is_empty() {
+                    spans.push(Span::styled(
+                        italic,
+                        Style::default().add_modifier(Modifier::ITALIC),
+                    ));
+                }
                 i += end + 2;
                 continue;
             }
@@ -620,8 +641,16 @@ fn parse_link(chars: &[char], start: usize) -> Option<(String, String, usize)> {
         return None;
     }
     let close_url = chars[close_text + 2..].iter().position(|&c| c == ')')? + close_text + 2;
-    let text: String = chars[start + 1..close_text].iter().collect();
-    let url: String = chars[close_text + 2..close_url].iter().collect();
+    let text: String = chars[start + 1..close_text]
+        .iter()
+        .collect::<String>()
+        .trim()
+        .to_string();
+    let url: String = chars[close_text + 2..close_url]
+        .iter()
+        .collect::<String>()
+        .trim()
+        .to_string();
     if text.is_empty() || url.is_empty() {
         return None;
     }
@@ -1047,6 +1076,31 @@ mod tests {
         assert!(!joined.contains('▍'), "no markers: {joined}");
         // single heading color everywhere
         assert!(joined.contains(&format!("{:?}", palette::ACCENT)));
+    }
+
+    #[test]
+    fn formatted_tokens_keep_single_adjacent_spaces() {
+        // inline code and emphasis carry no padding of their own: the
+        // source's surrounding spaces are the only ones rendered (one
+        // space in, one out, never doubled)
+        for (src, want) in [
+            (
+                "run `cargo build` for **release** builds",
+                "run cargo build for release builds",
+            ),
+            (
+                "**bold** and *italic* and `code`",
+                "bold and italic and code",
+            ),
+            ("a **bold** b", "a bold b"),
+            ("see [docs](http://x.io) now", "see docs (http://x.io) now"),
+            ("** spaced ** and ~~ struck ~~", "spaced and struck"),
+            ("x **bold** y", "x bold y"),
+        ] {
+            let spans = inline_spans(src);
+            let joined: String = spans.iter().map(|s| s.content.to_string()).collect();
+            assert_eq!(joined, want, "src: {src}");
+        }
     }
 
     #[test]
