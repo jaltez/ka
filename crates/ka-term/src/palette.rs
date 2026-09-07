@@ -2,7 +2,9 @@
 //! complementary pairs (light accent + its deep complement), tuned for
 //! contrast and chroma: warm near-black surfaces lift cream prose to
 //! 12+:1, every accent and text tier clears 4.2:1 on the surface it
-//! actually sits on, and hues carry saturation instead of gray mud. The
+//! actually sits on, hues carry saturation instead of gray mud, and the
+//! warm families (butter yellow, flame orange, coral red) burn brightest
+//! against the espresso ground. The
 //! app paints its own canvas and surfaces, so it reads identically on
 //! any terminal theme.
 use ratatui::style::{Color, Modifier, Style};
@@ -14,14 +16,14 @@ use ratatui::style::{Color, Modifier, Style};
 // the dark ground.
 pub const CREAM: Color = Color::Rgb(251, 247, 238); // #FBF7EE prose ground
 pub const CHARCOAL: Color = Color::Rgb(32, 29, 26); // #201D1A warm near-black ground
-pub const BUTTER: Color = Color::Rgb(241, 206, 121); // #F1CE79 attention
+pub const BUTTER: Color = Color::Rgb(255, 215, 94); // #FFD75E attention (bright gold)
 pub const PETROL: Color = Color::Rgb(11, 94, 135); // #0B5E87 deep complement of butter
-pub const CORAL: Color = Color::Rgb(240, 118, 107); // #F0766B errors
+pub const CORAL: Color = Color::Rgb(255, 107, 87); // #FF6B57 errors (bright coral-red)
 pub const UMBER: Color = Color::Rgb(156, 141, 114); // #9C8D72 lifted umber: quiet tier
-pub const KHAKI: Color = Color::Rgb(201, 184, 148); // #C9B894 chrome
+pub const KHAKI: Color = Color::Rgb(214, 197, 159); // #D6C59F chrome (warm sand)
 pub const SAGE: Color = Color::Rgb(156, 203, 158); // #9CCB9E complement of khaki: ok
 pub const STEEL: Color = Color::Rgb(93, 155, 180); // #5D9BB4 tooling
-pub const FLAME: Color = Color::Rgb(224, 132, 47); // #E0842F complement of steel: warn
+pub const FLAME: Color = Color::Rgb(255, 158, 53); // #FF9E35 complement of steel: warn (bright orange)
 
 // ── backgrounds: charcoal lifted into a four-step warm espresso
 // ladder (never flat gray — each step warms toward cream); petrol
@@ -50,7 +52,7 @@ pub const ACCENT: Color = BUTTER; // titles, cursor, key hints, user ❯, spinne
 pub const WARN: Color = FLAME; // #E0842F
 pub const OK: Color = SAGE; // #9CCB9E complement of khaki: success
 pub const ERR: Color = CORAL; // #F0766B bright coral: errors
-pub const CHERRY: Color = Color::Rgb(207, 91, 80); // #CF5B50 coral deepened: raw danger
+pub const CHERRY: Color = Color::Rgb(209, 88, 71); // #D15847 coral deepened: raw danger
 pub const TOOL: Color = STEEL; // #5D9BB4 → tool headers
 pub const SEL_BG: Color = PETROL; // #0B5E87 selection bar
 pub const SEL_FG: Color = CREAM; // #FBF7EE selection text
@@ -90,14 +92,14 @@ mod tests {
         for (got, want, name) in [
             (CREAM, (0xFB, 0xF7, 0xEE), "cream"),
             (CHARCOAL, (0x20, 0x1D, 0x1A), "charcoal"),
-            (BUTTER, (0xF1, 0xCE, 0x79), "butter"),
+            (BUTTER, (0xFF, 0xD7, 0x5E), "butter"),
             (PETROL, (0x0B, 0x5E, 0x87), "petrol"),
-            (CORAL, (0xF0, 0x76, 0x6B), "coral"),
+            (CORAL, (0xFF, 0x6B, 0x57), "coral"),
             (UMBER, (0x9C, 0x8D, 0x72), "umber"),
-            (KHAKI, (0xC9, 0xB8, 0x94), "khaki"),
+            (KHAKI, (0xD6, 0xC5, 0x9F), "khaki"),
             (SAGE, (0x9C, 0xCB, 0x9E), "sage"),
             (STEEL, (0x5D, 0x9B, 0xB4), "steel"),
-            (FLAME, (0xE0, 0x84, 0x2F), "flame"),
+            (FLAME, (0xFF, 0x9E, 0x35), "flame"),
         ] {
             assert_eq!(got, Color::Rgb(want.0, want.1, want.2), "{name}");
         }
