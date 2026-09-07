@@ -3508,14 +3508,9 @@ mod tests {
 
     /// Is `pid` alive? (`kill -0`)
     fn pid_alive(pid: u32) -> bool {
-        std::process::Command::new("kill")
-            .arg("-0")
-            .arg(pid.to_string())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false)
+        // zombies count as dead: the killed child is unreaped until the
+        // test process exits
+        crate::hands::jobs::pid_alive(Some(pid))
     }
 
     /// Three bash calls whose starts/finishes are logged to a shared file:

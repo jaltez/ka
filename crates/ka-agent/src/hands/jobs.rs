@@ -1,17 +1,17 @@
 //! The jobs hand: visibility and control over bash commands the engine
 //! auto-backgrounded after the `background_after_ms` threshold.
 //!
-//! The bash hand promotes a still-running child into the shared
-//! [`JobTable`] (one per voice, reachable through [`HandContext`]). The
-//! promoting watcher keeps streaming the child's output into a spill file
-//! and records the exit code when it lands; this hand lists jobs (with an
-//! output tail read from that spill file) and kills them.
+//! Backgrounded commands run FULLY DETACHED: `sh -c '( cmd ) > spill
+//! 2>&1; echo $? > spill.done'` in its own process group, with no
+//! in-session watcher. The [`JobTable`] persists entries to
+//! `jobs.jsonl` (state dir), liveness is derived from the `.done`
+//! marker plus pid liveness, and a later session adopts surviving
+//! entries — killing ka never kills detached work.
 
 use std::io::Seek;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
-use std::time::Instant;
 
 use serde_json::{Value, json};
 
@@ -26,12 +26,12 @@ pub enum JobState {
     Exited(i32),
 }
 
-/// Shared registry of auto-backgrounded bash jobs. One per voice; the
-/// bash hand registers promotions, the jobs hand reads and kills, the
-/// engine kills the rest at shutdown.
-#[derive(Default)]
+/// Shared registry of detached background jobs. One per voice; the bash
+/// hand registers promotions, this hand lists and kills.
 pub struct JobTable {
     inner: parking_lot::Mutex<TableInner>,
+    /// `jobs.jsonl` path; None = in-memory only (tests).
+    path: parking_lot::Mutex<Option<PathBuf>>,
 }
 
 #[derive(Default)]
@@ -40,90 +40,178 @@ struct TableInner {
     jobs: Vec<JobEntry>,
 }
 
+/// One persisted/backgrounded job. State is DERIVED (see
+/// [`derived_state`]), never stored.
 struct JobEntry {
     id: u64,
     cmd: String,
-    started: Instant,
+    started_epoch_ms: u64,
     spill: PathBuf,
     pid: Option<u32>,
-    state: JobState,
-    /// Signal channel to the promoting watcher; None once it reported exit.
-    kill: Option<tokio::sync::mpsc::UnboundedSender<()>>,
 }
 
 /// Immutable snapshot row handed to the jobs hand.
+#[derive(Debug)]
 pub struct JobView {
     pub id: u64,
     pub cmd: String,
-    pub started: Instant,
+    pub started: std::time::SystemTime,
     pub state: JobState,
     pub spill: PathBuf,
 }
 
+/// The persistent job registry file (`jobs.jsonl` under the state dir).
+pub fn default_jobs_file() -> Option<PathBuf> {
+    std::env::var("XDG_STATE_HOME")
+        .map(PathBuf::from)
+        .or_else(|_| std::env::var("HOME").map(|h| PathBuf::from(h).join(".local/state")))
+        .unwrap_or_else(|_| std::env::temp_dir())
+        .join("ka/jobs.jsonl")
+        .into()
+}
+
+/// `<spill>.done`: the detached shell writes the exit code there.
+pub(crate) fn done_path(spill: &Path) -> PathBuf {
+    PathBuf::from(format!("{}.done", spill.display()))
+}
+
+/// Pid liveness (`/proc/<pid>` — the Linux `kill -0` equivalent).
+/// Zombies count as dead: unreaped children of this very process must
+/// not keep a killed job looking alive.
+pub(crate) fn pid_alive(pid: Option<u32>) -> bool {
+    let Some(p) = pid else {
+        return false;
+    };
+    match std::fs::read_to_string(format!("/proc/{p}/stat")) {
+        Ok(stat) => match stat.rsplit_once(')') {
+            Some((_, rest)) => !rest.split_whitespace().next().is_some_and(|s| s == "Z"),
+            None => true,
+        },
+        Err(_) => false,
+    }
+}
+
+/// Derive a job's lifecycle state from disk: `.done` present → exited
+/// with the recorded code; pid live → running; otherwise died unknown.
+fn derived_state(spill: &Path, pid: Option<u32>) -> JobState {
+    if let Ok(text) = std::fs::read_to_string(done_path(spill)) {
+        return JobState::Exited(text.trim().parse::<i32>().unwrap_or(-1));
+    }
+    if pid_alive(pid) {
+        JobState::Running
+    } else {
+        JobState::Exited(-1)
+    }
+}
+
+impl Default for JobTable {
+    fn default() -> Self {
+        Self {
+            inner: parking_lot::Mutex::default(),
+            path: parking_lot::Mutex::new(None),
+        }
+    }
+}
+
 impl JobTable {
-    /// An empty table.
+    /// An empty, in-memory table (tests).
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Register a promoted command; returns its job id (1-based).
+    /// Attach the persistence file: adopt surviving jobs (dead entries
+    /// are compacted away) and rewrite the file. Must run before the
+    /// first registration.
+    pub fn set_path(&self, path: PathBuf) {
+        let mut t = self.inner.lock();
+        let mut adopted: Vec<JobEntry> = Vec::new();
+        let mut next_id = 0u64;
+        for line in std::fs::read_to_string(&path).unwrap_or_default().lines() {
+            let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+                continue;
+            };
+            let entry = JobEntry {
+                id: v["id"].as_u64().unwrap_or(0),
+                cmd: v["cmd"].as_str().unwrap_or_default().to_string(),
+                started_epoch_ms: v["started_ms"].as_u64().unwrap_or(0),
+                spill: PathBuf::from(v["spill"].as_str().unwrap_or_default()),
+                pid: v["pid"].as_u64().map(|p| p as u32),
+            };
+            next_id = next_id.max(entry.id);
+            // adopt only survivors; dead entries silently compact away
+            if derived_state(&entry.spill, entry.pid) == JobState::Running {
+                adopted.push(entry);
+            }
+        }
+        t.next_id = next_id;
+        t.jobs = adopted;
+        let _ = std::fs::create_dir_all(path.parent().unwrap_or(Path::new(".")));
+        self.persist_locked(&t, &path);
+        *self.path.lock() = Some(path);
+    }
+
+    /// Register a promoted detached command; returns its job id
+    /// (1-based) and persists the entry.
     pub fn register(
         &self,
         cmd: String,
-        started: Instant,
+        started_epoch_ms: u64,
         spill: PathBuf,
         pid: Option<u32>,
-        kill: tokio::sync::mpsc::UnboundedSender<()>,
     ) -> u64 {
         let mut t = self.inner.lock();
         t.next_id += 1;
         let id = t.next_id;
-        t.jobs.push(JobEntry {
+        let entry = JobEntry {
             id,
             cmd,
-            started,
+            started_epoch_ms,
             spill,
             pid,
-            state: JobState::Running,
-            kill: Some(kill),
-        });
+        };
+        t.jobs.push(entry);
+        if let Some(path) = self.path.lock().clone() {
+            let Some(e) = t.jobs.last() else {
+                return id;
+            };
+            let v = serde_json::json!({
+                "id": id,
+                "cmd": e.cmd,
+                "started_ms": e.started_epoch_ms,
+                "spill": e.spill.to_string_lossy(),
+                "pid": e.pid,
+            });
+            use std::io::Write;
+            if let Ok(mut f) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path)
+            {
+                let _ = writeln!(f, "{v}");
+            }
+        }
         id
     }
 
-    /// The promoting watcher reports the job's terminal exit code.
-    pub fn finish(&self, id: u64, code: Option<i32>) {
-        let mut t = self.inner.lock();
-        if let Some(e) = t.jobs.iter_mut().find(|e| e.id == id) {
-            e.state = JobState::Exited(code.unwrap_or(-1));
-            e.kill = None;
-        }
-    }
-
-    /// Ask a running job to die (signals its watcher, which kills the
-    /// process tree). Returns a human status; Err when there is nothing
-    /// to kill.
+    /// Kill a running job's process group. Returns a human status; Err
+    /// when there is nothing to kill.
     pub fn kill(&self, id: u64) -> Result<String, String> {
-        let mut t = self.inner.lock();
-        let Some(e) = t.jobs.iter_mut().find(|e| e.id == id) else {
+        let t = self.inner.lock();
+        let Some(e) = t.jobs.iter().find(|e| e.id == id) else {
             return Err(format!("no such job: {id}"));
         };
-        match e.state {
-            JobState::Exited(code) => Err(format!("job {id} already exited ({code})")),
-            JobState::Running => {
-                let signaled = e.kill.as_ref().map(|k| k.send(()).is_ok()).unwrap_or(false);
-                if !signaled {
-                    // watcher is gone (runtime shutdown race): kill directly
-                    if let Some(pid) = e.pid {
-                        #[cfg(unix)]
-                        super::bash::kill_tree(pid);
-                    }
-                }
-                Ok(format!("killing job {id} (`{}`)", e.cmd))
-            }
+        if let JobState::Exited(code) = derived_state(&e.spill, e.pid) {
+            return Err(format!("job {id} already exited ({code})"));
         }
+        if let Some(pid) = e.pid {
+            #[cfg(unix)]
+            super::bash::kill_tree(pid);
+        }
+        Ok(format!("killing job {id} (`{}`)", e.cmd))
     }
 
-    /// Snapshot of every job in registration order.
+    /// Snapshot of every job in registration order, state derived from
+    /// disk.
     pub fn snapshot(&self) -> Vec<JobView> {
         self.inner
             .lock()
@@ -132,36 +220,28 @@ impl JobTable {
             .map(|e| JobView {
                 id: e.id,
                 cmd: e.cmd.clone(),
-                started: e.started,
-                state: e.state,
+                started: std::time::SystemTime::UNIX_EPOCH
+                    + std::time::Duration::from_millis(e.started_epoch_ms),
+                state: derived_state(&e.spill, e.pid),
                 spill: e.spill.clone(),
             })
             .collect()
     }
 
-    /// Kill every still-running job. Best-effort and synchronous: used at
-    /// engine shutdown so no orphaned children survive the session.
-    pub fn kill_all(&self) {
-        let t = self.inner.lock();
+    fn persist_locked(&self, t: &TableInner, path: &Path) {
+        let mut out = String::new();
         for e in &t.jobs {
-            if e.state != JobState::Running {
-                continue;
-            }
-            if e.kill.as_ref().map(|k| k.send(()).is_err()).unwrap_or(true) {
-                if let Some(pid) = e.pid {
-                    #[cfg(unix)]
-                    super::bash::kill_tree(pid);
-                }
-            }
+            let v = serde_json::json!({
+                "id": e.id,
+                "cmd": e.cmd,
+                "started_ms": e.started_epoch_ms,
+                "spill": e.spill.to_string_lossy(),
+                "pid": e.pid,
+            });
+            out.push_str(&v.to_string());
+            out.push('\n');
         }
-    }
-}
-
-impl Drop for JobTable {
-    fn drop(&mut self) {
-        // last-resort sweep for every exit path (engine error returns,
-        // test teardown): no orphaned children outlive the session
-        self.kill_all();
+        let _ = std::fs::write(path, out);
     }
 }
 
@@ -258,7 +338,7 @@ impl JobsHand {
                 "job {}  {}  {}  `{}`\n",
                 j.id,
                 state,
-                human_elapsed(j.started.elapsed()),
+                human_elapsed(j.started.elapsed().unwrap_or(std::time::Duration::ZERO),),
                 cmd_head
             ));
             let tail = tail_of(&j.spill);
@@ -286,7 +366,7 @@ fn human_elapsed(d: std::time::Duration) -> String {
 
 /// Last few hundred bytes of a streamed output file, tail lines kept.
 /// Empty when the file is missing or has no content yet.
-fn tail_of(path: &Path) -> String {
+pub(crate) fn tail_of(path: &Path) -> String {
     const MAX_BYTES: u64 = 512;
     const MAX_LINES: usize = 5;
     let Ok(len) = path.metadata().map(|m| m.len()) else {
@@ -341,6 +421,37 @@ mod tests {
         }
     }
 
+    /// Spawn a REAL detached-style command writing into `spill`, like
+    /// the bash hand does; returns its pid.
+    fn spawn_detached(script_body: &str, spill: &std::path::Path) -> u32 {
+        use std::process::{Command, Stdio};
+        let done = super::done_path(spill);
+        let script = format!(
+            "( {script_body} ) > {} 2>&1; echo $? > {}",
+            spill.to_string_lossy(),
+            done.to_string_lossy(),
+        );
+        let mut cmd = Command::new("sh");
+        cmd.arg("-c").arg(&script).stdout(Stdio::null());
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            cmd.process_group(0);
+        }
+        cmd.spawn().unwrap().id()
+    }
+
+    fn wait_for(pred: impl Fn() -> bool, secs: u64) -> bool {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(secs);
+        while std::time::Instant::now() < deadline {
+            if pred() {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        pred()
+    }
+
     #[test]
     fn list_reports_state_and_tail() {
         let table = Arc::new(JobTable::new());
@@ -349,17 +460,19 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let spill = dir.join("out-1");
-        std::fs::write(&spill, "progress line\n").unwrap();
-
-        let (kill_tx, _kill_rx) = tokio::sync::mpsc::unbounded_channel();
-        let id = table.register(
-            "sleep 30".into(),
-            Instant::now(),
-            spill.clone(),
-            None,
-            kill_tx,
-        );
+        let pid = spawn_detached("echo progress line; sleep 30", &spill);
+        let started_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let id = table.register("sleep 30".into(), started_ms, spill.clone(), Some(pid));
         assert_eq!(id, 1, "ids are 1-based");
+        assert!(wait_for(
+            || std::fs::read_to_string(&spill)
+                .map(|s| s.contains("progress line"))
+                .unwrap_or(false),
+            5
+        ));
 
         let ctx = ctx_for(&dir);
         let out = tokio::runtime::Runtime::new()
@@ -371,8 +484,8 @@ mod tests {
         assert!(out.content.contains("sleep 30"), "{}", out.content);
         assert!(out.content.contains("progress line"), "{}", out.content);
 
-        // exit lands in the listing
-        table.finish(id, Some(0));
+        // exit lands in the listing (via the .done marker)
+        std::fs::write(super::done_path(&spill), "0\n").unwrap();
         let out = tokio::runtime::Runtime::new()
             .unwrap()
             .block_on(hand.execute(&json!({}), &ctx));
@@ -381,7 +494,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn kill_signals_watcher_and_reports_errors() {
+    async fn kill_terminates_detached_job() {
         let table = Arc::new(JobTable::new());
         let hand = JobsHand::new(table.clone());
         let dir = std::env::temp_dir();
@@ -394,22 +507,79 @@ mod tests {
         assert!(out.is_error, "{}", out.content);
         assert!(out.content.contains("no such job"), "{}", out.content);
 
-        // running job: kill routes through the watcher signal
-        let (kill_tx, mut kill_rx) = tokio::sync::mpsc::unbounded_channel();
-        let spill = dir.join(format!("ka-jobs-kill-{}", std::process::id()));
-        table.register("sleep 99".into(), Instant::now(), spill, None, kill_tx);
+        // running job: kill terminates the detached pid
+        let spill = dir.join(format!("ka-jobs-kill-{}.spill", std::process::id()));
+        let pid = spawn_detached("sleep 30", &spill);
+        let started_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        table.register("sleep 99".into(), started_ms, spill.clone(), Some(pid));
         let out = hand
             .execute(&json!({"action": "kill", "id": 1}), &ctx)
             .await;
         assert!(!out.is_error, "{}", out.content);
         assert!(out.content.contains("killing job 1"), "{}", out.content);
-        assert_eq!(kill_rx.recv().await, Some(()), "watcher must be signaled");
+        assert!(
+            wait_for(
+                || matches!(
+                    table.snapshot().first().map(|v| v.state),
+                    Some(JobState::Exited(_))
+                ),
+                5
+            ),
+            "detached pid must be dead after kill"
+        );
 
         // kill arg validation
         let out = hand.execute(&json!({"action": "kill"}), &ctx).await;
         assert!(out.is_error, "{}", out.content);
         let out = hand.execute(&json!({"action": "explode"}), &ctx).await;
         assert!(out.is_error, "{}", out.content);
+    }
+
+    #[test]
+    fn persistence_adopts_survivors_and_compacts_dead() {
+        let dir = std::env::temp_dir().join(format!("ka-jobs-persist-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let jsonl = dir.join("jobs.jsonl");
+
+        let spill = dir.join("out-live");
+        let pid = spawn_detached("sleep 30", &spill);
+        let started_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+
+        // session A: one live job, one already-dead (pid slot empty)
+        let a = Arc::new(JobTable::new());
+        a.set_path(jsonl.clone());
+        a.register("live job".into(), started_ms, spill.clone(), Some(pid));
+        a.register("dead job".into(), started_ms, dir.join("out-dead"), None);
+
+        // session B: adopts the survivor, compacts the dead entry
+        let b = Arc::new(JobTable::new());
+        b.set_path(jsonl.clone());
+        let snap = b.snapshot();
+        assert_eq!(snap.len(), 1, "dead entries compact away: {snap:?}");
+        assert_eq!(snap[0].cmd, "live job");
+        assert_eq!(snap[0].state, JobState::Running);
+
+        // and the adopted job is killable
+        let res = b.kill(snap[0].id);
+        assert!(res.is_ok(), "{res:?}");
+        assert!(
+            wait_for(
+                || matches!(
+                    b.snapshot().first().map(|v| v.state),
+                    Some(JobState::Exited(_))
+                ),
+                5
+            ),
+            "adopted job must die"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

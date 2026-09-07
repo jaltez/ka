@@ -500,7 +500,11 @@ async fn run(
         }
     }
     // session shutdown: no backgrounded bash job may outlive the engine
-    ctx.voice.jobs().kill_all();
+    // detached jobs intentionally SURVIVE session exit; adopt any
+    // survivors from earlier sessions into this table
+    if let Some(path) = crate::hands::jobs::default_jobs_file() {
+        ctx.voice.jobs().set_path(path);
+    }
     Ok(())
 }
 
