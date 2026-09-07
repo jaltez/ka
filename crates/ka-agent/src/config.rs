@@ -184,6 +184,14 @@ pub struct Sandbox {
     pub mode: Option<String>,
 }
 
+/// TUI appearance ([tui]).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields, default)]
+pub struct Tui {
+    /// Title glyph for the transcript window and sidebar (default ◆).
+    pub header_glyph: Option<String>,
+}
+
 impl Sandbox {
     /// Convert to the sandbox crate's policy config.
     pub fn to_policy_config(&self) -> ka_sandbox::SandboxConfig {
@@ -263,6 +271,9 @@ pub struct Config {
     /// Sandbox policy ([sandbox]).
     #[serde(default)]
     pub sandbox: Sandbox,
+    /// TUI appearance ([tui]).
+    #[serde(default)]
+    pub tui: Tui,
     /// Per-tool settings ([tools]).
     #[serde(default)]
     pub tools: Tools,
@@ -340,6 +351,14 @@ impl Config {
             .background_after_ms
             .unwrap_or(DEFAULT_BACKGROUND_AFTER_MS)
     }
+    /// The title glyph (default ◆).
+    pub fn effective_header_glyph(&self) -> String {
+        self.tui
+            .header_glyph
+            .clone()
+            .unwrap_or_else(|| "\u{25c6}".to_string())
+    }
+
     /// Whether web fetches may target private hosts (default false).
     pub fn effective_web_allow_private(&self) -> bool {
         self.tools.web.allow_private_hosts.unwrap_or(false)

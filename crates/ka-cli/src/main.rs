@@ -828,9 +828,23 @@ async fn run_tui(cli: Cli) -> Result<ExitCode, String> {
         .into_iter()
         .map(|a| (a.name, a.description))
         .collect();
-    let exit = ka_term::tui::run(commands, events, &model_label, providers, models, agents)
-        .await
-        .map_err(|e| format!("tui: {e}"))?;
+    let cfg_tui_header_glyph = {
+        let trust = trust_for_cwd(false);
+        load_config(&cli.configs, cli.model.clone(), cli.mode.clone(), trust)
+            .map(|c| c.effective_header_glyph())
+            .unwrap_or_else(|_| "\u{25c6}".to_string())
+    };
+    let exit = ka_term::tui::run(
+        commands,
+        events,
+        &model_label,
+        providers,
+        models,
+        agents,
+        &cfg_tui_header_glyph,
+    )
+    .await
+    .map_err(|e| format!("tui: {e}"))?;
     match exit {
         ka_term::tui::Exit::Quit | ka_term::tui::Exit::EngineEnded => Ok(ExitCode::SUCCESS),
     }

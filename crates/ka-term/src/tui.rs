@@ -1073,6 +1073,8 @@ pub struct SidebarState {
     pub skills_open: bool,
     /// Cursor is over the skills header (drives the hover affordance).
     pub skills_hover: bool,
+    /// Window/sidebar title glyph ([tui] header_glyph, default ◆).
+    pub header_glyph: String,
     /// The active session's display title ([`Event::Title`]; stored
     /// record or auto-generated). None until the engine announces one.
     pub title: Option<String>,
@@ -1088,6 +1090,7 @@ impl Default for SidebarState {
             skills_open: true,
             skills_hover: false,
             title: None,
+            header_glyph: "◆".to_string(),
         }
     }
 }
@@ -1893,6 +1896,7 @@ pub async fn run(
     providers: Vec<ProviderInfo>,
     models: Vec<ModelInfo>,
     agents: Vec<(String, String)>,
+    header_glyph: &str,
 ) -> std::io::Result<Exit> {
     let _ = AGENTS.set(agents.clone());
     let mut terminal = ratatui::init();
@@ -1924,6 +1928,7 @@ pub async fn run(
         providers,
         models,
         agents,
+        header_glyph,
     )
     .await;
     let _ = std::io::stdout().write_all(b"\x1b[?1003l");
@@ -1947,6 +1952,7 @@ async fn app(
     mut providers: Vec<ProviderInfo>,
     mut models: Vec<ModelInfo>,
     agents: Vec<(String, String)>,
+    header_glyph: &str,
 ) -> std::io::Result<Exit> {
     use crossterm::event::{Event as TermEvent, KeyCode, KeyModifiers};
     let _ = agents.clone();
@@ -1984,6 +1990,7 @@ async fn app(
     let mut sidebar = SidebarState {
         cwd: shorten_cwd(&std::env::current_dir().unwrap_or_default()),
         branch: detect_branch(),
+        header_glyph: header_glyph.to_string(),
         ..Default::default()
     };
     let mut exit = None;
@@ -4992,6 +4999,7 @@ fn render(
     sidebar: &SidebarState,
     sidebar_zone: &std::cell::Cell<Option<SidebarZone>>,
 ) {
+    let header_glyph = sidebar.header_glyph.as_str();
     use ratatui::layout::Constraint::{Length, Min};
     use ratatui::style::{Modifier, Style};
     use ratatui::text::{Line as TuiLine, Span};
@@ -5093,9 +5101,9 @@ fn render(
         }
     }
     let title = if pinned {
-        "𓂓".to_string()
+        header_glyph.to_string()
     } else {
-        format!("𓂓 · ↑{} above (pgdn/esc)", start)
+        format!("{header_glyph} · ↑{} above (pgdn/esc)", start)
     };
     let widget = Paragraph::new(window).block(
         Block::default()
@@ -5146,7 +5154,7 @@ fn render(
             .block(
                 Block::default()
                     .borders(Borders::LEFT)
-                    .title(padded_title("𓂓"))
+                    .title(padded_title(header_glyph))
                     .border_style(crate::palette::BORDER_STYLE)
                     .padding(ratatui::widgets::Padding::horizontal(1)),
             )
@@ -9256,12 +9264,12 @@ mod tests {
             assert_eq!(cell.symbol(), " ", "row 0 col {x} must be blank");
             assert_eq!(cell.bg, crate::palette::BG, "row 0 rides the canvas");
         }
-        // the transcript title row carries the 𓂓 glyph
+        // the transcript title row carries the header glyph (◆ default)
         let title_row: String = (1..93u16).map(|x| buf[(x, 1)].symbol()).collect();
-        assert!(title_row.contains('𓂓'), "glyph title: {title_row}");
+        assert!(title_row.contains('◆'), "glyph title: {title_row}");
         // the sidebar title carries it too
         let sb_title: String = (93..119u16).map(|x| buf[(x, 1)].symbol()).collect();
-        assert!(sb_title.contains('𓂓'), "sidebar glyph title: {sb_title}");
+        assert!(sb_title.contains('◆'), "sidebar glyph title: {sb_title}");
         // the input box closes with rounded corners (rows 36..39)
         assert_eq!(buf[(1, 36)].symbol(), "╭");
         assert_eq!(buf[(118, 36)].symbol(), "╮");
