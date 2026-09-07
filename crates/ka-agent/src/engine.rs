@@ -369,7 +369,7 @@ async fn run(
     if !agents.is_empty() {
         let slot = ctx.voice.pathfinder_slot();
         ctx.voice.push_hand(std::sync::Arc::new(
-            crate::hands::delegate::DelegateHand::new(agents, slot),
+            crate::hands::delegate::DelegateHand::new(agents, slot, mode),
         ));
     }
 
