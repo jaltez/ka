@@ -1,53 +1,60 @@
 //! TUI palette: black & gold, adapted from the "Bearded Theme Black &
 //! Gold Soft" editor theme (BeardedBear/bearded-theme, `black.ts`:
-//! base #221F1D, primary gold #C7910C, with its orange/green/blue/red
-//! support hues). Warm near-black surfaces carry warm-white prose at
-//! 15:1, every accent and text tier clears 4.2:1 on the surface it
-//! actually sits on (syntax roles ≥ 4.5:1 on output cards), the gold
-//! primary reads soft rather than neon, and the navy strata stay on as
-//! the deep complement of the gold. The
-//! app paints its own canvas and surfaces, so it reads identically on
-//! any terminal theme.
+//! base #221F1D, primary gold #C7910C) — following its *usage*, not
+//! just its hues. Surfaces are near-flat: panels and modals recede
+//! below the canvas (bearded's `uibackgroundalt` darkens too), output
+//! cards lift a step, nothing glows. Prose is the theme's soft warm
+//! gray rather than bright cream, chrome is dim warm gray, and gold
+//! carries every accent: titles, key hints, the user ❯, the selection
+//! bar. Support hues are bearded's own: orange warnings, green
+//! strings/success, blue functions, red errors. Bold is weight-only
+//! over the soft ground, the way bearded treats emphasis. Every text
+//! tier clears 4.2:1 on the surface it sits on (syntax roles ≥ 4.5:1
+//! on output cards, the quiet tier ≥ 4.8:1 on panels); the app paints
+//! its own canvas and surfaces, so it reads identically on any
+//! terminal theme.
 use ratatui::style::{Color, Modifier, Style};
 
 // ── the ten source colors (adapted from Bearded Black & Gold Soft;
 // kept as named sources for provenance) ──────────────────────────────
 // The five pairs: prose ground, attention/deep, error/warm-faint,
 // chrome/success, tooling/warning. Gold, orange, green, red and blue
-// are the theme's own hues; umber and charcoal were lifted until every
-// text tier cleared its contrast floor on the new ground.
-pub const CREAM: Color = Color::Rgb(251, 247, 238); // #FBF7EE prose ground
+// are the theme's own hues; prose, chrome and the quiet tier follow
+// bearded's soft warm grays, lifted to clear ka's contrast floors.
+pub const CREAM: Color = Color::Rgb(199, 193, 187); // #C7C1BB bearded soft gray-white prose
 pub const CHARCOAL: Color = Color::Rgb(34, 31, 29); // #221F1D bearded soft base: warm near-black ground
 pub const BUTTER: Color = Color::Rgb(199, 145, 12); // #C7910C bearded gold: attention (soft)
-pub const PETROL: Color = Color::Rgb(11, 94, 135); // #0B5E87 deep complement of gold
+pub const PETROL: Color = Color::Rgb(11, 94, 135); // #0B5E87 retired from surfaces; kept for provenance
 pub const CORAL: Color = Color::Rgb(227, 85, 53); // #E35535 bearded red: errors
-pub const UMBER: Color = Color::Rgb(162, 147, 119); // #A29377 lifted warm gray: quiet tier
-pub const KHAKI: Color = Color::Rgb(214, 197, 159); // #D6C59F chrome (warm sand)
+pub const UMBER: Color = Color::Rgb(148, 139, 131); // #948B83 dim warm gray: quiet tier
+pub const KHAKI: Color = Color::Rgb(173, 164, 159); // #ADA49F bearded chrome gray
 pub const SAGE: Color = Color::Rgb(0, 168, 132); // #00A884 bearded green: strings/success
 pub const STEEL: Color = Color::Rgb(17, 183, 212); // #11B7D4 bearded blue: functions/tooling
 pub const FLAME: Color = Color::Rgb(221, 129, 16); // #DD8110 bearded orange lifted: warn
 
-// ── backgrounds: charcoal lifted into a four-step warm espresso
-// ladder (never flat gray — each step warms toward cream); petrol
-// strata mark user rows and tool bands ──
+// ── backgrounds: bearded's near-flat ladder — the panel/modal
+// surfaces recede BELOW the canvas (its `uibackgroundalt` darkens),
+// output cards lift one warm step, and the user/tool bands are warm,
+// not colored ──
 pub const BG: Color = CHARCOAL; // #221F1D canvas
-pub const BG_PANEL: Color = Color::Rgb(40, 36, 32); // #282420 input box, sidebar
-pub const BG_OUTPUT: Color = Color::Rgb(46, 42, 38); // #2E2A26 assistant cards
-pub const BG_SURFACE: Color = Color::Rgb(53, 48, 43); // #35302B modal/picker boxes
-// user rows ride the petrol complement of the gold ❯ lead
-pub const BG_USER: Color = PETROL; // #0B5E87
-// tool activity rides petrol darkened toward charcoal: its own stratum
-pub const BG_TOOL: Color = Color::Rgb(10, 49, 69); // #0A3145
-/// Tool band: `→ tool` text on the darkened petrol stratum.
+pub const BG_PANEL: Color = Color::Rgb(30, 27, 25); // #1E1B19 input box, sidebar (recedes)
+pub const BG_OUTPUT: Color = Color::Rgb(39, 35, 32); // #272320 assistant cards
+pub const BG_SURFACE: Color = Color::Rgb(33, 30, 28); // #211E1C modal/picker boxes
+// user turns sit on a warm lift of the ground (bearded keeps bands
+// monochrome; the gold ❯ lead marks the row)
+pub const BG_USER: Color = Color::Rgb(42, 37, 33); // #2A2521
+// tool activity rides its own warm stratum, one step below the canvas
+pub const BG_TOOL: Color = Color::Rgb(36, 31, 27); // #241F1B
+/// Tool band: `→ tool` text on the warm tool stratum.
 pub const TOOL_BAND_STYLE: Style = Style::new().fg(TOOL).bg(BG_TOOL);
 
-// ── text: cream ramp over the espresso ground ────────────────────
-pub const FG: Color = CREAM; // #FBF7EE primary prose
-pub const FG_STRONG: Color = Color::Rgb(255, 252, 245); // #FFFCF5 emphasis
-pub const META: Color = KHAKI; // #D6C59F chrome
-pub const FAINT: Color = UMBER; // #A29377 quietest text tier (≥4.8:1 on panels)
-pub const BORDER: Color = Color::Rgb(70, 60, 51); // #463C33 block borders
-pub const BORDER_QUIET: Color = Color::Rgb(58, 50, 43); // #3A322B transcript top border
+// ── text: soft gray-white ramp over the near-black ground ─────────
+pub const FG: Color = CREAM; // #C7C1BB primary prose
+pub const FG_STRONG: Color = Color::Rgb(239, 233, 225); // #EFE9E1 emphasis (warm white)
+pub const META: Color = KHAKI; // #ADA49F bearded chrome gray
+pub const FAINT: Color = UMBER; // #948B83 quietest text tier (≥4.8:1 on panels)
+pub const BORDER: Color = Color::Rgb(58, 52, 46); // #3A342E block borders (subtle)
+pub const BORDER_QUIET: Color = Color::Rgb(43, 39, 35); // #2B2723 transcript top border
 
 // ── accents ──────────────────────────────────────────────────────
 pub const ACCENT: Color = BUTTER; // titles, cursor, key hints, user ❯, spinner
@@ -87,18 +94,18 @@ pub const CANVAS: Style = Style::new().fg(FG).bg(BG);
 mod tests {
     use super::*;
 
-    /// The ten user-provided complementary source colors, byte-exact
-    /// (v2: lifted in lightness/chroma for contrast).
+    /// The ten source colors, byte-exact (adapted from Bearded Black
+    /// & Gold Soft).
     #[test]
     fn source_colors_match_user_palette() {
         for (got, want, name) in [
-            (CREAM, (0xFB, 0xF7, 0xEE), "cream"),
+            (CREAM, (0xC7, 0xC1, 0xBB), "cream"),
             (CHARCOAL, (0x22, 0x1F, 0x1D), "charcoal"),
             (BUTTER, (0xC7, 0x91, 0x0C), "butter"),
             (PETROL, (0x0B, 0x5E, 0x87), "petrol"),
             (CORAL, (0xE3, 0x55, 0x35), "coral"),
-            (UMBER, (0xA2, 0x93, 0x77), "umber"),
-            (KHAKI, (0xD6, 0xC5, 0x9F), "khaki"),
+            (UMBER, (0x94, 0x8B, 0x83), "umber"),
+            (KHAKI, (0xAD, 0xA4, 0x9F), "khaki"),
             (SAGE, (0x00, 0xA8, 0x84), "sage"),
             (STEEL, (0x11, 0xB7, 0xD4), "steel"),
             (FLAME, (0xDD, 0x81, 0x10), "flame"),
