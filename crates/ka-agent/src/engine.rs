@@ -345,6 +345,7 @@ async fn run(
     voice.set_bash_background_ms(config.effective_bash_background_after_ms());
     voice.set_fallbacks(config.fallback.models.clone());
     voice.set_max_image_mb(config.effective_max_image_mb());
+    voice.set_context_promote(config.effective_context_promote());
     {
         let slot = voice.pathfinder_slot();
         slot.write().catalog = pathfinder_catalog;
@@ -1520,6 +1521,18 @@ async fn dispatch_turn(
     persist_delta(voice, state, strand);
     if let Err(note) = crate::fshooks::run(HookPoint::PostTurn, cwd, None).await {
         events.send(Event::Note { message: note }).await.ok();
+    }
+    // overflow promotion: apply the same switch path as /model
+    if let Some(selector) = voice.take_promotion() {
+        state.model = Some(selector.clone());
+        voice.pathfinder_slot().write().model = Some(selector.clone());
+        let _ = strand.append(ka_strand::Record::Change {
+            id: ka_strand::new_record_id(),
+            model: Some(selector.clone()),
+            effort: None,
+            mode: None,
+        });
+        events.send(Event::ModelChanged { selector }).await.ok();
     }
 }
 

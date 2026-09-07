@@ -144,14 +144,21 @@ pub const DEFAULT_MAX_IMAGE_MB: u32 = 5;
 /// Default bash auto-background threshold (30s).
 pub const DEFAULT_BACKGROUND_AFTER_MS: u64 = 30_000;
 
-/// Fallback model chain ([fallback]). When a turn fails on the active
-/// model with a provider/auth error after retries are exhausted, the
-/// engine re-dispatches the same messages on the next entry.
+/// Self-update settings ([update]).
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields, default)]
 pub struct Update {
     /// GitHub repo (`owner/name`) releases are fetched from.
     pub repo: Option<String>,
+}
+
+/// Context-window policy ([context]).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields, default)]
+pub struct Context {
+    /// Auto-promote to a bigger-context sibling on overflow
+    /// (None = default true; false opts out).
+    pub promote: Option<bool>,
 }
 
 /// Fallback model chain ([fallback]). When a turn fails on the active
@@ -206,6 +213,9 @@ pub struct Config {
     /// Self-update settings ([update]).
     #[serde(default)]
     pub update: Update,
+    /// Context-window policy ([context]).
+    #[serde(default)]
+    pub context: Context,
     /// Per-tool settings ([tools]).
     #[serde(default)]
     pub tools: Tools,
@@ -267,6 +277,9 @@ impl Config {
         if other.update.repo.is_some() {
             self.update.repo = other.update.repo;
         }
+        if other.context.promote.is_some() {
+            self.context.promote = other.context.promote;
+        }
     }
     /// Effective step cap (default 20).
     pub fn effective_max_steps(&self) -> u32 {
@@ -280,6 +293,11 @@ impl Config {
             .background_after_ms
             .unwrap_or(DEFAULT_BACKGROUND_AFTER_MS)
     }
+    /// Whether overflow promotion is enabled (default true).
+    pub fn effective_context_promote(&self) -> bool {
+        self.context.promote.unwrap_or(true)
+    }
+
     /// Effective read-hand image cap in MB (default 5, 0 = unlimited).
     pub fn effective_max_image_mb(&self) -> u32 {
         self.tools.read.max_image_mb.unwrap_or(DEFAULT_MAX_IMAGE_MB)

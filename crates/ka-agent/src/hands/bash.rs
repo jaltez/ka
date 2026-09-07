@@ -170,6 +170,7 @@ impl BashHand {
                 Promote,
             }
             let background_ms = ctx.bash_background_ms;
+            let mut previewed = String::new();
             let run = async {
                 let mut ticker = tokio::time::interval(Duration::from_millis(PREVIEW_TICK_MS));
                 ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -177,7 +178,16 @@ impl BashHand {
                 tokio::pin!(bg);
                 loop {
                     tokio::select! {
-                        _ = ticker.tick() => emit_progress(&pending, progress),
+                        _ = ticker.tick() => {
+                            // drained bytes feed the live preview AND stay
+                            // retained: they must reach the spill if the
+                            // command is backgrounded after this tick
+                            let fresh = std::mem::take(&mut *pending.lock());
+                            if !fresh.is_empty() {
+                                previewed.push_str(&fresh);
+                                progress(cap_preview(&fresh));
+                            }
+                        }
                         status = child.wait() => break Phase::Exited(status.ok()),
                         _ = &mut bg, if background_ms > 0 => break Phase::Promote,
                     }
@@ -207,10 +217,14 @@ impl BashHand {
                             ));
                         }
                     };
-                    // fresh bytes go into the spill file BEFORE the final
-                    // preview flush, which would otherwise consume them
-                    // into the live band and lose them; the TUI live band
-                    // simply closes when this call returns
+                    // bytes already drained as live previews are the
+                    // spill's starting content, then fresh bytes go in
+                    // BEFORE the final preview flush, which would otherwise
+                    // consume them into the live band and lose them; the
+                    // TUI live band simply closes when this call returns
+                    if !previewed.is_empty() {
+                        let _ = std::fs::write(&spill_path, previewed.as_bytes());
+                    }
                     append_pending(&pending, &spill_path);
                     emit_progress(&pending, progress);
                     let (kill_tx, kill_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -353,7 +367,9 @@ fn supervise(
                     break child.wait().await.ok();
                 }
                 status = child.wait() => break status.ok(),
-                _ = ticker.tick() => append_pending(&pending, &spill),
+                _ = ticker.tick() => {
+                    append_pending(&pending, &spill);
+                }
             }
         };
         let stdout = out_task.await.unwrap_or_default();
@@ -745,7 +761,8 @@ mod tests {
         assert_eq!(snap[0].id, 1);
         assert_eq!(snap[0].state, crate::hands::jobs::JobState::Running);
         assert_eq!(snap[0].cmd, "echo started; sleep 30");
-        // output streams into the spill file
+        // output streams into the spill file (generous window: the
+        // watcher ticks at 300ms but WSL2 spawns can lag far behind)
         assert!(
             wait_for(
                 || {
@@ -753,7 +770,7 @@ mod tests {
                         .map(|s| s.contains("started"))
                         .unwrap_or(false)
                 },
-                5
+                30
             )
             .await,
             "spill file must carry streamed output"

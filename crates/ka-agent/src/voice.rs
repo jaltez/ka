@@ -155,6 +155,13 @@ pub struct Voice {
     /// Fallback model chain ([fallback] models; tried in order on
     /// provider/auth failure, max 2 hops per turn).
     fallbacks: Vec<String>,
+    /// Auto-promote to a bigger-context sibling on overflow
+    /// ([context] promote, default true).
+    context_promote: bool,
+    /// Promotion already fired for the attached strand (once per strand).
+    promoted: bool,
+    /// Promotion the engine must apply after the turn (selector).
+    pending_promotion: Option<String>,
     /// Pathfinder bootstrap slot shared with the hand.
     pathfinder_slot:
         std::sync::Arc<parking_lot::RwLock<crate::hands::pathfinder::PathfinderSource>>,
@@ -202,6 +209,9 @@ impl Voice {
             digest_revision: 0,
             last_digest: None,
             fallbacks: Vec::new(),
+            context_promote: true,
+            promoted: false,
+            pending_promotion: None,
             rules_cfg: Vec::new(),
             hooks_cfg: Vec::new(),
             allowed_tools: Vec::new(),
@@ -296,6 +306,9 @@ impl Voice {
             digest_revision: 0,
             last_digest: None,
             fallbacks: Vec::new(),
+            context_promote: true,
+            promoted: false,
+            pending_promotion: None,
             pathfinder_slot: slot,
             todo: todos,
         }
@@ -328,6 +341,40 @@ impl Voice {
         self.fallbacks = models;
     }
 
+    /// Enable/disable overflow promotion ([context] promote).
+    pub fn set_context_promote(&mut self, promote: bool) {
+        self.context_promote = promote;
+    }
+
+    /// Consume a promotion the engine must apply (model switch with
+    /// Change record + event, same path as `/model`).
+    pub fn take_promotion(&mut self) -> Option<String> {
+        self.pending_promotion.take()
+    }
+
+    /// Biggest-context same-vendor sibling whose modalities cover the
+    /// current ones and whose context is ≥ 1.5× the current window.
+    fn promotion_candidate(&self) -> Option<String> {
+        let selector = self.model_selector.as_deref()?;
+        let parsed = ka_dialect::parse_selector(selector).ok()?;
+        let current_id = parsed.model_id();
+        let current = self.catalog.get(&current_id)?;
+        if current.context == 0 {
+            return None;
+        }
+        let vendor_prefix = format!("{}/", current_id.split_once('/')?.0);
+        self.catalog
+            .dialects
+            .iter()
+            .filter(|(id, d)| {
+                id.starts_with(&vendor_prefix)
+                    && d.context >= current.context.saturating_mul(3) / 2
+                    && current.input.iter().all(|m| d.input.contains(m))
+            })
+            .min_by_key(|(_, d)| d.context)
+            .map(|(id, _)| id.clone())
+    }
+
     /// Set the read-hand image size cap in MB (engine bootstrap).
     pub fn set_max_image_mb(&mut self, mb: u32) {
         self.hand_ctx.max_image_mb = mb;
@@ -355,10 +402,12 @@ impl Voice {
         run_hook_scripts(&self.hooks_cfg, event, tool, args, &self.hand_ctx.cwd).await
     }
 
-    /// Load resumed history + digest (engine bootstrap).
+    /// Load resumed history + digest (engine bootstrap). Also resets the
+    /// once-per-strand promotion latch.
     pub fn load_history(&mut self, history: Vec<TurnMessage>, digest: Option<String>) {
         self.history = history;
         self.digest = digest;
+        self.promoted = false;
     }
 
     /// Set the active model selector + ratio (engine forwards each turn
@@ -1109,9 +1158,49 @@ attempt implementation — the user will review and switch to build mode.",
             }
 
             if let Some((class, message, retryable)) = step_failed {
-                // Overflow → digest-and-retry once.
+                // Overflow → promote to a bigger sibling (once per
+                // strand, before digesting), else digest-and-retry once.
                 if class == ErrorClass::Overflow && !overflow_retried {
                     overflow_retried = true;
+                    if self.context_promote && !self.promoted {
+                        if let Some(target) = self.promotion_candidate() {
+                            self.promoted = true;
+                            self.pending_promotion = Some(target.clone());
+                            let k = self
+                                .catalog
+                                .get(&target)
+                                .map(|d| d.context / 1024)
+                                .unwrap_or(0);
+                            events
+                                .send(Event::Note {
+                                    message: format!("context → {target} ({k}k)"),
+                                })
+                                .await
+                                .ok();
+                            if let Ok(p) = parse_selector(&target) {
+                                if let Some(d) = self.catalog.get(&p.model_id()).cloned() {
+                                    parsed = p;
+                                    model_id = parsed.model_id();
+                                    dialect = d;
+                                    price = dialect.price;
+                                    ratio = if dialect.ratio > 0.0 {
+                                        dialect.ratio
+                                    } else {
+                                        4.0
+                                    };
+                                    token = dialect
+                                        .api_key_env
+                                        .as_deref()
+                                        .and_then(ka_dialect::auth::resolve_token);
+                                    window = dialect.context as u64;
+                                    retry_attempt = 0;
+                                    self.model_selector = Some(target);
+                                    self.ratio = ratio as f64;
+                                    continue 'outer;
+                                }
+                            }
+                        }
+                    }
                     events.send(Event::DigestStarted).await.ok();
                     if let Some(summary) = self
                         .summarize(None, std::time::Duration::from_secs(120))
@@ -3863,6 +3952,155 @@ mod tests {
         assert!(
             seen.lock().is_empty(),
             "the speaker must not be reached for unsupported schemas"
+        );
+    }
+
+    /// Overflows on the small model, succeeds otherwise; records models.
+    struct PromoteSpeaker {
+        seen: std::sync::Arc<parking_lot::Mutex<Vec<String>>>,
+    }
+
+    impl Speaker for PromoteSpeaker {
+        fn speak<'a>(
+            &'a self,
+            req: SpeakRequest,
+            out: mpsc::Sender<StreamEvent>,
+        ) -> SpeakFuture<'a> {
+            let seen = self.seen.clone();
+            Box::pin(async move {
+                seen.lock().push(req.model_id.clone());
+                if req.model_id == "test/small" {
+                    out.send(StreamEvent::Failed {
+                        class: ka_protocol::ErrorClass::Overflow,
+                        retryable: false,
+                        message: "prompt too long".into(),
+                    })
+                    .await
+                    .ok();
+                } else {
+                    out.send(StreamEvent::Text("fits".into())).await.ok();
+                    out.send(StreamEvent::Finished {
+                        stop: ka_protocol::Stop::Done,
+                        usage: ka_protocol::Usage::default(),
+                    })
+                    .await
+                    .ok();
+                }
+            })
+        }
+    }
+
+    fn promote_catalog() -> Catalog {
+        Catalog::parse(
+            "[dialects.\"test/small\"]\nwire = \"openai_chat\"\nbase_url = \"http://127.0.0.1:1\"\ncontext = 100\n\
+             [dialects.\"test/big\"]\nwire = \"openai_chat\"\nbase_url = \"http://127.0.0.1:1\"\ncontext = 1000\n",
+        )
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn overflow_promotes_before_digesting() {
+        let seen = std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let mut voice = Voice::new(
+            promote_catalog(),
+            std::env::temp_dir(),
+            ka_protocol::Mode::Free,
+            5,
+        )
+        .with_speaker(
+            Wire::OpenaiChat,
+            std::sync::Arc::new(PromoteSpeaker { seen: seen.clone() }),
+        );
+        let (_cmd_tx, mut cmd_rx) = mpsc::channel(16);
+        let (evt_tx, mut evt_rx) = mpsc::channel(256);
+        let mut interjections = Vec::new();
+        let mut deferrals = std::collections::VecDeque::new();
+        let mut guards = GuardRuntime::default();
+        let handle = tokio::spawn(async move {
+            voice
+                .turn(
+                    "test/small",
+                    "hi".into(),
+                    &mut cmd_rx,
+                    &evt_tx,
+                    &mut interjections,
+                    &mut deferrals,
+                    &mut guards,
+                    None,
+                    Vec::new(),
+                )
+                .await
+        });
+        let mut notes = Vec::new();
+        let mut saw_digest_started = false;
+        while let Some(evt) = evt_rx.recv().await {
+            match evt {
+                Event::Note { message } => notes.push(message),
+                Event::DigestStarted => saw_digest_started = true,
+                Event::TurnFinished { .. } => break,
+                _ => {}
+            }
+        }
+        let _ = handle.await.unwrap();
+        assert!(
+            notes.iter().any(|n| n.contains("context → test/big")),
+            "{notes:?}"
+        );
+        assert!(!saw_digest_started, "promotion must precede digestion");
+        {
+            let ids = seen.lock();
+            assert_eq!(ids.first().map(String::as_str), Some("test/small"));
+            assert_eq!(ids.last().map(String::as_str), Some("test/big"));
+        }
+    }
+
+    #[tokio::test]
+    async fn promotion_disabled_goes_straight_to_digest() {
+        let seen = std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let mut voice = Voice::new(
+            promote_catalog(),
+            std::env::temp_dir(),
+            ka_protocol::Mode::Free,
+            5,
+        )
+        .with_speaker(
+            Wire::OpenaiChat,
+            std::sync::Arc::new(PromoteSpeaker { seen: seen.clone() }),
+        );
+        voice.set_context_promote(false);
+        let (_cmd_tx, mut cmd_rx) = mpsc::channel(16);
+        let (evt_tx, mut evt_rx) = mpsc::channel(256);
+        let mut interjections = Vec::new();
+        let mut deferrals = std::collections::VecDeque::new();
+        let mut guards = GuardRuntime::default();
+        let handle = tokio::spawn(async move {
+            voice
+                .turn(
+                    "test/small",
+                    "hi".into(),
+                    &mut cmd_rx,
+                    &evt_tx,
+                    &mut interjections,
+                    &mut deferrals,
+                    &mut guards,
+                    None,
+                    Vec::new(),
+                )
+                .await
+        });
+        let mut notes = Vec::new();
+        while let Some(evt) = evt_rx.recv().await {
+            match evt {
+                Event::Note { message } => notes.push(message),
+                Event::TurnFinished { .. } => break,
+                _ => {}
+            }
+        }
+        let _ = handle.await.unwrap();
+        assert!(!notes.iter().any(|n| n.contains("context →")), "{notes:?}");
+        assert!(
+            seen.lock().iter().all(|m| m == "test/small"),
+            "no promotion means the model never changes"
         );
     }
 }
