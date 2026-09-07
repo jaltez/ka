@@ -830,7 +830,12 @@ async fn handle_command(
                     )
                     .await
                     {
-                        Ok(fresh) => ctx.strand = fresh,
+                        Ok(fresh) => {
+                            ctx.strand = fresh;
+                            // the fork carries the "(fork)" placeholder title:
+                            // let the fast-role auto-title replace it
+                            ctx.state.needs_title = true;
+                        }
                         Err(e) => {
                             ctx.events
                                 .send(Event::Error {
@@ -1606,6 +1611,13 @@ fn fork_strand(
     };
     let mut fork =
         ka_strand::StrandFile::create(cwd, repo_snapshot(cwd)).map_err(|e| e.to_string())?;
+    let parent_id = records.iter().find_map(|r| match r {
+        ka_strand::Record::Header { id, .. } => Some(id.0.clone()),
+        _ => None,
+    });
+    if let Some(parent_id) = &parent_id {
+        fork.set_parent(parent_id);
+    }
     for record in &records[..cut] {
         if matches!(record, ka_strand::Record::Header { .. }) {
             continue;
@@ -2964,6 +2976,40 @@ mod tests {
             vec!["Fix the parser".to_string()],
             "exactly one Title record, ever"
         );
+        let _ = std::fs::remove_dir_all(&work);
+    }
+
+    #[test]
+    fn fork_records_parent_linkage() {
+        let work = std::env::temp_dir().join(format!("ka-fork-parent-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&work);
+        std::fs::create_dir_all(&work).unwrap();
+        let mut parent = ka_strand::StrandFile::create(&work, None).unwrap();
+        parent
+            .append(ka_strand::Record::Message {
+                id: ka_strand::new_record_id(),
+                role: ka_strand::Role::User,
+                content: "hello".into(),
+                calls: Vec::new(),
+                results: Vec::new(),
+            })
+            .unwrap();
+
+        let child_path = super::fork_strand(&work, &parent, 0).expect("fork created");
+        let child = ka_strand::StrandFile::open(&child_path).expect("child opens");
+        let parent_id = parent
+            .records()
+            .iter()
+            .find_map(|r| match r {
+                ka_strand::Record::Header { id, .. } => Some(id.0.clone()),
+                _ => None,
+            })
+            .unwrap();
+        let child_parent = child.records().iter().find_map(|r| match r {
+            ka_strand::Record::Header { parent, .. } => parent.clone(),
+            _ => None,
+        });
+        assert_eq!(child_parent.as_deref(), Some(parent_id.as_str()));
         let _ = std::fs::remove_dir_all(&work);
     }
 }

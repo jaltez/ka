@@ -1852,6 +1852,15 @@ pub enum Modal {
         /// Selected row index.
         selected: usize,
     },
+    /// Strand tree (/tree): current session + descendants.
+    Tree {
+        /// Rendered rows (`title · date · N msgs`).
+        items: Vec<String>,
+        /// Switch targets aligned with `items`.
+        targets: Vec<String>,
+        /// Selected row index.
+        selected: usize,
+    },
     /// Help overlay.
     Help,
 }
@@ -2409,6 +2418,31 @@ async fn app(
                                     _ => {}
                                 }
                             }
+                            Modal::Tree {
+                                items,
+                                targets,
+                                selected,
+                            } => match key.code {
+                                KeyCode::Esc => modal = None,
+                                KeyCode::Up => {
+                                    *selected = selected.saturating_sub(1);
+                                }
+                                KeyCode::Down => {
+                                    if *selected + 1 < items.len() {
+                                        *selected += 1;
+                                    }
+                                }
+                                KeyCode::Enter => {
+                                    if let Some(id) = targets.get(*selected).cloned() {
+                                        modal = None;
+                                        let _ = commands
+                                            .send(Command::SwitchStrand { id })
+                                            .await;
+                                        busy = true;
+                                    }
+                                }
+                                _ => {}
+                            },
                             Modal::Prompts { items, selected } => match key.code {
                                 KeyCode::Esc => modal = None,
                                 KeyCode::Up => {
@@ -2856,6 +2890,59 @@ async fn app(
                                             items: sidebar.inventory.prompts.clone(),
                                             selected: 0,
                                         },
+                                        ModalKind::Tree => {
+                                            let cwd = std::env::current_dir()
+                                                .unwrap_or_else(|_| std::path::PathBuf::from("."));
+                                            let all = ka_strand::list(&cwd).unwrap_or_default();
+                                            let current = if meters.session.is_empty() {
+                                                None
+                                            } else {
+                                                Some(meters.session.clone())
+                                            };
+                                            let mut ids: Vec<String> =
+                                                current.clone().map(|c| vec![c]).unwrap_or_default();
+                                            let mut i = 0;
+                                            while i < ids.len() {
+                                                let frontier = ids.clone();
+                                                for s in &all {
+                                                    if s.parent
+                                                        .as_deref()
+                                                        .is_some_and(|p| frontier.iter().any(|id| id == p))
+                                                        && !ids.contains(&s.id)
+                                                    {
+                                                        ids.push(s.id.clone());
+                                                    }
+                                                }
+                                                i += 1;
+                                                if i > all.len() + 1 {
+                                                    break;
+                                                }
+                                            }
+                                            let mut items = Vec::new();
+                                            let mut targets = Vec::new();
+                                            for s in &all {
+                                                if !ids.contains(&s.id) {
+                                                    continue;
+                                                }
+                                                let date =
+                                                    s.ts.get(..10).unwrap_or(&s.ts).to_string();
+                                                let marker = if Some(&s.id) == current.as_ref() {
+                                                    "▸ "
+                                                } else {
+                                                    ""
+                                                };
+                                                items.push(format!(
+                                                    "{marker}{} · {date} · {} msgs",
+                                                    s.title, s.messages
+                                                ));
+                                                targets.push(s.id.clone());
+                                            }
+                                            Modal::Tree {
+                                                items,
+                                                targets,
+                                                selected: 0,
+                                            }
+                                        }
                                         // Mode borrows the input box (outer
                                         // arm) and Key the outer arm above:
                                         // neither ever becomes a modal
@@ -3182,6 +3269,7 @@ async fn app(
                                 prompt.input.extend(text.chars().filter(|c| !c.is_whitespace()));
                             }
                             Modal::Prompts { .. } => {}
+                            Modal::Tree { .. } => {}
                             Modal::Session(picker) => {
                                 picker.filter.extend(text.chars().filter(|c| !c.is_whitespace()));
                             }
@@ -3795,6 +3883,10 @@ pub fn available_slash_commands() -> Vec<(String, String)> {
             "/mcp".to_string(),
             "refresh MCP tool lists (/mcp refresh)".to_string(),
         ),
+        (
+            "/tree".to_string(),
+            "current session's fork tree".to_string(),
+        ),
         ("/prompt".to_string(), "run an MCP prompt".to_string()),
         (
             "/provider".to_string(),
@@ -4157,6 +4249,8 @@ pub enum ModalKind {
     Spills,
     /// MCP prompt picker.
     Prompts,
+    /// Strand tree.
+    Tree,
     /// Help overlay.
     Help,
 }
@@ -4209,6 +4303,7 @@ fn slash_command(text: &str) -> Option<Slash> {
             | "/restore"
             | "/mcp"
             | "/prompt"
+            | "/tree"
     ) {
         if let Some(body) = custom_command(head, rest) {
             return Some(Slash {
@@ -4413,6 +4508,13 @@ step now; verify each step."
             quit: false,
             followup: None,
             modal: Some(ModalKind::Help),
+        }),
+        "/tree" => Some(Slash {
+            note: None,
+            event: None,
+            quit: false,
+            followup: None,
+            modal: Some(ModalKind::Tree),
         }),
         "/mcp" => match rest {
             Some("refresh") => Some(Slash {
@@ -4965,6 +5067,9 @@ fn render(
                 (" ⏎", "run / fill args"),
                 (" esc", "close"),
             ]),
+            Modal::Tree { .. } => {
+                hint_spans(&[(" ↑↓", "choose"), (" ⏎", "attach"), (" esc", "close")])
+            }
             Modal::Key(_) => hint_spans(&[(" type", "value"), (" ⏎", "save"), (" esc", "cancel")]),
             Modal::Help => hint_spans(&[(" ⏎", "close")]),
         }
@@ -5496,6 +5601,45 @@ fn render(
                         Block::default()
                             .borders(Borders::ALL)
                             .title(padded_title("prompts"))
+                            .border_style(crate::palette::BORDER_STYLE)
+                            .padding(ratatui::widgets::Padding::new(1, 1, 1, 1)),
+                    )
+                    .style(ratatui::style::Style::new().bg(crate::palette::BG_SURFACE))
+                    .wrap(Wrap { trim: false });
+                frame.render_widget(widget, rect);
+            }
+            Modal::Tree {
+                items,
+                targets: _,
+                selected,
+            } => {
+                let height = (items.len() as u16 + 5).clamp(7, 21);
+                let width = 68.min(frame.area().width);
+                let rect = centered(width, height, modal_area);
+                let inner_w = width.saturating_sub(4) as usize;
+                let mut text = Vec::new();
+                if items.is_empty() {
+                    text.push(TuiLine::styled(
+                        "(no related sessions)",
+                        crate::palette::META,
+                    ));
+                }
+                let cap = (height as usize).saturating_sub(5);
+                for (i, row) in items.iter().take(cap).enumerate() {
+                    if i == *selected {
+                        text.push(TuiLine::styled(
+                            pad_to_width(row.clone(), inner_w),
+                            selection_style(),
+                        ));
+                    } else {
+                        text.push(TuiLine::raw(row.clone()));
+                    }
+                }
+                let widget = Paragraph::new(text)
+                    .block(
+                        Block::default()
+                            .borders(Borders::ALL)
+                            .title(padded_title("tree"))
                             .border_style(crate::palette::BORDER_STYLE)
                             .padding(ratatui::widgets::Padding::new(1, 1, 1, 1)),
                     )
@@ -6290,6 +6434,7 @@ mod tests {
                     messages: 2,
                     cost: 0.0,
                     tokens: 0,
+                    parent: None,
                 },
                 ka_strand::StrandSummary {
                     path: std::path::PathBuf::from("/tmp/b.jsonl"),
@@ -6299,6 +6444,7 @@ mod tests {
                     messages: 5,
                     cost: 0.0,
                     tokens: 0,
+                    parent: None,
                 },
             ],
             selected: 0,
@@ -6321,6 +6467,7 @@ mod tests {
                 messages: 4,
                 cost: 0.0,
                 tokens: 0,
+                parent: None,
             }],
             selected: 1,
             filter: "parser".to_string(),
@@ -7570,6 +7717,7 @@ mod tests {
             messages: 2,
             cost: 0.0,
             tokens: 0,
+            parent: None,
         };
         let picker = SessionPicker {
             sessions: vec![s],
@@ -7971,6 +8119,7 @@ mod tests {
                 messages: 7,
                 cost: 1.234,
                 tokens: 12_345,
+                parent: None,
             }],
             selected: 0,
             filter: String::new(),
@@ -7992,6 +8141,7 @@ mod tests {
                 messages: 2,
                 cost: 0.004,
                 tokens: 0,
+                parent: None,
             }],
             selected: 0,
             filter: String::new(),
@@ -8910,5 +9060,12 @@ mod tests {
         );
         let text = format!("{:?}", lines.entries());
         assert!(text.contains("digest"), "{text:?}");
+    }
+
+    #[test]
+    fn slash_tree_opens_modal() {
+        let slash = slash_command("/tree").unwrap();
+        assert!(matches!(slash.modal, Some(ModalKind::Tree)));
+        assert!(slash.event.is_none());
     }
 }

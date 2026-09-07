@@ -74,6 +74,9 @@ pub enum Record {
         version: u32,
         /// Repo state at creation, if inside a work tree.
         repo: Option<RepoSnapshot>,
+        /// Parent strand (forks); absent for fresh sessions.
+        #[serde(default)]
+        parent: Option<String>,
     },
     /// A conversation message (with tool calls/results when present).
     Message {
@@ -278,6 +281,7 @@ impl StrandFile {
             cwd: cwd.to_string_lossy().into_owned(),
             version: 1,
             repo,
+            parent: None,
         };
         Ok(Self {
             path: None,
@@ -285,6 +289,13 @@ impl StrandFile {
             records: vec![header],
             settings: Settings::default(),
         })
+    }
+
+    /// Mark this strand as a fork of `parent` (tree navigation).
+    pub fn set_parent(&mut self, parent: &str) {
+        if let Some(Record::Header { parent: p, .. }) = self.records.first_mut() {
+            *p = Some(parent.to_string());
+        }
     }
 
     /// Materialize the strand file on first use: directory + header.
@@ -486,6 +497,8 @@ pub struct StrandSummary {
     pub messages: usize,
     /// Summed cost in USD across the strand's Usage records.
     pub cost: f64,
+    /// Parent strand id when this strand is a fork.
+    pub parent: Option<String>,
     /// Summed tokens (input + output + cache reads/writes) across the
     /// strand's Usage records; 0 for strands without usage accounting.
     pub tokens: u64,
@@ -546,7 +559,7 @@ pub fn list(cwd: &Path) -> std::io::Result<Vec<StrandSummary>> {
         let Some(Ok(first)) = lines.next() else {
             continue;
         };
-        let Ok(Record::Header { id, ts, .. }) = serde_json::from_str(&first) else {
+        let Ok(Record::Header { id, ts, parent, .. }) = serde_json::from_str(&first) else {
             continue;
         };
         let mut title = String::new();
@@ -597,6 +610,7 @@ pub fn list(cwd: &Path) -> std::io::Result<Vec<StrandSummary>> {
             messages,
             cost,
             tokens,
+            parent,
         });
     }
     // ids embed millisecond timestamps (s{millis:x}), so they sort newer
@@ -639,6 +653,7 @@ pub fn resolve_id(cwd: &Path, needle: &str) -> std::io::Result<IdMatch> {
             messages: 0,
             cost: 0.0,
             tokens: 0,
+            parent: None,
         }));
     }
     let mut matches: Vec<StrandSummary> = strands_filter(cwd, needle)?;
@@ -1070,6 +1085,7 @@ mod tests {
                 cwd: "/tmp/proj".into(),
                 version: 1,
                 repo: None,
+                parent: None,
             },
             Record::Message {
                 id: new_record_id(),
