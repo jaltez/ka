@@ -5104,8 +5104,8 @@ fn append_tool_note(row: &mut String, excerpt: &str, is_error: bool) {
     }
 }
 
-/// The one selection identity of the whole TUI: a full-row twilight-indigo
-/// bar carrying cream text (pad_to_width fills the row with SEL_BG).
+/// The one selection identity of the whole TUI: a full-row petrol bar
+/// carrying cream text (pad_to_width fills the row with SEL_BG).
 fn selection_style() -> ratatui::style::Style {
     use ratatui::style::Modifier;
     ratatui::style::Style::new()
@@ -5216,7 +5216,7 @@ fn render(
     use ratatui::text::{Line as TuiLine, Span};
     use ratatui::widgets::{Block, BorderType, Borders, Paragraph, Wrap};
     // ── canvas: paint the whole frame before any widget so the app sits
-    // on the warm mocha ground with cream prose, whatever the terminal
+    // on the charcoal ground with cream prose, whatever the terminal
     // theme paints behind it ──
     frame.render_widget(Block::new().style(crate::palette::CANVAS), frame.area());
     // one column of air on each side of the frame; rows stay edge to
@@ -7385,7 +7385,7 @@ mod tests {
         // card inner top/bottom air
         let out = super::render_line(&Line::Assistant("**hi** there".into()), 40);
         assert!(out.len() >= 3, "blank + content + blank, got {}", out.len());
-        let surface = ratatui::style::Color::Rgb(32, 25, 19);
+        let surface = crate::palette::BG_OUTPUT;
         let row_text = |l: &ratatui::text::Line<'static>| {
             l.spans
                 .iter()
@@ -7412,7 +7412,7 @@ mod tests {
         assert_eq!(row_text(content).trim_end(), "hi there");
         assert_eq!(cols(content), 40, "surface fills the width");
         let slab = format!("{content:?}");
-        assert!(slab.contains("Rgb(32, 25, 19)"), "output bg: {slab}");
+        assert!(slab.contains(&format!("{surface:?}")), "output bg: {slab}");
     }
 
     #[test]
@@ -7429,7 +7429,7 @@ mod tests {
                 .collect::<String>()
         };
         // the card opens and closes on a BG_USER pad row
-        let user_bg = ratatui::style::Color::Rgb(38, 43, 69);
+        let user_bg = crate::palette::BG_USER;
         for pad in [out.first().unwrap(), out.last().unwrap()] {
             assert!(
                 pad.spans.iter().all(|s| s.style.bg == Some(user_bg)),
@@ -8055,7 +8055,7 @@ mod tests {
             assert!(
                 row.spans
                     .iter()
-                    .all(|s| s.style.bg == Some(ratatui::style::Color::Rgb(27, 30, 44))),
+                    .all(|s| s.style.bg == Some(crate::palette::BG_TOOL)),
                 "live rows ride BG_TOOL: {row:?}"
             );
         }
