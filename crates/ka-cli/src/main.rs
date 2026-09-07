@@ -79,6 +79,10 @@ enum CliCommand {
         /// JSON-schema file the reply must satisfy (structured output)
         #[arg(long, value_name = "PATH")]
         schema: Option<PathBuf>,
+        /// Output format: text (ka NDJSON events) or stream-json
+        /// (Claude-Code-shaped NDJSON)
+        #[arg(long, default_value = "text")]
+        print: String,
     },
     /// Environment health checks
     Doctor {
@@ -301,6 +305,7 @@ async fn dispatch(cli: Cli) -> Result<ExitCode, String> {
             session,
             trust,
             schema,
+            print,
         }) => {
             let schema_value = match schema {
                 Some(path) => {
@@ -324,6 +329,7 @@ async fn dispatch(cli: Cli) -> Result<ExitCode, String> {
                 trust,
                 schema_value,
                 Vec::new(),
+                print,
             )
             .await
         }
@@ -415,6 +421,7 @@ async fn run_headless(
     force_trust: bool,
     schema: Option<serde_json::Value>,
     images: Vec<ka_protocol::ImagePart>,
+    print: String,
 ) -> Result<ExitCode, String> {
     let trust = trust_for_cwd(force_trust);
     warn_untrusted_conventions(&std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
@@ -427,6 +434,7 @@ async fn run_headless(
         return Err("empty prompt".to_string());
     }
 
+    let cfg_model = cfg.model.clone();
     let catalog = build_catalog(dialects, with_discovery).await?;
     let choice = if let Some(id) = session {
         let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
@@ -455,10 +463,8 @@ async fn run_headless(
 
     let mut stdout = std::io::stdout().lock();
     let mut final_stop: Option<Stop> = None;
+    let mut sj = StreamJsonPrinter::with_model(cfg_model.clone());
     while let Some(event) = handle.events.recv().await {
-        let line = to_line(&event).map_err(|e| format!("serialize event: {e}"))?;
-        std::io::Write::write_all(&mut stdout, line.as_bytes())
-            .map_err(|e| format!("stdout: {e}"))?;
         // headless policy: permission asks auto-deny (last option = deny)
         if let Event::Ask { id, .. } = &event {
             handle
@@ -475,12 +481,191 @@ async fn run_headless(
             Event::Idle => break,
             _ => {}
         }
+        if print == "stream-json" {
+            for line in sj.map_event(&event) {
+                use std::io::Write;
+                writeln!(stdout, "{line}").map_err(|e| format!("stdout: {e}"))?;
+            }
+            continue;
+        }
+        let line = to_line(&event).map_err(|e| format!("serialize event: {e}"))?;
+        std::io::Write::write_all(&mut stdout, line.as_bytes())
+            .map_err(|e| format!("stdout: {e}"))?;
+    }
+    // stream-json: the terminating result line (after the loop so cost
+    // and stop reason are final)
+    if print == "stream-json" {
+        for line in sj.finish(final_stop) {
+            use std::io::Write;
+            writeln!(stdout, "{line}").map_err(|e| format!("stdout: {e}"))?;
+        }
     }
     std::io::Write::flush(&mut stdout).map_err(|e| format!("stdout: {e}"))?;
     match final_stop {
         Some(Stop::Aborted) => Ok(ExitCode::from(2)),
         Some(Stop::Error) => Ok(ExitCode::from(1)),
         _ => Ok(ExitCode::SUCCESS),
+    }
+}
+
+/// Maps ka events onto the Claude-Code-shaped NDJSON surface used by
+/// `ka run --print stream-json`:
+///
+/// - `{"type":"system","subtype":"init","model":...,"session":...}`
+/// - assistant text: `{"type":"assistant","message":{"role":"assistant",
+///   "content":[{"type":"text","text":...}]}}`
+/// - tool round-trips: an assistant `tool_use` block per CallStarted and
+///   a user `tool_result` per CallOutput
+/// - terminal: `{"type":"result","subtype":"success|error|aborted",
+///   "is_error":...,"total_cost_usd":...}`
+///
+/// Text deltas accumulate; a buffered assistant message flushes when a
+/// tool call starts or the turn finishes. Event kinds without a mapping
+/// (inventory, meters, notes) are dropped.
+#[derive(Default)]
+struct StreamJsonPrinter {
+    session: Option<String>,
+    model: Option<String>,
+    text: String,
+    finished: bool,
+    total_cost: f64,
+}
+
+impl StreamJsonPrinter {
+    fn with_model(model: Option<String>) -> Self {
+        Self {
+            model,
+            ..Default::default()
+        }
+    }
+}
+
+impl StreamJsonPrinter {
+    fn emit(&self, value: serde_json::Value) -> Option<String> {
+        if self.finished {
+            return None;
+        }
+        Some(value.to_string())
+    }
+
+    fn flush_text(&mut self) -> Option<String> {
+        if self.text.is_empty() {
+            return None;
+        }
+        let text = std::mem::take(&mut self.text);
+        self.emit(serde_json::json!({
+            "type": "assistant",
+            "message": {
+                "role": "assistant",
+                "content": [{"type": "text", "text": text}]
+            }
+        }))
+    }
+
+    fn map_event(&mut self, event: &Event) -> Vec<String> {
+        if self.finished {
+            return Vec::new();
+        }
+        match event {
+            Event::SessionInfo { id } => {
+                self.session = Some(id.clone());
+                self.emit(serde_json::json!({
+                    "type": "system",
+                    "subtype": "init",
+                    "session": id,
+                    "model": self.model,
+                }))
+                .into_iter()
+                .collect()
+            }
+            Event::Delta {
+                kind: ka_protocol::DeltaKind::Text(t),
+            } => {
+                self.text.push_str(t);
+                Vec::new()
+            }
+            Event::CallStarted { tool, id, .. } => {
+                let mut out = Vec::new();
+                if let Some(line) = self.flush_text() {
+                    out.push(line);
+                }
+                if let Some(line) = self.emit(serde_json::json!({
+                    "type": "assistant",
+                    "message": {
+                        "role": "assistant",
+                        "content": [{
+                            "type": "tool_use",
+                            "id": id,
+                            "name": tool,
+                            "input": {}
+                        }]
+                    }
+                })) {
+                    out.push(line);
+                }
+                out
+            }
+            Event::CallOutput {
+                id,
+                excerpt,
+                is_error,
+                ..
+            } => {
+                if let Some(line) = self.emit(serde_json::json!({
+                    "type": "user",
+                    "message": {
+                        "role": "user",
+                        "content": [{
+                            "type": "tool_result",
+                            "tool_use_id": id,
+                            "content": excerpt,
+                            "is_error": is_error
+                        }]
+                    }
+                })) {
+                    vec![line]
+                } else {
+                    Vec::new()
+                }
+            }
+            Event::ModelChanged { selector } => {
+                self.model = Some(selector.clone());
+                Vec::new()
+            }
+            Event::TurnFinished { usage, .. } => {
+                self.total_cost += usage.cost;
+                let mut out = Vec::new();
+                if let Some(line) = self.flush_text() {
+                    out.push(line);
+                }
+                out
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    fn finish(&mut self, final_stop: Option<Stop>) -> Vec<String> {
+        self.finished = true;
+        let mut out = Vec::new();
+        if let Some(line) = self.flush_text() {
+            out.push(line);
+        }
+        let (subtype, is_error) = match final_stop {
+            Some(Stop::Aborted) => ("aborted", true),
+            Some(Stop::Error) | None => ("error", true),
+            _ => ("success", false),
+        };
+        let total_cost = self.total_cost;
+        out.push(
+            serde_json::json!({
+                "type": "result",
+                "subtype": subtype,
+                "is_error": is_error,
+                "total_cost_usd": total_cost,
+            })
+            .to_string(),
+        );
+        out
     }
 }
 
@@ -976,4 +1161,102 @@ fn read_stdin() -> Result<String, String> {
         .read_to_string(&mut buf)
         .map_err(|e| format!("stdin: {e}"))?;
     Ok(buf)
+}
+
+#[cfg(test)]
+mod print_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use super::*;
+
+    #[test]
+    fn stream_json_maps_the_documented_shape() {
+        let mut sj = StreamJsonPrinter::with_model(Some("anthropic/claude-sonnet-5".into()));
+
+        // init
+        let lines = sj.map_event(&Event::SessionInfo { id: "s123".into() });
+        assert_eq!(lines.len(), 1);
+        let init: serde_json::Value = serde_json::from_str(&lines[0]).unwrap();
+        assert_eq!(init["type"], "system");
+        assert_eq!(init["subtype"], "init");
+        assert_eq!(init["session"], "s123");
+        assert_eq!(init["model"], "anthropic/claude-sonnet-5");
+
+        // text deltas buffer; a tool call flushes them as assistant text
+        sj.map_event(&Event::Delta {
+            kind: ka_protocol::DeltaKind::Text("thinking…".into()),
+        });
+        let lines = sj.map_event(&Event::CallStarted {
+            tool: "read".into(),
+            id: "c1".into(),
+            detail: String::new(),
+        });
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        let text_msg: serde_json::Value = serde_json::from_str(&lines[0]).unwrap();
+        assert_eq!(text_msg["type"], "assistant");
+        assert_eq!(text_msg["message"]["content"][0]["type"], "text");
+        assert_eq!(text_msg["message"]["content"][0]["text"], "thinking…");
+        let tool_msg: serde_json::Value = serde_json::from_str(&lines[1]).unwrap();
+        assert_eq!(tool_msg["message"]["content"][0]["type"], "tool_use");
+        assert_eq!(tool_msg["message"]["content"][0]["id"], "c1");
+
+        // tool result maps as a user tool_result
+        let lines = sj.map_event(&Event::CallOutput {
+            tool: "read".into(),
+            id: "c1".into(),
+            excerpt: "file body".into(),
+            is_error: false,
+            spill: None,
+        });
+        assert_eq!(lines.len(), 1);
+        let result: serde_json::Value = serde_json::from_str(&lines[0]).unwrap();
+        assert_eq!(result["type"], "user");
+        assert_eq!(result["message"]["content"][0]["type"], "tool_result");
+        assert_eq!(result["message"]["content"][0]["content"], "file body");
+
+        // turn finished flushes the remaining text as the final assistant
+        // message; the result line lands at finish()
+        sj.map_event(&Event::Delta {
+            kind: ka_protocol::DeltaKind::Text("answer".into()),
+        });
+        let lines = sj.map_event(&Event::TurnFinished {
+            stop: Stop::Done,
+            usage: ka_protocol::Usage {
+                cost: 0.42,
+                ..Default::default()
+            },
+        });
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        let text_msg: serde_json::Value = serde_json::from_str(&lines[0]).unwrap();
+        assert_eq!(text_msg["message"]["content"][0]["text"], "answer");
+
+        // finish emits the terminal result with accumulated cost
+        let lines = sj.finish(Some(Stop::Done));
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        let result: serde_json::Value = serde_json::from_str(&lines[0]).unwrap();
+        assert_eq!(result["type"], "result");
+        assert_eq!(result["subtype"], "success");
+        assert_eq!(result["is_error"], false);
+        assert_eq!(result["total_cost_usd"], 0.42);
+
+        // error stop maps to an error result
+        let mut sj = StreamJsonPrinter::default();
+        sj.finish(Some(Stop::Error));
+        // error path: nothing more may be mapped after finish
+        assert!(sj.map_event(&Event::Idle).is_empty());
+    }
+
+    #[test]
+    fn stream_json_error_and_abort_subtypes() {
+        let mut sj = StreamJsonPrinter::default();
+        let lines = sj.finish(Some(Stop::Aborted));
+        let result: serde_json::Value = serde_json::from_str(&lines[0]).unwrap();
+        assert_eq!(result["subtype"], "aborted");
+        assert_eq!(result["is_error"], true);
+
+        let mut sj = StreamJsonPrinter::default();
+        let lines = sj.finish(Some(Stop::Error));
+        let result: serde_json::Value = serde_json::from_str(&lines[0]).unwrap();
+        assert_eq!(result["subtype"], "error");
+    }
 }
