@@ -641,6 +641,20 @@ impl Transcript {
         self.rendered.iter().map(Vec::len).sum()
     }
 
+    /// Rendered row index where each user entry starts, in transcript
+    /// order (▲▼ title-arrow jump targets).
+    pub fn user_entry_rows(&self) -> Vec<usize> {
+        let mut rows = Vec::new();
+        let mut at = 0usize;
+        for (line, rendered) in self.lines.iter().zip(&self.rendered) {
+            if matches!(line, Line::User(_)) {
+                rows.push(at);
+            }
+            at += rendered.len();
+        }
+        rows
+    }
+
     /// One rendered row by absolute index.
     pub fn row(&self, i: usize) -> Option<&ratatui::text::Line<'static>> {
         let mut i = i;
@@ -797,6 +811,32 @@ fn window_range(total: usize, visible: usize, scroll: Option<usize>) -> (usize, 
             let anchor = anchor.min(max_start);
             (anchor, anchor >= max_start)
         }
+    }
+}
+
+/// Jump the viewport anchor to the previous (up) or next (down) user
+/// message relative to the window top. Up with nothing above is a
+/// no-op; down past the last user message lands on the live tail
+/// (scroll = None) unless the view is already pinned there.
+fn jump_to_user_message(
+    scroll: &mut Option<usize>,
+    user_rows: &[usize],
+    total: usize,
+    visible: usize,
+    up: bool,
+) {
+    if user_rows.is_empty() || visible == 0 {
+        return;
+    }
+    let (start, pinned) = window_range(total, visible, *scroll);
+    if up {
+        if let Some(&r) = user_rows.iter().rev().find(|&&r| r < start) {
+            *scroll = Some(r);
+        }
+    } else if let Some(&r) = user_rows.iter().find(|&&r| r > start) {
+        *scroll = Some(r);
+    } else if !pinned {
+        *scroll = None;
     }
 }
 
@@ -1109,6 +1149,31 @@ impl SidebarZone {
     fn hit(&self, x: u16, y: u16) -> bool {
         match self {
             SidebarZone::SkillsHeader(rect) => rect.contains(ratatui::layout::Position { x, y }),
+        }
+    }
+}
+
+/// Clickable ▲▼ jump targets on the transcript title row (recorded at
+/// render time like [`SidebarZone`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TitleArrows {
+    /// ▲ — jump to the previous user message.
+    up: ratatui::layout::Rect,
+    /// ▼ — jump to the next user message.
+    down: ratatui::layout::Rect,
+}
+
+impl TitleArrows {
+    /// Does a terminal-cell click land on one of the arrows? Returns
+    /// `Some(true)` for ▲ (previous), `Some(false)` for ▼ (next).
+    fn hit(&self, x: u16, y: u16) -> Option<bool> {
+        let pos = ratatui::layout::Position { x, y };
+        if self.up.contains(pos) {
+            Some(true)
+        } else if self.down.contains(pos) {
+            Some(false)
+        } else {
+            None
         }
     }
 }
@@ -2005,6 +2070,8 @@ async fn app(
     let mut mode_picker: Option<ModePicker> = None;
     // clickable sidebar regions, refreshed every frame by render()
     let sidebar_zone: std::cell::Cell<Option<SidebarZone>> = std::cell::Cell::new(None);
+    // clickable ▲▼ user-message jump targets on the title row
+    let title_arrows: std::cell::Cell<Option<TitleArrows>> = std::cell::Cell::new(None);
     let mut term_events = crossterm::event::EventStream::new();
     let mut spin = tokio::time::interval(Duration::from_millis(120));
 
@@ -2074,6 +2141,7 @@ async fn app(
                 &meters,
                 &sidebar,
                 &sidebar_zone,
+                &title_arrows,
             );
         })?;
 
@@ -3415,7 +3483,22 @@ async fn app(
                             crossterm::event::MouseEventKind::Down(
                                 crossterm::event::MouseButton::Left,
                             ) => {
-                                if sidebar_zone
+                                // ▲▼ jump arrows on the transcript title
+                                // row: step between user messages
+                                if let Some(up) = title_arrows
+                                    .get()
+                                    .and_then(|z| z.hit(mouse.column, mouse.row))
+                                {
+                                    let rows = transcript.user_entry_rows();
+                                    let total = transcript.total_rows();
+                                    jump_to_user_message(
+                                        &mut scroll,
+                                        &rows,
+                                        total,
+                                        view_rows,
+                                        up,
+                                    );
+                                } else if sidebar_zone
                                     .get()
                                     .is_some_and(|z| z.hit(mouse.column, mouse.row))
                                 {
@@ -5125,6 +5208,7 @@ fn render(
     meters: &Meters,
     sidebar: &SidebarState,
     sidebar_zone: &std::cell::Cell<Option<SidebarZone>>,
+    title_arrows: &std::cell::Cell<Option<TitleArrows>>,
 ) {
     let header_glyph = sidebar.header_glyph.as_str();
     use ratatui::layout::Constraint::{Length, Min};
@@ -5232,6 +5316,8 @@ fn render(
     } else {
         format!("{header_glyph} · ↑{} above (pgdn/esc)", start)
     };
+    // cells the padded title occupies (one space of air each side)
+    let title_cells = title.chars().count() + 2;
     let widget = Paragraph::new(window).block(
         Block::default()
             .borders(Borders::TOP)
@@ -5240,6 +5326,48 @@ fn render(
             .padding(ratatui::widgets::Padding::horizontal(1)),
     );
     frame.render_widget(widget, tx_area);
+
+    // ── ▲▼ user-message jump arrows at the end of the title row ──
+    // Only once the user has sent a message (nothing to jump to
+    // before), and only when the pane is wide enough that the arrows
+    // never collide with the title text. ▲ steps to the previous user
+    // message, ▼ to the next; both zones are recorded for the mouse
+    // handler.
+    title_arrows.set(None);
+    let has_user = transcript
+        .entries()
+        .iter()
+        .any(|l| matches!(l, Line::User(_)));
+    if has_user && tx_area.width >= 12 {
+        let need = title_cells + 7;
+        if tx_area.width as usize >= need {
+            let y = tx_area.y;
+            let x0 = tx_area.x + tx_area.width - 4; // ' ', '▲', ' ', '▼'
+            let buf = frame.buffer_mut();
+            for (i, sym) in [' ', '▲', ' ', '▼'].iter().enumerate() {
+                if let Some(c) = buf.cell_mut((x0 + i as u16, y)) {
+                    c.set_symbol(&sym.to_string());
+                    if *sym != ' ' {
+                        c.set_style(crate::palette::ACCENT_STYLE);
+                    }
+                }
+            }
+            title_arrows.set(Some(TitleArrows {
+                up: ratatui::layout::Rect {
+                    x: x0,
+                    y,
+                    width: 2,
+                    height: 1,
+                },
+                down: ratatui::layout::Rect {
+                    x: x0 + 2,
+                    y,
+                    width: 2,
+                    height: 1,
+                },
+            }));
+        }
+    }
 
     // ── scrollbar rail: painted into the transcript's always-blank
     // right padding column, so no width math ever learns about it ──
@@ -6736,6 +6864,69 @@ mod tests {
         assert_eq!(window_range(100, 20, Some(95)), (80, true));
         // zero visible
         assert_eq!(window_range(100, 0, Some(10)), (0, true));
+    }
+    #[test]
+    fn jump_to_user_message_steps_between_user_rows() {
+        // user messages start at rows 5, 40, 100; total 200, visible 20
+        let rows = [5usize, 40, 100];
+        let mut scroll: Option<usize> = None;
+        // pinned at the tail (start 180): up finds the newest message
+        jump_to_user_message(&mut scroll, &rows, 200, 20, true);
+        assert_eq!(scroll, Some(100));
+        // down from there: nothing below the pinned tail stays pinned
+        scroll = None;
+        jump_to_user_message(&mut scroll, &rows, 200, 20, false);
+        assert_eq!(scroll, None);
+        // anchored mid-history: up = previous, down = next
+        scroll = Some(50);
+        jump_to_user_message(&mut scroll, &rows, 200, 20, true);
+        assert_eq!(scroll, Some(40));
+        scroll = Some(50);
+        jump_to_user_message(&mut scroll, &rows, 200, 20, false);
+        assert_eq!(scroll, Some(100));
+        // exactly on a message start: strict comparison steps past it
+        scroll = Some(40);
+        jump_to_user_message(&mut scroll, &rows, 200, 20, false);
+        assert_eq!(scroll, Some(100));
+        // above the first message: up is a no-op
+        scroll = Some(0);
+        jump_to_user_message(&mut scroll, &rows, 200, 20, true);
+        assert_eq!(scroll, Some(0));
+        // past the last message, not pinned: down lands on the live tail
+        scroll = Some(120);
+        jump_to_user_message(&mut scroll, &rows, 200, 20, false);
+        assert_eq!(scroll, None);
+        // no user rows / zero visible: never moves
+        scroll = Some(7);
+        jump_to_user_message(&mut scroll, &[], 200, 20, true);
+        assert_eq!(scroll, Some(7));
+        scroll = Some(7);
+        jump_to_user_message(&mut scroll, &rows, 200, 0, false);
+        assert_eq!(scroll, Some(7));
+    }
+    #[test]
+    fn user_entry_rows_tracks_user_message_positions() {
+        let mut t = Transcript::default();
+        t.set_width(60);
+        t.push(Line::User("hello".into()));
+        t.push(Line::Assistant("world".into()));
+        t.push(Line::User("again".into()));
+        let rows = t.user_entry_rows();
+        assert_eq!(rows.len(), 2, "two user entries");
+        assert!(rows[0] == 0, "first entry is a user message");
+        assert!(
+            rows[1] > rows[0] && rows[1] < t.total_rows(),
+            "second user entry starts after the first, before the tail"
+        );
+        // every reported row really is the start of a user band
+        for &r in &rows {
+            let row = t.row(r).unwrap();
+            let bg = row.spans.first().and_then(|s| s.style.bg);
+            assert_eq!(bg, Some(crate::palette::BG_USER), "user band at row {r}");
+        }
+        // resizing keeps the mapping stable
+        t.set_width(20);
+        assert_eq!(t.user_entry_rows(), rows);
     }
     #[test]
     fn rail_thumb_sizes_and_positions_proportionally() {
@@ -9090,6 +9281,30 @@ mod tests {
     }
 
     #[test]
+    fn title_arrows_hit_testing() {
+        let zone = TitleArrows {
+            up: ratatui::layout::Rect {
+                x: 88,
+                y: 1,
+                width: 2,
+                height: 1,
+            },
+            down: ratatui::layout::Rect {
+                x: 90,
+                y: 1,
+                width: 2,
+                height: 1,
+            },
+        };
+        assert_eq!(zone.hit(88, 1), Some(true), "up arrow cell");
+        assert_eq!(zone.hit(89, 1), Some(true), "up zone is two cells wide");
+        assert_eq!(zone.hit(90, 1), Some(false), "down arrow cell");
+        assert_eq!(zone.hit(91, 1), Some(false), "down zone is two cells wide");
+        assert_eq!(zone.hit(92, 1), None, "past the arrows");
+        assert_eq!(zone.hit(88, 2), None, "row below the title");
+    }
+
+    #[test]
     fn skills_header_hover_lifts_onto_surface_tint() {
         use ratatui::style::Modifier;
         let rest = skills_header_line(true, false, 4);
@@ -9381,6 +9596,7 @@ mod tests {
                     &Meters::default(),
                     &SidebarState::default(),
                     &std::cell::Cell::new(None),
+                    &std::cell::Cell::new(None),
                 )
             })
             .unwrap();
@@ -9405,6 +9621,67 @@ mod tests {
         // the status bar still owns the last row (no bottom margin)
         let last_row: String = (0..120u16).map(|x| buf[(x, 39)].symbol()).collect();
         assert!(last_row.contains("enter"), "status hints on the last row");
+    }
+
+    #[test]
+    fn title_arrows_render_only_after_user_messages() {
+        use ratatui::backend::TestBackend;
+
+        let draw = |t: &Transcript| {
+            let arrows: std::cell::Cell<Option<TitleArrows>> = std::cell::Cell::new(None);
+            let mut terminal = ratatui::Terminal::new(TestBackend::new(120, 40)).unwrap();
+            terminal
+                .draw(|f| {
+                    super::render(
+                        f,
+                        t,
+                        None,
+                        "",
+                        0,
+                        false,
+                        None,
+                        Instant::now(),
+                        0,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        &Meters::default(),
+                        &SidebarState::default(),
+                        &std::cell::Cell::new(None),
+                        &arrows,
+                    )
+                })
+                .unwrap();
+            let buf = terminal.backend().buffer();
+            let syms: Vec<String> = (88..93u16).map(|x| buf[(x, 1)].symbol().into()).collect();
+            (arrows.get(), syms)
+        };
+
+        // empty transcript: no arrows, no zone
+        let (zone, syms) = draw(&Transcript::default());
+        assert!(zone.is_none(), "no user message -> no jump arrows");
+        assert!(
+            !syms.iter().any(|c| c == "▲" || c == "▼"),
+            "no glyphs on the title row: {syms:?}"
+        );
+
+        // one user message: arrows drawn at the end of the title row
+        let mut t = Transcript::default();
+        t.set_width(60);
+        for _ in 0..60 {
+            t.push(Line::User("a user message".into()));
+        }
+        let (zone, syms) = draw(&t);
+        let z = zone.expect("user message -> jump arrows recorded");
+        assert_eq!(syms[2], "▲", "▲ at the end of the title row: {syms:?}");
+        assert_eq!(syms[4], "▼", "▼ at the very edge: {syms:?}");
+        assert_eq!(z.hit(90, 1), Some(true), "▲ hit zone");
+        assert_eq!(z.hit(92, 1), Some(false), "▼ hit zone");
+        assert_eq!(z.hit(88, 1), None, "air left of the arrows");
     }
 
     #[test]
