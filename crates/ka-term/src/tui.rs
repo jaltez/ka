@@ -2991,6 +2991,32 @@ async fn app(
                                 input.cursor = 0;
                                 continue;
                             }
+                            // /clip: paste a clipboard image as the
+                            // next prompt's attachment
+                            if text == "/clip" {
+                                input.text.clear();
+                                input.cursor = 0;
+                                let staged = match clip_image_bytes().await {
+                                    Ok(bytes) => match image_part_from_bytes(&bytes) {
+                                        Ok(part) => {
+                                            let kb = bytes.len() / 1024;
+                                            let note = format!(
+                                                "[clip attachment · {} · {kb}KB]",
+                                                part.media_type
+                                            );
+                                            pending_image = Some(part);
+                                            Ok(note)
+                                        }
+                                        Err(e) => Err(e),
+                                    },
+                                    Err(e) => Err(e),
+                                };
+                                match staged {
+                                    Ok(note) => transcript.push_separated(Line::Note(note)),
+                                    Err(e) => transcript.push_separated(Line::Note(e)),
+                                }
+                                continue;
+                            }
                             if let Some(cmd) = slash_command(&text) {
                                 transcript.push_separated(Line::User(text));
                                 if matches!(
@@ -4178,27 +4204,49 @@ pub struct SlashPopup {
 }
 
 /// All available slash commands: builtins + custom files.
-/// Detect an image file by magic bytes (png/jpeg/gif/webp).
-fn sniff_image_type(path: &std::path::Path) -> Option<&'static str> {
-    use std::io::Read;
-    let mut head = [0u8; 12];
-    let n = std::fs::File::open(path).ok()?.read(&mut head).ok()?;
-    let h = &head[..n];
-    if h.starts_with(&[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]) {
+/// Detect image bytes by magic prefix (png/jpeg/gif/webp).
+fn sniff_image_bytes(head: &[u8]) -> Option<&'static str> {
+    if head.starts_with(&[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]) {
         Some("image/png")
-    } else if h.starts_with(&[0xFF, 0xD8, 0xFF]) {
+    } else if head.starts_with(&[0xFF, 0xD8, 0xFF]) {
         Some("image/jpeg")
-    } else if h.starts_with(b"GIF87a") || h.starts_with(b"GIF89a") {
+    } else if head.starts_with(b"GIF87a") || head.starts_with(b"GIF89a") {
         Some("image/gif")
-    } else if h.len() >= 12 && h.starts_with(b"RIFF") && &h[8..12] == b"WEBP" {
+    } else if head.len() >= 12 && head.starts_with(b"RIFF") && &head[8..12] == b"WEBP" {
         Some("image/webp")
     } else {
         None
     }
 }
 
-/// Load an image file into an attachment part: magic-byte sniff, 5 MB
-/// cap, base64 payload.
+/// Detect an image file by magic bytes (png/jpeg/gif/webp).
+fn sniff_image_type(path: &std::path::Path) -> Option<&'static str> {
+    use std::io::Read;
+    let mut head = [0u8; 12];
+    let n = std::fs::File::open(path).ok()?.read(&mut head).ok()?;
+    sniff_image_bytes(&head[..n])
+}
+
+/// Build an attachment part from raw image bytes: magic-byte sniff,
+/// 5 MB cap, base64 payload.
+fn image_part_from_bytes(data: &[u8]) -> Result<ka_protocol::ImagePart, String> {
+    const MAX_BYTES: usize = 5 * 1024 * 1024;
+    if data.len() > MAX_BYTES {
+        return Err(format!(
+            "clipboard image is {:.1} MB, over the 5 MB cap",
+            data.len() as f64 / (1024.0 * 1024.0)
+        ));
+    }
+    let media_type = sniff_image_bytes(data)
+        .ok_or_else(|| "unsupported image type (png/jpg/webp/gif only)".to_string())?;
+    Ok(ka_protocol::ImagePart {
+        data: b64encode(data),
+        media_type: media_type.to_string(),
+    })
+}
+
+/// Load an image file into an attachment part: size precheck, then the
+/// shared bytes path.
 fn image_part_from_path(path: &std::path::Path) -> Result<ka_protocol::ImagePart, String> {
     const MAX_MB: u64 = 5;
     let meta = std::fs::metadata(path).map_err(|e| format!("image {}: {e}", path.display()))?;
@@ -4209,17 +4257,8 @@ fn image_part_from_path(path: &std::path::Path) -> Result<ka_protocol::ImagePart
             meta.len() as f64 / (1024.0 * 1024.0)
         ));
     }
-    let media_type = sniff_image_type(path).ok_or_else(|| {
-        format!(
-            "image {}: unsupported type (png/jpg/webp/gif only)",
-            path.display()
-        )
-    })?;
     let bytes = std::fs::read(path).map_err(|e| format!("image {}: {e}", path.display()))?;
-    Ok(ka_protocol::ImagePart {
-        data: b64encode(bytes),
-        media_type: media_type.to_string(),
-    })
+    image_part_from_bytes(&bytes).map_err(|e| format!("image {}: {e}", path.display()))
 }
 
 /// Attach `/image <path>`: validate, stage, and confirm in the
@@ -4242,6 +4281,100 @@ fn handle_image_command(
         }
         Err(e) => Some(Err(e)),
     }
+}
+
+/// True under WSL (Windows Subsystem for Linux).
+fn is_wsl() -> bool {
+    std::fs::read_to_string("/proc/version")
+        .map(|v| v.to_lowercase().contains("microsoft"))
+        .unwrap_or(false)
+}
+
+/// Translate a Windows path (`C:\a\b`) to its WSL mount (`/mnt/c/a/b`).
+fn win_to_wsl(path: &str) -> Option<std::path::PathBuf> {
+    let path = path.trim().trim_matches('"');
+    let (drive, rest) = path.split_once(':')?;
+    let mut chars = drive.chars();
+    let letter = chars.next()?;
+    if chars.next().is_some() || !letter.is_ascii_alphabetic() {
+        return None;
+    }
+    Some(std::path::PathBuf::from(format!(
+        "/mnt/{}{}",
+        letter.to_ascii_lowercase(),
+        rest.replace('\\', "/")
+    )))
+}
+
+/// One clipboard probe under the shared deadline: stdout bytes on
+/// success, Err when the tool is missing, fails, or the budget ran out.
+async fn clip_probe(
+    program: &str,
+    args: &[&str],
+    deadline: tokio::time::Instant,
+) -> Result<Vec<u8>, ()> {
+    let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+    if remaining.is_zero() {
+        return Err(());
+    }
+    let out = tokio::time::timeout(remaining, async {
+        tokio::process::Command::new(program)
+            .args(args)
+            .output()
+            .await
+    })
+    .await
+    .map_err(|_| ())?
+    .map_err(|_| ())?;
+    if out.status.success() && !out.stdout.is_empty() {
+        Ok(out.stdout)
+    } else {
+        Err(())
+    }
+}
+
+/// Save the Windows clipboard image to %TEMP%\ka-clip.png via
+/// PowerShell and read it back across the /mnt/c boundary.
+async fn clip_via_powershell(deadline: tokio::time::Instant) -> Result<Vec<u8>, ()> {
+    const SCRIPT: &str = "$ErrorActionPreference='stop'; \
+Add-Type -AssemblyName System.Windows.Forms; \
+$i=[System.Windows.Forms.Clipboard]::GetImage(); \
+if ($i) { $p=Join-Path $env:TEMP 'ka-clip.png'; \
+$i.Save($p,[System.Drawing.Imaging.ImageFormat]::Png); Write-Output $p }";
+    let out = clip_probe(
+        "powershell.exe",
+        &["-NoProfile", "-Command", SCRIPT],
+        deadline,
+    )
+    .await?;
+    // the printed path is ASCII; lossy decoding never panics
+    let line = String::from_utf8_lossy(&out);
+    let win_path = line.lines().next().ok_or(())?.trim();
+    let path = win_to_wsl(win_path).ok_or(())?;
+    std::fs::read(path).map_err(|_| ())
+}
+
+/// Read image bytes off the clipboard: wl-paste → xclip → WSL2
+/// PowerShell bridge, all under one 4 s overall budget.
+async fn clip_image_bytes() -> Result<Vec<u8>, String> {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(4);
+    for (program, args) in [
+        ("wl-paste", vec!["--type", "image/png"]),
+        (
+            "xclip",
+            vec!["-selection", "clipboard", "-t", "image/png", "-o"],
+        ),
+    ] {
+        if let Ok(bytes) = clip_probe(program, &args, deadline).await {
+            return Ok(bytes);
+        }
+    }
+    if is_wsl() {
+        if let Ok(bytes) = clip_via_powershell(deadline).await {
+            return Ok(bytes);
+        }
+    }
+    Err("no image on clipboard (tried wl-paste, xclip, powershell)".to_string())
 }
 
 pub fn available_slash_commands() -> Vec<(String, String)> {
@@ -4324,6 +4457,7 @@ fn builtin_slash_commands() -> Vec<(String, String)> {
             "/copy".to_string(),
             "copy the last reply (OSC52)".to_string(),
         ),
+        ("/clip".to_string(), "attach a clipboard image".to_string()),
         (
             "/find".to_string(),
             "search the transcript: /find <text>, bare repeats".to_string(),
@@ -10083,5 +10217,66 @@ mod tests {
         let mut pending: Option<ka_protocol::ImagePart> = None;
         assert!(handle_image_command("/image", &mut pending).is_none());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn sniff_image_bytes_reads_magic_prefixes() {
+        assert_eq!(
+            sniff_image_bytes(&[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A, 0, 0, 0, 0]),
+            Some("image/png")
+        );
+        // short prefix still sniffs: 3 signature bytes are enough
+        assert_eq!(sniff_image_bytes(&[0x89, b'P', b'N']), None);
+        assert_eq!(
+            sniff_image_bytes(&[0xFF, 0xD8, 0xFF, 0xE0]),
+            Some("image/jpeg")
+        );
+        assert_eq!(sniff_image_bytes(b"GIF89a...."), Some("image/gif"));
+        assert_eq!(sniff_image_bytes(b"GIF87a"), Some("image/gif"));
+        assert_eq!(
+            sniff_image_bytes(b"RIFF\x00\x00\x00\x00WEBP"),
+            Some("image/webp")
+        );
+        assert_eq!(sniff_image_bytes(b"RIFFshort"), None);
+        assert_eq!(sniff_image_bytes(b"plain text!!!"), None);
+        assert_eq!(sniff_image_bytes(&[]), None);
+    }
+
+    #[test]
+    fn win_to_wsl_maps_drive_paths() {
+        assert_eq!(
+            win_to_wsl("C:\\Users\\javier\\AppData\\Local\\Temp\\ka-clip.png"),
+            Some(std::path::PathBuf::from(
+                "/mnt/c/Users/javier/AppData/Local/Temp/ka-clip.png"
+            ))
+        );
+        assert_eq!(
+            win_to_wsl("c:\\x\\y"),
+            Some(std::path::PathBuf::from("/mnt/c/x/y"))
+        );
+        // quotes and padding from console output are tolerated
+        assert_eq!(
+            win_to_wsl("\"D:\\a b\\c.png\"\r\n"),
+            Some(std::path::PathBuf::from("/mnt/d/a b/c.png"))
+        );
+        // not a drive path
+        assert_eq!(win_to_wsl("relative/path.png"), None);
+        assert_eq!(win_to_wsl(""), None);
+    }
+
+    #[test]
+    fn image_part_from_bytes_caps_and_sniffs() {
+        // over the cap → rejected before any encoding
+        let big = vec![0u8; 5 * 1024 * 1024 + 1];
+        let err = image_part_from_bytes(&big).unwrap_err();
+        assert!(err.contains("cap"), "{err}");
+        // unknown bytes → unsupported type
+        let err = image_part_from_bytes(b"not an image").unwrap_err();
+        assert!(err.contains("unsupported"), "{err}");
+        // a real png prefix round-trips
+        let png: &[u8] = &[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A, 1, 2, 3];
+        let part = image_part_from_bytes(png).unwrap();
+        assert_eq!(part.media_type, "image/png");
+        assert_eq!(part.data, b64encode(png));
     }
 }
