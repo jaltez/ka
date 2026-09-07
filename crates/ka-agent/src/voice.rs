@@ -205,6 +205,7 @@ impl Voice {
                 bash_background_ms: 0,
                 max_image_mb: 5,
                 web_allow_private: false,
+                sandbox: ka_sandbox::Policy::Off,
             },
             state: VoiceState::default(),
             max_steps,
@@ -296,6 +297,7 @@ impl Voice {
             bash_background_ms: 0,
             max_image_mb: 5,
             web_allow_private: false,
+            sandbox: ka_sandbox::Policy::Off,
         };
         Self {
             catalog,
@@ -483,6 +485,11 @@ impl Voice {
     /// Set the web-fetch private-host policy (engine bootstrap).
     pub fn set_web_allow_private(&mut self, allow: bool) {
         self.hand_ctx.web_allow_private = allow;
+    }
+
+    /// Set the bash sandbox policy (engine bootstrap).
+    pub fn set_sandbox(&mut self, policy: ka_sandbox::Policy) {
+        self.hand_ctx.sandbox = policy;
     }
 
     /// Set the bash auto-background threshold in ms (engine bootstrap;

@@ -176,6 +176,23 @@ pub struct SearchProvider {
     pub base_url: Option<String>,
 }
 
+/// Sandbox policy ([sandbox]).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields, default)]
+pub struct Sandbox {
+    /// `"off"` (default) or `"fs"`.
+    pub mode: Option<String>,
+}
+
+impl Sandbox {
+    /// Convert to the sandbox crate's policy config.
+    pub fn to_policy_config(&self) -> ka_sandbox::SandboxConfig {
+        ka_sandbox::SandboxConfig {
+            mode: self.mode.clone(),
+        }
+    }
+}
+
 /// Context-window policy ([context]).
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields, default)]
@@ -243,6 +260,9 @@ pub struct Config {
     /// Web-search providers ([[search]]; first entry is active).
     #[serde(default)]
     pub search: Vec<SearchProvider>,
+    /// Sandbox policy ([sandbox]).
+    #[serde(default)]
+    pub sandbox: Sandbox,
     /// Per-tool settings ([tools]).
     #[serde(default)]
     pub tools: Tools,

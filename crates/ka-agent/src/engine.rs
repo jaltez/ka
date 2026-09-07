@@ -348,6 +348,8 @@ async fn run(
     voice.set_fallbacks(config.fallback.models.clone());
     voice.set_max_image_mb(config.effective_max_image_mb());
     voice.set_context_promote(config.effective_context_promote());
+    let sandbox_policy = ka_sandbox::policy_from_config(&config.sandbox.to_policy_config(), &cwd)?;
+    voice.set_sandbox(sandbox_policy);
     voice.set_web_allow_private(config.effective_web_allow_private());
     {
         let slot = voice.pathfinder_slot();

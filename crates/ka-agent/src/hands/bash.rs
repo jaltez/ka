@@ -118,17 +118,15 @@ impl BashHand {
                 sh_quote(&spill_path.to_string_lossy()),
                 sh_quote(&done_path.to_string_lossy()),
             );
-            let mut cmd = Command::new("sh");
-            cmd.arg("-c")
-                .arg(&script)
-                .arg("sh")
-                .current_dir(&cwd)
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null());
-            #[cfg(unix)]
-            cmd.process_group(0);
-
-            let mut child = match cmd.spawn() {
+            // sandbox policy may wrap the command (fail-closed when the
+            // configured enforcement tool is missing)
+            let argv = match ka_sandbox::wrap_command(&ctx.sandbox, &script, &cwd) {
+                Ok(a) => a,
+                Err(e) => return ToolOutput::err(e),
+            };
+            let mut cmd = Command::new(&argv[0]);
+            cmd.args(&argv[1..]).current_dir(&cwd);
+            let mut child = match child_spawn(&mut cmd) {
                 Ok(c) => c,
                 Err(e) => return ToolOutput::err(format!("bash spawn: {e}")),
             };
@@ -322,6 +320,16 @@ pub fn cap_preview(raw: &str) -> String {
     text
 }
 
+/// Finish configuring and spawn the bash child (null stdio: output is
+/// redirected inside the script; own process group for clean kills).
+fn child_spawn(cmd: &mut Command) -> std::io::Result<tokio::process::Child> {
+    use std::process::Stdio;
+    cmd.stdout(Stdio::null()).stderr(Stdio::null());
+    #[cfg(unix)]
+    cmd.process_group(0);
+    cmd.spawn()
+}
+
 /// Single-quote a path for safe shell embedding.
 fn sh_quote(text: &str) -> String {
     format!("'{}'", text.replace('\'', "'\\''"))
@@ -463,6 +471,7 @@ mod tests {
             bash_background_ms: 0,
             max_image_mb: 5,
             web_allow_private: false,
+            sandbox: ka_sandbox::Policy::Off,
         }
     }
 

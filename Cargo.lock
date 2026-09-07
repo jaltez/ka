@@ -1031,6 +1031,7 @@ dependencies = [
  "ignore",
  "ka-dialect",
  "ka-protocol",
+ "ka-sandbox",
  "ka-strand",
  "parking_lot",
  "regex",
@@ -1089,6 +1090,14 @@ name = "ka-protocol"
 version = "0.1.0"
 dependencies = [
  "schemars",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "ka-sandbox"
+version = "0.1.0"
+dependencies = [
  "serde",
  "serde_json",
 ]

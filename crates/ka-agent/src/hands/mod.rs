@@ -128,6 +128,8 @@ pub struct HandContext {
     pub max_image_mb: u32,
     /// Web fetches may target private hosts ([tools.web]).
     pub web_allow_private: bool,
+    /// Sandbox policy for bash children ([sandbox]).
+    pub sandbox: ka_sandbox::Policy,
 }
 
 /// The read ledger: files the model has read, with their stamps. Edits

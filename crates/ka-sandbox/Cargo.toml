@@ -1,0 +1,17 @@
+[package]
+name = "ka-sandbox"
+description = "Filesystem sandbox policy for ka child processes (Linux)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+serde = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }
+
+[lints]
+workspace = true
