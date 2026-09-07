@@ -938,9 +938,9 @@ fn usage_tail(u: &ka_protocol::Usage, dur: f64) -> String {
 
 /// Base64-encode a string's UTF-8 bytes (standard alphabet, `=` padding).
 /// Local helper — the workspace has no base64 dependency.
-fn b64encode(data: &str) -> String {
+fn b64encode(data: impl AsRef<[u8]>) -> String {
     const ALPHA: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let bytes = data.as_bytes();
+    let bytes = data.as_ref();
     let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
     for chunk in bytes.chunks(3) {
         let b0 = chunk[0] as u32;
@@ -1987,6 +1987,9 @@ async fn app(
     let mut current_thought = String::new();
     let mut current_tool = String::new();
     let mut live_tool: Option<LiveTool> = None;
+    // pending image attachment: staged by `/image <path>`, consumed by
+    // the next sent prompt
+    let mut pending_image: Option<ka_protocol::ImagePart> = None;
     let mut sidebar = SidebarState {
         cwd: shorten_cwd(&std::env::current_dir().unwrap_or_default()),
         branch: detect_branch(),
@@ -2821,6 +2824,19 @@ async fn app(
                                 }
                                 continue;
                             }
+                            // /image: stage an attachment instead of a prompt
+                            if text.starts_with("/image ") || text == "/image" {
+                                match handle_image_command(&text, &mut pending_image) {
+                                    Some(Ok(note)) => {
+                                        transcript.push_separated(Line::Note(note));
+                                    }
+                                    Some(Err(e)) => transcript.push_separated(Line::Note(e)),
+                                    None => {}
+                                }
+                                input.text.clear();
+                                input.cursor = 0;
+                                continue;
+                            }
                             if let Some(cmd) = slash_command(&text) {
                                 transcript.push_separated(Line::User(text));
                                 if let Some(note) = cmd.note {
@@ -3030,9 +3046,21 @@ async fn app(
                                 ));
                                 Command::Interject { text }
                             } else {
-                                // plain new turn: the /retry target
+                                // plain new turn: the /retry target; a
+                                // staged /image attachment rides along
                                 last_user = Some(text.clone());
-                                Command::Prompt { text, schema: None, images: Vec::new() }
+                                if let Some(img) = &pending_image {
+                                    let kb = img.data.len() * 3 / 4 / 1024;
+                                    transcript.push_separated(Line::Note(format!(
+                                        "[img attachment · {} · {kb}KB]",
+                                        img.media_type
+                                    )));
+                                }
+                                Command::Prompt {
+                                    text,
+                                    schema: None,
+                                    images: pending_image.take().into_iter().collect(),
+                                }
                             };
                             busy = true;
                             let _ = commands.send(cmd).await;
@@ -3328,6 +3356,39 @@ async fn app(
                     } else if path_popup.is_some() {
                         path_popup = None;
                         input.insert_str(&text);
+                        slash_popup = update_suggestions(&input.text);
+                    } else if !input.searching()
+                        && text.trim().chars().filter(|c| !c.is_whitespace()).count() == 1
+                        && text.trim().chars().all(|c| !c.is_whitespace())
+                    {
+                        // bracketed paste carrying exactly one existing
+                        // image path: attach it instead of inserting text
+                        let trimmed = text.trim();
+                        if !trimmed.is_empty() {
+                            let as_path = std::path::PathBuf::from(trimmed);
+                            if as_path.is_file() && sniff_image_type(&as_path).is_some() {
+                                match image_part_from_path(&as_path) {
+                                    Ok(part) => {
+                                        let kb = part.data.len() * 3 / 4 / 1024;
+                                        let name = as_path
+                                            .file_name()
+                                            .map(|n| n.to_string_lossy().into_owned())
+                                            .unwrap_or_default();
+                                        pending_image = Some(part);
+                                        transcript.push_separated(Line::Note(format!(
+                                            "[img {name} · {kb}KB] — press enter to send"
+                                        )));
+                                        slash_popup = None;
+                                        continue;
+                                    }
+                                    Err(e) => {
+                                        transcript.push_separated(Line::Note(e));
+                                        slash_popup = None;
+                                        continue;
+                                    }
+                                }
+                            }
+                        }
                         slash_popup = update_suggestions(&input.text);
                     } else if input.searching() {
                         for c in text.chars().filter(|c| !c.is_whitespace()) {
@@ -3913,6 +3974,72 @@ pub struct SlashPopup {
 }
 
 /// All available slash commands: builtins + custom files.
+/// Detect an image file by magic bytes (png/jpeg/gif/webp).
+fn sniff_image_type(path: &std::path::Path) -> Option<&'static str> {
+    use std::io::Read;
+    let mut head = [0u8; 12];
+    let n = std::fs::File::open(path).ok()?.read(&mut head).ok()?;
+    let h = &head[..n];
+    if h.starts_with(&[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]) {
+        Some("image/png")
+    } else if h.starts_with(&[0xFF, 0xD8, 0xFF]) {
+        Some("image/jpeg")
+    } else if h.starts_with(b"GIF87a") || h.starts_with(b"GIF89a") {
+        Some("image/gif")
+    } else if h.len() >= 12 && h.starts_with(b"RIFF") && &h[8..12] == b"WEBP" {
+        Some("image/webp")
+    } else {
+        None
+    }
+}
+
+/// Load an image file into an attachment part: magic-byte sniff, 5 MB
+/// cap, base64 payload.
+fn image_part_from_path(path: &std::path::Path) -> Result<ka_protocol::ImagePart, String> {
+    const MAX_MB: u64 = 5;
+    let meta = std::fs::metadata(path).map_err(|e| format!("image {}: {e}", path.display()))?;
+    if meta.len() > MAX_MB * 1024 * 1024 {
+        return Err(format!(
+            "image {} is {:.1} MB, over the {MAX_MB} MB cap",
+            path.display(),
+            meta.len() as f64 / (1024.0 * 1024.0)
+        ));
+    }
+    let media_type = sniff_image_type(path).ok_or_else(|| {
+        format!(
+            "image {}: unsupported type (png/jpg/webp/gif only)",
+            path.display()
+        )
+    })?;
+    let bytes = std::fs::read(path).map_err(|e| format!("image {}: {e}", path.display()))?;
+    Ok(ka_protocol::ImagePart {
+        data: b64encode(bytes),
+        media_type: media_type.to_string(),
+    })
+}
+
+/// Attach `/image <path>`: validate, stage, and confirm in the
+/// transcript. Returns `None` when the text is not an /image command.
+fn handle_image_command(
+    text: &str,
+    pending_image: &mut Option<ka_protocol::ImagePart>,
+) -> Option<Result<String, String>> {
+    let rest = text.strip_prefix("/image ")?;
+    let path = std::path::PathBuf::from(rest.trim());
+    match image_part_from_path(&path) {
+        Ok(part) => {
+            let name = path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            let kb = part.data.len() * 3 / 4 / 1024;
+            *pending_image = Some(part);
+            Some(Ok(format!("[img {name} · {} · {kb}KB]", "attached")))
+        }
+        Err(e) => Some(Err(e)),
+    }
+}
+
 pub fn available_slash_commands() -> Vec<(String, String)> {
     let mut out = builtin_slash_commands();
     // custom files come after builtins, prefixed so they read as aliases
@@ -9351,5 +9478,57 @@ mod tests {
         let slash = slash_command("/tree").unwrap();
         assert!(matches!(slash.modal, Some(ModalKind::Tree)));
         assert!(slash.event.is_none());
+    }
+
+    #[test]
+    fn image_part_from_path_sniffs_and_encodes() {
+        let dir = std::env::temp_dir().join(format!("ka-img-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let png: &[u8] = &[
+            0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48,
+            0x44, 0x52,
+        ];
+        let path = dir.join("p.png");
+        std::fs::write(&path, png).unwrap();
+        let part = image_part_from_path(&path).unwrap();
+        assert_eq!(part.media_type, "image/png");
+        assert_eq!(part.data, b64encode(png));
+        // unsupported file rejected
+        let txt = dir.join("t.txt");
+        std::fs::write(&txt, "plain").unwrap();
+        assert!(image_part_from_path(&txt).is_err());
+        // missing file rejected
+        assert!(image_part_from_path(&dir.join("nope.png")).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn handle_image_command_stages_or_reports() {
+        let dir = std::env::temp_dir().join(format!("ka-imgc-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let png: &[u8] = &[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
+        std::fs::write(dir.join("p.png"), png).unwrap();
+        let mut pending: Option<ka_protocol::ImagePart> = None;
+        let out = handle_image_command(
+            &format!("/image {}", dir.join("p.png").display()),
+            &mut pending,
+        );
+        assert!(out.is_some());
+        assert!(out.unwrap().is_ok());
+        assert!(pending.is_some(), "image staged");
+        assert_eq!(pending.unwrap().media_type, "image/png");
+
+        // non-image paths error without staging
+        let mut pending: Option<ka_protocol::ImagePart> = None;
+        let out = handle_image_command("/image /definitely/absent.png", &mut pending);
+        assert!(matches!(out, Some(Err(_))));
+        assert!(pending.is_none());
+
+        // bare /image (no path) is not this command
+        let mut pending: Option<ka_protocol::ImagePart> = None;
+        assert!(handle_image_command("/image", &mut pending).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
