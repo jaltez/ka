@@ -80,6 +80,15 @@ enum CliCommand {
         #[arg(long, value_name = "PATH")]
         schema: Option<PathBuf>,
     },
+    /// Environment health checks
+    Doctor {
+        /// Probe provider + MCP reachability
+        #[arg(long)]
+        net: bool,
+        /// Machine-readable output
+        #[arg(long)]
+        json: bool,
+    },
     /// Check for / install a signed release update
     Update {
         /// Release channel (stable|edge)
@@ -153,6 +162,7 @@ enum ConfigCommand {
 /// presence marks a signed build and lets `ka update` verify artifacts.
 pub const PUBLIC_KEY: Option<&str> = option_env!("KA_PUBKEY");
 
+mod doctor;
 mod update;
 
 fn main() -> ExitCode {
@@ -317,6 +327,7 @@ async fn dispatch(cli: Cli) -> Result<ExitCode, String> {
             )
             .await
         }
+        Some(CliCommand::Doctor { net, json }) => doctor::run(net, json).await,
         Some(CliCommand::Update { channel, check }) => {
             let trust = trust_for_cwd(false);
             let cfg = load_config(&[], None, None, trust)?;
