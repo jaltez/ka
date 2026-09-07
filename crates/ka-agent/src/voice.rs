@@ -12,7 +12,7 @@ use ka_dialect::speaker::{
     SpeakRequest, Speaker, StreamEvent, ToolCall, ToolResult, ToolSpec, TurnMessage, TurnRole,
 };
 use ka_protocol::{AskId, AskQuestion, Command, ErrorClass, Event, Stop, Usage};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 
 use crate::hands::bashp::{all_readonly, analyze, hardstop};
 use crate::hands::{
@@ -123,6 +123,10 @@ fn message_tokens(msg: &TurnMessage, ratio: f64) -> u64 {
 }
 
 /// Everything needed to speak to real models and act on the world.
+/// Slot for an in-flight speculative digest: (history watermark,
+/// result receiver).
+type SpecSlot = std::sync::Arc<tokio::sync::Mutex<Option<(usize, oneshot::Receiver<String>)>>>;
+
 pub struct Voice {
     catalog: Catalog,
     speakers: HashMap<Wire, std::sync::Arc<dyn Speaker>>,
@@ -162,6 +166,9 @@ pub struct Voice {
     promoted: bool,
     /// Promotion the engine must apply after the turn (selector).
     pending_promotion: Option<String>,
+    /// In-flight speculative digest slot (shared with the background
+    /// summarizer task): (history watermark, result receiver).
+    speculative: SpecSlot,
     /// Pathfinder bootstrap slot shared with the hand.
     pathfinder_slot:
         std::sync::Arc<parking_lot::RwLock<crate::hands::pathfinder::PathfinderSource>>,
@@ -212,6 +219,7 @@ impl Voice {
             context_promote: true,
             promoted: false,
             pending_promotion: None,
+            speculative: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
             rules_cfg: Vec::new(),
             hooks_cfg: Vec::new(),
             allowed_tools: Vec::new(),
@@ -309,6 +317,7 @@ impl Voice {
             context_promote: true,
             promoted: false,
             pending_promotion: None,
+            speculative: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
             pathfinder_slot: slot,
             todo: todos,
         }
@@ -350,6 +359,90 @@ impl Voice {
     /// Change record + event, same path as `/model`).
     pub fn take_promotion(&mut self) -> Option<String> {
         self.pending_promotion.take()
+    }
+
+    /// Fire the speculative digest if pressure sits in the ≥80% zone of
+    /// the reserve threshold and nothing is in flight. The candidate is
+    /// tagged with the current history watermark; [`Self::take_speculative`]
+    /// consumes it only when the watermark still matches. `fast` names the
+    /// cheap role model (falls back to the active model).
+    pub fn start_speculative(&mut self, fast: Option<&str>) -> bool {
+        let window = self.window_tokens();
+        if window == 0 || !self.context_pressure_frac(window, 80) || self.context_pressure(window) {
+            return false;
+        }
+        // single in-flight guard
+        if self.speculative_in_flight() {
+            return false;
+        }
+        let Some(model_id) = fast
+            .map(str::to_string)
+            .or_else(|| self.model_selector.clone())
+        else {
+            return false;
+        };
+        let Some(dialect) = self.catalog.get(&model_id).cloned() else {
+            return false;
+        };
+        let token = dialect
+            .api_key_env
+            .as_deref()
+            .and_then(ka_dialect::auth::resolve_token);
+        let system = DIGEST_SYSTEM.to_string();
+        let mut messages = Vec::new();
+        if let Some(d) = &self.digest {
+            messages.push(TurnMessage::user(format!("<context-digest>\n{d}")));
+        }
+        messages.extend(self.history.iter().map(Voice::summarizer_view));
+        messages.push(TurnMessage::user(
+            "Summarize the conversation above now, in at most 300 words.",
+        ));
+        let watermark = self.history.len();
+        let speaker = self
+            .speakers
+            .get(&dialect.wire)
+            .cloned()
+            .unwrap_or_else(|| ka_dialect::speaker_for(dialect.wire));
+        let slot = self.speculative.clone();
+        tokio::spawn(async move {
+            let summary = Self::summarize_with(
+                speaker,
+                model_id.clone(),
+                dialect,
+                token,
+                system,
+                messages,
+                std::time::Duration::from_secs(120),
+            )
+            .await;
+            if let Some(summary) = summary {
+                slot.lock().await.replace((watermark, {
+                    let (tx, rx) = oneshot::channel();
+                    tx.send(summary).ok();
+                    rx
+                }));
+            }
+        });
+        true
+    }
+
+    /// Whether a speculative digest is being computed.
+    fn speculative_in_flight(&self) -> bool {
+        self.speculative
+            .try_lock()
+            .map(|s| s.is_some())
+            .unwrap_or(true)
+    }
+
+    /// Consume the speculative candidate when it is ready and computed
+    /// against the CURRENT history watermark; otherwise discard it.
+    pub async fn take_speculative(&mut self) -> Option<String> {
+        let entry = self.speculative.lock().await.take()?;
+        let (watermark, rx) = entry;
+        if watermark != self.history.len() {
+            return None;
+        }
+        rx.await.ok()
     }
 
     /// Biggest-context same-vendor sibling whose modalities cover the
@@ -426,6 +519,12 @@ impl Voice {
 
     /// Context-window pressure check against the active dialect.
     pub fn context_pressure(&self, window: u64) -> bool {
+        self.context_pressure_frac(window, 100)
+    }
+
+    /// Pressure at `pct`% of the reserve threshold (80 = speculative
+    /// kick-off zone).
+    pub fn context_pressure_frac(&self, window: u64, pct: u64) -> bool {
         if window == 0 {
             return false; // unknown window: never auto-digest
         }
@@ -433,7 +532,8 @@ impl Voice {
         // more than a quarter of small windows (proportional reserve)
         let proportional = window * RESERVE_PCT / 100;
         let reserve = proportional.max(RESERVE_FLOOR.min(window / 4));
-        self.last_context + KEEP_TAIL_TOKENS.min(window / 4) > window.saturating_sub(reserve)
+        let threshold = window.saturating_sub(reserve);
+        self.last_context + KEEP_TAIL_TOKENS.min(window / 4) > threshold * pct / 100
     }
 
     /// Blank old tool-result bodies in history beyond the protected
@@ -574,6 +674,32 @@ impl Voice {
         messages.push(TurnMessage::user(
             "Summarize the conversation above now, in at most 300 words.",
         ));
+        let speaker = self.speaker(dialect.wire);
+        let _ = ratio;
+        Self::summarize_with(
+            speaker,
+            model_id,
+            dialect,
+            token,
+            system,
+            messages,
+            window_deadline,
+        )
+        .await
+    }
+
+    /// Shared summarize core: one bounded completion collecting the
+    /// text (falling back to the reasoning tail). Static so the
+    /// speculative digest can run it without `&mut self`.
+    async fn summarize_with(
+        speaker: std::sync::Arc<dyn Speaker>,
+        model_id: String,
+        dialect: ka_dialect::Dialect,
+        token: Option<String>,
+        system: String,
+        messages: Vec<TurnMessage>,
+        window_deadline: std::time::Duration,
+    ) -> Option<String> {
         let req = SpeakRequest {
             model_id,
             dialect: dialect.clone(),
@@ -585,7 +711,6 @@ impl Voice {
             cache_key: None,
             schema: None,
         };
-        let speaker = self.speaker(dialect.wire);
         let (tx, mut rx) = mpsc::channel::<StreamEvent>(256);
         {
             let speaker = speaker.clone();
@@ -596,7 +721,6 @@ impl Voice {
         let mut text = String::new();
         let mut thought = String::new();
         let mut failure: Option<String> = None;
-        let _ = ratio;
         let _ = tokio::time::timeout(window_deadline, async {
             while let Some(evt) = rx.recv().await {
                 match evt {
@@ -4102,5 +4226,89 @@ mod tests {
             seen.lock().iter().all(|m| m == "test/small"),
             "no promotion means the model never changes"
         );
+    }
+
+    /// Responds "CANDIDATE" to summarize-shaped requests (no tools).
+    struct SpeculativeSpeaker;
+
+    impl Speaker for SpeculativeSpeaker {
+        fn speak<'a>(
+            &'a self,
+            req: SpeakRequest,
+            out: mpsc::Sender<StreamEvent>,
+        ) -> SpeakFuture<'a> {
+            Box::pin(async move {
+                if req.tools.is_empty() {
+                    out.send(StreamEvent::Text("CANDIDATE".into())).await.ok();
+                }
+                out.send(StreamEvent::Finished {
+                    stop: ka_protocol::Stop::Done,
+                    usage: ka_protocol::Usage::default(),
+                })
+                .await
+                .ok();
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn speculative_candidate_used_when_watermark_matches() {
+        let catalog = Catalog::parse(
+            "[dialects.\"test/m\"]\nwire = \"openai_chat\"\nbase_url = \"http://127.0.0.1:1\"\ncontext = 1000000\n",
+        )
+        .unwrap();
+        let mut voice = Voice::new(catalog, std::env::temp_dir(), ka_protocol::Mode::Free, 5)
+            .with_speaker(Wire::OpenaiChat, std::sync::Arc::new(SpeculativeSpeaker));
+        voice.set_model_selector("test/m", 4.0);
+        // 70% of the reserve threshold: speculative zone, not tripping
+        voice.note_context_for_tests(700_000);
+        assert!(voice.context_pressure_frac(1_000_000, 80));
+        assert!(!voice.context_pressure(1_000_000));
+        assert!(voice.start_speculative(None), "speculative must fire");
+
+        // watermark unchanged: the candidate is ready and matches
+        // (poll: the background task stores the receiver on completion)
+        let taken = loop {
+            if let Some(t) = voice.take_speculative().await {
+                break t;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        };
+        assert_eq!(taken, "CANDIDATE");
+        // consumed: nothing left
+        assert!(voice.take_speculative().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn speculative_candidate_discarded_on_watermark_mismatch() {
+        let catalog = Catalog::parse(
+            "[dialects.\"test/m\"]\nwire = \"openai_chat\"\nbase_url = \"http://127.0.0.1:1\"\ncontext = 1000000\n",
+        )
+        .unwrap();
+        let mut voice = Voice::new(catalog, std::env::temp_dir(), ka_protocol::Mode::Free, 5)
+            .with_speaker(Wire::OpenaiChat, std::sync::Arc::new(SpeculativeSpeaker));
+        voice.set_model_selector("test/m", 4.0);
+        voice.note_context_for_tests(700_000);
+        assert!(voice.start_speculative(None));
+        // history moved on since the candidate started
+        voice.history.push(TurnMessage::user("newer question"));
+        assert!(
+            voice.take_speculative().await.is_none(),
+            "stale candidate must be discarded"
+        );
+    }
+
+    #[tokio::test]
+    async fn speculative_skipped_below_eighty_percent() {
+        let catalog = Catalog::parse(
+            "[dialects.\"test/m\"]\nwire = \"openai_chat\"\nbase_url = \"http://127.0.0.1:1\"\ncontext = 1000000\n",
+        )
+        .unwrap();
+        let mut voice = Voice::new(catalog, std::env::temp_dir(), ka_protocol::Mode::Free, 5)
+            .with_speaker(Wire::OpenaiChat, std::sync::Arc::new(SpeculativeSpeaker));
+        voice.set_model_selector("test/m", 4.0);
+        voice.note_context_for_tests(400_000);
+        assert!(!voice.context_pressure_frac(1_000_000, 80));
+        assert!(!voice.start_speculative(None));
     }
 }

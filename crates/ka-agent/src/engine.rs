@@ -1396,6 +1396,11 @@ async fn settle_context(
             .await
             .ok();
     }
+    // speculative zone: pressure ≥80% but not yet tripping — fire the
+    // background candidate so the next real digest is instant
+    if !voice.context_pressure(window) && voice.context_pressure_frac(window, 80) {
+        voice.start_speculative(state.roles.fast.as_deref());
+    }
     let mut digests = 0;
     while voice.context_pressure(window) && digests < 3 {
         digests += 1;
@@ -1425,8 +1430,23 @@ async fn run_digest(
         return DigestResult::NoModel;
     };
     let _ = model;
-    events.send(Event::DigestStarted).await.ok();
     let ratio = voice_ratio(voice);
+    // a ready speculative candidate with a matching watermark skips the
+    // synchronous summarize entirely
+    if focus.is_none() {
+        if let Some(summary) = voice.take_speculative().await {
+            let _ = voice.apply_digest(summary, ratio);
+            persist_delta(voice, state, strand);
+            events
+                .send(Event::Note {
+                    message: "context digested (speculative)".to_string(),
+                })
+                .await
+                .ok();
+            return DigestResult::Digested;
+        }
+    }
+    events.send(Event::DigestStarted).await.ok();
     match voice
         .summarize(focus.as_deref(), std::time::Duration::from_secs(120))
         .await
