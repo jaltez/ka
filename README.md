@@ -38,7 +38,7 @@ Keys: `Enter` send / interject mid-turn · `+text` defer until turn ends · `Esc
 | `ka init` | starter AGENTS.md from repo shape |
 | `ka config {schema,print}` | resolved config / JSON schema |
 
-TUI slash commands: `/model <sel>` `/mode <guarded|free|plan>` `/plan <task>` `/build` `/rewind [N]` `/compact [focus]` `/quit` plus custom `/name` from `.ka/commands/*.md` (`$ARGUMENTS` substituted).
+TUI slash commands: `/model <sel>` `/mode [tier]` (picker: needs-approval | accept-edits | full-access | plan) `/plan <task>` `/build` `/rewind [N]` `/compact [focus]` `/quit` plus custom `/name` from `.ka/commands/*.md` (`$ARGUMENTS` substituted).
 
 ## Selectors & models
 
@@ -50,7 +50,7 @@ Strict TOML, layered: defaults → `~/.config/ka/ka.toml` → `.ka/ka.toml` (tru
 
 ```toml
 model = "ollama/qwen3.5:9b"
-mode = "guarded"            # guarded | free | plan
+mode = "accept_edits"       # guarded | accept_edits | free | plan
 
 [[rules]]                   # first match wins, before mode logic
 tool = "bash"

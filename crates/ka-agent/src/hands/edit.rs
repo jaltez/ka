@@ -132,6 +132,11 @@ mod tests {
             snapshots: Arc::new(parking_lot::Mutex::new(
                 crate::hands::snapshots::Snapshots::inert(),
             )),
+            jobs: std::sync::Arc::new(crate::hands::jobs::JobTable::new()),
+            bash_background_ms: 0,
+            max_image_mb: 5,
+            web_allow_private: false,
+            sandbox: ka_sandbox::Policy::Off,
         }
     }
 

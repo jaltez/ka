@@ -4,7 +4,7 @@
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 /// Binary-size contract from the design docs (MB).
 const SIZE_BUDGET_MB: f64 = 10.0;
@@ -20,6 +20,11 @@ fn main() {
         "ci" => ci(),
         "size" => size(),
         "models-sync" => models_sync(),
+        "keygen" => keygen(&rest),
+        "sign" => sign(&rest),
+        "release" => release(),
+        "bench" => bench(&rest),
+        "live-smoke" => live_smoke(),
         "help" | "--help" | "-h" => {
             print_help();
             0
@@ -44,6 +49,15 @@ fn print_help() {
             (hint: KA_DATA_DIR=/tmp/ka-dev cargo xtask dev -- models)
   ci        fmt --check + clippy -D warnings + tests (what CI runs)
   models-sync  regenerate crates/ka-dialect/models-dev.toml from models.dev
+  keygen    generate ka-release.key/.pub (ed25519, refused if keys exist;
+            --force overwrites)
+  sign <file>  sign with ka-release.key (or $KA_SIGNING_KEY base64) -> <file>.sig
+  release   build musl release, tar.gz it, sign, print artifact paths
+  bench [--update] [--bin <path>]
+            p50 `ka --version` latency + peak RSS vs baselines.json
+            (±30% tolerance; --update rewrites the baseline)
+  live-smoke  scripted one-turn conversations against real providers
+            (ANTHROPIC_API_KEY / OPENAI_API_KEY / KA_LM_URL; never in CI)
   help      this message"
     );
 }
@@ -201,6 +215,453 @@ fn size() -> i32 {
         mb, SIZE_BUDGET_MB
     );
     if mb <= SIZE_BUDGET_MB { 0 } else { 1 }
+}
+
+/// Base64 (standard alphabet) encoder — keeps xtask dependency-light.
+fn b64(data: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
+    for chunk in data.chunks(3) {
+        let n = ((chunk[0] as u32) << 16)
+            | ((*chunk.get(1).unwrap_or(&0) as u32) << 8)
+            | (*chunk.get(2).unwrap_or(&0) as u32);
+        out.push(TABLE[(n >> 18) as usize & 63] as char);
+        out.push(TABLE[(n >> 12) as usize & 63] as char);
+        out.push(if chunk.len() > 1 {
+            TABLE[(n >> 6) as usize & 63] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            TABLE[n as usize & 63] as char
+        } else {
+            '='
+        });
+    }
+    out
+}
+
+/// Base64 decode (ignores whitespace and '=' padding).
+fn unb64(text: &str) -> Option<Vec<u8>> {
+    fn val(c: u8) -> Option<u32> {
+        match c {
+            b'A'..=b'Z' => Some((c - b'A') as u32),
+            b'a'..=b'z' => Some((c - b'a' + 26) as u32),
+            b'0'..=b'9' => Some((c - b'0' + 52) as u32),
+            b'+' => Some(62),
+            b'/' => Some(63),
+            _ => None,
+        }
+    }
+    let cleaned: Vec<u8> = text
+        .bytes()
+        .filter(|b| !b.is_ascii_whitespace() && *b != b'=')
+        .collect();
+    let mut out = Vec::with_capacity(cleaned.len() * 3 / 4);
+    for chunk in cleaned.chunks(4) {
+        if chunk.len() == 1 {
+            return None;
+        }
+        let mut n = 0u32;
+        for (i, c) in chunk.iter().enumerate() {
+            n |= val(*c)? << (18 - 6 * i);
+        }
+        out.push((n >> 16) as u8);
+        if chunk.len() > 2 {
+            out.push((n >> 8) as u8);
+        }
+        if chunk.len() > 3 {
+            out.push(n as u8);
+        }
+    }
+    Some(out)
+}
+
+/// 32 random bytes from the OS (keygen only needs /dev/urandom).
+fn os_random_32() -> Option<[u8; 32]> {
+    use std::io::Read;
+    let mut key = [0u8; 32];
+    std::fs::File::open("/dev/urandom")
+        .ok()?
+        .read_exact(&mut key)
+        .ok()?;
+    Some(key)
+}
+
+fn key_paths() -> (PathBuf, PathBuf) {
+    (
+        repo_root().join("ka-release.key"),
+        repo_root().join("ka-release.pub"),
+    )
+}
+
+/// `xtask keygen [--force]`: write ka-release.key/.pub (base64), print pub.
+fn keygen(rest: &[String]) -> i32 {
+    let force = rest.iter().any(|a| a == "--force");
+    let (key_path, pub_path) = key_paths();
+    if !force && (key_path.exists() || pub_path.exists()) {
+        eprintln!(
+            "xtask: {} already exists (use --force to overwrite)",
+            key_path.display()
+        );
+        return 2;
+    }
+    let Some(seed) = os_random_32() else {
+        eprintln!("xtask: cannot read /dev/urandom");
+        return 2;
+    };
+    let signing = ed25519_dalek::SigningKey::from_bytes(&seed);
+    let secret = b64(signing.as_bytes());
+    let public = b64(signing.verifying_key().as_bytes());
+    if let Err(e) = std::fs::write(&key_path, secret + "\n") {
+        eprintln!("xtask: write {}: {e}", key_path.display());
+        return 2;
+    }
+    if let Err(e) = std::fs::write(&pub_path, public.clone() + "\n") {
+        eprintln!("xtask: write {}: {e}", pub_path.display());
+        return 2;
+    }
+    println!("wrote {} and {}", key_path.display(), pub_path.display());
+    println!("public key: {public}");
+    println!(
+        "keep the .key private; set KA_SIGNING_KEY or leave the file at the repo root to sign"
+    );
+    0
+}
+
+/// The signing key: $KA_SIGNING_KEY (base64) or ka-release.key at the root.
+fn load_signing_key() -> Option<ed25519_dalek::SigningKey> {
+    let text = match env::var("KA_SIGNING_KEY") {
+        Ok(k) if !k.trim().is_empty() => k,
+        _ => std::fs::read_to_string(key_paths().0).ok()?,
+    };
+    let seed: [u8; 32] = unb64(text.trim())?.try_into().ok()?;
+    Some(ed25519_dalek::SigningKey::from_bytes(&seed))
+}
+
+/// `xtask sign <file>`: write <file>.sig (base64 ed25519 signature).
+fn sign(rest: &[String]) -> i32 {
+    let Some(file) = rest.first() else {
+        eprintln!("xtask: sign <file> required");
+        return 2;
+    };
+    let Some(signing) = load_signing_key() else {
+        eprintln!("xtask: no signing key (set KA_SIGNING_KEY or run `cargo xtask keygen`)");
+        return 2;
+    };
+    let Ok(bytes) = std::fs::read(file) else {
+        eprintln!("xtask: cannot read {file}");
+        return 2;
+    };
+    use ed25519_dalek::Signer;
+    let sig = signing.sign(&bytes);
+    let sig_path = format!("{file}.sig");
+    if let Err(e) = std::fs::write(&sig_path, b64(&sig.to_bytes()) + "\n") {
+        eprintln!("xtask: write {sig_path}: {e}");
+        return 2;
+    }
+    println!("signed {file} -> {sig_path}");
+    0
+}
+
+/// `xtask release`: musl build -> tar.gz -> signature -> print artifacts.
+fn release() -> i32 {
+    let target = "x86_64-unknown-linux-musl";
+    let code = run(Command::new(cargo_bin_dir().join("cargo"))
+        .args(["build", "-p", "ka-cli", "--release", "--target", target])
+        .current_dir(repo_root()));
+    if code != 0 {
+        return code;
+    }
+    let bin = repo_root()
+        .join("target")
+        .join(target)
+        .join("release")
+        .join("ka");
+    let artifact = format!("ka-{target}.tar.gz");
+    let code = run(Command::new("tar")
+        .args([
+            "czf",
+            &artifact,
+            "-C",
+            bin.parent().and_then(Path::to_str).unwrap_or("."),
+            "ka",
+        ])
+        .current_dir(repo_root()));
+    if code != 0 {
+        return code;
+    }
+    let code = sign(std::slice::from_ref(&artifact));
+    if code != 0 {
+        return code;
+    }
+    println!("artifacts: {artifact} ({artifact}.sig)");
+    println!(
+        "CI release job embeds KA_PUBKEY into the binary so `ka update` verifies {artifact}.sig"
+    );
+    0
+}
+
+/// One measured perf baseline.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct Baselines {
+    /// p50 of 5 `ka --version` runs, microseconds (fresh process each).
+    version_p50_us: u64,
+    /// Peak RSS of one `ka --version` run in KB (None: no GNU time).
+    peak_rss_kb: Option<u64>,
+}
+
+/// µs timer around one fresh-process run; returns (duration µs, peak RSS KB).
+fn time_run(bin: &str) -> (u64, Option<u64>) {
+    let start = std::time::Instant::now();
+    let output = Command::new("/usr/bin/time")
+        .args(["-v", bin, "--version"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .output();
+    let elapsed_us = start.elapsed().as_micros() as u64;
+    let rss = output.ok().and_then(|o| {
+        String::from_utf8_lossy(&o.stderr)
+            .lines()
+            .find_map(|l| l.trim().strip_prefix("Maximum resident set size (kbytes):"))
+            .and_then(|v| v.trim().parse::<u64>().ok())
+    });
+    (elapsed_us, rss)
+}
+
+/// ±30% regression gate: only upward drift fails.
+fn within_tolerance(baseline: u64, current: u64) -> bool {
+    current <= baseline.saturating_add(baseline * 30 / 100)
+}
+
+/// `xtask bench [--update] [--bin <path>]`: measure and gate.
+fn bench(rest: &[String]) -> i32 {
+    let update = rest.iter().any(|a| a == "--update");
+    let bin = rest
+        .iter()
+        .position(|a| a == "--bin")
+        .and_then(|i| rest.get(i + 1))
+        .cloned()
+        .unwrap_or_else(|| "target/release/ka".to_string());
+
+    let bin_path = repo_root().join(&bin);
+    if !bin_path.exists() {
+        eprintln!(
+            "xtask: {} missing — build it first (cargo build --release -p ka-cli or --bin <path>)",
+            bin_path.display()
+        );
+        return 2;
+    }
+
+    // 5 fresh runs, p50 (sorted[2]); RSS from the median run
+    let mut runs: Vec<(u64, Option<u64>)> = (0..5).map(|_| time_run(&bin)).collect();
+    runs.sort_by_key(|(us, _)| *us);
+    let (p50_us, rss) = runs[2];
+
+    let baseline_path = repo_root().join("baselines.json");
+    if update || !baseline_path.exists() {
+        let b = Baselines {
+            version_p50_us: p50_us,
+            peak_rss_kb: rss,
+        };
+        let json = serde_json::to_string_pretty(&b).unwrap_or_else(|_| "{}".into());
+        if let Err(e) = std::fs::write(&baseline_path, json + "\n") {
+            eprintln!("xtask: write {}: {e}", baseline_path.display());
+            return 2;
+        }
+        println!(
+            "baseline written: p50 {p50_us}µs, rss {}",
+            rss.map(|k| format!("{k} KB"))
+                .unwrap_or_else(|| "n/a".into())
+        );
+        return 0;
+    }
+
+    let parsed: Baselines =
+        match serde_json::from_str(&std::fs::read_to_string(&baseline_path).unwrap_or_default()) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("xtask: parse {}: {e}", baseline_path.display());
+                return 2;
+            }
+        };
+
+    let mut failed = false;
+    if !within_tolerance(parsed.version_p50_us, p50_us) {
+        failed = true;
+    }
+    println!(
+        "version p50: {p50_us}µs (baseline {}µs) {}",
+        parsed.version_p50_us,
+        if within_tolerance(parsed.version_p50_us, p50_us) {
+            "ok"
+        } else {
+            "REGRESSION"
+        }
+    );
+    match (parsed.peak_rss_kb, rss) {
+        (Some(base), Some(cur)) => {
+            let ok = within_tolerance(base, cur);
+            failed |= !ok;
+            println!(
+                "peak rss: {cur} KB (baseline {base} KB) {}",
+                if ok { "ok" } else { "REGRESSION" }
+            );
+        }
+        (base, cur) => {
+            println!(
+                "peak rss: {} (baseline {}) — skipped",
+                cur.map(|k| format!("{k} KB"))
+                    .unwrap_or_else(|| "n/a".into()),
+                base.map(|k| format!("{k} KB"))
+                    .unwrap_or_else(|| "n/a".into()),
+            );
+        }
+    }
+    if failed {
+        eprintln!("xtask: perf regression vs baselines.json (investigate or --update)");
+        return 1;
+    }
+    0
+}
+
+/// One live-smoke scenario.
+struct Smoke {
+    name: &'static str,
+    model: String,
+    prompt: &'static str,
+    /// Substrings the NDJSON stream must contain (text markers).
+    expect_text: &'static str,
+    /// Whether a tool call must round-trip.
+    expect_tool: bool,
+    /// Extra `--dialects` overlay contents (local servers).
+    overlay: Option<String>,
+}
+
+/// `xtask live-smoke`: scripted one-turn conversations through `ka run`.
+/// Requires ANTHROPIC_API_KEY / OPENAI_API_KEY / KA_LM_URL; refuses to
+/// run in CI. Exit 1 on the first failure, printing the NDJSON tail.
+fn live_smoke() -> i32 {
+    if env::var("CI").is_ok() {
+        eprintln!("xtask: live-smoke never runs in CI");
+        return 2;
+    }
+    let mut scenarios: Vec<Smoke> = Vec::new();
+    if env::var("ANTHROPIC_API_KEY").is_ok_and(|v| !v.is_empty()) {
+        scenarios.push(Smoke {
+            name: "anthropic-text",
+            model: "anthropic/claude-sonnet-5".into(),
+            prompt: "Reply with exactly SMOKE-OK and nothing else.",
+            expect_text: "SMOKE-OK",
+            expect_tool: false,
+            overlay: None,
+        });
+        scenarios.push(Smoke {
+            name: "anthropic-tool",
+            model: "anthropic/claude-sonnet-5".into(),
+            prompt: "Use the read tool on Cargo.toml, then reply with exactly SMOKE-READ.",
+            expect_text: "SMOKE-READ",
+            expect_tool: true,
+            overlay: None,
+        });
+    }
+    if env::var("OPENAI_API_KEY").is_ok_and(|v| !v.is_empty()) {
+        scenarios.push(Smoke {
+            name: "openai-text",
+            model: "openai/gpt-5.1".into(),
+            prompt: "Reply with exactly SMOKE-OK and nothing else.",
+            expect_text: "SMOKE-OK",
+            expect_tool: false,
+            overlay: None,
+        });
+    }
+    if let Ok(base) = env::var("KA_LM_URL") {
+        let base = base.trim_end_matches('/').to_string();
+        scenarios.push(Smoke {
+            name: "local-text",
+            model: "local/smoke".into(),
+            prompt: "Reply with exactly SMOKE-OK and nothing else.",
+            expect_text: "SMOKE-OK",
+            expect_tool: false,
+            overlay: Some(format!(
+                "[dialects.\"local/smoke\"]\nwire = \"openai_chat\"\nbase_url = \"{base}/v1\"\ncontext = 32768\n"
+            )),
+        });
+    }
+    if scenarios.is_empty() {
+        eprintln!(
+            "xtask: live-smoke needs ANTHROPIC_API_KEY, OPENAI_API_KEY or KA_LM_URL in the environment"
+        );
+        return 2;
+    }
+
+    let root = repo_root();
+    let ka_bin = root.join("target/release/ka");
+    if !ka_bin.exists() {
+        eprintln!("xtask: build the release binary first (target/release/ka)");
+        return 2;
+    }
+
+    for smoke in &scenarios {
+        println!("── {} ({})…", smoke.name, smoke.model);
+        let mut overlay_path = None;
+        let mut cmd = Command::new(&ka_bin);
+        cmd.arg("run")
+            .arg("--model")
+            .arg(&smoke.model)
+            .arg(smoke.prompt);
+        if let Some(overlay) = &smoke.overlay {
+            let path = root.join("target/live-smoke-dialects.toml");
+            if std::fs::write(&path, overlay).is_err() {
+                eprintln!("xtask: cannot write overlay");
+                return 2;
+            }
+            overlay_path = Some(path.clone());
+            cmd.arg("--dialects").arg(path);
+        }
+        let output = cmd.current_dir(&root).output();
+        let lines: Vec<String> = match output {
+            Ok(o) => String::from_utf8_lossy(&o.stdout)
+                .lines()
+                .map(str::to_string)
+                .collect(),
+            Err(e) => {
+                eprintln!("FAIL {}: spawn ka: {e}", smoke.name);
+                return 1;
+            }
+        };
+        let joined = lines.join("\n");
+        let mut problems: Vec<String> = Vec::new();
+        if !joined.contains(smoke.expect_text) {
+            problems.push(format!("missing text {:?} in stream", smoke.expect_text));
+        }
+        if smoke.expect_tool
+            && !joined.contains("\"call_started\"")
+            && !joined.contains("\"call_output\"")
+        {
+            problems.push("no tool call round-trip in stream".to_string());
+        }
+        if !joined.contains("\"turn_finished\"") {
+            problems.push("stream never finished (no turn_finished event)".to_string());
+        }
+        match problems.is_empty() {
+            true => println!("   ok"),
+            false => {
+                eprintln!("FAIL {}: {}", smoke.name, problems.join("; "));
+                let tail: Vec<String> = lines.iter().rev().take(20).rev().cloned().collect();
+                eprintln!(
+                    "--- NDJSON tail ---\n{}\n-------------------",
+                    tail.join("\n")
+                );
+                return 1;
+            }
+        }
+        if let Some(path) = overlay_path {
+            let _ = fs::remove_file(path);
+        }
+    }
+    println!("live-smoke: all scenarios passed");
+    0
 }
 
 /// Regenerate `crates/ka-dialect/models-dev.toml` from https://models.dev.
@@ -388,4 +849,18 @@ fn models_sync() -> i32 {
         out_path.display()
     );
     0
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn tolerance_gates_upward_drift_only() {
+        use super::within_tolerance;
+        assert!(within_tolerance(1000, 1000));
+        assert!(within_tolerance(1000, 1299));
+        assert!(within_tolerance(1000, 1300));
+        assert!(!within_tolerance(1000, 1301));
+        // improvements always pass
+        assert!(within_tolerance(1000, 100));
+    }
 }

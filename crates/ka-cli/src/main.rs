@@ -76,6 +76,57 @@ enum CliCommand {
         /// Trust this directory's .ka/ka.toml (stores the decision)
         #[arg(long)]
         trust: bool,
+        /// JSON-schema file the reply must satisfy (structured output)
+        #[arg(long, value_name = "PATH")]
+        schema: Option<PathBuf>,
+        /// Output format: text (ka NDJSON events) or stream-json
+        /// (Claude-Code-shaped NDJSON)
+        #[arg(long, default_value = "text")]
+        print: String,
+    },
+    /// Serve the Agent Client Protocol on stdin/stdout
+    Acp,
+    /// Rebuild the full-text search index over all strands
+    #[cfg(feature = "index")]
+    Index,
+    /// Full-text search over strands
+    #[cfg(feature = "index")]
+    Search {
+        /// FTS5 query
+        query: String,
+        /// Filter to one session id
+        #[arg(long)]
+        session: Option<String>,
+        /// Max results
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+    },
+    /// Serve HTTP/SSE sessions on an address
+    Serve {
+        /// Bind address (loopback by default)
+        #[arg(long, default_value = "127.0.0.1:8417")]
+        addr: String,
+        /// Require this bearer token on every request
+        #[arg(long)]
+        token: Option<String>,
+    },
+    /// Environment health checks
+    Doctor {
+        /// Probe provider + MCP reachability
+        #[arg(long)]
+        net: bool,
+        /// Machine-readable output
+        #[arg(long)]
+        json: bool,
+    },
+    /// Check for / install a signed release update
+    Update {
+        /// Release channel (stable|edge)
+        #[arg(long, default_value = "stable")]
+        channel: String,
+        /// Only report the latest release, do not install
+        #[arg(long)]
+        check: bool,
     },
     /// List known models (embedded catalog + local discovery)
     Models {
@@ -102,7 +153,12 @@ enum CliCommand {
         session: Option<String>,
     },
     /// List sessions for this directory (ids for `ka --session`)
-    Sessions,
+    Sessions {
+        /// Print a JSON array of session objects (id, ts, title, messages,
+        /// path, cost, tokens).
+        #[arg(long)]
+        json: bool,
+    },
     /// Restore the latest snapshot of the newest session here
     Undo,
     /// Probe configured MCP servers and list their tools
@@ -130,6 +186,29 @@ enum ConfigCommand {
         #[arg(long = "config")]
         configs: Vec<PathBuf>,
     },
+}
+
+/// Ed25519 public key embedded at build time (`KA_PUBKEY=<base64>`); the
+/// presence marks a signed build and lets `ka update` verify artifacts.
+pub const PUBLIC_KEY: Option<&str> = option_env!("KA_PUBKEY");
+
+mod acp;
+mod doctor;
+mod serve;
+mod update;
+
+/// The strands storage root (`<data>/strands`).
+#[cfg(feature = "index")]
+fn ka_data_dir_strands() -> PathBuf {
+    std::env::var("KA_DATA_DIR")
+        .map(PathBuf::from)
+        .or_else(|_| {
+            std::env::var("XDG_DATA_HOME")
+                .map(PathBuf::from)
+                .or_else(|_| std::env::var("HOME").map(|h| PathBuf::from(h).join(".local/share")))
+        })
+        .unwrap_or_else(|_| PathBuf::from("."))
+        .join("strands")
 }
 
 fn main() -> ExitCode {
@@ -199,11 +278,13 @@ fn load_config(
 
 fn parse_mode(s: &str) -> Result<ka_protocol::Mode, String> {
     match s {
-        "guarded" => Ok(ka_protocol::Mode::Guarded),
-        "free" => Ok(ka_protocol::Mode::Free),
+        "guarded" | "needs-approval" | "needs_approval" => Ok(ka_protocol::Mode::Guarded),
+        "accept-edits" | "accept_edits" => Ok(ka_protocol::Mode::AcceptEdits),
+        "free" | "full-access" | "full_access" => Ok(ka_protocol::Mode::Free),
         "plan" => Ok(ka_protocol::Mode::Plan),
         other => Err(format!(
-            "unknown mode {other:?} (expected guarded|free|plan)"
+            "unknown mode {other:?} (expected \
+guarded|needs-approval|accept-edits|free|full-access|plan)"
         )),
     }
 }
@@ -265,7 +346,19 @@ async fn dispatch(cli: Cli) -> Result<ExitCode, String> {
             continue_latest,
             session,
             trust,
+            schema,
+            print,
         }) => {
+            let schema_value = match schema {
+                Some(path) => {
+                    let text = std::fs::read_to_string(&path)
+                        .map_err(|e| format!("schema {}: {e}", path.display()))?;
+                    let value: serde_json::Value = serde_json::from_str(&text)
+                        .map_err(|e| format!("schema {}: invalid JSON: {e}", path.display()))?;
+                    Some(value)
+                }
+                None => None,
+            };
             run_headless(
                 prompt,
                 model,
@@ -276,8 +369,54 @@ async fn dispatch(cli: Cli) -> Result<ExitCode, String> {
                 continue_latest,
                 session,
                 trust,
+                schema_value,
+                Vec::new(),
+                print,
             )
             .await
+        }
+        Some(CliCommand::Acp) => acp::run().await,
+        #[cfg(feature = "index")]
+        Some(CliCommand::Index) => {
+            let db = ka_index::open_db(&ka_index::default_db_path())?;
+            let dir = ka_data_dir_strands();
+            let stats = ka_index::rebuild(&dir, &db)?;
+            println!(
+                "indexed {} strand file(s), skipped {} unchanged",
+                stats.indexed, stats.skipped
+            );
+            Ok(ExitCode::SUCCESS)
+        }
+        #[cfg(feature = "index")]
+        Some(CliCommand::Search {
+            query,
+            session,
+            limit,
+        }) => {
+            let db = ka_index::open_db(&ka_index::default_db_path())?;
+            let hits = ka_index::search(&db, &query, session.as_deref(), limit)?;
+            if hits.is_empty() {
+                println!("(no results)");
+                return Ok(ExitCode::SUCCESS);
+            }
+            for h in hits {
+                println!("{} [{}] {}: {}", h.session, h.role, h.ts, h.snippet);
+            }
+            Ok(ExitCode::SUCCESS)
+        }
+        Some(CliCommand::Serve { addr, token }) => serve::run(&addr, token).await,
+        Some(CliCommand::Doctor { net, json }) => doctor::run(net, json).await,
+        Some(CliCommand::Update { channel, check }) => {
+            let trust = trust_for_cwd(false);
+            let cfg = load_config(&[], None, None, trust)?;
+            let repo = cfg
+                .update
+                .repo
+                .clone()
+                .unwrap_or_else(|| update::DEFAULT_REPO.to_string());
+            let message = update::run(&channel, check, &repo).await?;
+            println!("{message}");
+            Ok(ExitCode::SUCCESS)
         }
         Some(CliCommand::Models {
             no_discovery,
@@ -287,12 +426,12 @@ async fn dispatch(cli: Cli) -> Result<ExitCode, String> {
             if !no_discovery {
                 ka_dialect::discovery::overlay_discovered(&mut catalog).await;
             }
-            let header = format!(
-                "{:<34} {:<20} {:>9} {:>8}  {}",
-                "model", "wire", "context", "$in/M", "auth"
-            );
-            println!("{header}");
-            for (id, d) in &catalog.dialects {
+            let mut rows: Vec<(&String, &ka_dialect::Dialect)> = catalog.dialects.iter().collect();
+            rows.sort_by_key(|(id, _)| {
+                let vendor = id.split('/').next().unwrap_or(id.as_str());
+                (ka_dialect::providers::vendor_rank(vendor), (*id).clone())
+            });
+            for (id, d) in rows {
                 println!(
                     "{:<34} {:<20} {:>9} {:>7}  {}",
                     id,
@@ -308,12 +447,12 @@ async fn dispatch(cli: Cli) -> Result<ExitCode, String> {
             }
             Ok(ExitCode::SUCCESS)
         }
-        Some(CliCommand::Sessions) => run_sessions(),
         Some(CliCommand::Undo) => run_undo(),
         Some(CliCommand::Mcp) => run_mcp().await,
         Some(CliCommand::Agents) => run_agents(),
         Some(CliCommand::Providers) => run_providers(),
         Some(CliCommand::Init) => run_init(),
+        Some(CliCommand::Sessions { json }) => run_sessions(json),
         Some(CliCommand::Rewind { turns }) => run_rewind(turns).await,
         Some(CliCommand::Export { out, session }) => run_export(out, session),
         Some(CliCommand::Config { cmd }) => match cmd {
@@ -341,7 +480,6 @@ async fn dispatch(cli: Cli) -> Result<ExitCode, String> {
         }
     }
 }
-
 #[allow(clippy::too_many_arguments)]
 async fn run_headless(
     prompt: Option<String>,
@@ -353,8 +491,12 @@ async fn run_headless(
     continue_latest: bool,
     session: Option<String>,
     force_trust: bool,
+    schema: Option<serde_json::Value>,
+    images: Vec<ka_protocol::ImagePart>,
+    print: String,
 ) -> Result<ExitCode, String> {
     let trust = trust_for_cwd(force_trust);
+    warn_untrusted_conventions(&std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
     let cfg = load_config(configs, model, mode, trust)?;
     let prompt = match prompt {
         Some(p) => p,
@@ -364,6 +506,7 @@ async fn run_headless(
         return Err("empty prompt".to_string());
     }
 
+    let cfg_model = cfg.model.clone();
     let catalog = build_catalog(dialects, with_discovery).await?;
     let choice = if let Some(id) = session {
         let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
@@ -382,16 +525,18 @@ async fn run_headless(
     let mut handle = spawn_full(cfg, catalog, choice);
     handle
         .commands
-        .send(Command::Prompt { text: prompt })
+        .send(Command::Prompt {
+            text: prompt,
+            schema,
+            images,
+        })
         .await
         .map_err(|_| "engine closed before prompt".to_string())?;
 
     let mut stdout = std::io::stdout().lock();
     let mut final_stop: Option<Stop> = None;
+    let mut sj = StreamJsonPrinter::with_model(cfg_model.clone());
     while let Some(event) = handle.events.recv().await {
-        let line = to_line(&event).map_err(|e| format!("serialize event: {e}"))?;
-        std::io::Write::write_all(&mut stdout, line.as_bytes())
-            .map_err(|e| format!("stdout: {e}"))?;
         // headless policy: permission asks auto-deny (last option = deny)
         if let Event::Ask { id, .. } = &event {
             handle
@@ -408,12 +553,191 @@ async fn run_headless(
             Event::Idle => break,
             _ => {}
         }
+        if print == "stream-json" {
+            for line in sj.map_event(&event) {
+                use std::io::Write;
+                writeln!(stdout, "{line}").map_err(|e| format!("stdout: {e}"))?;
+            }
+            continue;
+        }
+        let line = to_line(&event).map_err(|e| format!("serialize event: {e}"))?;
+        std::io::Write::write_all(&mut stdout, line.as_bytes())
+            .map_err(|e| format!("stdout: {e}"))?;
+    }
+    // stream-json: the terminating result line (after the loop so cost
+    // and stop reason are final)
+    if print == "stream-json" {
+        for line in sj.finish(final_stop) {
+            use std::io::Write;
+            writeln!(stdout, "{line}").map_err(|e| format!("stdout: {e}"))?;
+        }
     }
     std::io::Write::flush(&mut stdout).map_err(|e| format!("stdout: {e}"))?;
     match final_stop {
         Some(Stop::Aborted) => Ok(ExitCode::from(2)),
         Some(Stop::Error) => Ok(ExitCode::from(1)),
         _ => Ok(ExitCode::SUCCESS),
+    }
+}
+
+/// Maps ka events onto the Claude-Code-shaped NDJSON surface used by
+/// `ka run --print stream-json`:
+///
+/// - `{"type":"system","subtype":"init","model":...,"session":...}`
+/// - assistant text: `{"type":"assistant","message":{"role":"assistant",
+///   "content":[{"type":"text","text":...}]}}`
+/// - tool round-trips: an assistant `tool_use` block per CallStarted and
+///   a user `tool_result` per CallOutput
+/// - terminal: `{"type":"result","subtype":"success|error|aborted",
+///   "is_error":...,"total_cost_usd":...}`
+///
+/// Text deltas accumulate; a buffered assistant message flushes when a
+/// tool call starts or the turn finishes. Event kinds without a mapping
+/// (inventory, meters, notes) are dropped.
+#[derive(Default)]
+struct StreamJsonPrinter {
+    session: Option<String>,
+    model: Option<String>,
+    text: String,
+    finished: bool,
+    total_cost: f64,
+}
+
+impl StreamJsonPrinter {
+    fn with_model(model: Option<String>) -> Self {
+        Self {
+            model,
+            ..Default::default()
+        }
+    }
+}
+
+impl StreamJsonPrinter {
+    fn emit(&self, value: serde_json::Value) -> Option<String> {
+        if self.finished {
+            return None;
+        }
+        Some(value.to_string())
+    }
+
+    fn flush_text(&mut self) -> Option<String> {
+        if self.text.is_empty() {
+            return None;
+        }
+        let text = std::mem::take(&mut self.text);
+        self.emit(serde_json::json!({
+            "type": "assistant",
+            "message": {
+                "role": "assistant",
+                "content": [{"type": "text", "text": text}]
+            }
+        }))
+    }
+
+    fn map_event(&mut self, event: &Event) -> Vec<String> {
+        if self.finished {
+            return Vec::new();
+        }
+        match event {
+            Event::SessionInfo { id } => {
+                self.session = Some(id.clone());
+                self.emit(serde_json::json!({
+                    "type": "system",
+                    "subtype": "init",
+                    "session": id,
+                    "model": self.model,
+                }))
+                .into_iter()
+                .collect()
+            }
+            Event::Delta {
+                kind: ka_protocol::DeltaKind::Text(t),
+            } => {
+                self.text.push_str(t);
+                Vec::new()
+            }
+            Event::CallStarted { tool, id, .. } => {
+                let mut out = Vec::new();
+                if let Some(line) = self.flush_text() {
+                    out.push(line);
+                }
+                if let Some(line) = self.emit(serde_json::json!({
+                    "type": "assistant",
+                    "message": {
+                        "role": "assistant",
+                        "content": [{
+                            "type": "tool_use",
+                            "id": id,
+                            "name": tool,
+                            "input": {}
+                        }]
+                    }
+                })) {
+                    out.push(line);
+                }
+                out
+            }
+            Event::CallOutput {
+                id,
+                excerpt,
+                is_error,
+                ..
+            } => {
+                if let Some(line) = self.emit(serde_json::json!({
+                    "type": "user",
+                    "message": {
+                        "role": "user",
+                        "content": [{
+                            "type": "tool_result",
+                            "tool_use_id": id,
+                            "content": excerpt,
+                            "is_error": is_error
+                        }]
+                    }
+                })) {
+                    vec![line]
+                } else {
+                    Vec::new()
+                }
+            }
+            Event::ModelChanged { selector } => {
+                self.model = Some(selector.clone());
+                Vec::new()
+            }
+            Event::TurnFinished { usage, .. } => {
+                self.total_cost += usage.cost;
+                let mut out = Vec::new();
+                if let Some(line) = self.flush_text() {
+                    out.push(line);
+                }
+                out
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    fn finish(&mut self, final_stop: Option<Stop>) -> Vec<String> {
+        self.finished = true;
+        let mut out = Vec::new();
+        if let Some(line) = self.flush_text() {
+            out.push(line);
+        }
+        let (subtype, is_error) = match final_stop {
+            Some(Stop::Aborted) => ("aborted", true),
+            Some(Stop::Error) | None => ("error", true),
+            _ => ("success", false),
+        };
+        let total_cost = self.total_cost;
+        out.push(
+            serde_json::json!({
+                "type": "result",
+                "subtype": subtype,
+                "is_error": is_error,
+                "total_cost_usd": total_cost,
+            })
+            .to_string(),
+        );
+        out
     }
 }
 
@@ -436,6 +760,7 @@ async fn run_tui(cli: Cli) -> Result<ExitCode, String> {
     };
 
     let trust = trust_for_cwd(cli.trust);
+    warn_untrusted_conventions(&cwd);
     let cfg = load_config(&cli.configs, cli.model.clone(), cli.mode.clone(), trust)?;
     let catalog = build_catalog(&cli.dialects, !cli.no_discovery).await?;
     let model_label = cfg.model.clone().unwrap_or_else(|| "(canned)".to_string());
@@ -445,7 +770,7 @@ async fn run_tui(cli: Cli) -> Result<ExitCode, String> {
             name: p.name.to_string(),
             env_var: p.key_env.unwrap_or("").to_string(),
             base_url: p.base_url.to_string(),
-            key_set: p.key_env.is_some_and(|k| std::env::var(k).is_ok()),
+            key_set: p.key_env.is_some_and(ka_dialect::auth::key_is_set),
         })
         .collect();
     // catalog-derived vendors (models.dev: coding plans, z.ai tiers, ...)
@@ -466,11 +791,13 @@ async fn run_tui(cli: Cli) -> Result<ExitCode, String> {
             name: vendor.to_string(),
             env_var: env_var.clone(),
             base_url,
-            key_set: !env_var.is_empty() && std::env::var(&env_var).is_ok(),
+            key_set: !env_var.is_empty() && ka_dialect::auth::key_is_set(&env_var),
         });
     }
-    providers.sort_by(|a, b| a.name.cmp(&b.name));
-    let models: Vec<ka_term::tui::ModelInfo> = catalog
+    // official registry order (official block first, locals last);
+    // catalog-only vendors (models.dev plans/tiers) rank as community
+    providers.sort_by_key(|p| ka_dialect::providers::vendor_rank(&p.name));
+    let mut models: Vec<ka_term::tui::ModelInfo> = catalog
         .dialects
         .iter()
         .map(|(id, d)| ka_term::tui::ModelInfo {
@@ -481,7 +808,7 @@ async fn run_tui(cli: Cli) -> Result<ExitCode, String> {
             key_set: d
                 .api_key_env
                 .as_deref()
-                .is_some_and(|k| std::env::var(k).is_ok()),
+                .is_some_and(ka_dialect::auth::key_is_set),
             doc_url: d.doc_url.clone().unwrap_or_default(),
             price_in: d.price.input_per_mtok,
             price_out: d.price.output_per_mtok,
@@ -489,15 +816,35 @@ async fn run_tui(cli: Cli) -> Result<ExitCode, String> {
             plan: id.split('/').next().is_some_and(|v| v.contains("plan")),
         })
         .collect();
+    // the picker inherits catalog order: official block first, then
+    // community vendors, local discoveries last (vendor_rank policy)
+    models.sort_by_key(|m| {
+        let vendor = m.id.split('/').next().unwrap_or_default();
+        (ka_dialect::providers::vendor_rank(vendor), m.id.clone())
+    });
     let handle = ka_agent::spawn_full(cfg, catalog, choice);
     let ka_agent::EngineHandle { commands, events } = handle;
     let agents: Vec<(String, String)> = ka_agent::agents::AgentDef::discover(&cwd)
         .into_iter()
         .map(|a| (a.name, a.description))
         .collect();
-    let exit = ka_term::tui::run(commands, events, &model_label, providers, models, agents)
-        .await
-        .map_err(|e| format!("tui: {e}"))?;
+    let cfg_tui_header_glyph = {
+        let trust = trust_for_cwd(false);
+        load_config(&cli.configs, cli.model.clone(), cli.mode.clone(), trust)
+            .map(|c| c.effective_header_glyph())
+            .unwrap_or_else(|_| "\u{25c6}".to_string())
+    };
+    let exit = ka_term::tui::run(
+        commands,
+        events,
+        &model_label,
+        providers,
+        models,
+        agents,
+        &cfg_tui_header_glyph,
+    )
+    .await
+    .map_err(|e| format!("tui: {e}"))?;
     match exit {
         ka_term::tui::Exit::Quit | ka_term::tui::Exit::EngineEnded => Ok(ExitCode::SUCCESS),
     }
@@ -519,21 +866,47 @@ fn resolve_session(cwd: &std::path::Path, id: &str) -> Result<ka_agent::StrandCh
 }
 
 /// `ka sessions`: list strands for this cwd with resolvable ids.
-fn run_sessions() -> Result<ExitCode, String> {
+fn run_sessions(json: bool) -> Result<ExitCode, String> {
     let cwd = std::env::current_dir().map_err(|e| format!("cwd: {e}"))?;
     let strands = ka_strand::list(&cwd).map_err(|e| format!("listing sessions: {e}"))?;
+    if json {
+        let rows: Vec<serde_json::Value> = strands
+            .iter()
+            .map(|s| {
+                serde_json::json!({
+                    "id": s.id,
+                    "ts": s.ts,
+                    "title": s.title,
+                    "messages": s.messages,
+                    "path": s.path.display().to_string(),
+                    "cost": s.cost,
+                    "tokens": s.tokens,
+                })
+            })
+            .collect();
+        let text = serde_json::to_string_pretty(&rows).map_err(|e| format!("serialize: {e}"))?;
+        println!("{text}");
+        return Ok(ExitCode::SUCCESS);
+    }
     if strands.is_empty() {
         println!("no sessions yet for {}", cwd.display());
         return Ok(ExitCode::SUCCESS);
     }
     println!(
-        "{:<26} {:>5}  {first_message:<}",
+        "{:<26} {:>5} {:>10}  {first_message:<}",
         "session id",
         "msgs",
+        "cost",
         first_message = "first message"
     );
     for s in strands.iter().take(30) {
-        println!("{:<26} {:>5}  {}", s.id, s.messages, s.title);
+        println!(
+            "{:<26} {:>5} {:>10}  {}",
+            s.id,
+            s.messages,
+            format!("${:.4}", s.cost),
+            s.title
+        );
     }
     Ok(ExitCode::SUCCESS)
 }
@@ -598,7 +971,10 @@ async fn run_mcp() -> Result<ExitCode, String> {
         println!(
             "{:<16} {} {}",
             server.name,
-            server.command,
+            server
+                .command
+                .clone()
+                .unwrap_or_else(|| server.url.clone().unwrap_or_default()),
             server.args.join(" ")
         );
         match tokio::time::timeout(
@@ -635,7 +1011,7 @@ fn run_providers() -> Result<ExitCode, String> {
     let mut rows: Vec<(String, String, bool, String)> = Vec::new();
     for p in ka_dialect::providers::PROVIDERS {
         let env = p.key_env.unwrap_or("-").to_string();
-        let set = p.key_env.is_some_and(|k| std::env::var(k).is_ok());
+        let set = p.key_env.is_some_and(ka_dialect::auth::key_is_set);
         seen.push(p.name.to_string());
         rows.push((p.name.to_string(), env, set, p.base_url.to_string()));
     }
@@ -657,7 +1033,7 @@ fn run_providers() -> Result<ExitCode, String> {
         let set = d
             .api_key_env
             .as_deref()
-            .is_some_and(|k| std::env::var(k).is_ok());
+            .is_some_and(ka_dialect::auth::key_is_set);
         seen.push(vendor.to_string());
         rows.push((vendor.to_string(), env, set, base_url));
     }
@@ -676,64 +1052,79 @@ fn run_providers() -> Result<ExitCode, String> {
     Ok(ExitCode::SUCCESS)
 }
 
-/// Trust store: directories whose `.ka/` local config ka will load.
-fn trust_path() -> PathBuf {
-    std::env::var("XDG_STATE_HOME")
-        .map(PathBuf::from)
-        .or_else(|_| std::env::var("HOME").map(|h| PathBuf::from(h).join(".local/state")))
-        .unwrap_or_else(|_| std::env::temp_dir())
-        .join("ka/trust.json")
+/// Whether `dir` exists and holds at least one entry.
+fn dir_has_entries(dir: &std::path::Path) -> bool {
+    std::fs::read_dir(dir)
+        .map(|mut d| d.next().is_some())
+        .unwrap_or(false)
 }
 
-fn load_trust() -> Vec<PathBuf> {
-    std::fs::read_to_string(trust_path())
-        .ok()
-        .and_then(|t| serde_json::from_str(&t).ok())
-        .unwrap_or_default()
+/// Whether this project ships gateable `.ka/` content: a local config,
+/// skills, or convention hooks. Nothing gateable → nothing to trust.
+fn has_gateable_ka(cwd: &std::path::Path) -> bool {
+    cwd.join(".ka/ka.toml").is_file()
+        || dir_has_entries(&cwd.join(".ka/skills"))
+        || dir_has_entries(&cwd.join(".ka/hooks"))
 }
 
-fn save_trust(dirs: &[PathBuf]) {
-    let path = trust_path();
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    if let Ok(json) = serde_json::to_string_pretty(dirs) {
-        let _ = std::fs::write(path, json);
-    }
-}
-
-/// Whether the project config layer for `cwd` may load. Prompts on a TTY
-/// (first sighting), skips with a warning otherwise. `--trust` forces.
+/// Whether the project `.ka/` layer (config, skills, hooks) for `cwd` may
+/// load. Prompts on a TTY (first sighting), skips with a warning
+/// otherwise. `--trust` forces. The store itself lives in
+/// [`ka_agent::trust`]; approval unlocks all three layers.
 fn project_config_trusted(cwd: &std::path::Path, force_trust: bool) -> bool {
-    // nothing to trust — and no prompt — without a project config
-    if !cwd.join(".ka/ka.toml").is_file() {
+    // nothing to trust — and no prompt — without gateable .ka/ content
+    if !has_gateable_ka(cwd) {
         return false;
     }
+    if ka_agent::trust::trusted_in(cwd, &ka_agent::trust::load_trust()) {
+        return true;
+    }
     let canonical = std::fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
-    let mut trusted = load_trust();
     if force_trust {
-        trusted.push(canonical);
-        save_trust(&trusted);
+        ka_agent::trust::approve(cwd);
         return true;
     }
     // prompt only when interactive
     if std::io::IsTerminal::is_terminal(&std::io::stdin()) {
         eprintln!(
-            "ka: this directory has a .ka/ka.toml project config.\n     {}\n   Trust it (loads its rules/model settings)? [y/N]",
+            "ka: this directory has a .ka/ project config, skills, or hooks.\n     {}\n   Trust it (loads its rules/model settings, skills and hooks)? [y/N]",
             canonical.display()
         );
         let mut line = String::new();
         if std::io::stdin().read_line(&mut line).is_ok() {
             let ans = line.trim().to_lowercase();
             if ans == "y" || ans == "yes" {
-                trusted.push(canonical);
-                save_trust(&trusted);
+                ka_agent::trust::approve(cwd);
                 return true;
             }
         }
     }
-    eprintln!("ka: project config NOT trusted; skipping .ka/ka.toml (pass --trust to trust it)");
+    eprintln!(
+        "ka: project .ka/ NOT trusted; skipping its config, skills and hooks (pass --trust to trust it)"
+    );
     false
+}
+
+/// Startup note: when an untrusted project's `.ka/` would have contributed
+/// skills or hooks (both silently skipped by the engine), say so.
+fn warn_untrusted_conventions(cwd: &std::path::Path) {
+    if ka_agent::trust::project_trusted(cwd) {
+        return;
+    }
+    let mut layers: Vec<&str> = Vec::new();
+    if dir_has_entries(&cwd.join(".ka/skills")) {
+        layers.push("skills");
+    }
+    if dir_has_entries(&cwd.join(".ka/hooks")) {
+        layers.push("hooks");
+    }
+    if !layers.is_empty() {
+        eprintln!(
+            "ka: project .ka/{} present but NOT trusted; skipping {} (pass --trust to enable)",
+            layers.join(" and "),
+            if layers.len() == 1 { "it" } else { "them" }
+        );
+    }
 }
 
 /// Deterministic starter AGENTS.md from repo shape (no model call).
@@ -838,29 +1229,7 @@ fn run_export(out: Option<PathBuf>, session: Option<String>) -> Result<ExitCode,
         },
     };
     let records = ka_strand::read(&target).map_err(|e| format!("{}: {e}", target.display()))?;
-    let mut md = String::from("# ka session\n\n");
-    for r in &records {
-        match r {
-            ka_strand::Record::Header { id, ts, .. } => {
-                md.push_str(&format!("> strand `{}` at {}\n\n", id.0, ts));
-            }
-            ka_strand::Record::Message { role, content, .. } => {
-                let who = match role {
-                    ka_strand::Role::User => "**you**",
-                    ka_strand::Role::Tool => "*tool*",
-                    _ => "**ka**",
-                };
-                if !content.trim().is_empty() {
-                    md.push_str(&format!("### {who}\n\n{}\n\n", content.trim()));
-                }
-            }
-            ka_strand::Record::Digest { summary, .. } => {
-                md.push_str(&format!("### *digest*\n\n> {}\n\n", summary.trim()));
-            }
-            ka_strand::Record::Rewind { .. } => md.push_str("### *rewound*\n\n"),
-            _ => {}
-        }
-    }
+    let md = ka_strand::render_markdown(&records);
     match out {
         Some(path) => {
             std::fs::write(&path, &md).map_err(|e| format!("{}: {e}", path.display()))?;
@@ -878,4 +1247,102 @@ fn read_stdin() -> Result<String, String> {
         .read_to_string(&mut buf)
         .map_err(|e| format!("stdin: {e}"))?;
     Ok(buf)
+}
+
+#[cfg(test)]
+mod print_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use super::*;
+
+    #[test]
+    fn stream_json_maps_the_documented_shape() {
+        let mut sj = StreamJsonPrinter::with_model(Some("anthropic/claude-sonnet-5".into()));
+
+        // init
+        let lines = sj.map_event(&Event::SessionInfo { id: "s123".into() });
+        assert_eq!(lines.len(), 1);
+        let init: serde_json::Value = serde_json::from_str(&lines[0]).unwrap();
+        assert_eq!(init["type"], "system");
+        assert_eq!(init["subtype"], "init");
+        assert_eq!(init["session"], "s123");
+        assert_eq!(init["model"], "anthropic/claude-sonnet-5");
+
+        // text deltas buffer; a tool call flushes them as assistant text
+        sj.map_event(&Event::Delta {
+            kind: ka_protocol::DeltaKind::Text("thinking…".into()),
+        });
+        let lines = sj.map_event(&Event::CallStarted {
+            tool: "read".into(),
+            id: "c1".into(),
+            detail: String::new(),
+        });
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        let text_msg: serde_json::Value = serde_json::from_str(&lines[0]).unwrap();
+        assert_eq!(text_msg["type"], "assistant");
+        assert_eq!(text_msg["message"]["content"][0]["type"], "text");
+        assert_eq!(text_msg["message"]["content"][0]["text"], "thinking…");
+        let tool_msg: serde_json::Value = serde_json::from_str(&lines[1]).unwrap();
+        assert_eq!(tool_msg["message"]["content"][0]["type"], "tool_use");
+        assert_eq!(tool_msg["message"]["content"][0]["id"], "c1");
+
+        // tool result maps as a user tool_result
+        let lines = sj.map_event(&Event::CallOutput {
+            tool: "read".into(),
+            id: "c1".into(),
+            excerpt: "file body".into(),
+            is_error: false,
+            spill: None,
+        });
+        assert_eq!(lines.len(), 1);
+        let result: serde_json::Value = serde_json::from_str(&lines[0]).unwrap();
+        assert_eq!(result["type"], "user");
+        assert_eq!(result["message"]["content"][0]["type"], "tool_result");
+        assert_eq!(result["message"]["content"][0]["content"], "file body");
+
+        // turn finished flushes the remaining text as the final assistant
+        // message; the result line lands at finish()
+        sj.map_event(&Event::Delta {
+            kind: ka_protocol::DeltaKind::Text("answer".into()),
+        });
+        let lines = sj.map_event(&Event::TurnFinished {
+            stop: Stop::Done,
+            usage: ka_protocol::Usage {
+                cost: 0.42,
+                ..Default::default()
+            },
+        });
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        let text_msg: serde_json::Value = serde_json::from_str(&lines[0]).unwrap();
+        assert_eq!(text_msg["message"]["content"][0]["text"], "answer");
+
+        // finish emits the terminal result with accumulated cost
+        let lines = sj.finish(Some(Stop::Done));
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        let result: serde_json::Value = serde_json::from_str(&lines[0]).unwrap();
+        assert_eq!(result["type"], "result");
+        assert_eq!(result["subtype"], "success");
+        assert_eq!(result["is_error"], false);
+        assert_eq!(result["total_cost_usd"], 0.42);
+
+        // error stop maps to an error result
+        let mut sj = StreamJsonPrinter::default();
+        sj.finish(Some(Stop::Error));
+        // error path: nothing more may be mapped after finish
+        assert!(sj.map_event(&Event::Idle).is_empty());
+    }
+
+    #[test]
+    fn stream_json_error_and_abort_subtypes() {
+        let mut sj = StreamJsonPrinter::default();
+        let lines = sj.finish(Some(Stop::Aborted));
+        let result: serde_json::Value = serde_json::from_str(&lines[0]).unwrap();
+        assert_eq!(result["subtype"], "aborted");
+        assert_eq!(result["is_error"], true);
+
+        let mut sj = StreamJsonPrinter::default();
+        let lines = sj.finish(Some(Stop::Error));
+        let result: serde_json::Value = serde_json::from_str(&lines[0]).unwrap();
+        assert_eq!(result["subtype"], "error");
+    }
 }

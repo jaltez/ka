@@ -16,6 +16,9 @@ pub struct AgentDef {
     pub system: String,
     /// Step budget for the nested voice.
     pub max_steps: u32,
+    /// Run this agent in an isolated git worktree (its own branch);
+    /// requires a git repository.
+    pub isolate: bool,
 }
 
 impl AgentDef {
@@ -25,6 +28,7 @@ impl AgentDef {
         let mut name = String::new();
         let mut description = String::new();
         let mut max_steps = 12u32;
+        let mut isolate = false;
         let mut body = text.to_string();
 
         if let Some(rest) = text.strip_prefix("---") {
@@ -40,6 +44,10 @@ impl AgentDef {
                         "max-steps" | "max_steps" => {
                             max_steps = value.parse().unwrap_or(12).clamp(1, 64);
                         }
+                        "isolate" => {
+                            isolate =
+                                matches!(value.to_ascii_lowercase().as_str(), "true" | "yes" | "1");
+                        }
                         _ => {}
                     }
                 }
@@ -54,6 +62,7 @@ impl AgentDef {
             description,
             system: body.trim().to_string(),
             max_steps,
+            isolate,
         }
     }
 

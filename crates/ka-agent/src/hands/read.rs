@@ -1,6 +1,8 @@
 //! The read hand: line-ranged file reads with caps and ledger minting.
-
+//! Image files (png/jpg/webp/gif, detected by magic bytes) come back as
+//! a placeholder plus an `ImagePart` for vision models.
 use std::future::Future;
+use std::io::Read;
 use std::path::PathBuf;
 use std::pin::Pin;
 
@@ -55,6 +57,36 @@ impl Hand for ReadHand {
                 return list_dir(&path);
             }
             ctx.ledger.lock().mint(&path, &meta);
+
+            // image files: sniff by magic bytes, cap size, return a
+            // placeholder plus the base64 payload for the vision wire
+            if let Some(media_type) = sniff_image_type(&path) {
+                let cap_mb = ctx.max_image_mb;
+                if cap_mb > 0 && meta.len() > cap_mb as u64 * 1024 * 1024 {
+                    return ToolOutput::err(format!(
+                        "read {}: image is {:.1} MB, over the {} MB cap \
+                         ([tools.read] max_image_mb)",
+                        path.display(),
+                        meta.len() as f64 / (1024.0 * 1024.0),
+                        cap_mb
+                    ));
+                }
+                let bytes = match std::fs::read(&path) {
+                    Ok(b) => b,
+                    Err(e) => return ToolOutput::err(format!("read {}: {e}", path.display())),
+                };
+                let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("image");
+                let kb = bytes.len().div_ceil(1024);
+                return ToolOutput {
+                    content: format!("[image {name} {kb}KB]\n"),
+                    is_error: false,
+                    spill: None,
+                    images: vec![ka_protocol::ImagePart {
+                        data: b64_encode(&bytes),
+                        media_type: media_type.to_string(),
+                    }],
+                };
+            }
 
             let text = match std::fs::read_to_string(&path) {
                 Ok(t) => t,
@@ -126,6 +158,50 @@ fn list_dir(path: &std::path::Path) -> ToolOutput {
     ToolOutput::ok(names.join("\n"))
 }
 
+/// Detect an image file by its leading magic bytes. Returns the IANA
+/// media type.
+fn sniff_image_type(path: &std::path::Path) -> Option<&'static str> {
+    let mut head = [0u8; 12];
+    let n = std::fs::File::open(path).ok()?.read(&mut head).ok()?;
+    let h = &head[..n];
+    if h.starts_with(&[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]) {
+        Some("image/png")
+    } else if h.starts_with(&[0xFF, 0xD8, 0xFF]) {
+        Some("image/jpeg")
+    } else if h.starts_with(b"GIF87a") || h.starts_with(b"GIF89a") {
+        Some("image/gif")
+    } else if h.len() >= 12 && h.starts_with(b"RIFF") && &h[8..12] == b"WEBP" {
+        Some("image/webp")
+    } else {
+        None
+    }
+}
+
+/// Minimal standard base64 encoder (keeps ka dependency-free).
+fn b64_encode(data: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
+    for chunk in data.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = *chunk.get(1).unwrap_or(&0) as u32;
+        let b2 = *chunk.get(2).unwrap_or(&0) as u32;
+        let n = (b0 << 16) | (b1 << 8) | b2;
+        out.push(TABLE[(n >> 18) as usize & 63] as char);
+        out.push(TABLE[(n >> 12) as usize & 63] as char);
+        out.push(if chunk.len() > 1 {
+            TABLE[(n >> 6) as usize & 63] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            TABLE[n as usize & 63] as char
+        } else {
+            '='
+        });
+    }
+    out
+}
+
 pub(crate) fn resolve(ctx: &HandContext, p: &str) -> PathBuf {
     let expanded = if let Some(rest) = p.strip_prefix("~/") {
         std::env::var("HOME")
@@ -160,6 +236,11 @@ mod tests {
             snapshots: Arc::new(parking_lot::Mutex::new(
                 crate::hands::snapshots::Snapshots::inert(),
             )),
+            jobs: std::sync::Arc::new(crate::hands::jobs::JobTable::new()),
+            bash_background_ms: 0,
+            max_image_mb: 5,
+            web_allow_private: false,
+            sandbox: ka_sandbox::Policy::Off,
         }
     }
 
@@ -203,6 +284,81 @@ mod tests {
         assert!(!out.is_error);
         assert!(out.content.contains("a.txt"));
         assert!(out.content.contains("sub/"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn read_returns_image_part_for_png() {
+        let dir = std::env::temp_dir().join(format!("ka-read-img-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // 1x1 transparent PNG
+        let png: &[u8] = &[
+            0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48,
+            0x44, 0x52,
+        ];
+        std::fs::write(dir.join("pic.png"), png).unwrap();
+        let ctx = ctx_for(&dir);
+        let out = ReadHand
+            .execute(&serde_json::json!({"path": "pic.png"}), &ctx)
+            .await;
+        assert!(!out.is_error, "{:?}", out.content);
+        assert_eq!(out.images.len(), 1);
+        assert_eq!(out.images[0].media_type, "image/png");
+        assert_eq!(out.images[0].data, b64_encode(png));
+        assert!(out.content.contains("[image pic.png"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn read_image_respects_max_image_mb() {
+        let dir = std::env::temp_dir().join(format!("ka-read-cap-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let jpeg: &[u8] = &[0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10];
+        std::fs::write(dir.join("big.jpg"), jpeg).unwrap();
+        let mut ctx = ctx_for(&dir);
+        ctx.max_image_mb = 0; // 0 = unlimited
+        let out = ReadHand
+            .execute(&serde_json::json!({"path": "big.jpg"}), &ctx)
+            .await;
+        assert!(!out.is_error);
+        assert_eq!(out.images[0].media_type, "image/jpeg");
+
+        // 1.1 MB file against a 1 MB cap
+        let mut big: Vec<u8> = vec![0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10];
+        big.resize(1100 * 1024, 0);
+        std::fs::write(dir.join("big.jpg"), &big).unwrap();
+        let mut ctx = ctx_for(&dir);
+        ctx.max_image_mb = 1;
+        let out = ReadHand
+            .execute(&serde_json::json!({"path": "big.jpg"}), &ctx)
+            .await;
+        assert!(out.is_error);
+        assert!(out.content.contains("max_image_mb"), "{}", out.content);
+        assert!(out.images.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn b64_encode_matches_known_vectors() {
+        assert_eq!(b64_encode(b""), "");
+        assert_eq!(b64_encode(b"f"), "Zg==");
+        assert_eq!(b64_encode(b"fo"), "Zm8=");
+        assert_eq!(b64_encode(b"foo"), "Zm9v");
+        assert_eq!(b64_encode(b"foob"), "Zm9vYg==");
+        assert_eq!(b64_encode(b"fooba"), "Zm9vYmE=");
+        assert_eq!(b64_encode(b"foobar"), "Zm9vYmFy");
+    }
+
+    #[test]
+    fn sniff_rejects_text_files() {
+        let dir = std::env::temp_dir().join(format!("ka-read-sniff-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("plain.txt");
+        std::fs::write(&p, "just text\n").unwrap();
+        assert_eq!(sniff_image_type(&p), None);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

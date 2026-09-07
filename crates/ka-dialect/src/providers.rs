@@ -4,11 +4,16 @@
 //! `provider/model` selector on a registered provider works without a
 //! catalog row.
 //!
-//! Curation (v1): direct OpenAI-compatible endpoints with static base
-//! URLs and plain env keys, Anthropic's native wire, Google's
-//! OpenAI-compatible bridge, and local runtimes. Excluded for now:
-//! Azure/Bedrock/Vertex (sigv4/Entra machinery), proxies (LiteLLM,
-//! Cloudflare), and JWT-only flows.
+//! Curation (v2): official providers first and FEW — Anthropic, OpenAI,
+//! Google, z.ai (API), z.ai (Coding Plan) — then community/alternative
+//! vendors, then local runtimes last. The z.ai family is merged: legacy
+//! `zhipu`/`zhipuai` selectors resolve to the z.ai provider (see
+//! [`find`]). The final display order for both providers and catalog
+//! models is defined by [`vendor_rank`]; surfaces sort by it and inherit
+//! the order with no per-surface policy.
+//!
+//! Excluded entirely: Azure/Bedrock/Vertex (sigv4/Entra machinery),
+//! JWT-only flows, and mirrors/duplicates of the official five.
 
 use crate::dialects::{Dialect, Wire};
 
@@ -27,16 +32,10 @@ pub struct Provider {
     pub note: &'static str,
 }
 
-/// The v1 registry.
+/// The v2 registry, in display order: official first, community next,
+/// local runtimes last (mirrored by [`vendor_rank`]).
 pub const PROVIDERS: &[Provider] = &[
-    // ── first-party ──────────────────────────────────────────────
-    Provider {
-        name: "openai",
-        wire: Wire::OpenaiChat,
-        base_url: "https://api.openai.com/v1",
-        key_env: Some("OPENAI_API_KEY"),
-        note: "GPT models",
-    },
+    // ── official (first and few) ────────────────────────────────
     Provider {
         name: "anthropic",
         wire: Wire::AnthropicMessages,
@@ -45,13 +44,41 @@ pub const PROVIDERS: &[Provider] = &[
         note: "Claude models",
     },
     Provider {
+        name: "openai",
+        wire: Wire::OpenaiChat,
+        base_url: "https://api.openai.com/v1",
+        key_env: Some("OPENAI_API_KEY"),
+        note: "GPT models",
+    },
+    Provider {
         name: "google",
         wire: Wire::OpenaiChat,
         base_url: "https://generativelanguage.googleapis.com/v1beta/openai",
         key_env: Some("GEMINI_API_KEY"),
         note: "Gemini via OpenAI-compatible bridge",
     },
-    // ── hosted inference ─────────────────────────────────────────
+    Provider {
+        name: "zai",
+        wire: Wire::OpenaiChat,
+        base_url: "https://api.z.ai/api/paas/v4",
+        key_env: Some("ZHIPU_API_KEY"),
+        note: "z.ai API — GLM models (absorbs the legacy zhipu entry)",
+    },
+    Provider {
+        name: "zai-plan",
+        wire: Wire::OpenaiChat,
+        base_url: "https://api.z.ai/api/coding/paas/v4",
+        key_env: Some("ZHIPU_API_KEY"),
+        note: "z.ai Coding Plan subscription endpoint",
+    },
+    // ── community / alternative ─────────────────────────────────
+    Provider {
+        name: "deepseek",
+        wire: Wire::OpenaiChat,
+        base_url: "https://api.deepseek.com",
+        key_env: Some("DEEPSEEK_API_KEY"),
+        note: "DeepSeek models",
+    },
     Provider {
         name: "mistral",
         wire: Wire::OpenaiChat,
@@ -72,13 +99,6 @@ pub const PROVIDERS: &[Provider] = &[
         base_url: "https://api.cerebras.ai/v1",
         key_env: Some("CEREBRAS_API_KEY"),
         note: "very fast Llama/Qwen inference",
-    },
-    Provider {
-        name: "deepseek",
-        wire: Wire::OpenaiChat,
-        base_url: "https://api.deepseek.com",
-        key_env: Some("DEEPSEEK_API_KEY"),
-        note: "DeepSeek models",
     },
     Provider {
         name: "qwen",
@@ -102,20 +122,12 @@ pub const PROVIDERS: &[Provider] = &[
         note: "Grok models",
     },
     Provider {
-        name: "zhipu",
-        wire: Wire::OpenaiChat,
-        base_url: "https://open.bigmodel.cn/api/paas/v4",
-        key_env: Some("ZHIPU_API_KEY"),
-        note: "GLM models",
-    },
-    Provider {
         name: "nvidia",
         wire: Wire::OpenaiChat,
         base_url: "https://integrate.api.nvidia.com/v1",
         key_env: Some("NVIDIA_API_KEY"),
         note: "NVIDIA AI Foundation models",
     },
-    // ── aggregators ──────────────────────────────────────────────
     Provider {
         name: "openrouter",
         wire: Wire::OpenaiChat,
@@ -137,7 +149,7 @@ pub const PROVIDERS: &[Provider] = &[
         key_env: Some("FIREWORKS_API_KEY"),
         note: "fast open-model inference",
     },
-    // ── local runtimes ───────────────────────────────────────────
+    // ── local runtimes (always last) ────────────────────────────
     Provider {
         name: "ollama",
         wire: Wire::OpenaiChat,
@@ -168,9 +180,36 @@ pub const PROVIDERS: &[Provider] = &[
     },
 ];
 
-/// Look a provider up by vendor prefix.
+/// Display tier for a vendor prefix — the stable ordering every catalog
+/// listing and the model picker sort by (ascending; ties fall back to
+/// the model id). Final order:
+///
+/// 1. official block — `anthropic` (0), `openai` (1), `google` (2),
+///    `zai` (3), `zai-plan`/`zai-coding-plan` (4)
+/// 2. community / alternative vendors (500)
+/// 3. local runtimes + discovered endpoints — `ollama`, `lmstudio`,
+///    `llamacpp`, `vllm` (900)
+pub fn vendor_rank(vendor: &str) -> u32 {
+    match vendor {
+        "anthropic" => 0,
+        "openai" => 1,
+        "google" => 2,
+        "zai" => 3,
+        "zai-plan" | "zai-coding-plan" => 4,
+        "ollama" | "lmstudio" | "llamacpp" | "vllm" => 900,
+        _ => 500,
+    }
+}
+
+/// Look a provider up by vendor prefix. Legacy z.ai aliases merge into
+/// the canonical `zai` entry so `zhipu/model` and `zhipuai/model`
+/// selectors keep synthesizing against the z.ai endpoint.
 pub fn find(vendor: &str) -> Option<&'static Provider> {
-    PROVIDERS.iter().find(|p| p.name == vendor)
+    let canonical = match vendor {
+        "zhipu" | "zhipuai" => "zai",
+        other => other,
+    };
+    PROVIDERS.iter().find(|p| p.name == canonical)
 }
 
 /// Synthesize a dialect for `provider/model` when the catalog has no row.
@@ -246,5 +285,60 @@ mod tests {
         for name in ["ollama", "lmstudio", "llamacpp", "vllm"] {
             assert!(find(name).unwrap().key_env.is_none());
         }
+    }
+
+    #[test]
+    fn official_block_comes_first_and_locals_last() {
+        let official: Vec<_> = PROVIDERS.iter().take(5).map(|p| p.name).collect();
+        assert_eq!(
+            official,
+            ["anthropic", "openai", "google", "zai", "zai-plan"]
+        );
+        let last = PROVIDERS.last().unwrap().name;
+        assert_eq!(last, "vllm");
+        for p in PROVIDERS.iter().skip(PROVIDERS.len() - 4) {
+            assert_eq!(vendor_rank(p.name), 900, "{} must be local-tier", p.name);
+        }
+        for name in ["anthropic", "openai", "google", "zai", "zai-plan"] {
+            assert!(vendor_rank(name) < 500, "{name} must be official-tier");
+        }
+    }
+
+    #[test]
+    fn zai_aliases_merge_into_canonical_provider() {
+        for legacy in ["zhipu", "zhipuai"] {
+            let p = find(legacy).unwrap();
+            assert_eq!(p.name, "zai", "{legacy} must resolve to zai");
+            assert_eq!(p.key_env, Some("ZHIPU_API_KEY"));
+        }
+    }
+
+    #[test]
+    fn vendor_rank_orders_catalog_listing() {
+        let mut ids = [
+            "zai-coding-plan/glm-4.7",
+            "ollama/qwen3",
+            "deepseek/deepseek-v3",
+            "anthropic/claude-sonnet-5",
+            "openai/gpt-5.1",
+            "zai/glm-4.7",
+            "google/gemini-3-pro",
+        ];
+        ids.sort_by_key(|id| {
+            let vendor = id.split('/').next().unwrap_or(id);
+            (vendor_rank(vendor), *id)
+        });
+        assert_eq!(
+            ids,
+            [
+                "anthropic/claude-sonnet-5",
+                "openai/gpt-5.1",
+                "google/gemini-3-pro",
+                "zai/glm-4.7",
+                "zai-coding-plan/glm-4.7",
+                "deepseek/deepseek-v3",
+                "ollama/qwen3",
+            ]
+        );
     }
 }

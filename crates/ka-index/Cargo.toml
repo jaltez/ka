@@ -1,0 +1,16 @@
+[package]
+name = "ka-index"
+description = "Full-text search over ka strands (SQLite FTS5, bundled)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+ka-strand = { workspace = true }
+rusqlite = { version = "0.32", features = ["bundled"] }
+serde_json = { workspace = true }
+
+[lints]
+workspace = true

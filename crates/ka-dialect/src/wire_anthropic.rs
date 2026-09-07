@@ -109,9 +109,51 @@ async fn speak_anthropic(
             .collect();
         body["tools"] = Value::Array(tools);
     }
+    if let Some(schema) = &req.schema {
+        let mut tools: Vec<Value> = body["tools"].as_array().cloned().unwrap_or_default();
+        tools.push(json!({
+            "name": "structured_output",
+            "description": "Reply with the final answer as JSON matching the given schema.",
+            "input_schema": schema,
+        }));
+        body["tools"] = Value::Array(tools);
+        body["tool_choice"] = json!({ "type": "tool", "name": "structured_output" });
+    }
+    // vision gate: images on the wire require an image-input dialect
+    let has_images = req
+        .messages
+        .iter()
+        .any(|m| !m.images.is_empty() || m.results.iter().any(|r| !r.images.is_empty()));
+    if has_images && !dialect.input.contains(&crate::dialects::Modality::Image) {
+        return Err(WireError {
+            class: ka_protocol::ErrorClass::Unsupported,
+            retryable: false,
+            message: format!("model {} has no vision", req.model_id),
+        });
+    }
+    let image_blocks = |images: &[crate::ImagePart]| -> Vec<Value> {
+        images
+            .iter()
+            .map(|img| {
+                json!({
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": img.media_type,
+                        "data": img.data,
+                    }
+                })
+            })
+            .collect()
+    };
     let mut messages = Vec::new();
     for m in &req.messages {
         match m.role {
+            crate::speaker::TurnRole::User if !m.images.is_empty() => {
+                let mut blocks = image_blocks(&m.images);
+                blocks.push(json!({"type": "text", "text": m.content}));
+                messages.push(json!({"role": "user", "content": blocks}));
+            }
             crate::speaker::TurnRole::User => {
                 messages.push(json!({"role": "user", "content": m.content}));
             }
@@ -138,12 +180,24 @@ async fn speak_anthropic(
                     .results
                     .iter()
                     .map(|r| {
-                        json!({
-                            "type": "tool_result",
-                            "tool_use_id": r.call_id,
-                            "content": r.content,
-                            "is_error": r.is_error,
-                        })
+                        if r.images.is_empty() {
+                            json!({
+                                "type": "tool_result",
+                                "tool_use_id": r.call_id,
+                                "content": r.content,
+                                "is_error": r.is_error,
+                            })
+                        } else {
+                            // native: tool_result content takes image blocks
+                            let mut parts = image_blocks(&r.images);
+                            parts.push(json!({"type": "text", "text": r.content}));
+                            json!({
+                                "type": "tool_result",
+                                "tool_use_id": r.call_id,
+                                "content": parts,
+                                "is_error": r.is_error,
+                            })
+                        }
                     })
                     .collect();
                 messages.push(json!({"role": "user", "content": blocks}));
@@ -276,13 +330,19 @@ async fn speak_anthropic(
                     if index < blocks.len() && blocks[index].kind == "tool_use" {
                         let b = &blocks[index];
                         if !b.tool.is_empty() {
-                            out.send(StreamEvent::Call(ToolCall {
-                                id: b.id.clone(),
-                                tool: b.tool.clone(),
-                                arguments: repair_json(&b.args),
-                            }))
-                            .await
-                            .ok();
+                            // a structured-output request surfaces the forced
+                            // tool's arguments as the reply text
+                            if b.tool == "structured_output" {
+                                out.send(StreamEvent::Text(b.args.clone())).await.ok();
+                            } else {
+                                out.send(StreamEvent::Call(ToolCall {
+                                    id: b.id.clone(),
+                                    tool: b.tool.clone(),
+                                    arguments: repair_json(&b.args),
+                                }))
+                                .await
+                                .ok();
+                            }
                         }
                     }
                 }

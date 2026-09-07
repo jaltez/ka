@@ -74,6 +74,9 @@ pub enum Record {
         version: u32,
         /// Repo state at creation, if inside a work tree.
         repo: Option<RepoSnapshot>,
+        /// Parent strand (forks); absent for fresh sessions.
+        #[serde(default)]
+        parent: Option<String>,
     },
     /// A conversation message (with tool calls/results when present).
     Message {
@@ -131,6 +134,30 @@ pub enum Record {
         /// Opaque payload.
         data: serde_json::Value,
     },
+    /// A stored title override (forks mark themselves this way; the
+    /// summary title comes from here instead of the first user message).
+    Title {
+        /// Record identifier.
+        id: RecordId,
+        /// The display title.
+        title: String,
+    },
+    /// Per-turn token/cost accounting, appended by the engine at each
+    /// TurnFinished. `list()` sums these into the summary fields.
+    Usage {
+        /// Record identifier.
+        id: RecordId,
+        /// Turn cost in USD (0.0 when unpriced/unknown).
+        cost: f64,
+        /// Input tokens.
+        input: u64,
+        /// Output tokens.
+        output: u64,
+        /// Cache-read tokens.
+        cache_read: u64,
+        /// Cache-write tokens.
+        cache_write: u64,
+    },
 }
 
 impl Record {
@@ -143,6 +170,8 @@ impl Record {
             | Record::Digest { id, .. }
             | Record::Boundary { id, .. }
             | Record::Rewind { id, .. }
+            | Record::Title { id, .. }
+            | Record::Usage { id, .. }
             | Record::Custom { id, .. } => Some(id),
         }
     }
@@ -252,6 +281,7 @@ impl StrandFile {
             cwd: cwd.to_string_lossy().into_owned(),
             version: 1,
             repo,
+            parent: None,
         };
         Ok(Self {
             path: None,
@@ -259,6 +289,13 @@ impl StrandFile {
             records: vec![header],
             settings: Settings::default(),
         })
+    }
+
+    /// Mark this strand as a fork of `parent` (tree navigation).
+    pub fn set_parent(&mut self, parent: &str) {
+        if let Some(Record::Header { parent: p, .. }) = self.records.first_mut() {
+            *p = Some(parent.to_string());
+        }
     }
 
     /// Materialize the strand file on first use: directory + header.
@@ -446,7 +483,7 @@ impl StrandWriter {
 }
 
 /// Summary of a strand for pickers.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct StrandSummary {
     /// File path.
     pub path: PathBuf,
@@ -454,15 +491,22 @@ pub struct StrandSummary {
     pub id: String,
     /// Creation timestamp.
     pub ts: String,
-    /// First user message (truncated) or "(empty)".
+    /// Stored title, first user message (truncated), or "(empty)".
     pub title: String,
     /// Message count.
     pub messages: usize,
+    /// Summed cost in USD across the strand's Usage records.
+    pub cost: f64,
+    /// Parent strand id when this strand is a fork.
+    pub parent: Option<String>,
+    /// Summed tokens (input + output + cache reads/writes) across the
+    /// strand's Usage records; 0 for strands without usage accounting.
+    pub tokens: u64,
 }
 
 /// List strands for a working directory, newest first. Scans cheaply:
-/// full parse for the header line only, a `"record":"message"` prefix
-/// test for counting, and one partial probe for the title — no
+/// full parse for the header line only, `"record":…` prefix tests for
+/// counting/summing, and one partial probe for the title — no
 /// per-record deserialization of calls/results.
 pub fn list(cwd: &Path) -> std::io::Result<Vec<StrandSummary>> {
     /// Just the fields a summary needs off a message line.
@@ -470,6 +514,29 @@ pub fn list(cwd: &Path) -> std::io::Result<Vec<StrandSummary>> {
     struct TitleProbe {
         role: Option<Role>,
         content: Option<String>,
+    }
+
+    /// Just the fields a summary needs off a usage line.
+    #[derive(serde::Deserialize)]
+    #[serde(default)]
+    struct UsageProbe {
+        cost: f64,
+        input: u64,
+        output: u64,
+        cache_read: u64,
+        cache_write: u64,
+    }
+
+    impl Default for UsageProbe {
+        fn default() -> Self {
+            Self {
+                cost: 0.0,
+                input: 0,
+                output: 0,
+                cache_read: 0,
+                cache_write: 0,
+            }
+        }
     }
 
     let dir = strand_dir(cwd);
@@ -492,11 +559,13 @@ pub fn list(cwd: &Path) -> std::io::Result<Vec<StrandSummary>> {
         let Some(Ok(first)) = lines.next() else {
             continue;
         };
-        let Ok(Record::Header { id, ts, .. }) = serde_json::from_str(&first) else {
+        let Ok(Record::Header { id, ts, parent, .. }) = serde_json::from_str(&first) else {
             continue;
         };
         let mut title = String::new();
         let mut messages = 0usize;
+        let mut cost = 0.0f64;
+        let mut tokens = 0u64;
         for line in lines.map_while(Result::ok) {
             if line.starts_with("{\"record\":\"message\"") {
                 messages += 1;
@@ -518,6 +587,16 @@ pub fn list(cwd: &Path) -> std::io::Result<Vec<StrandSummary>> {
                         }
                     }
                 }
+            } else if line.starts_with("{\"record\":\"title\"") {
+                // stored title (forks): wins over the first-user-message probe
+                if let Ok(Record::Title { title: t, .. }) = serde_json::from_str(&line) {
+                    title = t;
+                }
+            } else if line.starts_with("{\"record\":\"usage\"") {
+                if let Ok(probe) = serde_json::from_str::<UsageProbe>(&line) {
+                    cost += probe.cost;
+                    tokens += probe.input + probe.output + probe.cache_read + probe.cache_write;
+                }
             }
         }
         if title.is_empty() {
@@ -529,6 +608,9 @@ pub fn list(cwd: &Path) -> std::io::Result<Vec<StrandSummary>> {
             ts: ts.clone(),
             title,
             messages,
+            cost,
+            tokens,
+            parent,
         });
     }
     // ids embed millisecond timestamps (s{millis:x}), so they sort newer
@@ -543,7 +625,7 @@ pub fn latest(cwd: &Path) -> std::io::Result<Option<StrandSummary>> {
 }
 
 /// Outcome of resolving a user-supplied session reference.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum IdMatch {
     /// No strand matched.
     None,
@@ -569,6 +651,9 @@ pub fn resolve_id(cwd: &Path, needle: &str) -> std::io::Result<IdMatch> {
             ts: String::new(),
             title: String::new(),
             messages: 0,
+            cost: 0.0,
+            tokens: 0,
+            parent: None,
         }));
     }
     let mut matches: Vec<StrandSummary> = strands_filter(cwd, needle)?;
@@ -601,7 +686,43 @@ impl IdMatch {
     }
 }
 
-fn now_rfc3339() -> String {
+/// The display title for a strand's records: the stored [`Record::Title`]
+/// when present, else the first user message (truncated), else
+/// `"(empty)"`. Shared by [`list`] and the engine's fork path.
+pub fn title_of(records: &[Record]) -> String {
+    let mut title = String::new();
+    for record in records {
+        match record {
+            Record::Title { title: t, .. } => return t.clone(),
+            Record::Message {
+                role: Role::User,
+                content,
+                ..
+            } if title.is_empty() => {
+                let first_line = content
+                    .lines()
+                    .next()
+                    .unwrap_or("")
+                    .chars()
+                    .take(60)
+                    .collect::<String>();
+                if !first_line.is_empty() {
+                    title = first_line;
+                }
+            }
+            _ => {}
+        }
+    }
+    if title.is_empty() {
+        "(empty)".to_string()
+    } else {
+        title
+    }
+}
+
+/// Current time as RFC 3339 UTC (shared by strand headers and
+/// checkpoint labels).
+pub fn now_rfc3339() -> String {
     let secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -647,6 +768,35 @@ pub fn read(path: &Path) -> std::io::Result<Vec<Record>> {
         out.push(record);
     }
     Ok(out)
+}
+
+/// Render records as markdown — the exact shape the CLI's `ka export`
+/// writes to a file or stdout (shared with the TUI's `/export`).
+pub fn render_markdown(records: &[Record]) -> String {
+    let mut md = String::from("# ka session\n\n");
+    for r in records {
+        match r {
+            Record::Header { id, ts, .. } => {
+                md.push_str(&format!("> strand `{}` at {}\n\n", id.0, ts));
+            }
+            Record::Message { role, content, .. } => {
+                let who = match role {
+                    Role::User => "**you**",
+                    Role::Tool => "*tool*",
+                    _ => "**ka**",
+                };
+                if !content.trim().is_empty() {
+                    md.push_str(&format!("### {who}\n\n{}\n\n", content.trim()));
+                }
+            }
+            Record::Digest { summary, .. } => {
+                md.push_str(&format!("### *digest*\n\n> {}\n\n", summary.trim()));
+            }
+            Record::Rewind { .. } => md.push_str("### *rewound*\n\n"),
+            _ => {}
+        }
+    }
+    md
 }
 
 #[cfg(test)]
@@ -924,5 +1074,137 @@ mod tests {
         assert_ne!(a, b);
         assert!(a.0.starts_with('r'));
         assert!(new_strand_id().0.starts_with('s'));
+    }
+
+    #[test]
+    fn render_markdown_roundtrips_the_export_shape() {
+        let records = vec![
+            Record::Header {
+                id: StrandId("s1".into()),
+                ts: "2026-09-02T10:00:00Z".into(),
+                cwd: "/tmp/proj".into(),
+                version: 1,
+                repo: None,
+                parent: None,
+            },
+            Record::Message {
+                id: new_record_id(),
+                role: Role::User,
+                content: "hi\n there".into(),
+                calls: Vec::new(),
+                results: Vec::new(),
+            },
+            Record::Message {
+                id: new_record_id(),
+                role: Role::Assistant,
+                content: "**bold**".into(),
+                calls: Vec::new(),
+                results: Vec::new(),
+            },
+            Record::Digest {
+                id: new_record_id(),
+                summary: "compacted".into(),
+                kept_from: new_record_id(),
+            },
+            Record::Message {
+                id: new_record_id(),
+                role: Role::Tool,
+                content: "  ".into(),
+                calls: Vec::new(),
+                results: Vec::new(),
+            },
+        ];
+        let md = render_markdown(&records);
+        assert!(md.starts_with("# ka session\n\n"));
+        assert!(md.contains("> strand `s1` at 2026-09-02T10:00:00Z"));
+        assert!(md.contains("### **you**\n\nhi\n there"));
+        assert!(md.contains("### **ka**\n\n**bold**"));
+        assert!(md.contains("### *digest*\n\n> compacted"));
+        assert!(!md.contains("*tool*"), "blank tool content is skipped");
+    }
+
+    #[test]
+    fn usage_record_serde_roundtrip() {
+        let record = Record::Usage {
+            id: new_record_id(),
+            cost: 0.0125,
+            input: 1_234,
+            output: 567,
+            cache_read: 89,
+            cache_write: 12,
+        };
+        let line = serde_json::to_string(&record).unwrap();
+        assert!(line.starts_with("{\"record\":\"usage\""), "{line}");
+        let back: Record = serde_json::from_str(&line).unwrap();
+        assert_eq!(back, record);
+    }
+
+    #[test]
+    fn list_sums_usage_and_honors_title_override() {
+        let data = temp_data("usage-sum");
+        let cwd = data.join("proj");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let mut strand = StrandFile::create(&cwd, None).unwrap();
+        for (cost, input, output) in [(0.01, 100, 50), (0.02, 200, 80)] {
+            strand
+                .append(Record::Message {
+                    id: new_record_id(),
+                    role: Role::User,
+                    content: "question".into(),
+                    calls: Vec::new(),
+                    results: Vec::new(),
+                })
+                .unwrap();
+            strand
+                .append(Record::Usage {
+                    id: new_record_id(),
+                    cost,
+                    input,
+                    output,
+                    cache_read: 10,
+                    cache_write: 5,
+                })
+                .unwrap();
+        }
+        let path = strand.path().unwrap().to_path_buf();
+        drop(strand);
+
+        let summaries = list(&cwd).unwrap();
+        assert_eq!(summaries.len(), 1);
+        let s = &summaries[0];
+        assert_eq!(s.messages, 2);
+        assert!((s.cost - 0.03).abs() < 1e-9, "cost {}", s.cost);
+        assert_eq!(s.tokens, 100 + 50 + 10 + 5 + 200 + 80 + 10 + 5);
+
+        // title override (the fork marker) wins over the message probe
+        let mut titled = StrandFile::open(&path).unwrap();
+        titled
+            .append(Record::Title {
+                id: new_record_id(),
+                title: "question (fork)".into(),
+            })
+            .unwrap();
+        drop(titled);
+        let summaries = list(&cwd).unwrap();
+        assert_eq!(summaries[0].title, "question (fork)");
+    }
+
+    #[test]
+    fn summary_defaults_are_zero_without_usage_records() {
+        let data = temp_data("usage-zero");
+        let cwd = data.join("proj");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let mut strand = StrandFile::create(&cwd, None).unwrap();
+        strand
+            .append(Record::Message {
+                id: new_record_id(),
+                role: Role::User,
+                content: "plain".into(),
+                calls: Vec::new(),
+                results: Vec::new(),
+            })
+            .unwrap();
+        let s = list(&cwd).unwrap().remove(0);
+        assert_eq!((s.cost, s.tokens), (0.0, 0));
     }
 }

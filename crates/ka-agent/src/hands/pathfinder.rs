@@ -12,7 +12,7 @@ use serde_json::{Value, json};
 use tokio::sync::mpsc;
 
 use super::{Clearance, Hand, HandContext, HandDef, ToolOutput};
-use crate::voice::Voice;
+use crate::voice::{GuardRuntime, Voice};
 
 /// Shared bootstrap the engine injects after catalog/model resolution.
 #[derive(Default, Clone)]
@@ -108,6 +108,9 @@ impl Hand for PathfinderHand {
                         &evt_tx,
                         &mut interjections,
                         &mut deferrals,
+                        &mut GuardRuntime::default(),
+                        None,
+                        Vec::new(),
                     )
                     .await;
             });

@@ -18,10 +18,13 @@ pub mod edit;
 pub mod git;
 pub mod glob;
 pub mod grep;
+pub mod jobs;
 pub mod pathfinder;
 pub mod read;
 pub mod secrets;
 pub mod snapshots;
+pub mod todo;
+pub mod web;
 pub mod write;
 
 /// Execution clearance tiers.
@@ -44,6 +47,8 @@ pub struct ToolOutput {
     pub is_error: bool,
     /// Spill pointer if full output was parked on disk.
     pub spill: Option<String>,
+    /// Images produced by the tool (read hand on an image file).
+    pub images: Vec<ka_protocol::ImagePart>,
 }
 
 impl ToolOutput {
@@ -53,6 +58,7 @@ impl ToolOutput {
             content: content.into(),
             is_error: false,
             spill: None,
+            images: Vec::new(),
         }
     }
 
@@ -62,6 +68,7 @@ impl ToolOutput {
             content: content.into(),
             is_error: true,
             spill: None,
+            images: Vec::new(),
         }
     }
 }
@@ -86,6 +93,12 @@ pub trait Hand: Send + Sync {
     /// The definition (built per hand; registries are constructed once).
     fn def(&self) -> HandDef;
 
+    /// Clearance tier for THIS call. Defaults to the hand's static tier;
+    /// override for argument-dependent tiers (jobs: kill = exec).
+    fn clearance_for(&self, _args: &Value) -> Clearance {
+        self.def().clearance
+    }
+
     /// Execute with parsed arguments.
     fn execute<'a>(
         &'a self,
@@ -106,6 +119,17 @@ pub struct HandContext {
     pub spill: std::sync::Arc<Spill>,
     /// Shared pre-mutation snapshot journal (inert for readonly voices).
     pub snapshots: std::sync::Arc<parking_lot::Mutex<snapshots::Snapshots>>,
+    /// Shared table of auto-backgrounded bash jobs (bash hand registers,
+    /// the jobs hand lists/kills, the engine kills the rest at shutdown).
+    pub jobs: std::sync::Arc<jobs::JobTable>,
+    /// Bash auto-background threshold in ms (0 = never background).
+    pub bash_background_ms: u64,
+    /// Read-hand image size cap in MB (0 = unlimited).
+    pub max_image_mb: u32,
+    /// Web fetches may target private hosts ([tools.web]).
+    pub web_allow_private: bool,
+    /// Sandbox policy for bash children ([sandbox]).
+    pub sandbox: ka_sandbox::Policy,
 }
 
 /// The read ledger: files the model has read, with their stamps. Edits
@@ -196,6 +220,26 @@ impl Spill {
         Self { dir }
     }
 
+    /// Create an empty spill slot for streamed (backgrounded) output;
+    /// returns the file path and its `spill://<id>` pointer. The file is
+    /// created eagerly so tail reads never race creation.
+    pub fn slot(&self) -> std::io::Result<(PathBuf, String)> {
+        std::fs::create_dir_all(&self.dir)?;
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let id = format!(
+            "job-{}-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_millis())
+                .unwrap_or(0),
+            n
+        );
+        let path = self.dir.join(&id);
+        std::fs::write(&path, b"")?;
+        Ok((path, format!("spill://{id}")))
+    }
+
     /// Park `content`, returning its `spill://<id>` pointer.
     pub fn park(&self, content: &str) -> std::io::Result<String> {
         std::fs::create_dir_all(&self.dir)?;
@@ -212,31 +256,36 @@ impl Spill {
     }
 }
 
-/// The full registry wired for Phase 2.
-pub fn registry() -> Vec<Box<dyn Hand>> {
-    vec![
-        Box::new(read::ReadHand),
-        Box::new(edit::EditHand),
-        Box::new(write::WriteHand),
-        Box::new(bash::BashHand),
-        Box::new(glob::GlobHand),
-        Box::new(grep::GrepHand),
-        Box::new(pathfinder::PathfinderHand::new()),
-    ]
+/// The full registry wired for Phase 2: an internally-owned todo slot.
+pub fn registry() -> Vec<std::sync::Arc<dyn Hand>> {
+    registry_with_pathfinder(
+        std::sync::Arc::new(parking_lot::RwLock::new(
+            pathfinder::PathfinderSource::default(),
+        )),
+        todo::slot(),
+        std::sync::Arc::new(jobs::JobTable::new()),
+    )
 }
 
-/// Registry with an externally-owned pathfinder bootstrap slot (engine).
+/// Registry with externally-owned pathfinder bootstrap slot (engine) and
+/// todo slot (voice — it forwards the list as `Event::Todos`); `jobs` is
+/// the shared auto-backgrounded-job table the bash hand promotes into and
+/// the jobs hand serves.
 pub fn registry_with_pathfinder(
     slot: std::sync::Arc<parking_lot::RwLock<pathfinder::PathfinderSource>>,
-) -> Vec<Box<dyn Hand>> {
+    todos: todo::TodoSlot,
+    jobs: std::sync::Arc<jobs::JobTable>,
+) -> Vec<std::sync::Arc<dyn Hand>> {
     vec![
-        Box::new(read::ReadHand),
-        Box::new(edit::EditHand),
-        Box::new(write::WriteHand),
-        Box::new(bash::BashHand),
-        Box::new(glob::GlobHand),
-        Box::new(grep::GrepHand),
-        Box::new(pathfinder::PathfinderHand::from_slot(slot)),
+        std::sync::Arc::new(read::ReadHand),
+        std::sync::Arc::new(edit::EditHand),
+        std::sync::Arc::new(write::WriteHand),
+        std::sync::Arc::new(bash::BashHand),
+        std::sync::Arc::new(glob::GlobHand),
+        std::sync::Arc::new(grep::GrepHand),
+        std::sync::Arc::new(pathfinder::PathfinderHand::from_slot(slot)),
+        std::sync::Arc::new(todo::TodoHand::new(todos)),
+        std::sync::Arc::new(jobs::JobsHand::new(jobs)),
     ]
 }
 
@@ -272,6 +321,34 @@ mod tests {
         ledger.invalidate_all();
         assert!(ledger.is_empty());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn registries_carry_todo_and_grow_by_one() {
+        let base = [
+            "read",
+            "edit",
+            "write",
+            "bash",
+            "glob",
+            "grep",
+            "pathfinder",
+        ];
+        let with = registry_with_pathfinder(
+            std::sync::Arc::new(parking_lot::RwLock::new(
+                pathfinder::PathfinderSource::default(),
+            )),
+            todo::slot(),
+            std::sync::Arc::new(jobs::JobTable::new()),
+        );
+        let names: Vec<String> = with.iter().map(|h| h.def().name).collect();
+        assert_eq!(names.len(), base.len() + 2, "todo + jobs grow the registry");
+        assert!(names.iter().any(|n| n == "todo"), "names: {names:?}");
+        assert_eq!(registry().len(), with.len(), "both registries match");
+        let todo = with.iter().find(|h| h.def().name == "todo").unwrap();
+        let def = todo.def();
+        assert_eq!(def.clearance, Clearance::Read, "todo must auto-allow");
+        assert!(def.read_only);
     }
 
     #[test]

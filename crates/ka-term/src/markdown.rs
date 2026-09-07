@@ -1,8 +1,9 @@
-//! Markdown renderer for the TUI transcript, mirroring the Oh My Pi / pi
-//! design language: one accent color for headings, dim fence lines around
-//! syntax-colored code, quiet gutters for quotes, and pure font-modifier
-//! emphasis on default text. The only dependency beyond ratatui is
-//! unicode-width, already in the tree via ratatui.
+//! Markdown renderer for the TUI transcript. One accent color for
+//! headings, faint fence lines around syntax-colored code, quiet gutters
+//! for quotes, and pure font-modifier emphasis on cream text — all tuned
+//! to the complementary cream/charcoal palette in [`crate::palette`]. The only
+//! dependency beyond ratatui is unicode-width, already in the tree via
+//! ratatui.
 
 use crate::palette;
 use ratatui::style::{Modifier, Style};
@@ -105,7 +106,7 @@ pub fn render(text: &str, width: u16) -> Vec<TuiLine<'static>> {
         } else if trimmed.starts_with(">") {
             let q = trimmed.trim_start_matches('>').trim();
             out.push(TuiLine::from(vec![
-                Span::styled("▏ ", palette::BORDER),
+                Span::styled("▏ ", palette::BORDER_STYLE),
                 Span::styled(q.to_string(), palette::QUOTE),
             ]));
         } else if trimmed.starts_with("- ") || trimmed.starts_with("* ") {
@@ -132,7 +133,7 @@ pub fn render(text: &str, width: u16) -> Vec<TuiLine<'static>> {
         } else if trimmed == "---" || trimmed == "***" {
             out.push(TuiLine::styled(
                 "─".repeat(width.min(80) as usize),
-                palette::BORDER,
+                palette::BORDER_STYLE,
             ));
         } else if lines.get(i + 1).and_then(|n| setext_level(n)).is_some() {
             // setext `====` h1 (underlined, like ATX h1)
@@ -239,7 +240,7 @@ fn list_indent(line: &str, trimmed: &str) -> String {
 /// `- [ ]` / `- [x]` task boxes.
 fn task_marker(rest: &str) -> Option<(Span<'static>, &str)> {
     if let Some(r) = rest.strip_prefix("[ ] ") {
-        Some((Span::styled("☐ ", Style::new().fg(palette::MUTED)), r))
+        Some((Span::styled("☐ ", Style::new().fg(palette::META)), r))
     } else if let Some(r) = rest
         .strip_prefix("[x] ")
         .or_else(|| rest.strip_prefix("[X] "))
@@ -353,6 +354,7 @@ fn render_table(
             header_w.max(body_w).max(1)
         })
         .collect();
+
     let available = width as usize - overhead;
     while widths.iter().sum::<usize>() > available {
         let (mi, mw) = widths
@@ -367,7 +369,15 @@ fn render_table(
     }
 
     let mut lines: Vec<TuiLine<'static>> = Vec::new();
-    let edge = Span::styled("│", palette::BORDER);
+    let edge = Span::styled("│", palette::BORDER_STYLE);
+
+    // top rule
+    let mut top = String::from("┌");
+    for (c, w) in widths.iter().enumerate() {
+        top.push_str(&"─".repeat(w + 2));
+        top.push(if c + 1 == cols { '┐' } else { '┬' });
+    }
+    lines.push(TuiLine::styled(top, palette::BORDER_STYLE));
 
     // header row: bold, default text color
     let mut spans = vec![edge.clone()];
@@ -390,7 +400,7 @@ fn render_table(
         }
         spans.push(Span::styled(" ", Style::default()));
         if c + 1 < cols {
-            spans.push(Span::styled("│", palette::BORDER));
+            spans.push(Span::styled("│", palette::BORDER_STYLE));
         }
     }
     spans.push(edge.clone());
@@ -402,7 +412,7 @@ fn render_table(
         sep.push_str(&"─".repeat(w + 2));
         sep.push(if c + 1 == cols { '┤' } else { '┼' });
     }
-    lines.push(TuiLine::styled(sep, palette::BORDER));
+    lines.push(TuiLine::styled(sep, palette::BORDER_STYLE));
 
     // body rows (inline markdown intact inside cells)
     for row in body {
@@ -418,12 +428,19 @@ fn render_table(
             }
             spans.push(Span::styled(" ", Style::default()));
             if c + 1 < cols {
-                spans.push(Span::styled("│", palette::BORDER));
+                spans.push(Span::styled("│", palette::BORDER_STYLE));
             }
         }
         spans.push(edge.clone());
         lines.push(TuiLine::from(spans));
     }
+    // bottom rule
+    let mut bottom = String::from("└");
+    for (c, w) in widths.iter().enumerate() {
+        bottom.push_str(&"─".repeat(w + 2));
+        bottom.push(if c + 1 == cols { '┘' } else { '┴' });
+    }
+    lines.push(TuiLine::styled(bottom, palette::BORDER_STYLE));
     lines.push(TuiLine::default());
     Some(lines)
 }
@@ -500,11 +517,11 @@ pub fn inline_spans(s: &str) -> Vec<Span<'static>> {
                 flush(&mut plain, &mut spans);
                 spans.push(Span::styled(
                     format!("🖼 {alt}"),
-                    Style::new().fg(palette::DIM),
+                    Style::new().fg(palette::FAINT),
                 ));
                 spans.push(Span::styled(
                     format!(" ({url})"),
-                    Style::new().fg(palette::DIM),
+                    Style::new().fg(palette::FAINT),
                 ));
                 i = next_i;
                 continue;
@@ -517,12 +534,12 @@ pub fn inline_spans(s: &str) -> Vec<Span<'static>> {
                 spans.push(Span::styled(
                     text,
                     Style::new()
-                        .fg(palette::CYAN)
+                        .fg(palette::TOOL)
                         .add_modifier(Modifier::UNDERLINED),
                 ));
                 spans.push(Span::styled(
                     format!(" ({url})"),
-                    Style::new().fg(palette::DIM),
+                    Style::new().fg(palette::FAINT),
                 ));
                 i = next_i;
                 continue;
@@ -532,11 +549,17 @@ pub fn inline_spans(s: &str) -> Vec<Span<'static>> {
         if c == '~' && chars.get(i + 1) == Some(&'~') {
             if let Some(end) = find_double(&chars, i + 2, '~') {
                 flush(&mut plain, &mut spans);
-                let struck: String = chars[i + 2..end].iter().collect();
-                spans.push(Span::styled(
-                    struck,
-                    Style::default().add_modifier(Modifier::CROSSED_OUT),
-                ));
+                let struck: String = chars[i + 2..end]
+                    .iter()
+                    .collect::<String>()
+                    .trim()
+                    .to_string();
+                if !struck.is_empty() {
+                    spans.push(Span::styled(
+                        struck,
+                        Style::default().add_modifier(Modifier::CROSSED_OUT),
+                    ));
+                }
                 i = end + 2;
                 continue;
             }
@@ -544,11 +567,14 @@ pub fn inline_spans(s: &str) -> Vec<Span<'static>> {
         if c == '`' {
             if let Some(end) = chars[i + 1..].iter().position(|&x| x == '`') {
                 flush(&mut plain, &mut spans);
-                let code: String = chars[i + 1..i + 1 + end].iter().collect();
-                spans.push(Span::styled(
-                    format!(" {code} "),
-                    Style::new().fg(palette::CODE_INLINE),
-                ));
+                let code: String = chars[i + 1..i + 1 + end]
+                    .iter()
+                    .collect::<String>()
+                    .trim()
+                    .to_string();
+                if !code.is_empty() {
+                    spans.push(Span::styled(code, Style::new().fg(palette::CODE_INLINE)));
+                }
                 i += end + 2;
                 continue;
             }
@@ -556,11 +582,17 @@ pub fn inline_spans(s: &str) -> Vec<Span<'static>> {
         if c == '*' && i + 1 < chars.len() && chars[i + 1] == '*' {
             if let Some(end) = find_double(&chars, i + 2, '*') {
                 flush(&mut plain, &mut spans);
-                let bold: String = chars[i + 2..end].iter().collect();
-                spans.push(Span::styled(
-                    bold,
-                    Style::default().add_modifier(Modifier::BOLD),
-                ));
+                let bold: String = chars[i + 2..end]
+                    .iter()
+                    .collect::<String>()
+                    .trim()
+                    .to_string();
+                if !bold.is_empty() {
+                    spans.push(Span::styled(
+                        bold,
+                        Style::default().add_modifier(Modifier::BOLD),
+                    ));
+                }
                 i = end + 2;
                 continue;
             }
@@ -568,11 +600,17 @@ pub fn inline_spans(s: &str) -> Vec<Span<'static>> {
         if c == '*' && i + 1 < chars.len() && chars[i + 1] != ' ' {
             if let Some(end) = chars[i + 1..].iter().position(|&x| x == '*') {
                 flush(&mut plain, &mut spans);
-                let italic: String = chars[i + 1..i + 1 + end].iter().collect();
-                spans.push(Span::styled(
-                    italic,
-                    Style::default().add_modifier(Modifier::ITALIC),
-                ));
+                let italic: String = chars[i + 1..i + 1 + end]
+                    .iter()
+                    .collect::<String>()
+                    .trim()
+                    .to_string();
+                if !italic.is_empty() {
+                    spans.push(Span::styled(
+                        italic,
+                        Style::default().add_modifier(Modifier::ITALIC),
+                    ));
+                }
                 i += end + 2;
                 continue;
             }
@@ -603,28 +641,48 @@ fn parse_link(chars: &[char], start: usize) -> Option<(String, String, usize)> {
         return None;
     }
     let close_url = chars[close_text + 2..].iter().position(|&c| c == ')')? + close_text + 2;
-    let text: String = chars[start + 1..close_text].iter().collect();
-    let url: String = chars[close_text + 2..close_url].iter().collect();
+    let text: String = chars[start + 1..close_text]
+        .iter()
+        .collect::<String>()
+        .trim()
+        .to_string();
+    let url: String = chars[close_text + 2..close_url]
+        .iter()
+        .collect::<String>()
+        .trim()
+        .to_string();
     if text.is_empty() || url.is_empty() {
         return None;
     }
     Some((text, url, close_url + 1))
 }
 
-/// Code block: dim ` ``` ` fence lines around syntax-colored body
-/// (OMP `codeBlockBorder` + `codeBlock`). No backgrounds.
+/// Code block: faint ` ``` ` fence lines around syntax-colored code, which
+/// rides the assistant card surface (BG_OUTPUT).
+///
+/// Fences tagged with a known language go through [`CodeHighlighter`],
+/// which tracks block comments across lines within this block; every
+/// other fence keeps the line-local generic `highlight`. Style roles for
+/// both paths come from the palette's syntax ramp (consistent across all
+/// code surfaces): comments → SYNTAX_COMMENT, strings → SYNTAX_STRING,
+/// keywords → SYNTAX_KEYWORD, numbers → SYNTAX_NUMBER, everything else
+/// stays CODE_BLOCK.
 fn push_code_block(out: &mut Vec<TuiLine<'static>>, lines: &[String], lang: &str) {
     if lines.is_empty() {
         return;
     }
     out.push(TuiLine::styled(
         format!("```{lang}"),
-        Style::new().fg(palette::BORDER_DIM),
+        Style::new().fg(palette::FAINT),
     ));
+    let mut hl = code_lang(lang).map(CodeHighlighter::new);
     for line in lines {
-        out.push(TuiLine::from(highlight(line)));
+        out.push(TuiLine::from(match &mut hl {
+            Some(h) => h.line(line),
+            None => highlight(line),
+        }));
     }
-    out.push(TuiLine::styled("```", Style::new().fg(palette::BORDER_DIM)));
+    out.push(TuiLine::styled("```", Style::new().fg(palette::FAINT)));
     out.push(TuiLine::default());
 }
 
@@ -728,6 +786,260 @@ fn highlight_plain(chunk: &str, base: Style, spans: &mut Vec<Span<'static>>) {
     }
 }
 
+/// Fence-tag languages the per-language highlighter understands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CodeLang {
+    Rust,
+    Python,
+    Js,
+    Json,
+    Toml,
+    Shell,
+}
+
+/// Map a (lowercased) fence tag to a highlightable language.
+fn code_lang(tag: &str) -> Option<CodeLang> {
+    match tag {
+        "rust" | "rs" => Some(CodeLang::Rust),
+        "python" | "py" => Some(CodeLang::Python),
+        "js" | "ts" | "javascript" | "typescript" | "jsx" | "tsx" => Some(CodeLang::Js),
+        "json" | "jsonc" => Some(CodeLang::Json),
+        "toml" => Some(CodeLang::Toml),
+        "bash" | "sh" | "shell" | "zsh" => Some(CodeLang::Shell),
+        _ => None,
+    }
+}
+
+impl CodeLang {
+    /// `(line-comment marker, block comments exist)`.
+    fn comments(self) -> (Option<&'static str>, bool) {
+        match self {
+            CodeLang::Rust | CodeLang::Js => (Some("//"), true),
+            CodeLang::Json => (Some("//"), false),
+            CodeLang::Python | CodeLang::Toml | CodeLang::Shell => (Some("#"), false),
+        }
+    }
+
+    fn keywords(self) -> &'static [&'static str] {
+        match self {
+            CodeLang::Rust => RUST_KW,
+            CodeLang::Python => PYTHON_KW,
+            CodeLang::Js => JS_KW,
+            CodeLang::Json => JSON_KW,
+            CodeLang::Toml => TOML_KW,
+            CodeLang::Shell => SHELL_KW,
+        }
+    }
+}
+
+const RUST_KW: &[&str] = &[
+    "as", "async", "await", "break", "const", "continue", "crate", "dyn", "else", "enum", "extern",
+    "false", "fn", "for", "if", "impl", "in", "let", "loop", "match", "mod", "move", "mut", "pub",
+    "ref", "return", "self", "Self", "static", "struct", "super", "trait", "true", "type",
+    "unsafe", "use", "where", "while",
+];
+
+const PYTHON_KW: &[&str] = &[
+    "and", "as", "assert", "async", "await", "break", "class", "continue", "def", "del", "elif",
+    "else", "except", "False", "finally", "for", "from", "global", "if", "import", "in", "is",
+    "lambda", "None", "nonlocal", "not", "or", "pass", "raise", "return", "True", "try", "while",
+    "with", "yield",
+];
+
+const JS_KW: &[&str] = &[
+    "async",
+    "await",
+    "break",
+    "case",
+    "catch",
+    "class",
+    "const",
+    "continue",
+    "default",
+    "delete",
+    "do",
+    "else",
+    "export",
+    "extends",
+    "false",
+    "finally",
+    "for",
+    "function",
+    "if",
+    "import",
+    "in",
+    "instanceof",
+    "let",
+    "new",
+    "null",
+    "of",
+    "return",
+    "static",
+    "super",
+    "switch",
+    "this",
+    "throw",
+    "true",
+    "try",
+    "typeof",
+    "undefined",
+    "var",
+    "void",
+    "while",
+    "yield",
+];
+
+const JSON_KW: &[&str] = &["false", "null", "true"];
+
+const TOML_KW: &[&str] = &["false", "inf", "nan", "true"];
+
+const SHELL_KW: &[&str] = &[
+    "break", "case", "continue", "coproc", "do", "done", "elif", "else", "esac", "exit", "export",
+    "fi", "for", "function", "if", "in", "local", "return", "select", "set", "then", "time",
+    "trap", "until", "while",
+];
+
+/// Zero-dependency per-language tokenizer for fenced code. State:
+/// `/* */` block comments carry across lines WITHIN one fence; strings
+/// are line-scoped, so an unterminated quote colors to end of line and
+/// never leaks past the fence (the highlighter is dropped with the
+/// block). Apostrophes glued to a word (`don't`, `'a`) never open a
+/// string.
+struct CodeHighlighter {
+    lang: CodeLang,
+    /// Nesting depth of an open `/* */` comment (0 = not in one).
+    block_depth: usize,
+}
+
+impl CodeHighlighter {
+    fn new(lang: CodeLang) -> Self {
+        Self {
+            lang,
+            block_depth: 0,
+        }
+    }
+
+    /// Tokenize one source line into styled spans, carrying block-comment
+    /// state across calls.
+    fn line(&mut self, src: &str) -> Vec<Span<'static>> {
+        let base = Style::new().fg(palette::CODE_BLOCK);
+        let comment = Style::new().fg(palette::SYNTAX_COMMENT);
+        let string = Style::new().fg(palette::SYNTAX_STRING);
+        let number = Style::new().fg(palette::SYNTAX_NUMBER);
+        let keyword = Style::new().fg(palette::SYNTAX_KEYWORD);
+        if src.trim().is_empty() {
+            return vec![Span::styled(String::new(), base)];
+        }
+        let (line_cmt, block_cmt) = self.lang.comments();
+        let keywords = self.lang.keywords();
+        let chars: Vec<char> = src.chars().collect();
+        let mut out: Vec<(char, Style)> = Vec::with_capacity(chars.len());
+        let mut i = 0;
+        while i < chars.len() {
+            // inside a block comment: scan for the (nesting-aware) close
+            if self.block_depth > 0 {
+                let start = i;
+                while i < chars.len() {
+                    if chars[i] == '*' && chars.get(i + 1) == Some(&'/') {
+                        i += 2;
+                        self.block_depth -= 1;
+                        if self.block_depth == 0 {
+                            break;
+                        }
+                    } else if chars[i] == '/' && chars.get(i + 1) == Some(&'*') {
+                        i += 2;
+                        self.block_depth += 1;
+                    } else {
+                        i += 1;
+                    }
+                }
+                if self.block_depth > 0 {
+                    i = chars.len(); // still open at end of line
+                }
+                for &c in &chars[start..i] {
+                    out.push((c, comment));
+                }
+                continue;
+            }
+            let c = chars[i];
+            // line comment: everything to end of line
+            if line_cmt.is_some_and(|m| marker_at(&chars, i, m)) {
+                for &c in &chars[i..] {
+                    out.push((c, comment));
+                }
+                break;
+            }
+            // block comment opener
+            if block_cmt && c == '/' && chars.get(i + 1) == Some(&'*') {
+                self.block_depth = 1;
+                i += 2;
+                continue;
+            }
+            // string literal: closing quote on the same line, `\` escapes;
+            // an unterminated string colors the rest of the line
+            if matches!(c, '"' | '\'' | '`')
+                && !(c == '\'' && i > 0 && (chars[i - 1].is_alphanumeric() || chars[i - 1] == '_'))
+            {
+                let start = i;
+                i += 1;
+                while i < chars.len() && chars[i] != c {
+                    if chars[i] == '\\' {
+                        i += 1;
+                    }
+                    i += 1;
+                }
+                if i < chars.len() {
+                    i += 1; // the closing quote
+                }
+                for &ch in &chars[start..i.min(chars.len())] {
+                    out.push((ch, string));
+                }
+                continue;
+            }
+            // identifier / keyword
+            if c.is_alphabetic() || c == '_' {
+                let start = i;
+                while i < chars.len() && (chars[i].is_alphanumeric() || chars[i] == '_') {
+                    i += 1;
+                }
+                let word: String = chars[start..i].iter().collect();
+                let style = if keywords.contains(&word.as_str()) {
+                    keyword
+                } else {
+                    base
+                };
+                for ch in word.chars() {
+                    out.push((ch, style));
+                }
+                continue;
+            }
+            // number: digit-led run (0x1F, 3.14, 1_000, 1e5)
+            if c.is_ascii_digit() {
+                let start = i;
+                while i < chars.len()
+                    && (chars[i].is_ascii_alphanumeric() || chars[i] == '.' || chars[i] == '_')
+                {
+                    i += 1;
+                }
+                for &ch in &chars[start..i] {
+                    out.push((ch, number));
+                }
+                continue;
+            }
+            out.push((c, base));
+            i += 1;
+        }
+        spans_from_chars(out)
+    }
+}
+
+/// Whether the char slice has `marker` at position `i`.
+fn marker_at(chars: &[char], i: usize, marker: &str) -> bool {
+    marker
+        .chars()
+        .enumerate()
+        .all(|(k, mc)| chars.get(i + k) == Some(&mc))
+}
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
@@ -747,7 +1059,7 @@ mod tests {
     }
 
     #[test]
-    fn headings_follow_omp_hierarchy() {
+    fn headings_share_one_accent() {
         let lines = render("# Top\n## Mid\n### Deep\n#### Deepest\n", 80);
         assert!(
             format!("{:?}", lines[0]).contains("underlined()"),
@@ -763,7 +1075,32 @@ mod tests {
         assert!(!joined.contains('═'), "no rules: {joined}");
         assert!(!joined.contains('▍'), "no markers: {joined}");
         // single heading color everywhere
-        assert!(joined.contains("Rgb(254, 188, 56)"));
+        assert!(joined.contains(&format!("{:?}", palette::ACCENT)));
+    }
+
+    #[test]
+    fn formatted_tokens_keep_single_adjacent_spaces() {
+        // inline code and emphasis carry no padding of their own: the
+        // source's surrounding spaces are the only ones rendered (one
+        // space in, one out, never doubled)
+        for (src, want) in [
+            (
+                "run `cargo build` for **release** builds",
+                "run cargo build for release builds",
+            ),
+            (
+                "**bold** and *italic* and `code`",
+                "bold and italic and code",
+            ),
+            ("a **bold** b", "a bold b"),
+            ("see [docs](http://x.io) now", "see docs (http://x.io) now"),
+            ("** spaced ** and ~~ struck ~~", "spaced and struck"),
+            ("x **bold** y", "x bold y"),
+        ] {
+            let spans = inline_spans(src);
+            let joined: String = spans.iter().map(|s| s.content.to_string()).collect();
+            assert_eq!(joined, want, "src: {src}");
+        }
     }
 
     #[test]
@@ -774,15 +1111,15 @@ mod tests {
         assert_eq!(line_text(&lines[0]), "```rust", "literal fence kept");
         let rendered = format!("{:?}", lines);
         assert!(
-            rendered.contains("Rgb(206, 145, 120)"),
+            rendered.contains(&format!("{:?}", palette::OK)),
             "string: {rendered}"
         );
         assert!(
-            rendered.contains("Rgb(86, 156, 214)"),
+            rendered.contains(&format!("{:?}", palette::ACCENT)),
             "keyword: {rendered}"
         );
         assert!(
-            rendered.contains("Rgb(106, 153, 85)"),
+            rendered.contains(&format!("{:?}", palette::META)),
             "comment: {rendered}"
         );
     }
@@ -793,8 +1130,8 @@ mod tests {
         let joined = format!("{spans:?}");
         assert!(joined.contains("cargo build"), "{joined}");
         assert!(
-            joined.contains("Rgb(229, 193, 255)"),
-            "violet code: {joined}"
+            joined.contains(&format!("{:?}", palette::CODE_INLINE)),
+            "inline code tint: {joined}"
         );
         assert!(joined.contains("bold()"), "{joined}");
     }
@@ -819,9 +1156,18 @@ mod tests {
     fn highlight_numbers_and_keywords() {
         let spans = highlight("let count = 42; // note");
         let joined = format!("{spans:?}");
-        assert!(joined.contains("Rgb(86, 156, 214)"), "keyword: {joined}");
-        assert!(joined.contains("Rgb(181, 206, 168)"), "number: {joined}");
-        assert!(joined.contains("Rgb(106, 153, 85)"), "comment: {joined}");
+        assert!(
+            joined.contains(&format!("{:?}", palette::ACCENT)),
+            "keyword: {joined}"
+        );
+        assert!(
+            joined.contains(&format!("{:?}", palette::WARN)),
+            "number: {joined}"
+        );
+        assert!(
+            joined.contains(&format!("{:?}", palette::META)),
+            "comment: {joined}"
+        );
     }
 
     #[test]
@@ -829,13 +1175,13 @@ mod tests {
         let spans = highlight("greet(\"hi\"); // don't panic");
         let joined = format!("{spans:?}");
         assert!(
-            joined.contains("Rgb(206, 145, 120)"),
+            joined.contains(&format!("{:?}", palette::OK)),
             "real string colored: {joined}"
         );
         // an unclosed quote must not color the rest of the line
         let spans = highlight("let s = 'abc;");
         assert!(
-            !format!("{spans:?}").contains("Rgb(206, 145, 120)"),
+            !format!("{spans:?}").contains(&format!("{:?}", palette::OK)),
             "no phantom string"
         );
     }
@@ -849,15 +1195,17 @@ mod tests {
             .map(|l| l.spans.iter().map(|s| s.content.to_string()).collect())
             .collect();
         assert!(
-            texts[0].contains("Name") && texts[0].contains("Qty"),
+            texts[1].contains("Name") && texts[1].contains("Qty"),
             "{texts:?}"
         );
         assert!(
-            texts[0].starts_with('│') && texts[0].ends_with('│'),
+            texts[1].starts_with('│') && texts[1].ends_with('│'),
             "{:?}",
-            texts[0]
+            texts[1]
         );
-        assert!(texts[1].contains('┼') && texts[1].contains('├') && texts[1].contains('┤'));
+        assert!(texts[0].starts_with('┌') && texts[0].ends_with('┐') && texts[0].contains('┬'));
+        assert!(texts[2].contains('┼') && texts[2].contains('├') && texts[2].contains('┤'));
+        assert!(texts[5].starts_with('└') && texts[5].ends_with('┘'));
         assert!(texts.iter().any(|t| t.contains("alpha")));
         assert!(texts.iter().any(|t| t.contains("12")));
         for t in &texts {
@@ -885,6 +1233,23 @@ mod tests {
             .collect();
         assert!(bar_cols.len() >= 3, "{bar_cols:?}");
         assert!(bar_cols.windows(2).all(|w| w[0] == w[1]), "{bar_cols:?}");
+    }
+
+    #[test]
+    fn table_has_top_and_bottom_rules() {
+        let md = "| a | b |\n|---|---|\n| 1 | 2 |\n";
+        let lines = render(md, 40);
+        let texts: Vec<String> = lines
+            .iter()
+            .map(|l| l.spans.iter().map(|s| s.content.to_string()).collect())
+            .collect();
+        assert_eq!(texts.len(), 6, "{texts:?}");
+        assert_eq!(texts[0], "┌───┬───┐");
+        assert_eq!(texts[1], "│ a │ b │");
+        assert_eq!(texts[2], "├───┼───┤");
+        assert_eq!(texts[3], "│ 1 │ 2 │");
+        assert_eq!(texts[4], "└───┴───┘");
+        assert_eq!(texts[5], "");
     }
 
     #[test]
@@ -926,7 +1291,10 @@ mod tests {
         assert!(joined.contains("docs"), "{joined}");
         assert!(joined.contains("http://x.io"), "{joined}");
         assert!(joined.contains("underlined()"), "{joined}");
-        assert!(joined.contains("Rgb(0, 136, 250)"), "link blue: {joined}");
+        assert!(
+            joined.contains(&format!("{:?}", palette::TOOL)),
+            "link steel: {joined}"
+        );
     }
 
     #[test]
@@ -997,11 +1365,11 @@ mod tests {
     }
 
     #[test]
-    fn bullets_use_accent_amber() {
+    fn bullets_use_accent_butter() {
         let lines = render("- item\n", 80);
         assert!(
-            format!("{lines:?}").contains("Rgb(254, 188, 56)"),
-            "amber bullet"
+            format!("{lines:?}").contains(&format!("{:?}", palette::ACCENT)),
+            "butter bullet"
         );
     }
 
@@ -1045,8 +1413,155 @@ mod tests {
         assert!(text.starts_with("▏ "), "{text}");
         assert!(format!("{:?}", lines[0]).contains("italic()"));
         assert!(
-            format!("{:?}", lines[0]).contains("Rgb(119, 125, 136)"),
+            format!("{:?}", lines[0]).contains(&format!("{:?}", palette::META)),
             "muted gray"
+        );
+    }
+    #[test]
+    fn rust_fence_uses_the_language_tokenizer() {
+        let mut out: Vec<TuiLine> = Vec::new();
+        push_code_block(
+            &mut out,
+            &["let x = 42; // note".to_string(), "fn f() {}".to_string()],
+            "rust",
+        );
+        let joined = format!("{out:?}");
+        assert!(
+            joined.contains(&format!("{:?}", palette::ACCENT)),
+            "keyword: {joined}"
+        );
+        assert!(
+            joined.contains(&format!("{:?}", palette::WARN)),
+            "number: {joined}"
+        );
+        assert!(
+            joined.contains(&format!("{:?}", palette::META)),
+            "comment: {joined}"
+        );
+    }
+
+    #[test]
+    fn json_and_toml_fences_highlight_basics() {
+        let mut out: Vec<TuiLine> = Vec::new();
+        push_code_block(&mut out, &[r#"{"k": true, "n": 1}"#.to_string()], "json");
+        let joined = format!("{out:?}");
+        assert!(
+            joined.contains(&format!("{:?}", palette::OK)),
+            "json string: {joined}"
+        );
+        assert!(
+            joined.contains(&format!("{:?}", palette::ACCENT)),
+            "true keyword: {joined}"
+        );
+        assert!(
+            joined.contains(&format!("{:?}", palette::WARN)),
+            "json number: {joined}"
+        );
+
+        let mut out: Vec<TuiLine> = Vec::new();
+        push_code_block(&mut out, &["rate = 0.5 # capped".to_string()], "toml");
+        let joined = format!("{out:?}");
+        assert!(
+            joined.contains(&format!("{:?}", palette::WARN)),
+            "toml number: {joined}"
+        );
+        assert!(
+            joined.contains(&format!("{:?}", palette::META)),
+            "toml comment: {joined}"
+        );
+
+        let mut out: Vec<TuiLine> = Vec::new();
+        push_code_block(&mut out, &["for f in *.md; do echo $f; done".into()], "sh");
+        let joined = format!("{out:?}");
+        assert!(
+            joined.matches(&format!("{:?}", palette::ACCENT)).count() >= 3,
+            "shell keywords (for/in/do/done): {joined}"
+        );
+    }
+
+    #[test]
+    fn block_comments_carry_across_lines_and_strings_do_not_leak() {
+        // the comment swallows line one and the head of line two; the
+        // tokens after `*/` come back
+        let mut out: Vec<TuiLine> = Vec::new();
+        push_code_block(
+            &mut out,
+            &[
+                "/* start of".to_string(),
+                "still comment */ let x = 1;".to_string(),
+            ],
+            "rust",
+        );
+        let second = &out[2];
+        let text: String = second.spans.iter().map(|s| s.content.to_string()).collect();
+        assert_eq!(text, "still comment */ let x = 1;");
+        assert!(
+            format!("{second:?}").contains(&format!("{:?}", palette::ACCENT)),
+            "let styled after the close: {second:?}"
+        );
+
+        // unterminated string: rest of line colored, next line unaffected
+        let mut out: Vec<TuiLine> = Vec::new();
+        push_code_block(
+            &mut out,
+            &["let s = \"oops".to_string(), "fn after() {}".to_string()],
+            "rust",
+        );
+        assert!(
+            format!("{:?}", out[2]).contains(&format!("{:?}", palette::ACCENT)),
+            "next line keywords styled: {:?}",
+            out[2]
+        );
+
+        // unterminated block comment swallows the rest of the block, no panic
+        let mut out: Vec<TuiLine> = Vec::new();
+        push_code_block(
+            &mut out,
+            &["/* never closed".to_string(), "let x = 1;".to_string()],
+            "rust",
+        );
+        assert!(
+            format!("{:?}", out[2]).contains(&format!("{:?}", palette::META)),
+            "rest of the fence stays comment: {:?}",
+            out[2]
+        );
+    }
+
+    #[test]
+    fn unknown_and_untagged_fences_stay_generic() {
+        for tag in ["", "text", "output"] {
+            assert!(code_lang(tag).is_none(), "{tag:?} must not highlight");
+        }
+        for (tag, lang) in [
+            ("rust", CodeLang::Rust),
+            ("rs", CodeLang::Rust),
+            ("python", CodeLang::Python),
+            ("py", CodeLang::Python),
+            ("js", CodeLang::Js),
+            ("ts", CodeLang::Js),
+            ("javascript", CodeLang::Js),
+            ("typescript", CodeLang::Js),
+            ("json", CodeLang::Json),
+            ("toml", CodeLang::Toml),
+            ("bash", CodeLang::Shell),
+            ("sh", CodeLang::Shell),
+            ("shell", CodeLang::Shell),
+        ] {
+            assert_eq!(code_lang(tag), Some(lang), "{tag:?}");
+        }
+        // untagged fences keep the generic highlighter (keywords still styled)
+        let mut out: Vec<TuiLine> = Vec::new();
+        push_code_block(&mut out, &["let x = 1".to_string()], "");
+        assert!(
+            format!("{out:?}").contains(&format!("{:?}", palette::ACCENT)),
+            "generic keyword: {out:?}"
+        );
+        // apostrophes glued to a word never open a string in rust fences
+        let mut out: Vec<TuiLine> = Vec::new();
+        push_code_block(&mut out, &["don't panic;".to_string()], "rust");
+        assert!(
+            !format!("{out:?}").contains(&format!("{:?}", palette::OK)),
+            "no phantom string: {out:?}"
         );
     }
 }
