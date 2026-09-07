@@ -987,6 +987,43 @@ impl Voice {
         self.history.clone()
     }
 
+    /// Estimated context usage per component (/context). History
+    /// buckets use the same chars/ratio heuristic as the context meter;
+    /// the residual (system prompt, conventions, digest, tool specs)
+    /// folds into `system`, so the parts sum to `last_context`.
+    pub fn context_breakdown(&self) -> Vec<ka_protocol::ContextPart> {
+        let ratio = if self.ratio > 0.0 { self.ratio } else { 4.0 };
+        let mut user = 0u64;
+        let mut assistant = 0u64;
+        let mut tools = 0u64;
+        for m in &self.history {
+            match m.role {
+                ka_dialect::speaker::TurnRole::User => user += message_tokens(m, ratio),
+                ka_dialect::speaker::TurnRole::Assistant => assistant += message_tokens(m, ratio),
+                ka_dialect::speaker::TurnRole::Tool => tools += message_tokens(m, ratio),
+            }
+        }
+        let system = self.last_context.saturating_sub(user + assistant + tools);
+        vec![
+            ka_protocol::ContextPart {
+                name: "system".into(),
+                tokens: system,
+            },
+            ka_protocol::ContextPart {
+                name: "user".into(),
+                tokens: user,
+            },
+            ka_protocol::ContextPart {
+                name: "assistant".into(),
+                tokens: assistant,
+            },
+            ka_protocol::ContextPart {
+                name: "tools".into(),
+                tokens: tools,
+            },
+        ]
+    }
+
     fn speaker(&mut self, wire: Wire) -> std::sync::Arc<dyn Speaker> {
         self.speakers
             .entry(wire)
@@ -3763,6 +3800,43 @@ mod tests {
         assert_eq!(kept, 0);
         assert!(voice.history.is_empty());
         assert!(voice.rewind(1).is_none(), "nothing left to rewind");
+    }
+
+    #[test]
+    fn context_breakdown_sums_to_last_context() {
+        use ka_dialect::speaker::TurnMessage;
+        let catalog = Catalog::parse(
+            "[dialects.\"test/m\"]\nwire = \"openai_chat\"\nbase_url = \"http://127.0.0.1:1\"\ncontext = 1000\n",
+        )
+        .unwrap();
+        let mut voice = Voice::new(catalog, std::env::temp_dir(), ka_protocol::Mode::Free, 5);
+        voice.ratio = 4.0;
+        voice.last_context = 10_000;
+        voice
+            .history
+            .push(TurnMessage::user("hello there, a user prompt"));
+        voice
+            .history
+            .push(TurnMessage::assistant("and the assistant reply"));
+        voice
+            .history
+            .push(TurnMessage::tool(vec![ka_dialect::speaker::ToolResult {
+                call_id: "c1".into(),
+                content: "some tool output bytes".into(),
+                is_error: false,
+                images: Vec::new(),
+            }]));
+        let parts = voice.context_breakdown();
+        let sum: u64 = parts.iter().map(|p| p.tokens).sum();
+        assert_eq!(sum, 10_000, "parts must sum to last_context: {parts:?}");
+        let by_name = |n: &str| parts.iter().find(|p| p.name == n).unwrap().tokens;
+        assert!(by_name("user") > 0, "{parts:?}");
+        assert!(by_name("assistant") > 0, "{parts:?}");
+        assert!(by_name("tools") > 0, "{parts:?}");
+        assert!(
+            by_name("system") >= 9_000,
+            "untracked residual folds into system: {parts:?}"
+        );
     }
 
     #[test]

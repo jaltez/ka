@@ -734,6 +734,14 @@ async fn handle_command(
             ctx.events.send(Event::EffortChanged { level }).await?;
             ctx.events.send(Event::Idle).await.ok();
         }
+        Command::ContextBreakdown => {
+            let parts = ctx.voice.context_breakdown();
+            let window = ctx.voice.window_tokens();
+            ctx.events
+                .send(Event::ContextBreakdown { parts, window })
+                .await?;
+            ctx.events.send(Event::Idle).await.ok();
+        }
         Command::Interject { text } => ctx.state.interjections.push(text),
         Command::Defer { text } => ctx.state.deferrals.push_back(text),
         Command::Abort => {}

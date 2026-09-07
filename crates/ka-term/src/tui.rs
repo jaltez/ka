@@ -1639,6 +1639,39 @@ fn usage_rows(meters: &Meters, summaries: &[ka_strand::StrandSummary]) -> Vec<St
     rows
 }
 
+/// Rows for the `/context` popup: one bar per component scaled to the
+/// window, plus a used/free footer.
+fn context_rows(parts: &[ka_protocol::ContextPart], window: u64) -> Vec<String> {
+    const BAR_W: usize = 20;
+    let used: u64 = parts.iter().map(|p| p.tokens).sum();
+    let mut rows = vec!["▸ context".to_string()];
+    for p in parts {
+        let filled = if window > 0 {
+            ((p.tokens as f64 / window as f64) * BAR_W as f64).round() as usize
+        } else {
+            0
+        }
+        .min(BAR_W);
+        let bar = format!("{}{}", "█".repeat(filled), "░".repeat(BAR_W - filled));
+        let pct = (p.tokens * 100).checked_div(used).unwrap_or(0);
+        rows.push(format!(
+            "{:<10} {bar} {:>7} ({pct}%)",
+            p.name,
+            fmt_tok(p.tokens)
+        ));
+    }
+    rows.push(String::new());
+    let free = window.saturating_sub(used);
+    let pct = (used * 100).checked_div(window).unwrap_or(0);
+    rows.push(format!(
+        "▸ used {} of {} ({pct}%) · free {}",
+        fmt_tok(used),
+        fmt_tok(window),
+        fmt_tok(free)
+    ));
+    rows
+}
+
 /// The shared follow-up prompt that starts a build turn from the plan
 /// file (both `/build` and `/approve`).
 fn build_followup() -> String {
@@ -2051,6 +2084,11 @@ pub enum Modal {
     /// Usage dashboard (/usage): session + recent session rows.
     Usage {
         /// Rendered rows (section headers + figures + total).
+        rows: Vec<String>,
+    },
+    /// Context breakdown (/context): rendered rows.
+    Context {
+        /// Rendered rows (bars + footer).
         rows: Vec<String>,
     },
     /// Strand tree (/tree): current session + descendants.
@@ -2636,6 +2674,9 @@ async fn app(
                                 }
                             }
                             Modal::Usage { .. } => {
+                                modal = None;
+                            }
+                            Modal::Context { .. } => {
                                 modal = None;
                             }
                             Modal::Tree {
@@ -3594,7 +3635,10 @@ async fn app(
                                     edit.extend(text.chars().filter(|c| !c.is_whitespace()));
                                 }
                             }
-                            Modal::Help | Modal::Spills { .. } | Modal::Usage { .. } => {}
+                            Modal::Help
+                            | Modal::Spills { .. }
+                            | Modal::Usage { .. }
+                            | Modal::Context { .. } => {}
                         }
                     } else if path_popup.is_some() {
                         path_popup = None;
@@ -3771,6 +3815,11 @@ async fn app(
                                 "Plan drafted — review .ka/plans/plan.md, then /approve to build"
                                     .into(),
                             ));
+                        }
+                        if let Event::ContextBreakdown { parts, window } = &evt {
+                            modal = Some(Modal::Context {
+                                rows: context_rows(parts, *window),
+                            });
                         }
                         if replayed {
                             scroll = None;
@@ -4106,6 +4155,8 @@ fn apply_event(
             transcript.push_separated(Line::Note("⋯ digesting context…".to_string()))
         }
         Event::DigestFinished { .. } => {}
+        // the run loop opens the /context modal from this event
+        Event::ContextBreakdown { .. } => {}
     }
 }
 
@@ -4525,6 +4576,10 @@ fn builtin_slash_commands() -> Vec<(String, String)> {
         (
             "/usage".to_string(),
             "usage & cost: session + recent".to_string(),
+        ),
+        (
+            "/context".to_string(),
+            "context usage breakdown".to_string(),
         ),
         (
             "/key".to_string(),
@@ -5294,6 +5349,13 @@ then write a concrete numbered implementation plan to .ka/plans/plan.md. Task: {
             followup: None,
             modal: Some(ModalKind::Usage),
         }),
+        "/context" => Some(Slash {
+            note: None,
+            event: Some(Command::ContextBreakdown),
+            quit: false,
+            followup: None,
+            modal: None,
+        }),
         "/key" => Some(Slash {
             note: None,
             event: None,
@@ -5878,6 +5940,7 @@ fn render(
             }
             Modal::Memory { .. } => hint_spans(&[(" esc", "close")]),
             Modal::Usage { .. } => hint_spans(&[(" any", "close")]),
+            Modal::Context { .. } => hint_spans(&[(" any", "close")]),
             Modal::Key(_) => hint_spans(&[(" type", "value"), (" ⏎", "save"), (" esc", "cancel")]),
             Modal::Help => hint_spans(&[(" ⏎", "close")]),
         }
@@ -6472,6 +6535,35 @@ fn render(
                         Block::default()
                             .borders(Borders::ALL)
                             .title(padded_title("usage"))
+                            .border_style(crate::palette::BORDER_STYLE)
+                            .padding(ratatui::widgets::Padding::new(1, 1, 1, 1)),
+                    )
+                    .style(ratatui::style::Style::new().bg(crate::palette::BG_SURFACE))
+                    .wrap(Wrap { trim: false });
+                frame.render_widget(widget, rect);
+            }
+            Modal::Context { rows } => {
+                let height = (rows.len() as u16 + 4).clamp(6, 24);
+                let width = 72.min(frame.area().width);
+                let rect = centered(width, height, modal_area);
+                let inner_w = width.saturating_sub(4) as usize;
+                let mut text = Vec::new();
+                let cap = (height as usize).saturating_sub(4);
+                for row in rows.iter().take(cap) {
+                    if row.starts_with('▸') {
+                        text.push(TuiLine::styled(
+                            pad_to_width(row.clone(), inner_w),
+                            crate::palette::META,
+                        ));
+                    } else {
+                        text.push(TuiLine::raw(row.clone()));
+                    }
+                }
+                let widget = Paragraph::new(text)
+                    .block(
+                        Block::default()
+                            .borders(Borders::ALL)
+                            .title(padded_title("context"))
                             .border_style(crate::palette::BORDER_STYLE)
                             .padding(ratatui::widgets::Padding::new(1, 1, 1, 1)),
                     )
@@ -7602,6 +7694,31 @@ mod tests {
         // never started planning → not drafted
         assert!(!plan_drafted(None, &plan));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn context_rows_renders_bars_and_footer() {
+        let parts = vec![
+            ka_protocol::ContextPart {
+                name: "system".into(),
+                tokens: 800,
+            },
+            ka_protocol::ContextPart {
+                name: "user".into(),
+                tokens: 200,
+            },
+        ];
+        let rows = context_rows(&parts, 10_000);
+        let joined = rows.join("\n");
+        assert!(joined.contains("system"), "{joined}");
+        assert!(joined.contains("█"), "{joined}");
+        assert!(joined.contains("200 (20%)"), "{joined}");
+        assert!(
+            joined.contains("used 1k of 10k (10%) · free 9k"),
+            "{joined}"
+        );
+        let rows = context_rows(&parts, 0);
+        assert!(rows.join("\n").contains("free 0"), "{rows:?}");
     }
 
     #[test]

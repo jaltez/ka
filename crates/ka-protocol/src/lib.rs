@@ -260,6 +260,8 @@ pub enum Command {
         /// Default permission mode.
         mode: Option<Mode>,
     },
+    /// Ask for a context-usage breakdown (see [`Event::ContextBreakdown`]).
+    ContextBreakdown,
     /// Answer an outstanding ask.
     Answer {
         /// Which ask is being answered.
@@ -310,6 +312,15 @@ pub enum TodoState {
     Pending,
     /// Finished.
     Done,
+}
+
+/// One component of the context breakdown.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct ContextPart {
+    /// Component name (`system`, `user`, `assistant`, `tools`).
+    pub name: String,
+    /// Estimated tokens in this component.
+    pub tokens: u64,
 }
 
 /// Engine → surface events.
@@ -453,6 +464,14 @@ pub enum Event {
     Note {
         /// Note text.
         message: String,
+    },
+    /// Context-usage breakdown (/context): estimated tokens per
+    /// component plus the active window.
+    ContextBreakdown {
+        /// Estimated tokens per component.
+        parts: Vec<ContextPart>,
+        /// Context window of the active model (0 = unknown).
+        window: u64,
     },
     /// Engine-level error report.
     Error {
@@ -610,6 +629,13 @@ mod tests {
                 options: vec!["yes".into(), "no".into()],
                 detail: Some("--- a/f.rs\n+++ b/f.rs\n@@\n".into()),
             }],
+        });
+        roundtrip_event(Event::ContextBreakdown {
+            parts: vec![ContextPart {
+                name: "system".into(),
+                tokens: 950,
+            }],
+            window: 128_000,
         });
         roundtrip_event(Event::TurnFinished {
             stop: Stop::Done,
