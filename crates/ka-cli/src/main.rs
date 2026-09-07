@@ -86,6 +86,15 @@ enum CliCommand {
     },
     /// Serve the Agent Client Protocol on stdin/stdout
     Acp,
+    /// Serve HTTP/SSE sessions on an address
+    Serve {
+        /// Bind address (loopback by default)
+        #[arg(long, default_value = "127.0.0.1:8417")]
+        addr: String,
+        /// Require this bearer token on every request
+        #[arg(long)]
+        token: Option<String>,
+    },
     /// Environment health checks
     Doctor {
         /// Probe provider + MCP reachability
@@ -170,6 +179,7 @@ pub const PUBLIC_KEY: Option<&str> = option_env!("KA_PUBKEY");
 
 mod acp;
 mod doctor;
+mod serve;
 mod update;
 
 fn main() -> ExitCode {
@@ -337,6 +347,7 @@ async fn dispatch(cli: Cli) -> Result<ExitCode, String> {
             .await
         }
         Some(CliCommand::Acp) => acp::run().await,
+        Some(CliCommand::Serve { addr, token }) => serve::run(&addr, token).await,
         Some(CliCommand::Doctor { net, json }) => doctor::run(net, json).await,
         Some(CliCommand::Update { channel, check }) => {
             let trust = trust_for_cwd(false);
