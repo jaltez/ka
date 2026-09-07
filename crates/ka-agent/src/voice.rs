@@ -514,6 +514,19 @@ impl Voice {
         run_hook_scripts(&self.hooks_cfg, event, tool, args, &self.hand_ctx.cwd).await
     }
 
+    /// Fire `stop` hooks at turn exit. Advisory only: failures surface
+    /// as notes and never fail the turn.
+    async fn stop_hooks(&self, events: &mpsc::Sender<Event>, status: &str) {
+        for reason in run_stop_scripts(&self.hooks_cfg, status, &self.hand_ctx.cwd).await {
+            events
+                .send(Event::Note {
+                    message: format!("stop hook: {reason}"),
+                })
+                .await
+                .ok();
+        }
+    }
+
     /// Load resumed history + digest (engine bootstrap). Also resets the
     /// once-per-strand promotion latch.
     pub fn load_history(&mut self, history: Vec<TurnMessage>, digest: Option<String>) {
@@ -1180,6 +1193,7 @@ attempt implementation — the user will review and switch to build mode.",
                                     stop: Stop::Aborted,
                                     usage: Usage::default(),
                                 }).await.ok();
+                                self.stop_hooks(events, "aborted").await;
                                 return Usage::default();
                             }
                             Some(Command::Interject { text }) => interjections.push(text),
@@ -1253,6 +1267,7 @@ attempt implementation — the user will review and switch to build mode.",
                                                     })
                                                     .await
                                                     .ok();
+                                                self.stop_hooks(events, "aborted").await;
                                                 return Usage::default();
                                             }
                                         }
@@ -1286,6 +1301,7 @@ attempt implementation — the user will review and switch to build mode.",
                                                     })
                                                     .await
                                                     .ok();
+                                                self.stop_hooks(events, "aborted").await;
                                                 return Usage::default();
                                             }
                                         }
@@ -1613,6 +1629,7 @@ attempt implementation — the user will review and switch to build mode.",
                     })
                     .await
                     .ok();
+                self.stop_hooks(events, "aborted").await;
                 return Usage::default();
             }
             if final_stop == Stop::Length {
@@ -1649,6 +1666,12 @@ attempt implementation — the user will review and switch to build mode.",
             })
             .await
             .ok();
+        let status = match final_stop {
+            Stop::Done | Stop::Length => "done",
+            Stop::Aborted => "aborted",
+            Stop::Error => "error",
+        };
+        self.stop_hooks(events, status).await;
         usage_total
     }
 
@@ -2046,6 +2069,57 @@ async fn run_hook_scripts(
     Ok(())
 }
 
+/// Run configured `stop` hooks once at turn exit (`status` is `done`,
+/// `aborted`, or `error`). Exit codes are advisory: failures are
+/// collected for the caller to surface as notes, never to fail the turn.
+async fn run_stop_scripts(
+    hooks: &[crate::config::Hook],
+    status: &str,
+    cwd: &std::path::Path,
+) -> Vec<String> {
+    use tokio::io::AsyncWriteExt;
+    let mut failures = Vec::new();
+    for hook in hooks {
+        if hook.event != crate::config::HookEvent::Stop || hook.tool.is_some() {
+            continue;
+        }
+        let payload = serde_json::json!({"event": "stop", "stop": status});
+        let outcome = async {
+            let mut child = tokio::process::Command::new("sh")
+                .arg("-c")
+                .arg(&hook.command)
+                .current_dir(cwd)
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .map_err(|e| format!("failed to spawn: {e}"))?;
+            if let Some(mut stdin) = child.stdin.take() {
+                let _ = stdin.write_all(payload.to_string().as_bytes()).await;
+            }
+            let output =
+                tokio::time::timeout(std::time::Duration::from_secs(30), child.wait_with_output())
+                    .await
+                    .map_err(|_| "timed out after 30s".to_string())?
+                    .map_err(|e| format!("failed: {e}"))?;
+            if !output.status.success() {
+                let err = String::from_utf8_lossy(&output.stderr).trim().to_string();
+                return Err(if err.is_empty() {
+                    format!("exit {}", output.status)
+                } else {
+                    err
+                });
+            }
+            Ok(())
+        }
+        .await;
+        if let Err(reason) = outcome {
+            failures.push(reason);
+        }
+    }
+    failures
+}
+
 /// Automatic retry backoff for retryable turn failures: 5s, 20s, 60s
 /// (max 3 attempts) before falling through to the normal error finish.
 /// Tests shrink the schedule to keep the suite fast.
@@ -2396,6 +2470,69 @@ mod tests {
             .expect("second speak must carry the tool result");
         assert!(result.content.contains("ROUNDTRIP-CONTENT"));
         assert!(!result.is_error);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+    #[tokio::test]
+    async fn stop_hook_fires_once_per_turn_with_payload() {
+        use ka_protocol::Event;
+        use tokio::sync::mpsc;
+
+        let dir = std::env::temp_dir().join(format!("ka-voice-stop-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let marker = dir.join("stop-marker");
+
+        let catalog = Catalog::parse(
+            "[dialects.\"test/m\"]\nwire = \"openai_chat\"\nbase_url = \"http://127.0.0.1:1\"\ncontext = 1000\n",
+        )
+        .unwrap();
+        let seen = std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let mut voice = Voice::new(catalog, dir.clone(), ka_protocol::Mode::Free, 10).with_speaker(
+            Wire::OpenaiChat,
+            std::sync::Arc::new(FakeSpeaker { seen: seen.clone() }),
+        );
+        voice.set_hooks(vec![crate::config::Hook {
+            event: crate::config::HookEvent::Stop,
+            tool: None,
+            command: format!("cat >> {}", marker.display()),
+        }]);
+
+        let (cmd_tx, mut cmd_rx) = mpsc::channel(16);
+        let (evt_tx, mut evt_rx) = mpsc::channel(256);
+        let mut interjections = Vec::new();
+        let mut deferrals = std::collections::VecDeque::new();
+
+        let handle = tokio::spawn(async move {
+            voice
+                .turn(
+                    "test/m",
+                    "read the file".into(),
+                    &mut cmd_rx,
+                    &evt_tx,
+                    &mut interjections,
+                    &mut deferrals,
+                    &mut GuardRuntime::default(),
+                    None,
+                    Vec::new(),
+                )
+                .await;
+        });
+
+        while let Some(evt) = evt_rx.recv().await {
+            if matches!(evt, Event::TurnFinished { .. }) {
+                break;
+            }
+        }
+        drop(cmd_tx);
+        handle.await.unwrap();
+
+        let content = std::fs::read_to_string(&marker).unwrap();
+        assert_eq!(
+            content.matches("\"event\":\"stop\"").count(),
+            1,
+            "stop hook must fire exactly once per turn: {content}"
+        );
+        assert!(content.contains("\"stop\":\"done\""), "{content}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

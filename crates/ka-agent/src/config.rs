@@ -35,7 +35,7 @@ pub struct Rule {
     pub verdict: Verdict,
 }
 
-/// One hook: a shell command run around tool calls.
+/// One hook: a shell command run around tool calls or at turn end.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Hook {
@@ -44,8 +44,10 @@ pub struct Hook {
     /// Only this tool (None = every tool).
     #[serde(default)]
     pub tool: Option<String>,
-    /// Shell command. Receives JSON on stdin (tool name + arguments);
-    /// exit 2 blocks the call (pre_tool_use) with stderr as the reason.
+    /// Shell command. Tool-call hooks receive the tool name + arguments
+    /// on stdin; `stop` hooks receive `{"event": "stop", "stop": "done"
+    /// | "aborted" | "error"}`. Exit 2 blocks the call (pre_tool_use)
+    /// with stderr as the reason.
     pub command: String,
 }
 
@@ -57,6 +59,8 @@ pub enum HookEvent {
     PreToolUse,
     /// After a tool finished; exit 2 marks the result an error.
     PostToolUse,
+    /// After a turn finishes, any stop kind.
+    Stop,
 }
 
 /// Rule verdicts.
@@ -660,6 +664,13 @@ mod tests {
         assert_eq!(c.hooks.len(), 1);
         assert_eq!(c.hooks[0].event, HookEvent::PreToolUse);
         assert_eq!(c.hooks[0].tool.as_deref(), Some("bash"));
+        let stop = Config::parse_layer(
+            "[[hooks]]\nevent = \"stop\"\ncommand = \"notify.sh\"\n",
+            "user",
+        )
+        .unwrap();
+        assert_eq!(stop.hooks[0].event, HookEvent::Stop);
+        assert!(stop.hooks[0].tool.is_none());
         let bad = Config::parse_layer("[[hooks]]\nevent = \"whenever\"\ncommand = \"x\"\n", "u");
         assert!(bad.is_err());
     }
