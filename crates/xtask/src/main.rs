@@ -4,7 +4,7 @@
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 /// Binary-size contract from the design docs (MB).
 const SIZE_BUDGET_MB: f64 = 10.0;
@@ -23,6 +23,7 @@ fn main() {
         "keygen" => keygen(&rest),
         "sign" => sign(&rest),
         "release" => release(),
+        "bench" => bench(&rest),
         "help" | "--help" | "-h" => {
             print_help();
             0
@@ -51,6 +52,9 @@ fn print_help() {
             --force overwrites)
   sign <file>  sign with ka-release.key (or $KA_SIGNING_KEY base64) -> <file>.sig
   release   build musl release, tar.gz it, sign, print artifact paths
+  bench [--update] [--bin <path>]
+            p50 `ka --version` latency + peak RSS vs baselines.json
+            (±30% tolerance; --update rewrites the baseline)
   help      this message"
     );
 }
@@ -395,6 +399,129 @@ fn release() -> i32 {
     0
 }
 
+/// One measured perf baseline.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct Baselines {
+    /// p50 of 5 `ka --version` runs, microseconds (fresh process each).
+    version_p50_us: u64,
+    /// Peak RSS of one `ka --version` run in KB (None: no GNU time).
+    peak_rss_kb: Option<u64>,
+}
+
+/// µs timer around one fresh-process run; returns (duration µs, peak RSS KB).
+fn time_run(bin: &str) -> (u64, Option<u64>) {
+    let start = std::time::Instant::now();
+    let output = Command::new("/usr/bin/time")
+        .args(["-v", bin, "--version"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .output();
+    let elapsed_us = start.elapsed().as_micros() as u64;
+    let rss = output.ok().and_then(|o| {
+        String::from_utf8_lossy(&o.stderr)
+            .lines()
+            .find_map(|l| l.trim().strip_prefix("Maximum resident set size (kbytes):"))
+            .and_then(|v| v.trim().parse::<u64>().ok())
+    });
+    (elapsed_us, rss)
+}
+
+/// ±30% regression gate: only upward drift fails.
+fn within_tolerance(baseline: u64, current: u64) -> bool {
+    current <= baseline.saturating_add(baseline * 30 / 100)
+}
+
+/// `xtask bench [--update] [--bin <path>]`: measure and gate.
+fn bench(rest: &[String]) -> i32 {
+    let update = rest.iter().any(|a| a == "--update");
+    let bin = rest
+        .iter()
+        .position(|a| a == "--bin")
+        .and_then(|i| rest.get(i + 1))
+        .cloned()
+        .unwrap_or_else(|| "target/release/ka".to_string());
+
+    let bin_path = repo_root().join(&bin);
+    if !bin_path.exists() {
+        eprintln!(
+            "xtask: {} missing — build it first (cargo build --release -p ka-cli or --bin <path>)",
+            bin_path.display()
+        );
+        return 2;
+    }
+
+    // 5 fresh runs, p50 (sorted[2]); RSS from the median run
+    let mut runs: Vec<(u64, Option<u64>)> = (0..5).map(|_| time_run(&bin)).collect();
+    runs.sort_by_key(|(us, _)| *us);
+    let (p50_us, rss) = runs[2];
+
+    let baseline_path = repo_root().join("baselines.json");
+    if update || !baseline_path.exists() {
+        let b = Baselines {
+            version_p50_us: p50_us,
+            peak_rss_kb: rss,
+        };
+        let json = serde_json::to_string_pretty(&b).unwrap_or_else(|_| "{}".into());
+        if let Err(e) = std::fs::write(&baseline_path, json + "\n") {
+            eprintln!("xtask: write {}: {e}", baseline_path.display());
+            return 2;
+        }
+        println!(
+            "baseline written: p50 {p50_us}µs, rss {}",
+            rss.map(|k| format!("{k} KB"))
+                .unwrap_or_else(|| "n/a".into())
+        );
+        return 0;
+    }
+
+    let parsed: Baselines =
+        match serde_json::from_str(&std::fs::read_to_string(&baseline_path).unwrap_or_default()) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("xtask: parse {}: {e}", baseline_path.display());
+                return 2;
+            }
+        };
+
+    let mut failed = false;
+    if !within_tolerance(parsed.version_p50_us, p50_us) {
+        failed = true;
+    }
+    println!(
+        "version p50: {p50_us}µs (baseline {}µs) {}",
+        parsed.version_p50_us,
+        if within_tolerance(parsed.version_p50_us, p50_us) {
+            "ok"
+        } else {
+            "REGRESSION"
+        }
+    );
+    match (parsed.peak_rss_kb, rss) {
+        (Some(base), Some(cur)) => {
+            let ok = within_tolerance(base, cur);
+            failed |= !ok;
+            println!(
+                "peak rss: {cur} KB (baseline {base} KB) {}",
+                if ok { "ok" } else { "REGRESSION" }
+            );
+        }
+        (base, cur) => {
+            println!(
+                "peak rss: {} (baseline {}) — skipped",
+                cur.map(|k| format!("{k} KB"))
+                    .unwrap_or_else(|| "n/a".into()),
+                base.map(|k| format!("{k} KB"))
+                    .unwrap_or_else(|| "n/a".into()),
+            );
+        }
+    }
+    if failed {
+        eprintln!("xtask: perf regression vs baselines.json (investigate or --update)");
+        return 1;
+    }
+    0
+}
+
 /// Regenerate `crates/ka-dialect/models-dev.toml` from https://models.dev.
 /// Keeps curated `dialects.toml` selectors untouched (their flags and effort
 /// budgets win); adds every tool-capable model on a static OpenAI-compatible
@@ -580,4 +707,18 @@ fn models_sync() -> i32 {
         out_path.display()
     );
     0
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn tolerance_gates_upward_drift_only() {
+        use super::within_tolerance;
+        assert!(within_tolerance(1000, 1000));
+        assert!(within_tolerance(1000, 1299));
+        assert!(within_tolerance(1000, 1300));
+        assert!(!within_tolerance(1000, 1301));
+        // improvements always pass
+        assert!(within_tolerance(1000, 100));
+    }
 }
