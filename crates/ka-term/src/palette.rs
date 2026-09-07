@@ -32,15 +32,16 @@ pub const STEEL: Color = Color::Rgb(44, 199, 232); // #2CC7E8 bright cyan-blue: 
 pub const FLAME: Color = Color::Rgb(255, 160, 46); // #FFA02E bright orange: warn
 
 // ── backgrounds: neutral near-black, near-flat — panels and modals
-// recede below the canvas, output cards lift one step, and the
-// user/tool bands keep only a hint of warmth ──
+// recede below the canvas, output cards lift one step, and user turns
+// are the one gold-tinted surface in the transcript ──
 pub const BG: Color = CHARCOAL; // #141210 canvas
 pub const BG_PANEL: Color = Color::Rgb(26, 24, 22); // #1A1816 input box, sidebar (recedes)
 pub const BG_OUTPUT: Color = Color::Rgb(33, 30, 27); // #211E1B assistant cards
 pub const BG_SURFACE: Color = Color::Rgb(29, 26, 24); // #1D1A18 modal/picker boxes
-// user turns sit on a whisper-warm lift of the ground; the gold ❯
-// lead marks the row
-pub const BG_USER: Color = Color::Rgb(38, 34, 30); // #26221E
+// user turns are the gold stratum: a dark gold-tinted band (the only
+// saturated surface) against the neutral assistant cards, with the
+// gold ❯ lead and bold text
+pub const BG_USER: Color = Color::Rgb(46, 37, 19); // #2E2513 gold-dark
 // tool activity rides its own stratum, one step below the canvas
 pub const BG_TOOL: Color = Color::Rgb(27, 24, 21); // #1B1815
 /// Tool band: `→ tool` text on the tool stratum.

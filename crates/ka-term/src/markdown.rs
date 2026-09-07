@@ -332,7 +332,8 @@ fn parse_table(rows: &[&str]) -> Option<(Vec<String>, Vec<Vec<String>>)> {
 
 /// Render a parsed table as a sharp box-drawn grid (OMP `table` symbols)
 /// fitted to `width`. Bars/rules sit in the dim border color; the header is
-/// bold on default text. Cells clip with `…`, never overflow.
+/// bold on default text. Cells clip with `…`, never overflow. Inner
+/// rules separate every body row.
 fn render_table(
     header: &[String],
     body: &[Vec<String>],
@@ -370,23 +371,28 @@ fn render_table(
 
     let mut lines: Vec<TuiLine<'static>> = Vec::new();
     let edge = Span::styled("│", palette::BORDER_STYLE);
+    let hrule = |l: char, m: char, r: char| {
+        let mut line = String::from(l);
+        for (c, w) in widths.iter().enumerate() {
+            line.push_str(&"─".repeat(w + 2));
+            line.push(if c + 1 == cols { r } else { m });
+        }
+        TuiLine::styled(line, palette::BORDER_STYLE)
+    };
 
     // top rule
-    let mut top = String::from("┌");
-    for (c, w) in widths.iter().enumerate() {
-        top.push_str(&"─".repeat(w + 2));
-        top.push(if c + 1 == cols { '┐' } else { '┬' });
-    }
-    lines.push(TuiLine::styled(top, palette::BORDER_STYLE));
+    lines.push(hrule('┌', '┬', '┐'));
 
-    // header row: bold, default text color
+    // header row: gold bold
     let mut spans = vec![edge.clone()];
     for (c, h) in header.iter().enumerate() {
         spans.push(Span::styled(" ", Style::default()));
         let fitted: Vec<Span<'static>> = fit_spans(inline_spans(h), widths[c])
             .into_iter()
             .map(|mut s| {
-                s.style = Style::default().add_modifier(Modifier::BOLD);
+                s.style = Style::default()
+                    .fg(palette::ACCENT)
+                    .add_modifier(Modifier::BOLD);
                 s
             })
             .collect();
@@ -395,7 +401,9 @@ fn render_table(
         if widths[c] > used {
             spans.push(Span::styled(
                 " ".repeat(widths[c] - used),
-                Style::default().add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(palette::ACCENT)
+                    .add_modifier(Modifier::BOLD),
             ));
         }
         spans.push(Span::styled(" ", Style::default()));
@@ -407,15 +415,11 @@ fn render_table(
     lines.push(TuiLine::from(spans));
 
     // header/body rule
-    let mut sep = String::from("├");
-    for (c, w) in widths.iter().enumerate() {
-        sep.push_str(&"─".repeat(w + 2));
-        sep.push(if c + 1 == cols { '┤' } else { '┼' });
-    }
-    lines.push(TuiLine::styled(sep, palette::BORDER_STYLE));
+    lines.push(hrule('├', '┼', '┤'));
 
-    // body rows (inline markdown intact inside cells)
-    for row in body {
+    // body rows (inline markdown intact inside cells), separated by
+    // inner rules so every row reads as part of the grid
+    for (ri, row) in body.iter().enumerate() {
         let mut spans = vec![edge.clone()];
         for (c, w) in widths.iter().enumerate() {
             spans.push(Span::styled(" ", Style::default()));
@@ -433,14 +437,12 @@ fn render_table(
         }
         spans.push(edge.clone());
         lines.push(TuiLine::from(spans));
+        if ri + 1 < body.len() {
+            lines.push(hrule('├', '┼', '┤'));
+        }
     }
     // bottom rule
-    let mut bottom = String::from("└");
-    for (c, w) in widths.iter().enumerate() {
-        bottom.push_str(&"─".repeat(w + 2));
-        bottom.push(if c + 1 == cols { '┘' } else { '┴' });
-    }
-    lines.push(TuiLine::styled(bottom, palette::BORDER_STYLE));
+    lines.push(hrule('└', '┴', '┘'));
     lines.push(TuiLine::default());
     Some(lines)
 }
@@ -590,7 +592,9 @@ pub fn inline_spans(s: &str) -> Vec<Span<'static>> {
                 if !bold.is_empty() {
                     spans.push(Span::styled(
                         bold,
-                        Style::default().add_modifier(Modifier::BOLD),
+                        Style::default()
+                            .fg(palette::FG_STRONG)
+                            .add_modifier(Modifier::BOLD),
                     ));
                 }
                 i = end + 2;
@@ -608,7 +612,9 @@ pub fn inline_spans(s: &str) -> Vec<Span<'static>> {
                 if !italic.is_empty() {
                     spans.push(Span::styled(
                         italic,
-                        Style::default().add_modifier(Modifier::ITALIC),
+                        Style::default()
+                            .fg(palette::FG_STRONG)
+                            .add_modifier(Modifier::ITALIC),
                     ));
                 }
                 i += end + 2;
@@ -1136,14 +1142,26 @@ mod tests {
         assert!(joined.contains("bold()"), "{joined}");
     }
 
+    /// Bold and italic read as bright warm-white (weight + slant over
+    /// the soft gray prose); strike-through stays a pure modifier.
     #[test]
-    fn emphasis_is_pure_modifier() {
+    fn emphasis_is_bright_and_strike_is_plain() {
         let spans = inline_spans("**loud** and *soft* and ~~gone~~");
         let joined = format!("{spans:?}");
         assert!(joined.contains("bold()"), "{joined}");
         assert!(joined.contains("italic()"), "{joined}");
         assert!(joined.contains("crossed_out()"), "{joined}");
-        assert!(!joined.contains("Rgb("), "no color tints: {joined}");
+        let loud_is_tinted = spans
+            .iter()
+            .any(|s| s.content == "loud" && s.style.fg == Some(palette::FG_STRONG));
+        let soft_is_tinted = spans
+            .iter()
+            .any(|s| s.content == "soft" && s.style.fg == Some(palette::FG_STRONG));
+        let gone_is_plain = spans
+            .iter()
+            .any(|s| s.content == "gone" && s.style.fg.is_none());
+        assert!(loud_is_tinted && soft_is_tinted, "{spans:?}");
+        assert!(gone_is_plain, "{spans:?}");
     }
 
     #[test]
@@ -1205,7 +1223,9 @@ mod tests {
         );
         assert!(texts[0].starts_with('┌') && texts[0].ends_with('┐') && texts[0].contains('┬'));
         assert!(texts[2].contains('┼') && texts[2].contains('├') && texts[2].contains('┤'));
-        assert!(texts[5].starts_with('└') && texts[5].ends_with('┘'));
+        assert!(texts[6].starts_with('└') && texts[6].ends_with('┘'));
+        // every body row is separated by an inner rule
+        assert!(texts[4].starts_with('├') && texts[4].contains('┼'));
         assert!(texts.iter().any(|t| t.contains("alpha")));
         assert!(texts.iter().any(|t| t.contains("12")));
         for t in &texts {
