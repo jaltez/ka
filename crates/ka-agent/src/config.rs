@@ -149,6 +149,16 @@ pub const DEFAULT_BACKGROUND_AFTER_MS: u64 = 30_000;
 /// engine re-dispatches the same messages on the next entry.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields, default)]
+pub struct Update {
+    /// GitHub repo (`owner/name`) releases are fetched from.
+    pub repo: Option<String>,
+}
+
+/// Fallback model chain ([fallback]). When a turn fails on the active
+/// model with a provider/auth error after retries are exhausted, the
+/// engine re-dispatches the same messages on the next entry.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields, default)]
 pub struct Fallback {
     /// Fallback selectors (`vendor/model[:effort]`) in try-order; at
     /// most 2 hops are taken per turn.
@@ -193,6 +203,9 @@ pub struct Config {
     /// Fallback model chain ([fallback]).
     #[serde(default)]
     pub fallback: Fallback,
+    /// Self-update settings ([update]).
+    #[serde(default)]
+    pub update: Update,
     /// Per-tool settings ([tools]).
     #[serde(default)]
     pub tools: Tools,
@@ -250,6 +263,9 @@ impl Config {
         }
         if !other.fallback.models.is_empty() {
             self.fallback.models = other.fallback.models;
+        }
+        if other.update.repo.is_some() {
+            self.update.repo = other.update.repo;
         }
     }
     /// Effective step cap (default 20).

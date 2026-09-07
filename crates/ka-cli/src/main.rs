@@ -80,6 +80,15 @@ enum CliCommand {
         #[arg(long, value_name = "PATH")]
         schema: Option<PathBuf>,
     },
+    /// Check for / install a signed release update
+    Update {
+        /// Release channel (stable|edge)
+        #[arg(long, default_value = "stable")]
+        channel: String,
+        /// Only report the latest release, do not install
+        #[arg(long)]
+        check: bool,
+    },
     /// List known models (embedded catalog + local discovery)
     Models {
         /// Skip local discovery probes
@@ -143,6 +152,8 @@ enum ConfigCommand {
 /// Ed25519 public key embedded at build time (`KA_PUBKEY=<base64>`); the
 /// presence marks a signed build and lets `ka update` verify artifacts.
 pub const PUBLIC_KEY: Option<&str> = option_env!("KA_PUBKEY");
+
+mod update;
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
@@ -305,6 +316,18 @@ async fn dispatch(cli: Cli) -> Result<ExitCode, String> {
                 Vec::new(),
             )
             .await
+        }
+        Some(CliCommand::Update { channel, check }) => {
+            let trust = trust_for_cwd(false);
+            let cfg = load_config(&[], None, None, trust)?;
+            let repo = cfg
+                .update
+                .repo
+                .clone()
+                .unwrap_or_else(|| update::DEFAULT_REPO.to_string());
+            let message = update::run(&channel, check, &repo).await?;
+            println!("{message}");
+            Ok(ExitCode::SUCCESS)
         }
         Some(CliCommand::Models {
             no_discovery,

@@ -11,6 +11,8 @@ name = "ka"
 path = "src/main.rs"
 
 [dependencies]
+ed25519-dalek = { workspace = true }
+reqwest = { workspace = true }
 ka-agent = { workspace = true }
 ka-dialect = { workspace = true }
 ka-strand = { workspace = true }
