@@ -1077,6 +1077,14 @@ impl Voice {
                 agents.content
             ));
         }
+        // memory tiers (project, then user-level)
+        for memory in crate::conventions::discover_memory(&self.hand_ctx.cwd) {
+            system.push_str(&format!(
+                "\n<memory src=\"{}\">\n{}\n</memory>\n",
+                memory.path.display(),
+                memory.content
+            ));
+        }
         // skills: progressive disclosure — names/descriptions/paths only
         let skills = crate::conventions::discover_skills(&self.hand_ctx.cwd);
         if !skills.is_empty() {

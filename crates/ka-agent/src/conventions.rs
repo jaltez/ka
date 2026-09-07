@@ -15,6 +15,44 @@ pub struct AgentsFile {
 
 /// Discover AGENTS.md files from the filesystem root side of cwd down to
 /// cwd itself (nearest = last). Stops walking at the home directory or `/`.
+/// One loaded memory file.
+pub struct MemoryFile {
+    /// Where it came from.
+    pub path: PathBuf,
+    /// Full content.
+    pub content: String,
+}
+
+/// Memory tiers: project `MEMORY.md` first (cwd, ungated like
+/// AGENTS.md), then the user-level `~/.config/ka/MEMORY.md`. Missing
+/// files are skipped.
+pub fn discover_memory(cwd: &Path) -> Vec<MemoryFile> {
+    let mut out = Vec::new();
+    let project = cwd.join("MEMORY.md");
+    if let Ok(content) = std::fs::read_to_string(&project) {
+        if !content.trim().is_empty() {
+            out.push(MemoryFile {
+                path: project,
+                content,
+            });
+        }
+    }
+    let user = std::env::var("HOME")
+        .map(|h| PathBuf::from(h).join(".config/ka/MEMORY.md"))
+        .ok();
+    if let Some(user) = user {
+        if let Ok(content) = std::fs::read_to_string(&user) {
+            if !content.trim().is_empty() {
+                out.push(MemoryFile {
+                    path: user,
+                    content,
+                });
+            }
+        }
+    }
+    out
+}
+
 pub fn discover_agents(cwd: &Path) -> Vec<AgentsFile> {
     let mut chain: Vec<PathBuf> = vec![cwd.to_path_buf()];
     let mut cur = cwd.to_path_buf();

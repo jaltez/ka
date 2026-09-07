@@ -1852,6 +1852,11 @@ pub enum Modal {
         /// Selected row index.
         selected: usize,
     },
+    /// Memory viewer (/memory): project + user memory files.
+    Memory {
+        /// Rendered rows (path header + content lines).
+        rows: Vec<String>,
+    },
     /// Strand tree (/tree): current session + descendants.
     Tree {
         /// Rendered rows (`title · date · N msgs`).
@@ -2418,6 +2423,11 @@ async fn app(
                                     _ => {}
                                 }
                             }
+                            Modal::Memory { .. } => {
+                                if key.code == KeyCode::Esc {
+                                    modal = None;
+                                }
+                            }
                             Modal::Tree {
                                 items,
                                 targets,
@@ -2890,6 +2900,25 @@ async fn app(
                                             items: sidebar.inventory.prompts.clone(),
                                             selected: 0,
                                         },
+                                        ModalKind::Memory => {
+                                            let cwd = std::env::current_dir()
+                                                .unwrap_or_else(|_| std::path::PathBuf::from("."));
+                                            let files = discover_memory_files(&cwd);
+                                            let mut rows = Vec::new();
+                                            if files.is_empty() {
+                                                rows.push("(no memory files)".into());
+                                                rows.push(
+                                                    "create ./MEMORY.md or ~/.config/ka/MEMORY.md".into(),
+                                                );
+                                            }
+                                            for (path, content) in files {
+                                                rows.push(format!("▸ {}", path.display()));
+                                                for line in content.lines() {
+                                                    rows.push(line.to_string());
+                                                }
+                                            }
+                                            Modal::Memory { rows }
+                                        }
                                         ModalKind::Tree => {
                                             let cwd = std::env::current_dir()
                                                 .unwrap_or_else(|_| std::path::PathBuf::from("."));
@@ -3269,6 +3298,7 @@ async fn app(
                                 prompt.input.extend(text.chars().filter(|c| !c.is_whitespace()));
                             }
                             Modal::Prompts { .. } => {}
+                            Modal::Memory { .. } => {}
                             Modal::Tree { .. } => {}
                             Modal::Session(picker) => {
                                 picker.filter.extend(text.chars().filter(|c| !c.is_whitespace()));
@@ -3887,6 +3917,10 @@ pub fn available_slash_commands() -> Vec<(String, String)> {
             "/tree".to_string(),
             "current session's fork tree".to_string(),
         ),
+        (
+            "/memory".to_string(),
+            "show loaded MEMORY.md tiers".to_string(),
+        ),
         ("/prompt".to_string(), "run an MCP prompt".to_string()),
         (
             "/provider".to_string(),
@@ -4249,6 +4283,8 @@ pub enum ModalKind {
     Spills,
     /// MCP prompt picker.
     Prompts,
+    /// Memory viewer.
+    Memory,
     /// Strand tree.
     Tree,
     /// Help overlay.
@@ -4304,6 +4340,7 @@ fn slash_command(text: &str) -> Option<Slash> {
             | "/mcp"
             | "/prompt"
             | "/tree"
+            | "/memory"
     ) {
         if let Some(body) = custom_command(head, rest) {
             return Some(Slash {
@@ -4508,6 +4545,13 @@ step now; verify each step."
             quit: false,
             followup: None,
             modal: Some(ModalKind::Help),
+        }),
+        "/memory" => Some(Slash {
+            note: None,
+            event: None,
+            quit: false,
+            followup: None,
+            modal: Some(ModalKind::Memory),
         }),
         "/tree" => Some(Slash {
             note: None,
@@ -4715,6 +4759,27 @@ fn pad_to_width(s: String, width: usize) -> String {
 
 /// Status-bar key hints: each entry is a bold key plus a dim action,
 /// separated by dim ` · `.
+/// Memory tier files for /memory: project MEMORY.md, then the
+/// user-level one. Mirrors the engine's system-prompt fold.
+fn discover_memory_files(cwd: &std::path::Path) -> Vec<(std::path::PathBuf, String)> {
+    let mut out = Vec::new();
+    let project = cwd.join("MEMORY.md");
+    if let Ok(content) = std::fs::read_to_string(&project) {
+        if !content.trim().is_empty() {
+            out.push((project, content));
+        }
+    }
+    if let Ok(home) = std::env::var("HOME") {
+        let user = std::path::PathBuf::from(home).join(".config/ka/MEMORY.md");
+        if let Ok(content) = std::fs::read_to_string(&user) {
+            if !content.trim().is_empty() {
+                out.push((user, content));
+            }
+        }
+    }
+    out
+}
+
 fn hint_spans(pairs: &[(&str, &str)]) -> Vec<ratatui::text::Span<'static>> {
     use ratatui::style::{Modifier, Style};
     use ratatui::text::Span;
@@ -5070,6 +5135,7 @@ fn render(
             Modal::Tree { .. } => {
                 hint_spans(&[(" ↑↓", "choose"), (" ⏎", "attach"), (" esc", "close")])
             }
+            Modal::Memory { .. } => hint_spans(&[(" esc", "close")]),
             Modal::Key(_) => hint_spans(&[(" type", "value"), (" ⏎", "save"), (" esc", "cancel")]),
             Modal::Help => hint_spans(&[(" ⏎", "close")]),
         }
@@ -5601,6 +5667,35 @@ fn render(
                         Block::default()
                             .borders(Borders::ALL)
                             .title(padded_title("prompts"))
+                            .border_style(crate::palette::BORDER_STYLE)
+                            .padding(ratatui::widgets::Padding::new(1, 1, 1, 1)),
+                    )
+                    .style(ratatui::style::Style::new().bg(crate::palette::BG_SURFACE))
+                    .wrap(Wrap { trim: false });
+                frame.render_widget(widget, rect);
+            }
+            Modal::Memory { rows } => {
+                let height = (rows.len() as u16 + 4).clamp(6, 24);
+                let width = 72.min(frame.area().width);
+                let rect = centered(width, height, modal_area);
+                let inner_w = width.saturating_sub(4) as usize;
+                let mut text = Vec::new();
+                let cap = (height as usize).saturating_sub(4);
+                for row in rows.iter().take(cap) {
+                    if row.starts_with('▸') {
+                        text.push(TuiLine::styled(
+                            pad_to_width(row.clone(), inner_w),
+                            crate::palette::META,
+                        ));
+                    } else {
+                        text.push(TuiLine::raw(row.clone()));
+                    }
+                }
+                let widget = Paragraph::new(text)
+                    .block(
+                        Block::default()
+                            .borders(Borders::ALL)
+                            .title(padded_title("memory"))
                             .border_style(crate::palette::BORDER_STYLE)
                             .padding(ratatui::widgets::Padding::new(1, 1, 1, 1)),
                     )

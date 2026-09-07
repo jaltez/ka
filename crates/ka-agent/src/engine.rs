@@ -2665,9 +2665,9 @@ mod tests {
                 tools: 0,
             }]
         );
-        // 7 built-ins + todo + jobs + the delegate hand the discovered
-        // agent adds
-        assert_eq!(tools.len(), 10, "tools: {tools:?}");
+        // 7 built-ins + todo + jobs + delegate + web_fetch (search
+        // registers only with a configured [[search]] provider)
+        assert_eq!(tools.len(), 11, "tools: {tools:?}");
         assert!(tools.contains(&"delegate".to_string()), "tools: {tools:?}");
         assert!(tools.contains(&"todo".to_string()), "tools: {tools:?}");
         assert!(tools.contains(&"jobs".to_string()), "tools: {tools:?}");
