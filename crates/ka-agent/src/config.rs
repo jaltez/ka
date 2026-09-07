@@ -113,6 +113,8 @@ pub struct Tools {
     pub bash: BashTools,
     /// Read tool settings.
     pub read: ReadTools,
+    /// Web tool settings.
+    pub web: WebTools,
 }
 
 /// Read tool tuning (`[tools.read]`).
@@ -123,6 +125,16 @@ pub struct Tools {
 pub struct ReadTools {
     /// Image size cap in MB for the read hand (None = 5; 0 = unlimited).
     pub max_image_mb: Option<u32>,
+}
+
+/// Web tool tuning (`[tools.web]`).
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema,
+)]
+#[serde(deny_unknown_fields, default)]
+pub struct WebTools {
+    /// Allow fetching private/loopback addresses (None = false).
+    pub allow_private_hosts: Option<bool>,
 }
 
 /// Bash tool tuning (`[tools.bash]`).
@@ -150,6 +162,18 @@ pub const DEFAULT_BACKGROUND_AFTER_MS: u64 = 30_000;
 pub struct Update {
     /// GitHub repo (`owner/name`) releases are fetched from.
     pub repo: Option<String>,
+}
+
+/// One web-search provider (`[[search]]`; first entry is active).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields, default)]
+pub struct SearchProvider {
+    /// `tavily` | `brave` | `bing`.
+    pub provider: String,
+    /// Env var holding the API key.
+    pub api_key_env: String,
+    /// API base override (fixture tests, proxies).
+    pub base_url: Option<String>,
 }
 
 /// Context-window policy ([context]).
@@ -216,6 +240,9 @@ pub struct Config {
     /// Context-window policy ([context]).
     #[serde(default)]
     pub context: Context,
+    /// Web-search providers ([[search]]; first entry is active).
+    #[serde(default)]
+    pub search: Vec<SearchProvider>,
     /// Per-tool settings ([tools]).
     #[serde(default)]
     pub tools: Tools,
@@ -293,6 +320,16 @@ impl Config {
             .background_after_ms
             .unwrap_or(DEFAULT_BACKGROUND_AFTER_MS)
     }
+    /// Whether web fetches may target private hosts (default false).
+    pub fn effective_web_allow_private(&self) -> bool {
+        self.tools.web.allow_private_hosts.unwrap_or(false)
+    }
+
+    /// The active search provider, if any.
+    pub fn effective_search(&self) -> Option<SearchProvider> {
+        self.search.first().cloned()
+    }
+
     /// Whether overflow promotion is enabled (default true).
     pub fn effective_context_promote(&self) -> bool {
         self.context.promote.unwrap_or(true)

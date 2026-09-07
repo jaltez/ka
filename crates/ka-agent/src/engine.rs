@@ -338,6 +338,8 @@ async fn run(
     // main model uses (discovery overlays already applied by the caller)
     let roles = resolve_roles(&catalog, &config.roles, config.model.as_deref());
     let pathfinder_catalog = catalog.clone();
+    let search_provider = config.effective_search();
+    let web_allow_private = config.effective_web_allow_private();
     let mut voice = Voice::new(catalog, cwd.clone(), mode, max_steps);
     voice.set_rules(rules);
     voice.set_allowed_tools(allowed_tools);
@@ -346,6 +348,7 @@ async fn run(
     voice.set_fallbacks(config.fallback.models.clone());
     voice.set_max_image_mb(config.effective_max_image_mb());
     voice.set_context_promote(config.effective_context_promote());
+    voice.set_web_allow_private(config.effective_web_allow_private());
     {
         let slot = voice.pathfinder_slot();
         slot.write().catalog = pathfinder_catalog;
@@ -463,6 +466,10 @@ async fn run(
                 ));
             }
         }
+    }
+    // web search + fetch hands (search only when a provider is set)
+    for hand in crate::hands::web::hands(search_provider, web_allow_private) {
+        ctx.voice.push_hand(hand);
     }
     // browse hand over every server: resources + prompts discovery
     if !ctx.mcp_shared.is_empty() {

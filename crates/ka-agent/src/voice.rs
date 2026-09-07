@@ -204,6 +204,7 @@ impl Voice {
                 jobs,
                 bash_background_ms: 0,
                 max_image_mb: 5,
+                web_allow_private: false,
             },
             state: VoiceState::default(),
             max_steps,
@@ -294,6 +295,7 @@ impl Voice {
             jobs: std::sync::Arc::new(crate::hands::jobs::JobTable::new()),
             bash_background_ms: 0,
             max_image_mb: 5,
+            web_allow_private: false,
         };
         Self {
             catalog,
@@ -476,6 +478,11 @@ impl Voice {
     /// Set the read-hand image size cap in MB (engine bootstrap).
     pub fn set_max_image_mb(&mut self, mb: u32) {
         self.hand_ctx.max_image_mb = mb;
+    }
+
+    /// Set the web-fetch private-host policy (engine bootstrap).
+    pub fn set_web_allow_private(&mut self, allow: bool) {
+        self.hand_ctx.web_allow_private = allow;
     }
 
     /// Set the bash auto-background threshold in ms (engine bootstrap;

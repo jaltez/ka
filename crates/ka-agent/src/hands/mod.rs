@@ -24,6 +24,7 @@ pub mod read;
 pub mod secrets;
 pub mod snapshots;
 pub mod todo;
+pub mod web;
 pub mod write;
 
 /// Execution clearance tiers.
@@ -125,6 +126,8 @@ pub struct HandContext {
     pub bash_background_ms: u64,
     /// Read-hand image size cap in MB (0 = unlimited).
     pub max_image_mb: u32,
+    /// Web fetches may target private hosts ([tools.web]).
+    pub web_allow_private: bool,
 }
 
 /// The read ledger: files the model has read, with their stamps. Edits
