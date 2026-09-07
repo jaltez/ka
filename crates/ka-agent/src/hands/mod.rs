@@ -91,7 +91,7 @@ pub fn unified_diff(path: &str, old: &str, new: &str, max_lines: usize) -> Strin
     let a = &a[..a.len().min(SIDE_CAP)];
     let b = &b[..b.len().min(SIDE_CAP)];
     let (n, m) = (a.len(), b.len());
-    if a == b && !a_trunc && !b_trunc {
+    if old == new {
         return String::new();
     }
 
@@ -473,9 +473,12 @@ mod tests {
         let body = d.lines().skip(2).count();
         assert!(body <= 11, "{body} lines: {d}");
         assert!(d.contains("more lines"), "{d}");
-        // sides over the 2000-line cap truncate with a note, never hang
+        // differing sides over the 2000-line cap truncate with a note,
+        // never hang; identical sides stay empty regardless of size
         let big: String = std::iter::repeat_n("x\n", 3000).collect();
-        let d = unified_diff("f.txt", &big, &big, 24);
+        assert_eq!(unified_diff("f.txt", &big, &big, 24), "");
+        let big_new = format!("{big}y\n");
+        let d = unified_diff("f.txt", &big, &big_new, 24);
         assert!(d.contains("diff truncated"), "{d}");
     }
 

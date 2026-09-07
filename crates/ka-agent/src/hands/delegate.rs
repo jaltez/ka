@@ -70,11 +70,11 @@ Or pass `tasks` to run several agents concurrently (up to 4 at a time; results r
                     "agent": {
                         "type": "string",
                         "enum": self.agents.iter().map(|a| a.name.clone()).collect::<Vec<_>>(),
-                        "description": "Which agent to run"
+                        "description": "Which agent to run (required unless `tasks` is given)"
                     },
                     "task": {
                         "type": "string",
-                        "description": "The complete, self-contained task for the agent"
+                        "description": "The complete, self-contained task for the agent (required unless `tasks` is given)"
                     },
                     "tasks": {
                         "type": "array",
@@ -96,7 +96,7 @@ Or pass `tasks` to run several agents concurrently (up to 4 at a time; results r
                         "description": "Fan out: run several agents concurrently (max 4 at a time). Mutually exclusive with agent+task."
                     }
                 },
-                "required": ["agent", "task"]
+                "required": []
             }),
             clearance: Clearance::Read,
             read_only: true,
@@ -385,13 +385,17 @@ fn create_worktree(cwd: &std::path::Path, name: &str) -> Result<std::path::PathB
             std::env::var("HOME").map(|h| std::path::PathBuf::from(h).join(".local/state"))
         })
         .unwrap_or_else(|_| std::env::temp_dir());
+    static WORKTREE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let uuid = format!(
-        "{}-{}",
+        "{}-{}-{}",
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis())
+            .map(|d| d.as_nanos())
             .unwrap_or(0),
-        std::process::id()
+        std::process::id(),
+        // fanout can run the same isolated agent twice in one
+        // millisecond; the sequence number keeps branch/path unique
+        WORKTREE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
     );
     let path = state.join("ka/worktrees").join(format!("{name}-{uuid}"));
     if let Some(parent) = path.parent() {

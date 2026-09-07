@@ -879,20 +879,35 @@ fn input_height(row_count: usize) -> u16 {
 fn input_area_rows(ask: Option<&PendingAsk>, picker: Option<&ModePicker>, draft: &str) -> usize {
     match ask {
         Some(a) => {
-            a.question.split('\n').count()
-                + 1
-                + a.detail
-                    .as_ref()
-                    .map_or(0, |d| ask_detail_rows(d, ASK_DETAIL_MAX).len())
+            let q = a.question.split('\n').count();
+            let budget = ask_detail_budget(q);
+            q + 1
+                + a.detail.as_ref().map_or(0, |d| {
+                    if budget == 0 {
+                        0
+                    } else {
+                        ask_detail_rows(d, budget).len()
+                    }
+                })
         }
         None if picker.is_some() => MODE_CHOICES.len(),
         None => draft.split('\n').count(),
     }
 }
 
-/// Max rows of diff detail shown in an ask form (the form borrows the
-/// input box; uncapped diffs would crowd out the choice).
+/// Max rows of diff detail shown in an ask form. The input box grows
+/// at most five rows past its base (six content rows total), and the
+/// options row must stay visible: the detail budget is whatever is
+/// left after the question lines and the options row, never above 8.
 const ASK_DETAIL_MAX: usize = 8;
+
+/// Rows of detail the ask form can afford for `question_lines` lines.
+/// `ask_detail_rows` may add a trailer, so one row of headroom is kept.
+fn ask_detail_budget(question_lines: usize) -> usize {
+    ASK_DETAIL_MAX
+        .min(6usize.saturating_sub(question_lines + 1))
+        .saturating_sub(1)
+}
 
 /// Colorized rows for an ask's diff detail: additions in OK, removals
 /// in ERR, hunk headers in META, file headers in FAINT, context plain.
@@ -3080,7 +3095,7 @@ async fn app(
                             }
                             // /clip: paste a clipboard image as the
                             // next prompt's attachment
-                            if text == "/clip" {
+                            if text.trim() == "/clip" {
                                 input.text.clear();
                                 input.cursor = 0;
                                 let staged = match clip_image_bytes().await {
@@ -5829,9 +5844,13 @@ fn render(
         // question text, then one options row: the selected option is
         // inverse video, every option carries a single leading space so
         // the text never shifts when the selection moves
+        let question_lines = ask.question.split('\n').count();
+        let budget = ask_detail_budget(question_lines);
         let mut rows = vec![TuiLine::from(ask.question.as_str())];
-        if let Some(detail) = &ask.detail {
-            rows.extend(ask_detail_rows(detail, ASK_DETAIL_MAX));
+        if budget > 0 {
+            if let Some(detail) = &ask.detail {
+                rows.extend(ask_detail_rows(detail, budget));
+            }
         }
         let mut opts: Vec<Span> = Vec::new();
         for (i, opt) in ask.options.iter().enumerate() {
@@ -9695,6 +9714,35 @@ mod tests {
             detail: Some("ctx\n+added\n".into()),
         };
         assert_eq!(input_area_rows(Some(&ask), None, ""), 4);
+        // regression: a huge diff must never push the options row past
+        // the input box's six-content-row cap (the choices stay visible)
+        let ask = PendingAsk {
+            id: AskId("a".into()),
+            question: "allow write to modify files?".into(),
+            options: vec!["allow".into(), "deny".into()],
+            selected: 0,
+            detail: Some((0..9).map(|i| format!("+line{i}\n")).collect()),
+        };
+        let total = input_area_rows(Some(&ask), None, "");
+        assert!(total <= 6, "ask form grew to {total} rows");
+        // a four-line question leaves no detail budget (trailer headroom)
+        let ask = PendingAsk {
+            id: AskId("a".into()),
+            question: "q1\nq2\nq3\nq4".into(),
+            options: vec!["allow".into()],
+            selected: 0,
+            detail: Some("+a\n".into()),
+        };
+        assert_eq!(input_area_rows(Some(&ask), None, ""), 5);
+        // six question lines: no budget left, detail omitted entirely
+        let ask = PendingAsk {
+            id: AskId("a".into()),
+            question: "q1\nq2\nq3\nq4\nq5\nq6".into(),
+            options: vec!["allow".into()],
+            selected: 0,
+            detail: Some("+a\n".into()),
+        };
+        assert_eq!(input_area_rows(Some(&ask), None, ""), 7);
     }
     // ── sidebar ──────────────────────────────────────────────────
     use unicode_width::UnicodeWidthStr;

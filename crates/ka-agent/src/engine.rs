@@ -1548,8 +1548,9 @@ async fn dispatch_turn(
     if let Err(note) = crate::fshooks::run(HookPoint::PreTurn, cwd, None).await {
         events.send(Event::Note { message: note }).await.ok();
     }
+    let prompt_head = text.lines().next().unwrap_or("").to_string();
     let usage = if let Some(model) = state.model.clone() {
-        voice
+        let usage = voice
             .turn(
                 &model,
                 text,
@@ -1561,7 +1562,11 @@ async fn dispatch_turn(
                 schema,
                 images,
             )
-            .await
+            .await;
+        if state.auto_commit && voice.last_stop() == Stop::Done {
+            auto_commit(events, cwd, &prompt_head).await;
+        }
+        usage
     } else {
         let mut history = std::mem::take(&mut voice.history);
         let usage = turn_canned(commands, events, state, &mut history, text, cwd).await;
@@ -1874,23 +1879,23 @@ async fn turn_canned(
 /// git failure is an advisory note, never a turn failure.
 async fn auto_commit(events: &mpsc::Sender<Event>, cwd: &std::path::Path, prompt: &str) {
     let git = |args: &[&str]| {
-        std::process::Command::new("git")
+        tokio::process::Command::new("git")
             .args(args)
             .current_dir(cwd)
             .output()
     };
-    let in_repo = match git(&["rev-parse", "--is-inside-work-tree"]) {
-        Ok(out) if String::from_utf8_lossy(&out.stdout).trim() == "true" => true,
+    match git(&["rev-parse", "--is-inside-work-tree"]).await {
+        Ok(out) if String::from_utf8_lossy(&out.stdout).trim() == "true" => {}
         _ => return,
-    };
-    let _ = in_repo;
+    }
     let dirty = git(&["status", "--porcelain"])
+        .await
         .map(|out| !out.stdout.is_empty())
         .unwrap_or(false);
     if !dirty {
         return;
     }
-    if let Err(e) = git(&["add", "-A"]) {
+    if let Err(e) = git(&["add", "-A"]).await {
         events
             .send(Event::Note {
                 message: format!("auto-commit: {e}"),
@@ -1915,9 +1920,12 @@ async fn auto_commit(events: &mpsc::Sender<Event>, cwd: &std::path::Path, prompt
         "commit",
         "-m",
         &msg,
-    ]) {
+    ])
+    .await
+    {
         Ok(out) if out.status.success() => {
             let id = git(&["rev-parse", "--short", "HEAD"])
+                .await
                 .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
                 .unwrap_or_default();
             events

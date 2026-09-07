@@ -145,6 +145,8 @@ pub struct Voice {
     digest: Option<String>,
     /// Last measured context consumption (tokens, from provider usage).
     last_context: u64,
+    /// Stop kind of the most recent turn (set at each turn exit).
+    pub(crate) last_stop: Stop,
     /// Bumped every time a digest replaces history.
     digest_revision: u64,
     /// (summary, kept index) of the most recent digest, for persistence.
@@ -215,6 +217,7 @@ impl Voice {
             ratio: 4.0,
             digest: None,
             last_context: 0,
+            last_stop: Stop::Done,
             digest_revision: 0,
             last_digest: None,
             fallbacks: Vec::new(),
@@ -315,6 +318,7 @@ impl Voice {
             ratio: 4.0,
             digest: None,
             last_context: 0,
+            last_stop: Stop::Done,
             digest_revision: 0,
             last_digest: None,
             fallbacks: Vec::new(),
@@ -514,9 +518,14 @@ impl Voice {
         run_hook_scripts(&self.hooks_cfg, event, tool, args, &self.hand_ctx.cwd).await
     }
 
-    /// Fire `stop` hooks at turn exit. Advisory only: failures surface
-    /// as notes and never fail the turn.
-    async fn stop_hooks(&self, events: &mpsc::Sender<Event>, status: &str) {
+    /// Fire `stop` hooks at turn exit and record the stop kind.
+    /// Advisory only: failures surface as notes and never fail the turn.
+    async fn stop_hooks(&mut self, events: &mpsc::Sender<Event>, status: &str) {
+        self.last_stop = match status {
+            "aborted" => Stop::Aborted,
+            "error" => Stop::Error,
+            _ => Stop::Done,
+        };
         for reason in run_stop_scripts(&self.hooks_cfg, status, &self.hand_ctx.cwd).await {
             events
                 .send(Event::Note {
@@ -957,6 +966,11 @@ impl Voice {
         self.ratio
     }
 
+    /// Stop kind of the most recently completed turn.
+    pub fn last_stop(&self) -> Stop {
+        self.last_stop
+    }
+
     /// Debug accessor for the last measured context.
     #[doc(hidden)]
     pub fn debug_last_context(&self) -> u64 {
@@ -1072,6 +1086,7 @@ impl Voice {
         let mut parsed = match parse_selector(model_selector) {
             Ok(p) => p,
             Err(e) => {
+                self.stop_hooks(events, "error").await;
                 return finish_after_error(events, ErrorClass::Protocol, &e.to_string()).await;
             }
         };
@@ -1079,6 +1094,7 @@ impl Voice {
         let mut dialect = match self.catalog.get(&model_id).cloned() {
             Some(d) => d,
             None => {
+                self.stop_hooks(events, "error").await;
                 return finish_after_error(
                     events,
                     ErrorClass::Protocol,
@@ -1088,12 +1104,13 @@ impl Voice {
             }
         };
         if schema.is_some() && !dialect.flags.structured {
+            self.stop_hooks(events, "error").await;
             return finish_after_error(
                 events,
                 ErrorClass::Unsupported,
                 &format!(
                     "model {model_id:?} does not support structured output \
-                     (no `structured` support; drop --schema or pick a model that has it)"
+                         (no `structured` support; drop --schema or pick a model that has it)"
                 ),
             )
             .await;

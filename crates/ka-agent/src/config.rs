@@ -356,6 +356,12 @@ impl Config {
         if other.context.promote.is_some() {
             self.context.promote = other.context.promote;
         }
+        if !other.hooks.is_empty() {
+            self.hooks = other.hooks;
+        }
+        if other.git.auto_commit {
+            self.git.auto_commit = true;
+        }
     }
     /// Effective step cap (default 20).
     pub fn effective_max_steps(&self) -> u32 {
