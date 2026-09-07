@@ -57,7 +57,10 @@ impl Hand for DelegateHand {
             };
             listing.push_str(&format!("- {}: {desc}\n", a.name));
         }
-        listing.push_str("The agent runs with read-only tools and returns a dense summary.");
+        listing.push_str(
+            "The agent runs with read-only tools and returns a dense summary. \
+Or pass `tasks` to run several agents concurrently (up to 4 at a time; results return in order).",
+        );
         HandDef {
             name: "delegate".to_string(),
             description: listing,
@@ -72,6 +75,25 @@ impl Hand for DelegateHand {
                     "task": {
                         "type": "string",
                         "description": "The complete, self-contained task for the agent"
+                    },
+                    "tasks": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "agent": {
+                                    "type": "string",
+                                    "enum": self.agents.iter().map(|a| a.name.clone()).collect::<Vec<_>>(),
+                                    "description": "Which agent to run"
+                                },
+                                "task": {
+                                    "type": "string",
+                                    "description": "The complete, self-contained task for this agent"
+                                }
+                            },
+                            "required": ["agent", "task"]
+                        },
+                        "description": "Fan out: run several agents concurrently (max 4 at a time). Mutually exclusive with agent+task."
                     }
                 },
                 "required": ["agent", "task"]
@@ -87,10 +109,21 @@ impl Hand for DelegateHand {
         ctx: &'a HandContext,
     ) -> Pin<Box<dyn Future<Output = ToolOutput> + Send + 'a>> {
         Box::pin(async move {
-            let Some(agent_name) = args.get("agent").and_then(Value::as_str) else {
+            let agent_arg = args.get("agent").and_then(Value::as_str);
+            let task_arg = args.get("task").and_then(Value::as_str);
+            let tasks_arg = args.get("tasks").filter(|v| !v.is_null());
+
+            if tasks_arg.is_some() && (agent_arg.is_some() || task_arg.is_some()) {
+                return ToolOutput::err("delegate: pass either agent+task or tasks, not both");
+            }
+            if let Some(tasks) = tasks_arg {
+                return self.fanout(tasks, ctx).await;
+            }
+
+            let Some(agent_name) = agent_arg else {
                 return ToolOutput::err("delegate: missing required 'agent'");
             };
-            let Some(task) = args.get("task").and_then(Value::as_str) else {
+            let Some(task) = task_arg else {
                 return ToolOutput::err("delegate: missing required 'task'");
             };
             let Some(def) = self.find(agent_name) else {
@@ -101,115 +134,234 @@ impl Hand for DelegateHand {
                 ));
             };
             let source = self.source.read().clone();
-            let Some(model) = source.model else {
-                return ToolOutput::err("delegate: no model configured for the parent session");
-            };
-
-            // isolated agents write in a throwaway git worktree on their
-            // own branch: they need a repo and write-mode permission
-            let mut worktree: Option<std::path::PathBuf> = None;
-            if def.isolate {
-                if !matches!(
-                    self.parent_mode,
-                    ka_protocol::Mode::AcceptEdits | ka_protocol::Mode::Free
-                ) {
-                    return ToolOutput::err(
-                        "delegate: isolated agents need write access — switch to accept_edits or free mode first (/mode)",
-                    );
-                }
-                match create_worktree(&ctx.cwd, &format!("ka-{agent_name}")) {
-                    Ok(path) => worktree = Some(path),
-                    Err(e) => return ToolOutput::err(e),
-                }
+            match run_agent(
+                def.clone(),
+                task.to_string(),
+                ctx.cwd.clone(),
+                source,
+                self.parent_mode,
+            )
+            .await
+            {
+                Ok(summary) => ToolOutput::ok(summary),
+                Err(e) => ToolOutput::err(e),
             }
-            let agent_cwd = worktree.clone().unwrap_or_else(|| ctx.cwd.clone());
-
-            let prompt = format!("{}\n\nTask: {}", def.system, task);
-            let (cmd_tx, mut cmd_rx) = mpsc::channel(16);
-            let (evt_tx, mut evt_rx) = mpsc::channel(256);
-            let isolated = worktree.is_some();
-            let max_steps = def.max_steps;
-            let handle = tokio::spawn(async move {
-                let mut interjections = Vec::new();
-                let mut deferrals = std::collections::VecDeque::new();
-                let mut voice = if isolated {
-                    // isolated agents may write — inside the worktree only
-                    Voice::new(
-                        source.catalog,
-                        agent_cwd,
-                        ka_protocol::Mode::Free,
-                        max_steps,
-                    )
-                } else {
-                    Voice::new_readonly(
-                        source.catalog,
-                        agent_cwd,
-                        ka_protocol::Mode::Free,
-                        max_steps,
-                    )
-                };
-                voice.set_model_selector(&model, 4.0);
-                voice
-                    .turn(
-                        &model,
-                        prompt,
-                        &mut cmd_rx,
-                        &evt_tx,
-                        &mut interjections,
-                        &mut deferrals,
-                        &mut GuardRuntime::default(),
-                        None,
-                        Vec::new(),
-                    )
-                    .await;
-            });
-
-            let mut summary = String::new();
-            let mut thought = String::new();
-            let mut failed: Option<String> = None;
-            // 10-minute cap, same budget as pathfinder
-            let deadline = tokio::time::timeout(std::time::Duration::from_secs(600), async {
-                while let Some(evt) = evt_rx.recv().await {
-                    match evt {
-                        ka_protocol::Event::Delta {
-                            kind: ka_protocol::DeltaKind::Text(t),
-                        } => summary.push_str(&t),
-                        ka_protocol::Event::Delta {
-                            kind: ka_protocol::DeltaKind::Thought(t),
-                        } => thought.push_str(&t),
-                        ka_protocol::Event::Error { message, .. } => failed = Some(message),
-                        ka_protocol::Event::TurnFinished { .. } => break,
-                        _ => {}
-                    }
-                }
-            })
-            .await;
-            drop(cmd_tx);
-            let _ = handle.await;
-
-            if !matches!(deadline, Ok(())) {
-                return ToolOutput::err("delegate: agent timed out (10m)");
-            }
-            if summary.trim().is_empty() && !thought.trim().is_empty() {
-                summary = thought; // thinking models: reason-only replies
-            }
-            if summary.trim().is_empty() {
-                return ToolOutput::err(format!(
-                    "agent {agent_name} failed: {}",
-                    failed.unwrap_or_else(|| "no summary produced".to_string())
-                ));
-            }
-            if let Some(wt) = &worktree {
-                match finish_worktree(&ctx.cwd, wt, agent_name) {
-                    Ok(branch) => summary.push_str(&format!(
-                        "\n\n(isolated worktree: changes live on branch `{branch}`)"
-                    )),
-                    Err(e) => return ToolOutput::err(e),
-                }
-            }
-            ToolOutput::ok(summary)
         })
     }
+}
+
+impl DelegateHand {
+    /// Fan out: run every task concurrently (semaphore cap 4) and
+    /// report `## task N — <agent>` sections in input order under a
+    /// wall-time header. Per-task failures stay inline; only
+    /// structural problems (bad shape, empty list) fail the call.
+    async fn fanout(&self, tasks: &Value, ctx: &HandContext) -> ToolOutput {
+        let Some(list) = tasks.as_array() else {
+            return ToolOutput::err("delegate: tasks must be an array of {agent, task}");
+        };
+        if list.is_empty() {
+            return ToolOutput::err("delegate: tasks must not be empty");
+        }
+        let mut picked: Vec<Result<FanoutJob, String>> = Vec::with_capacity(list.len());
+        for (i, entry) in list.iter().enumerate() {
+            let Some(name) = entry.get("agent").and_then(Value::as_str) else {
+                return ToolOutput::err(format!("delegate: tasks[{i}] needs an 'agent'"));
+            };
+            let Some(task) = entry.get("task").and_then(Value::as_str) else {
+                return ToolOutput::err(format!("delegate: tasks[{i}] needs a 'task'"));
+            };
+            match self.find(name) {
+                Some(def) => picked.push(Ok(FanoutJob {
+                    def: def.clone(),
+                    task: task.to_string(),
+                    cwd: ctx.cwd.clone(),
+                    source: self.source.read().clone(),
+                    parent_mode: self.parent_mode,
+                })),
+                None => picked.push(Err(format!("unknown agent '{name}'"))),
+            }
+        }
+
+        let started = std::time::Instant::now();
+        let sem = Arc::new(tokio::sync::Semaphore::new(4));
+        let mut handles = Vec::with_capacity(picked.len());
+        for entry in picked {
+            let sem = sem.clone();
+            handles.push(tokio::spawn(async move {
+                let _permit = sem.acquire().await;
+                match entry {
+                    Ok(job) => {
+                        let name = job.def.name.clone();
+                        let out =
+                            run_agent(job.def, job.task, job.cwd, job.source, job.parent_mode)
+                                .await;
+                        (Some(name), out)
+                    }
+                    Err(reason) => (None, Err(reason)),
+                }
+            }));
+        }
+        let mut sections = Vec::with_capacity(handles.len());
+        for (i, h) in handles.into_iter().enumerate() {
+            let idx = i + 1;
+            match h.await {
+                Ok((Some(name), Ok(summary))) => {
+                    sections.push(format!("## task {idx} — {name}\n{summary}"));
+                }
+                Ok((Some(name), Err(reason))) => {
+                    sections.push(format!("## task {idx} — {name}\n[failed: {reason}]"));
+                }
+                // unnamed entries are the pre-resolved inline failures
+                Ok((None, outcome)) => {
+                    let reason = outcome
+                        .err()
+                        .unwrap_or_else(|| "no summary produced".to_string());
+                    sections.push(format!("## task {idx}\n[failed: {reason}]"));
+                }
+                Err(e) => {
+                    sections.push(format!("## task {idx}\n[failed: {e}]"));
+                }
+            }
+        }
+        let mut report = format!(
+            "{} tasks · {:.1}s\n",
+            sections.len(),
+            started.elapsed().as_secs_f64()
+        );
+        report.push_str(&sections.join("\n\n"));
+        ToolOutput::ok(report)
+    }
+}
+
+/// One fanout entry's shared source bootstrap (clone of the engine's
+/// pathfinder slot plus the parent mode), moved into spawned tasks.
+struct FanoutJob {
+    def: AgentDef,
+    task: String,
+    cwd: std::path::PathBuf,
+    source: super::pathfinder::PathfinderSource,
+    parent_mode: ka_protocol::Mode,
+}
+
+/// Run one agent on one task: a nested voice turn (read-only, or
+/// worktree-isolated when the agent opts in), 10-minute cap. `Err`
+/// carries the full user-facing reason.
+async fn run_agent(
+    def: AgentDef,
+    task: String,
+    cwd: std::path::PathBuf,
+    source: super::pathfinder::PathfinderSource,
+    parent_mode: ka_protocol::Mode,
+) -> Result<String, String> {
+    let agent_name = def.name.as_str();
+    let Some(model) = source.model else {
+        return Err("delegate: no model configured for the parent session".to_string());
+    };
+
+    // isolated agents write in a throwaway git worktree on their
+    // own branch: they need a repo and write-mode permission
+    let mut worktree: Option<std::path::PathBuf> = None;
+    if def.isolate {
+        if !matches!(
+            parent_mode,
+            ka_protocol::Mode::AcceptEdits | ka_protocol::Mode::Free
+        ) {
+            return Err(
+                "delegate: isolated agents need write access — switch to accept_edits or free mode first (/mode)"
+                    .to_string(),
+            );
+        }
+        match create_worktree(&cwd, &format!("ka-{agent_name}")) {
+            Ok(path) => worktree = Some(path),
+            Err(e) => return Err(e),
+        }
+    }
+    let agent_cwd = worktree.clone().unwrap_or_else(|| cwd.clone());
+
+    let prompt = format!("{}\n\nTask: {}", def.system, task);
+    let (cmd_tx, mut cmd_rx) = mpsc::channel(16);
+    let (evt_tx, mut evt_rx) = mpsc::channel(256);
+    let isolated = worktree.is_some();
+    let max_steps = def.max_steps;
+    let handle = tokio::spawn(async move {
+        let mut interjections = Vec::new();
+        let mut deferrals = std::collections::VecDeque::new();
+        let mut voice = if isolated {
+            // isolated agents may write — inside the worktree only
+            Voice::new(
+                source.catalog,
+                agent_cwd,
+                ka_protocol::Mode::Free,
+                max_steps,
+            )
+        } else {
+            Voice::new_readonly(
+                source.catalog,
+                agent_cwd,
+                ka_protocol::Mode::Free,
+                max_steps,
+            )
+        };
+        voice.set_model_selector(&model, 4.0);
+        voice
+            .turn(
+                &model,
+                prompt,
+                &mut cmd_rx,
+                &evt_tx,
+                &mut interjections,
+                &mut deferrals,
+                &mut GuardRuntime::default(),
+                None,
+                Vec::new(),
+            )
+            .await;
+    });
+
+    let mut summary = String::new();
+    let mut thought = String::new();
+    let mut failed: Option<String> = None;
+    // 10-minute cap, same budget as pathfinder
+    let deadline = tokio::time::timeout(std::time::Duration::from_secs(600), async {
+        while let Some(evt) = evt_rx.recv().await {
+            match evt {
+                ka_protocol::Event::Delta {
+                    kind: ka_protocol::DeltaKind::Text(t),
+                } => summary.push_str(&t),
+                ka_protocol::Event::Delta {
+                    kind: ka_protocol::DeltaKind::Thought(t),
+                } => thought.push_str(&t),
+                ka_protocol::Event::Error { message, .. } => failed = Some(message),
+                ka_protocol::Event::TurnFinished { .. } => break,
+                _ => {}
+            }
+        }
+    })
+    .await;
+    drop(cmd_tx);
+    let _ = handle.await;
+
+    if !matches!(deadline, Ok(())) {
+        return Err("delegate: agent timed out (10m)".to_string());
+    }
+    if summary.trim().is_empty() && !thought.trim().is_empty() {
+        summary = thought; // thinking models: reason-only replies
+    }
+    if summary.trim().is_empty() {
+        return Err(format!(
+            "agent {agent_name} failed: {}",
+            failed.unwrap_or_else(|| "no summary produced".to_string())
+        ));
+    }
+    if let Some(wt) = &worktree {
+        match finish_worktree(&cwd, wt, agent_name) {
+            Ok(branch) => summary.push_str(&format!(
+                "\n\n(isolated worktree: changes live on branch `{branch}`)"
+            )),
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(summary)
 }
 /// Create an isolated git worktree on its own branch under the state
 /// dir. `Err` when the cwd is not a git repository.
@@ -399,6 +551,89 @@ mod tests {
         assert!(out.is_error);
         assert!(
             out.content.contains("no model configured"),
+            "{}",
+            out.content
+        );
+    }
+
+    #[tokio::test]
+    async fn tasks_fanout_reports_both_unknown_agents_in_one_output() {
+        let h = hand();
+        let ctx = ctx_for();
+        let out = h
+            .execute(
+                &serde_json::json!({"tasks": [
+                    {"agent": "nope1", "task": "a"},
+                    {"agent": "nope2", "task": "b"}
+                ]}),
+                &ctx,
+            )
+            .await;
+        assert!(
+            !out.is_error,
+            "fanout succeeds with inline failures: {}",
+            out.content
+        );
+        assert!(out.content.contains("2 tasks"), "{}", out.content);
+        assert!(
+            out.content.contains("[failed: unknown agent 'nope1']"),
+            "{}",
+            out.content
+        );
+        assert!(
+            out.content.contains("[failed: unknown agent 'nope2']"),
+            "{}",
+            out.content
+        );
+        // input order preserved
+        let n1 = out.content.find("nope1").unwrap();
+        let n2 = out.content.find("nope2").unwrap();
+        assert!(n1 < n2);
+    }
+
+    #[tokio::test]
+    async fn tasks_arg_validation_rejects_mixed_and_empty() {
+        let h = hand();
+        let ctx = ctx_for();
+        // agent+task together with tasks is refused
+        let out = h
+            .execute(
+                &serde_json::json!({"agent": "reviewer", "task": "x", "tasks": []}),
+                &ctx,
+            )
+            .await;
+        assert!(out.is_error);
+        assert!(
+            out.content.contains("either agent+task or tasks"),
+            "{}",
+            out.content
+        );
+        // empty tasks array is refused
+        let out = h.execute(&serde_json::json!({"tasks": []}), &ctx).await;
+        assert!(out.is_error);
+        assert!(out.content.contains("must not be empty"), "{}", out.content);
+        // known agents without a model: sections fail inline, in input order
+        let out = h
+            .execute(
+                &serde_json::json!({"tasks": [
+                    {"agent": "scout", "task": "a"},
+                    {"agent": "reviewer", "task": "b"}
+                ]}),
+                &ctx,
+            )
+            .await;
+        assert!(!out.is_error, "{}", out.content);
+        assert!(out.content.contains("## task 1 — scout"), "{}", out.content);
+        assert!(
+            out.content.contains("## task 2 — reviewer"),
+            "{}",
+            out.content
+        );
+        assert_eq!(
+            out.content
+                .matches("[failed: delegate: no model configured")
+                .count(),
+            2,
             "{}",
             out.content
         );
