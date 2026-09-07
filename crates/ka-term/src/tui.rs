@@ -1593,6 +1593,27 @@ fn usage_rows(meters: &Meters, summaries: &[ka_strand::StrandSummary]) -> Vec<St
     rows
 }
 
+/// The shared follow-up prompt that starts a build turn from the plan
+/// file (both `/build` and `/approve`).
+fn build_followup() -> String {
+    "Switching to build mode. Read .ka/plans/plan.md and implement it step by \
+step now; verify each step."
+        .to_string()
+}
+
+/// True when the plan file exists and was written after `/plan` started
+/// its turn: a fresh plan on disk → suggest `/approve`.
+fn plan_drafted(plan_started: Option<std::time::SystemTime>, plan_path: &std::path::Path) -> bool {
+    let Some(started) = plan_started else {
+        return false;
+    };
+    plan_path
+        .metadata()
+        .ok()
+        .and_then(|m| m.modified().ok())
+        .is_some_and(|mt| mt >= started)
+}
+
 /// Session picker (/session, /resume): newest strands + a fresh-session
 /// row, filtered by the typed substring.
 #[derive(Debug, Clone)]
@@ -2108,6 +2129,7 @@ async fn app(
     let mut queue: Vec<String> = Vec::new();
     let mut turn_produced = false;
     let mut turn_usage: Option<(u64, u64, u64)> = None; // (input+cache_read, total_in_seen, output)
+    let mut plan_started: Option<std::time::SystemTime> = None;
     let mut current_assistant = String::new();
     let mut spills: Vec<String> = Vec::new();
     let mut current_thought = String::new();
@@ -2971,6 +2993,14 @@ async fn app(
                             }
                             if let Some(cmd) = slash_command(&text) {
                                 transcript.push_separated(Line::User(text));
+                                if matches!(
+                                    cmd.event,
+                                    Some(Command::SetMode {
+                                        mode: ka_protocol::Mode::Plan,
+                                    })
+                                ) {
+                                    plan_started = Some(std::time::SystemTime::now());
+                                }
                                 if let Some(note) = cmd.note {
                                     transcript.push_separated(Line::Note(note));
                                 }
@@ -3657,6 +3687,19 @@ async fn app(
                                 }
                             }
                         }
+                        if matches!(evt, Event::TurnFinished { .. })
+                            && meters.mode == mode_label(ka_protocol::Mode::Plan)
+                            && plan_drafted(
+                                plan_started,
+                                std::path::Path::new(".ka/plans/plan.md"),
+                            )
+                        {
+                            plan_started = None;
+                            transcript.push_separated(Line::Note(
+                                "Plan drafted — review .ka/plans/plan.md, then /approve to build"
+                                    .into(),
+                            ));
+                        }
                         if replayed {
                             scroll = None;
                         }
@@ -4245,6 +4288,10 @@ fn builtin_slash_commands() -> Vec<(String, String)> {
             "research the task, write .ka/plans/plan.md".to_string(),
         ),
         ("/build".to_string(), "implement the plan file".to_string()),
+        (
+            "/approve".to_string(),
+            "review the plan file, then build it".to_string(),
+        ),
         (
             "/rewind".to_string(),
             "drop the last N exchanges".to_string(),
@@ -4867,11 +4914,16 @@ then write a concrete numbered implementation plan to .ka/plans/plan.md. Task: {
             }),
             quit: false,
             modal: None,
-            followup: Some(
-                "Switching to build mode. Read .ka/plans/plan.md and implement it step by \\
-step now; verify each step."
-                    .to_string(),
-            ),
+            followup: Some(build_followup()),
+        }),
+        "/approve" => Some(Slash {
+            note: None,
+            event: Some(Command::SetMode {
+                mode: ka_protocol::Mode::Guarded,
+            }),
+            quit: false,
+            modal: None,
+            followup: Some(build_followup()),
         }),
         "/rewind" => {
             let turns: u32 = rest.and_then(|r| r.trim().parse().ok()).unwrap_or(1);
@@ -7320,6 +7372,52 @@ mod tests {
         // empty history degrades to a placeholder, not a bare section
         let empty = usage_rows(&Meters::default(), &[]);
         assert!(empty.join("\n").contains("(no recorded sessions)"));
+    }
+
+    #[test]
+    fn approve_matches_build_commands() {
+        let build = slash_command("/build").unwrap();
+        let approve = slash_command("/approve").unwrap();
+        let guard = |sl: &Slash| {
+            matches!(
+                sl.event,
+                Some(Command::SetMode {
+                    mode: ka_protocol::Mode::Guarded,
+                })
+            )
+        };
+        assert!(guard(&build) && guard(&approve), "both flip to Guarded");
+        assert_eq!(build.followup, approve.followup, "shared followup");
+        assert!(
+            approve
+                .followup
+                .as_deref()
+                .is_some_and(|f| f.contains(".ka/plans/plan.md")),
+            "{:?}",
+            approve.followup
+        );
+    }
+
+    #[test]
+    fn plan_drafted_needs_a_file_fresh_after_start() {
+        let dir = std::env::temp_dir().join(format!("ka-plan-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let plan = dir.join("plan.md");
+        let started = std::time::SystemTime::now() - std::time::Duration::from_secs(60);
+        // no file yet → not drafted
+        assert!(!plan_drafted(Some(started), &plan));
+        std::fs::write(&plan, "# plan\n").unwrap();
+        // file written after start → drafted
+        assert!(plan_drafted(Some(started), &plan));
+        // start in the future (file older) → not drafted
+        assert!(!plan_drafted(
+            Some(std::time::SystemTime::now() + std::time::Duration::from_secs(60)),
+            &plan
+        ));
+        // never started planning → not drafted
+        assert!(!plan_drafted(None, &plan));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
