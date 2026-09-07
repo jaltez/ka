@@ -24,6 +24,7 @@ fn main() {
         "sign" => sign(&rest),
         "release" => release(),
         "bench" => bench(&rest),
+        "live-smoke" => live_smoke(),
         "help" | "--help" | "-h" => {
             print_help();
             0
@@ -55,6 +56,8 @@ fn print_help() {
   bench [--update] [--bin <path>]
             p50 `ka --version` latency + peak RSS vs baselines.json
             (±30% tolerance; --update rewrites the baseline)
+  live-smoke  scripted one-turn conversations against real providers
+            (ANTHROPIC_API_KEY / OPENAI_API_KEY / KA_LM_URL; never in CI)
   help      this message"
     );
 }
@@ -519,6 +522,145 @@ fn bench(rest: &[String]) -> i32 {
         eprintln!("xtask: perf regression vs baselines.json (investigate or --update)");
         return 1;
     }
+    0
+}
+
+/// One live-smoke scenario.
+struct Smoke {
+    name: &'static str,
+    model: String,
+    prompt: &'static str,
+    /// Substrings the NDJSON stream must contain (text markers).
+    expect_text: &'static str,
+    /// Whether a tool call must round-trip.
+    expect_tool: bool,
+    /// Extra `--dialects` overlay contents (local servers).
+    overlay: Option<String>,
+}
+
+/// `xtask live-smoke`: scripted one-turn conversations through `ka run`.
+/// Requires ANTHROPIC_API_KEY / OPENAI_API_KEY / KA_LM_URL; refuses to
+/// run in CI. Exit 1 on the first failure, printing the NDJSON tail.
+fn live_smoke() -> i32 {
+    if env::var("CI").is_ok() {
+        eprintln!("xtask: live-smoke never runs in CI");
+        return 2;
+    }
+    let mut scenarios: Vec<Smoke> = Vec::new();
+    if env::var("ANTHROPIC_API_KEY").is_ok_and(|v| !v.is_empty()) {
+        scenarios.push(Smoke {
+            name: "anthropic-text",
+            model: "anthropic/claude-sonnet-5".into(),
+            prompt: "Reply with exactly SMOKE-OK and nothing else.",
+            expect_text: "SMOKE-OK",
+            expect_tool: false,
+            overlay: None,
+        });
+        scenarios.push(Smoke {
+            name: "anthropic-tool",
+            model: "anthropic/claude-sonnet-5".into(),
+            prompt: "Use the read tool on Cargo.toml, then reply with exactly SMOKE-READ.",
+            expect_text: "SMOKE-READ",
+            expect_tool: true,
+            overlay: None,
+        });
+    }
+    if env::var("OPENAI_API_KEY").is_ok_and(|v| !v.is_empty()) {
+        scenarios.push(Smoke {
+            name: "openai-text",
+            model: "openai/gpt-5.1".into(),
+            prompt: "Reply with exactly SMOKE-OK and nothing else.",
+            expect_text: "SMOKE-OK",
+            expect_tool: false,
+            overlay: None,
+        });
+    }
+    if let Ok(base) = env::var("KA_LM_URL") {
+        let base = base.trim_end_matches('/').to_string();
+        scenarios.push(Smoke {
+            name: "local-text",
+            model: "local/smoke".into(),
+            prompt: "Reply with exactly SMOKE-OK and nothing else.",
+            expect_text: "SMOKE-OK",
+            expect_tool: false,
+            overlay: Some(format!(
+                "[dialects.\"local/smoke\"]\nwire = \"openai_chat\"\nbase_url = \"{base}/v1\"\ncontext = 32768\n"
+            )),
+        });
+    }
+    if scenarios.is_empty() {
+        eprintln!(
+            "xtask: live-smoke needs ANTHROPIC_API_KEY, OPENAI_API_KEY or KA_LM_URL in the environment"
+        );
+        return 2;
+    }
+
+    let root = repo_root();
+    let ka_bin = root.join("target/release/ka");
+    if !ka_bin.exists() {
+        eprintln!("xtask: build the release binary first (target/release/ka)");
+        return 2;
+    }
+
+    for smoke in &scenarios {
+        println!("── {} ({})…", smoke.name, smoke.model);
+        let mut overlay_path = None;
+        let mut cmd = Command::new(&ka_bin);
+        cmd.arg("run")
+            .arg("--model")
+            .arg(&smoke.model)
+            .arg(smoke.prompt);
+        if let Some(overlay) = &smoke.overlay {
+            let path = root.join("target/live-smoke-dialects.toml");
+            if std::fs::write(&path, overlay).is_err() {
+                eprintln!("xtask: cannot write overlay");
+                return 2;
+            }
+            overlay_path = Some(path.clone());
+            cmd.arg("--dialects").arg(path);
+        }
+        let output = cmd.current_dir(&root).output();
+        let lines: Vec<String> = match output {
+            Ok(o) => String::from_utf8_lossy(&o.stdout)
+                .lines()
+                .map(str::to_string)
+                .collect(),
+            Err(e) => {
+                eprintln!("FAIL {}: spawn ka: {e}", smoke.name);
+                return 1;
+            }
+        };
+        let joined = lines.join("\n");
+        let mut problems: Vec<String> = Vec::new();
+        if !joined.contains(smoke.expect_text) {
+            problems.push(format!("missing text {:?} in stream", smoke.expect_text));
+        }
+        if smoke.expect_tool
+            && !joined.contains("\"call_started\"")
+            && !joined.contains("\"call_output\"")
+        {
+            problems.push("no tool call round-trip in stream".to_string());
+        }
+        if !joined.contains("\"turn_finished\"") {
+            problems.push("stream never finished (no turn_finished event)".to_string());
+        }
+        match problems.is_empty() {
+            true => println!("   ok"),
+            false => {
+                eprintln!("FAIL {}: {}", smoke.name, problems.join("; "));
+                let tail: Vec<String> = lines.iter().rev().take(20).rev().cloned().collect();
+                eprintln!(
+                    "--- NDJSON tail ---\n{}\n-------------------",
+                    tail.join("\n")
+                );
+                return 1;
+            }
+        }
+        if let Some(path) = overlay_path {
+            let _ = fs::remove_file(path);
+        }
+    }
+    println!("live-smoke: all scenarios passed");
     0
 }
 
