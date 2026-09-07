@@ -1,63 +1,69 @@
-//! TUI palette: a cream-on-charcoal complementary scheme grown from five
-//! user-provided complementary pairs (light accent + its dark
-//! complement). The app paints its own canvas and surfaces, so it reads
-//! identically on any terminal theme; accents carry semantics (butter
-//! attention on petrol, steel tooling, coral errors, flame warnings,
-//! sage success).
+//! TUI palette: a cream-on-espresso complementary scheme grown from five
+//! complementary pairs (light accent + its deep complement), tuned for
+//! contrast and chroma: warm near-black surfaces lift cream prose to
+//! 12+:1, every accent and text tier clears 4.2:1 on the surface it
+//! actually sits on, and hues carry saturation instead of gray mud. The
+//! app paints its own canvas and surfaces, so it reads identically on
+//! any terminal theme.
 use ratatui::style::{Color, Modifier, Style};
 
-// ── the ten source colors (user palette, kept for provenance) ────
-pub const CREAM: Color = Color::Rgb(246, 240, 224); // #F6F0E0 prose ground
-pub const CHARCOAL: Color = Color::Rgb(45, 45, 47); // #2D2D2F canvas ground
-pub const BUTTER: Color = Color::Rgb(245, 225, 162); // #F5E1A2 attention
-pub const PETROL: Color = Color::Rgb(2, 83, 113); // #025371 deep complement of butter
-pub const CORAL: Color = Color::Rgb(239, 114, 102); // #EF7266 errors
-pub const UMBER: Color = Color::Rgb(109, 89, 59); // #6D593B deep complement of coral
-pub const KHAKI: Color = Color::Rgb(155, 145, 117); // #9B9175 chrome
-pub const SAGE: Color = Color::Rgb(170, 194, 168); // #AAC2A8 complement of khaki: ok
-pub const STEEL: Color = Color::Rgb(89, 137, 157); // #59899D tooling
-pub const FLAME: Color = Color::Rgb(198, 85, 41); // #C65529 complement of steel: warn
+// ── the ten source colors (user palette, tuned; kept for provenance) ─
+// The five pairs: prose ground, attention/deep, error/warm-faint,
+// chrome/success, tooling/warning. Each was lifted in lightness or
+// chroma from the user's original hexes so text tiers read crisply on
+// the dark ground.
+pub const CREAM: Color = Color::Rgb(251, 247, 238); // #FBF7EE prose ground
+pub const CHARCOAL: Color = Color::Rgb(32, 29, 26); // #201D1A warm near-black ground
+pub const BUTTER: Color = Color::Rgb(241, 206, 121); // #F1CE79 attention
+pub const PETROL: Color = Color::Rgb(11, 94, 135); // #0B5E87 deep complement of butter
+pub const CORAL: Color = Color::Rgb(240, 118, 107); // #F0766B errors
+pub const UMBER: Color = Color::Rgb(156, 141, 114); // #9C8D72 lifted umber: quiet tier
+pub const KHAKI: Color = Color::Rgb(201, 184, 148); // #C9B894 chrome
+pub const SAGE: Color = Color::Rgb(156, 203, 158); // #9CCB9E complement of khaki: ok
+pub const STEEL: Color = Color::Rgb(93, 155, 180); // #5D9BB4 tooling
+pub const FLAME: Color = Color::Rgb(224, 132, 47); // #E0842F complement of steel: warn
 
-// ── backgrounds: charcoal lifted into a four-step neutral surface
-// ladder; cream rides the top, petrol strata mark user and tool bands ──
-pub const BG: Color = CHARCOAL; // #2D2D2F canvas
-pub const BG_PANEL: Color = Color::Rgb(52, 52, 56); // #343438 input box, sidebar
-pub const BG_OUTPUT: Color = Color::Rgb(58, 58, 63); // #3A3A3F assistant cards
-pub const BG_SURFACE: Color = Color::Rgb(65, 65, 71); // #414147 modal/picker boxes
+// ── backgrounds: charcoal lifted into a four-step warm espresso
+// ladder (never flat gray — each step warms toward cream); petrol
+// strata mark user rows and tool bands ──
+pub const BG: Color = CHARCOAL; // #201D1A canvas
+pub const BG_PANEL: Color = Color::Rgb(38, 35, 31); // #26231F input box, sidebar
+pub const BG_OUTPUT: Color = Color::Rgb(44, 41, 37); // #2C2925 assistant cards
+pub const BG_SURFACE: Color = Color::Rgb(51, 48, 43); // #33302B modal/picker boxes
 // user rows ride the petrol complement of the butter ❯ lead
-pub const BG_USER: Color = PETROL; // #025371
+pub const BG_USER: Color = PETROL; // #0B5E87
 // tool activity rides petrol darkened toward charcoal: its own stratum
-pub const BG_TOOL: Color = Color::Rgb(11, 44, 59); // #0B2C3B
+pub const BG_TOOL: Color = Color::Rgb(10, 49, 69); // #0A3145
 /// Tool band: `→ tool` text on the darkened petrol stratum.
 pub const TOOL_BAND_STYLE: Style = Style::new().fg(TOOL).bg(BG_TOOL);
 
-// ── text: cream ramp over the charcoal ground ────────────────────
-pub const FG: Color = CREAM; // #F6F0E0 primary prose
-pub const FG_STRONG: Color = Color::Rgb(251, 247, 238); // #FBF7EE emphasis
-pub const META: Color = KHAKI; // #9B9175 muted chrome
-pub const FAINT: Color = UMBER; // #6D593B quietest text tier
-pub const BORDER: Color = Color::Rgb(76, 76, 83); // #4C4C53 block borders
-pub const BORDER_QUIET: Color = Color::Rgb(58, 58, 64); // #3A3A40 transcript top border
+// ── text: cream ramp over the espresso ground ────────────────────
+pub const FG: Color = CREAM; // #FBF7EE primary prose
+pub const FG_STRONG: Color = Color::Rgb(255, 252, 245); // #FFFCF5 emphasis
+pub const META: Color = KHAKI; // #C9B894 chrome
+pub const FAINT: Color = UMBER; // #9C8D72 quietest text tier (≥4.8:1 on panels)
+pub const BORDER: Color = Color::Rgb(70, 61, 48); // #463D30 block borders
+pub const BORDER_QUIET: Color = Color::Rgb(57, 50, 41); // #393229 transcript top border
 
 // ── accents ──────────────────────────────────────────────────────
 pub const ACCENT: Color = BUTTER; // titles, cursor, key hints, user ❯, spinner
-pub const WARN: Color = FLAME; // #C65529
-pub const OK: Color = SAGE; // #AAC2A8 complement of khaki: success
-pub const ERR: Color = CORAL; // #EF7266 bright coral: errors
-pub const CHERRY: Color = Color::Rgb(179, 86, 77); // #B3564D coral deepened: raw danger
-pub const TOOL: Color = STEEL; // #59899D → tool headers
-pub const SEL_BG: Color = PETROL; // #025371 selection bar
-pub const SEL_FG: Color = CREAM; // #F6F0E0 selection text
+pub const WARN: Color = FLAME; // #E0842F
+pub const OK: Color = SAGE; // #9CCB9E complement of khaki: success
+pub const ERR: Color = CORAL; // #F0766B bright coral: errors
+pub const CHERRY: Color = Color::Rgb(207, 91, 80); // #CF5B50 coral deepened: raw danger
+pub const TOOL: Color = STEEL; // #5D9BB4 → tool headers
+pub const SEL_BG: Color = PETROL; // #0B5E87 selection bar
+pub const SEL_FG: Color = CREAM; // #FBF7EE selection text
 
 // markdown roles
 pub const HEADING: Color = ACCENT; // every heading level
-pub const CODE_INLINE: Color = FLAME; // #C65529 warm `code`
-pub const CODE_BLOCK: Color = Color::Rgb(223, 216, 197); // #DFD8C5 cream-dim: fenced code base
-// syntax palette in palette harmony; every role ≥ 4:1 on BG_OUTPUT
-pub const SYNTAX_COMMENT: Color = META; // #9B9175
-pub const SYNTAX_KEYWORD: Color = ACCENT; // #F5E1A2
-pub const SYNTAX_STRING: Color = OK; // #AAC2A8
-pub const SYNTAX_NUMBER: Color = WARN; // #C65529
+pub const CODE_INLINE: Color = FLAME; // #E0842F warm `code`
+pub const CODE_BLOCK: Color = Color::Rgb(221, 211, 191); // #DDD3BF cream-dim: fenced code base
+// syntax palette in palette harmony; every role ≥ 4.5:1 on BG_OUTPUT
+pub const SYNTAX_COMMENT: Color = META; // #C9B894
+pub const SYNTAX_KEYWORD: Color = ACCENT; // #F1CE79
+pub const SYNTAX_STRING: Color = OK; // #9CCB9E
+pub const SYNTAX_NUMBER: Color = WARN; // #E0842F
 
 // ── derived styles ───────────────────────────────────────────────
 pub const META_STYLE: Style = Style::new().fg(META); // footer, titles, hints
@@ -69,7 +75,7 @@ pub const PLACEHOLDER: Style = Style::new().fg(META).add_modifier(Modifier::ITAL
 // thinking sits a tier below normal chrome: umber, italic
 pub const THOUGHT: Style = Style::new().fg(FAINT).add_modifier(Modifier::ITALIC);
 pub const QUOTE: Style = Style::new().fg(META).add_modifier(Modifier::ITALIC);
-/// Canvas fill: cream prose on the charcoal ground, painted over the
+/// Canvas fill: cream prose on the espresso ground, painted over the
 /// whole frame before layout so the app owns its look on any theme.
 pub const CANVAS: Style = Style::new().fg(FG).bg(BG);
 
@@ -77,20 +83,21 @@ pub const CANVAS: Style = Style::new().fg(FG).bg(BG);
 mod tests {
     use super::*;
 
-    /// The ten user-provided complementary source colors, byte-exact.
+    /// The ten user-provided complementary source colors, byte-exact
+    /// (v2: lifted in lightness/chroma for contrast).
     #[test]
     fn source_colors_match_user_palette() {
         for (got, want, name) in [
-            (CREAM, (0xF6, 0xF0, 0xE0), "cream"),
-            (CHARCOAL, (0x2D, 0x2D, 0x2F), "charcoal"),
-            (BUTTER, (0xF5, 0xE1, 0xA2), "butter"),
-            (PETROL, (0x02, 0x53, 0x71), "petrol"),
-            (CORAL, (0xEF, 0x72, 0x66), "coral"),
-            (UMBER, (0x6D, 0x59, 0x3B), "umber"),
-            (KHAKI, (0x9B, 0x91, 0x75), "khaki"),
-            (SAGE, (0xAA, 0xC2, 0xA8), "sage"),
-            (STEEL, (0x59, 0x89, 0x9D), "steel"),
-            (FLAME, (0xC6, 0x55, 0x29), "flame"),
+            (CREAM, (0xFB, 0xF7, 0xEE), "cream"),
+            (CHARCOAL, (0x20, 0x1D, 0x1A), "charcoal"),
+            (BUTTER, (0xF1, 0xCE, 0x79), "butter"),
+            (PETROL, (0x0B, 0x5E, 0x87), "petrol"),
+            (CORAL, (0xF0, 0x76, 0x6B), "coral"),
+            (UMBER, (0x9C, 0x8D, 0x72), "umber"),
+            (KHAKI, (0xC9, 0xB8, 0x94), "khaki"),
+            (SAGE, (0x9C, 0xCB, 0x9E), "sage"),
+            (STEEL, (0x5D, 0x9B, 0xB4), "steel"),
+            (FLAME, (0xE0, 0x84, 0x2F), "flame"),
         ] {
             assert_eq!(got, Color::Rgb(want.0, want.1, want.2), "{name}");
         }
