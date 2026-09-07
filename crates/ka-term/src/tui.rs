@@ -1079,6 +1079,16 @@ pub struct Meters {
     pub cost: f64,
     /// Cache-hit rate (0-1) when known.
     pub cache_hit: Option<f32>,
+    /// Finished turns this session.
+    pub turns: u64,
+    /// Cumulative input tokens seen (incl. cache reads/writes).
+    pub tokens_in: u64,
+    /// Cumulative output tokens.
+    pub tokens_out: u64,
+    /// Cumulative cache-read tokens.
+    pub cache_read: u64,
+    /// Accumulated busy seconds across finished turns.
+    pub elapsed: f64,
 }
 
 /// Bootstrap inventory for the sidebar (the [`Event::Inventory`] payload,
@@ -1537,6 +1547,52 @@ pub fn rel_age(ts: &str) -> String {
     rel_age_at(ts, now)
 }
 
+/// Rows for the `/usage` popup: session figures, recent strands, total.
+fn usage_rows(meters: &Meters, summaries: &[ka_strand::StrandSummary]) -> Vec<String> {
+    let hit = if meters.tokens_in > 0 {
+        format!(
+            "{:.0}%",
+            meters.cache_read as f32 / meters.tokens_in as f32 * 100.0
+        )
+    } else {
+        "—".to_string()
+    };
+    let mut rows = vec![
+        "▸ session".to_string(),
+        format!(
+            "{} turns · {} in / {} out · cache {} · hit {hit}",
+            meters.turns,
+            fmt_tok(meters.tokens_in),
+            fmt_tok(meters.tokens_out),
+            fmt_tok(meters.cache_read),
+        ),
+        format!("${:.4} · {} busy", meters.cost, fmt_dur(meters.elapsed)),
+        String::new(),
+        "▸ recent sessions".to_string(),
+    ];
+    for s in summaries.iter().take(8) {
+        let title: String = s.title.chars().take(34).collect();
+        rows.push(format!(
+            "{title} · {} · {} tok · ${:.2}",
+            rel_age(&s.ts),
+            fmt_tok(s.tokens),
+            s.cost,
+        ));
+    }
+    if summaries.is_empty() {
+        rows.push("(no recorded sessions)".to_string());
+    }
+    let tot_tok: u64 = summaries.iter().map(|s| s.tokens).sum();
+    let tot_cost: f64 = summaries.iter().map(|s| s.cost).sum();
+    rows.push(String::new());
+    rows.push(format!(
+        "▸ total · {} sessions · {} tok · ${tot_cost:.2}",
+        summaries.len(),
+        fmt_tok(tot_tok),
+    ));
+    rows
+}
+
 /// Session picker (/session, /resume): newest strands + a fresh-session
 /// row, filtered by the typed substring.
 #[derive(Debug, Clone)]
@@ -1923,6 +1979,11 @@ pub enum Modal {
     /// Memory viewer (/memory): project + user memory files.
     Memory {
         /// Rendered rows (path header + content lines).
+        rows: Vec<String>,
+    },
+    /// Usage dashboard (/usage): session + recent session rows.
+    Usage {
+        /// Rendered rows (section headers + figures + total).
         rows: Vec<String>,
     },
     /// Strand tree (/tree): current session + descendants.
@@ -2506,6 +2567,9 @@ async fn app(
                                     modal = None;
                                 }
                             }
+                            Modal::Usage { .. } => {
+                                modal = None;
+                            }
                             Modal::Tree {
                                 items,
                                 targets,
@@ -3010,6 +3074,15 @@ async fn app(
                                             }
                                             Modal::Memory { rows }
                                         }
+                                        ModalKind::Usage => {
+                                            let sessions = std::env::current_dir()
+                                                .ok()
+                                                .and_then(|cwd| ka_strand::list(&cwd).ok())
+                                                .unwrap_or_default();
+                                            Modal::Usage {
+                                                rows: usage_rows(&meters, &sessions),
+                                            }
+                                        }
                                         ModalKind::Tree => {
                                             let cwd = std::env::current_dir()
                                                 .unwrap_or_else(|_| std::path::PathBuf::from("."));
@@ -3419,7 +3492,7 @@ async fn app(
                                     edit.extend(text.chars().filter(|c| !c.is_whitespace()));
                                 }
                             }
-                            Modal::Help | Modal::Spills { .. } => {}
+                            Modal::Help | Modal::Spills { .. } | Modal::Usage { .. } => {}
                         }
                     } else if path_popup.is_some() {
                         path_popup = None;
@@ -3782,6 +3855,11 @@ fn apply_event(
             };
             meters.cache_hit = cache_hit;
             *turn_usage = Some((in_seen, usage.input, usage.output));
+            meters.turns += 1;
+            meters.tokens_in += in_seen;
+            meters.tokens_out += usage.output;
+            meters.cache_read += usage.cache_read;
+            meters.elapsed += elapsed;
             let tail = usage_tail(usage, elapsed);
             let silent = matches!(stop, ka_protocol::Stop::Done)
                 && usage.input + usage.output + usage.cache_read == 0
@@ -4217,6 +4295,10 @@ fn builtin_slash_commands() -> Vec<(String, String)> {
             "settings & provider status".to_string(),
         ),
         (
+            "/usage".to_string(),
+            "usage & cost: session + recent".to_string(),
+        ),
+        (
             "/key".to_string(),
             "set an api key for the current model".to_string(),
         ),
@@ -4520,6 +4602,8 @@ pub enum ModalKind {
     Prompts,
     /// Memory viewer.
     Memory,
+    /// Usage dashboard.
+    Usage,
     /// Strand tree.
     Tree,
     /// Help overlay.
@@ -4969,6 +5053,13 @@ step now; verify each step."
             quit: false,
             followup: None,
             modal: Some(ModalKind::Settings),
+        }),
+        "/usage" => Some(Slash {
+            note: None,
+            event: None,
+            quit: false,
+            followup: None,
+            modal: Some(ModalKind::Usage),
         }),
         "/key" => Some(Slash {
             note: None,
@@ -5550,6 +5641,7 @@ fn render(
                 hint_spans(&[(" ↑↓", "choose"), (" ⏎", "attach"), (" esc", "close")])
             }
             Modal::Memory { .. } => hint_spans(&[(" esc", "close")]),
+            Modal::Usage { .. } => hint_spans(&[(" any", "close")]),
             Modal::Key(_) => hint_spans(&[(" type", "value"), (" ⏎", "save"), (" esc", "cancel")]),
             Modal::Help => hint_spans(&[(" ⏎", "close")]),
         }
@@ -6115,6 +6207,35 @@ fn render(
                         Block::default()
                             .borders(Borders::ALL)
                             .title(padded_title("memory"))
+                            .border_style(crate::palette::BORDER_STYLE)
+                            .padding(ratatui::widgets::Padding::new(1, 1, 1, 1)),
+                    )
+                    .style(ratatui::style::Style::new().bg(crate::palette::BG_SURFACE))
+                    .wrap(Wrap { trim: false });
+                frame.render_widget(widget, rect);
+            }
+            Modal::Usage { rows } => {
+                let height = (rows.len() as u16 + 4).clamp(6, 24);
+                let width = 72.min(frame.area().width);
+                let rect = centered(width, height, modal_area);
+                let inner_w = width.saturating_sub(4) as usize;
+                let mut text = Vec::new();
+                let cap = (height as usize).saturating_sub(4);
+                for row in rows.iter().take(cap) {
+                    if row.starts_with('▸') {
+                        text.push(TuiLine::styled(
+                            pad_to_width(row.clone(), inner_w),
+                            crate::palette::META,
+                        ));
+                    } else {
+                        text.push(TuiLine::raw(row.clone()));
+                    }
+                }
+                let widget = Paragraph::new(text)
+                    .block(
+                        Block::default()
+                            .borders(Borders::ALL)
+                            .title(padded_title("usage"))
                             .border_style(crate::palette::BORDER_STYLE)
                             .padding(ratatui::widgets::Padding::new(1, 1, 1, 1)),
                     )
@@ -7116,6 +7237,7 @@ mod tests {
             "/export",
             "/retry",
             "/copy",
+            "/usage",
         ] {
             assert!(names.contains(&want.to_string()), "missing {want}");
         }
@@ -7143,6 +7265,61 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn usage_rows_render_session_totals_and_recent() {
+        let meters = Meters {
+            turns: 3,
+            tokens_in: 1500,
+            tokens_out: 300,
+            cache_read: 900,
+            cost: 0.0123,
+            elapsed: 95.0,
+            ..Default::default()
+        };
+        let sessions = vec![
+            ka_strand::StrandSummary {
+                path: std::path::PathBuf::from("/tmp/a.jsonl"),
+                id: "s1-aaaa1111".into(),
+                ts: "2026-09-01T10:00:00Z".into(),
+                title: "fix the parser".into(),
+                messages: 12,
+                cost: 0.5,
+                parent: None,
+                tokens: 1234,
+            },
+            ka_strand::StrandSummary {
+                path: std::path::PathBuf::from("/tmp/b.jsonl"),
+                id: "s1-bbbb2222".into(),
+                ts: "2026-09-02T10:00:00Z".into(),
+                title: "tidy docs".into(),
+                messages: 4,
+                cost: 0.003,
+                parent: None,
+                tokens: 0,
+            },
+        ];
+        let rows = usage_rows(&meters, &sessions);
+        let joined = rows.join("\n");
+        assert_eq!(rows[0], "▸ session", "{joined}");
+        assert!(joined.contains("3 turns"), "{joined}");
+        assert!(joined.contains("1.5k in / 300 out"), "{joined}");
+        assert!(joined.contains("cache 900"), "{joined}");
+        assert!(joined.contains("hit 60%"), "{joined}");
+        assert!(joined.contains("$0.0123"), "{joined}");
+        assert!(joined.contains("1:35 busy"), "{joined}");
+        // recent sessions: title, age, tokens, cost
+        assert!(joined.contains("fix the parser"), "{joined}");
+        assert!(joined.contains("1.2k tok · $0.50"), "{joined}");
+        // total row sums the listed sessions
+        assert!(
+            joined.contains("total · 2 sessions · 1.2k tok · $0.50"),
+            "{joined}"
+        );
+        // empty history degrades to a placeholder, not a bare section
+        let empty = usage_rows(&Meters::default(), &[]);
+        assert!(empty.join("\n").contains("(no recorded sessions)"));
     }
 
     #[test]
@@ -9097,6 +9274,7 @@ mod tests {
             context: (12_000, 200_000),
             cost: 0.0123,
             cache_hit: None,
+            ..Default::default()
         }
     }
 
