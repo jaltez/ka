@@ -86,6 +86,21 @@ enum CliCommand {
     },
     /// Serve the Agent Client Protocol on stdin/stdout
     Acp,
+    /// Rebuild the full-text search index over all strands
+    #[cfg(feature = "index")]
+    Index,
+    /// Full-text search over strands
+    #[cfg(feature = "index")]
+    Search {
+        /// FTS5 query
+        query: String,
+        /// Filter to one session id
+        #[arg(long)]
+        session: Option<String>,
+        /// Max results
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+    },
     /// Serve HTTP/SSE sessions on an address
     Serve {
         /// Bind address (loopback by default)
@@ -181,6 +196,20 @@ mod acp;
 mod doctor;
 mod serve;
 mod update;
+
+/// The strands storage root (`<data>/strands`).
+#[cfg(feature = "index")]
+fn ka_data_dir_strands() -> PathBuf {
+    std::env::var("KA_DATA_DIR")
+        .map(PathBuf::from)
+        .or_else(|_| {
+            std::env::var("XDG_DATA_HOME")
+                .map(PathBuf::from)
+                .or_else(|_| std::env::var("HOME").map(|h| PathBuf::from(h).join(".local/share")))
+        })
+        .unwrap_or_else(|_| PathBuf::from("."))
+        .join("strands")
+}
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
@@ -347,6 +376,34 @@ async fn dispatch(cli: Cli) -> Result<ExitCode, String> {
             .await
         }
         Some(CliCommand::Acp) => acp::run().await,
+        #[cfg(feature = "index")]
+        Some(CliCommand::Index) => {
+            let db = ka_index::open_db(&ka_index::default_db_path())?;
+            let dir = ka_data_dir_strands();
+            let stats = ka_index::rebuild(&dir, &db)?;
+            println!(
+                "indexed {} strand file(s), skipped {} unchanged",
+                stats.indexed, stats.skipped
+            );
+            Ok(ExitCode::SUCCESS)
+        }
+        #[cfg(feature = "index")]
+        Some(CliCommand::Search {
+            query,
+            session,
+            limit,
+        }) => {
+            let db = ka_index::open_db(&ka_index::default_db_path())?;
+            let hits = ka_index::search(&db, &query, session.as_deref(), limit)?;
+            if hits.is_empty() {
+                println!("(no results)");
+                return Ok(ExitCode::SUCCESS);
+            }
+            for h in hits {
+                println!("{} [{}] {}: {}", h.session, h.role, h.ts, h.snippet);
+            }
+            Ok(ExitCode::SUCCESS)
+        }
         Some(CliCommand::Serve { addr, token }) => serve::run(&addr, token).await,
         Some(CliCommand::Doctor { net, json }) => doctor::run(net, json).await,
         Some(CliCommand::Update { channel, check }) => {
