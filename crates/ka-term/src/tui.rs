@@ -3907,6 +3907,24 @@ pub struct SlashPopup {
 
 /// All available slash commands: builtins + custom files.
 pub fn available_slash_commands() -> Vec<(String, String)> {
+    let mut out = builtin_slash_commands();
+    // custom files come after builtins, prefixed so they read as aliases
+    let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    for c in scan_custom_commands(&cwd) {
+        let hint = if c.argument_hint.is_empty() {
+            String::new()
+        } else {
+            format!(" ({})", c.argument_hint)
+        };
+        out.push((
+            format!("cmd:{}", c.name),
+            format!("custom command{hint} — {desc}", desc = c.description),
+        ));
+    }
+    out
+}
+
+fn builtin_slash_commands() -> Vec<(String, String)> {
     let mut cmds = vec![
         ("/model".to_string(), "pick a model".to_string()),
         (
@@ -4293,9 +4311,134 @@ pub enum ModalKind {
 
 /// Load a custom command body from `.ka/commands/<name>.md` (project) or
 /// the user dir; `$ARGUMENTS` substituted with the rest of the line.
+fn project_trusted_in(state_home: &std::path::Path, cwd: &std::path::Path) -> bool {
+    let Ok(text) = std::fs::read_to_string(state_home.join("ka/trust.json")) else {
+        return false;
+    };
+    text.contains(&cwd.to_string_lossy().to_string())
+}
+
+/// One discovered custom slash command.
+pub struct CustomCommand {
+    /// Command name (without `/`).
+    pub name: String,
+    /// Frontmatter description (or first body line).
+    pub description: String,
+    /// Frontmatter argument hint.
+    pub argument_hint: String,
+}
+
+/// Project command directories, scanned for the popup.
+const PROJECT_COMMAND_DIRS: &[&str] = &[".ka/commands", ".agents/commands", ".claude/commands"];
+
+/// Scan custom slash commands: project dirs (trust-gated like skills)
+/// plus the user dir (ungated). Project wins on name collisions.
+pub fn scan_custom_commands(cwd: &std::path::Path) -> Vec<CustomCommand> {
+    let state_home = std::env::var("XDG_STATE_HOME")
+        .map(std::path::PathBuf::from)
+        .or_else(|_| {
+            std::env::var("HOME").map(|h| std::path::PathBuf::from(h).join(".local/state"))
+        })
+        .unwrap_or_else(|_| std::env::temp_dir());
+    scan_custom_commands_in(cwd, &state_home)
+}
+
+pub fn scan_custom_commands_in(
+    cwd: &std::path::Path,
+    state_home: &std::path::Path,
+) -> Vec<CustomCommand> {
+    let mut out: Vec<CustomCommand> = Vec::new();
+    let mut dirs: Vec<std::path::PathBuf> = Vec::new();
+    if project_trusted_in(state_home, cwd) {
+        dirs.extend(PROJECT_COMMAND_DIRS.iter().map(|d| cwd.join(d)));
+    }
+    if let Ok(home) = std::env::var("HOME") {
+        dirs.push(std::path::PathBuf::from(home).join(".config/ka/commands"));
+    }
+    for dir in dirs {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().is_none_or(|e| e != "md") {
+                continue;
+            }
+            let Ok(text) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            let (description, argument_hint, _body) = parse_command_md(&text);
+            let name = path
+                .file_stem()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned();
+            if out.iter().any(|c: &CustomCommand| c.name == name) {
+                continue;
+            }
+            out.push(CustomCommand {
+                name,
+                description,
+                argument_hint,
+            });
+        }
+    }
+    out.sort_by(|a, b| a.name.cmp(&b.name));
+    out
+}
+
+/// Split frontmatter (`description`, `argument-hint`) off a command
+/// markdown body.
+fn parse_command_md(text: &str) -> (String, String, String) {
+    let mut description = String::new();
+    let mut argument_hint = String::new();
+    let mut body = text.to_string();
+    if let Some(rest) = text.strip_prefix("---") {
+        if let Some(end) = rest.find("\n---") {
+            for line in rest[..end].lines() {
+                if let Some((key, value)) = line.split_once(':') {
+                    match key.trim() {
+                        "description" => description = value.trim().to_string(),
+                        "argument-hint" | "argument_hint" => {
+                            argument_hint = value.trim().to_string();
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            body = rest[end + 4..].trim_start_matches('\n').to_string();
+        }
+    }
+    if description.is_empty() {
+        description = body
+            .lines()
+            .find(|l| !l.trim().is_empty())
+            .unwrap_or("custom command")
+            .chars()
+            .take(60)
+            .collect();
+    }
+    (description, argument_hint, body)
+}
+
 fn custom_command(head: &str, rest: Option<&str>) -> Option<String> {
-    let name = head.strip_prefix('/')?;
     let cwd = std::env::current_dir().ok()?;
+    let state_home = std::env::var("XDG_STATE_HOME")
+        .map(std::path::PathBuf::from)
+        .or_else(|_| {
+            std::env::var("HOME").map(|h| std::path::PathBuf::from(h).join(".local/state"))
+        })
+        .unwrap_or_else(|_| std::env::temp_dir());
+    custom_command_in(&cwd, &state_home, head, rest)
+}
+
+fn custom_command_in(
+    cwd: &std::path::Path,
+    state_home: &std::path::Path,
+    head: &str,
+    rest: Option<&str>,
+) -> Option<String> {
+    let name = head.strip_prefix('/')?;
     let mut candidates = vec![
         cwd.join(format!(".ka/commands/{name}.md")),
         cwd.join(format!(".agents/commands/{name}.md")),
@@ -4305,10 +4448,18 @@ fn custom_command(head: &str, rest: Option<&str>) -> Option<String> {
         candidates
             .push(std::path::PathBuf::from(home).join(format!(".config/ka/commands/{name}.md")));
     }
+    let home = std::env::var("HOME").unwrap_or_default();
     for path in candidates {
+        // user-dir commands are ungated; project commands pay the trust
+        // gate (like skills)
+        let is_user_file = !home.is_empty() && path.starts_with(&home);
+        if !is_user_file && !project_trusted_in(state_home, cwd) {
+            continue;
+        }
         if let Ok(body) = std::fs::read_to_string(&path) {
             let args = rest.unwrap_or("");
-            return Some(body.replace("$ARGUMENTS", args));
+            let (_, _, clean) = parse_command_md(&body);
+            return Some(clean.replace("$ARGUMENTS", args));
         }
     }
     None
@@ -5362,6 +5513,11 @@ fn render(
                     "commands:",
                     ratatui::style::Style::default(),
                 ));
+                text.push(TuiLine::from(Span::styled(
+                    "custom commands: .ka/commands/*.md (project, trust-gated) or \
+~/.config/ka/commands/*.md; body supports $ARGUMENTS",
+                    ratatui::style::Style::default().fg(crate::palette::META),
+                )));
                 for (name, desc) in available_slash_commands() {
                     text.push(TuiLine::from(vec![
                         Span::styled(format!("{name:<12} "), crate::palette::ACCENT_STYLE),
@@ -6985,16 +7141,41 @@ mod tests {
     #[test]
     fn custom_command_loads_and_substitutes() {
         let dir = std::env::temp_dir().join(format!("ka-cmd-{}", std::process::id()));
+        let state = std::env::temp_dir().join(format!("ka-cmd-state-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&state);
         let cmds = dir.join(".ka/commands");
         std::fs::create_dir_all(&cmds).unwrap();
         std::fs::write(cmds.join("review.md"), "Review this diff: $ARGUMENTS").unwrap();
-        let prev = std::env::current_dir().unwrap();
-        std::env::set_current_dir(&dir).unwrap();
-        let body = custom_command("/review", Some("src/main.rs")).unwrap();
+        // untrusted project: the command must NOT dispatch
+        assert!(
+            custom_command_in(&dir, &state, "/review", Some("src/main.rs")).is_none(),
+            "untrusted project commands stay gated"
+        );
+        // trust the project: dispatch substitutes $ARGUMENTS
+        std::fs::create_dir_all(state.join("ka")).unwrap();
+        std::fs::write(
+            state.join("ka/trust.json"),
+            format!("{{\"projects\":[{{\"path\":\"{}\"}}]}}", dir.display()),
+        )
+        .unwrap();
+        let body = custom_command_in(&dir, &state, "/review", Some("src/main.rs")).unwrap();
         assert_eq!(body, "Review this diff: src/main.rs");
-        std::env::set_current_dir(prev).unwrap();
+
+        // frontmatter is stripped from the body and surfaces in the scan
+        std::fs::write(
+            cmds.join("ship.md"),
+            "---\ndescription: ship it\nargument-hint: branch\n---\nShip {branch}: $ARGUMENTS",
+        )
+        .unwrap();
+        let scanned = scan_custom_commands_in(&dir, &state);
+        let ship = scanned.iter().find(|c| c.name == "ship").unwrap();
+        assert_eq!(ship.description, "ship it");
+        assert_eq!(ship.argument_hint, "branch");
+        let body = custom_command_in(&dir, &state, "/ship", Some("main")).unwrap();
+        assert_eq!(body, "Ship {branch}: main");
         let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&state);
     }
 
     #[test]
