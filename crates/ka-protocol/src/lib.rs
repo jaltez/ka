@@ -269,10 +269,13 @@ pub enum Command {
 /// reconstruct the transcript).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct ReplayedMessage {
-    /// `user` or `assistant`.
+    /// `user`, `assistant`, or `digest` (a compaction divider).
     pub role: String,
     /// Message text.
     pub content: String,
+    /// Whether this row is a digest divider (additive).
+    #[serde(default)]
+    pub digest: bool,
 }
 
 /// Per-MCP-server line of the bootstrap [`Event::Inventory`] card.
@@ -565,6 +568,7 @@ mod tests {
             messages: vec![ReplayedMessage {
                 role: "user".into(),
                 content: "before the crash".into(),
+                digest: false,
             }],
         });
         roundtrip_event(Event::TurnStarted {

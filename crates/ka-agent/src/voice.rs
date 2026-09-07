@@ -355,6 +355,11 @@ impl Voice {
         self.context_promote = promote;
     }
 
+    /// Whether an active digest summary rides the system prompt.
+    pub fn has_digest(&self) -> bool {
+        self.digest.is_some()
+    }
+
     /// Consume a promotion the engine must apply (model switch with
     /// Change record + event, same path as `/model`).
     pub fn take_promotion(&mut self) -> Option<String> {

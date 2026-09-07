@@ -1264,18 +1264,30 @@ async fn attach_strand(
     // replay resumed history so surfaces can rebuild the transcript;
     // emit unconditionally — an empty replay tells surfaces to clear
     // (fresh strands via /new rely on this to reset the transcript)
-    let messages = voice
-        .history
-        .iter()
-        .filter(|m| !m.content.trim().is_empty())
-        .map(|m| ka_protocol::ReplayedMessage {
-            role: match m.role {
-                ka_dialect::speaker::TurnRole::User => "user".to_string(),
-                _ => "assistant".to_string(),
-            },
-            content: m.content.clone(),
-        })
-        .collect();
+    let mut messages: Vec<ka_protocol::ReplayedMessage> = Vec::new();
+    if voice.has_digest() {
+        // the digest boundary replays as a divider row: everything
+        // before it is carried by the summary in the system prompt
+        messages.push(ka_protocol::ReplayedMessage {
+            role: "digest".to_string(),
+            content: String::new(),
+            digest: true,
+        });
+    }
+    messages.extend(
+        voice
+            .history
+            .iter()
+            .filter(|m| !m.content.trim().is_empty())
+            .map(|m| ka_protocol::ReplayedMessage {
+                role: match m.role {
+                    ka_dialect::speaker::TurnRole::User => "user".to_string(),
+                    _ => "assistant".to_string(),
+                },
+                content: m.content.clone(),
+                digest: false,
+            }),
+    );
     events.send(Event::Replay { messages }).await.ok();
     Ok(strand)
 }

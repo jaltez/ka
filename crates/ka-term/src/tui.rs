@@ -3593,6 +3593,12 @@ fn apply_event(
             *last_user = None;
             *last_error = None;
             for m in messages {
+                if m.digest || m.role == "digest" {
+                    // faint compaction divider: history before this point
+                    // lives in the summary, not the transcript
+                    transcript.push_separated(Line::Report("⋯ digest ⋯".into()));
+                    continue;
+                }
                 if m.role == "user" {
                     transcript.push_separated(Line::User(m.content.clone()));
                 } else {
@@ -8880,5 +8886,29 @@ mod tests {
         // bare /prompt opens the picker modal
         let slash = slash_command("/prompt").unwrap();
         assert!(matches!(slash.modal, Some(ModalKind::Prompts)));
+    }
+
+    #[test]
+    fn replay_digest_divider_renders_faint_row() {
+        let mut lines = Transcript::default();
+        feed(
+            &mut lines,
+            &Event::Replay {
+                messages: vec![
+                    ka_protocol::ReplayedMessage {
+                        role: "digest".into(),
+                        content: String::new(),
+                        digest: true,
+                    },
+                    ka_protocol::ReplayedMessage {
+                        role: "user".into(),
+                        content: "after the digest".into(),
+                        digest: false,
+                    },
+                ],
+            },
+        );
+        let text = format!("{:?}", lines.entries());
+        assert!(text.contains("digest"), "{text:?}");
     }
 }
