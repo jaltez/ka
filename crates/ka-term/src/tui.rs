@@ -6027,12 +6027,7 @@ fn render(
     } else if busy {
         hint_spans(&[(" enter", "interject"), (" +", "defer"), (" esc", "abort")])
     } else {
-        hint_spans(&[
-            (" enter", "send"),
-            (" /", "commands"),
-            (" drag", "select"),
-            (" ctrl+c", "copy"),
-        ])
+        hint_spans(&[(" enter", "send"), (" /", "commands"), (" drag", "copy")])
     };
     let right = status_right(meters);
     let w = unicode_width::UnicodeWidthStr::width;
