@@ -551,9 +551,6 @@ async fn run_headless(
                 .map_err(|_| "engine closed during ask")?;
         }
         match &event {
-            Event::Delta {
-                kind: ka_protocol::DeltaKind::Text(t),
-            } => final_text.push_str(t),
             Event::TurnFinished { stop, .. } => final_stop = Some(*stop),
             Event::Idle => break,
             _ => {}
@@ -596,10 +593,12 @@ async fn run_headless(
 }
 
 /// One event's stdout contribution for a headless run. All modes
-/// accumulate text deltas into `final_text`; `ndjson` emits the raw ka
-/// event as one NDJSON line, `stream-json` maps onto the Claude-Code
-/// shape, and `text` (default) emits nothing — the caller prints the
-/// collected final answer after the loop.
+/// accumulate text deltas into `final_text` — this is the single
+/// accumulation point (the caller's loop must not also collect, or
+/// every chunk lands twice); `ndjson` emits the raw ka event as one
+/// NDJSON line, `stream-json` maps onto the Claude-Code shape, and
+/// `text` (default) emits nothing — the caller prints the collected
+/// final answer after the loop.
 fn headless_sink(
     print: &str,
     event: &Event,
