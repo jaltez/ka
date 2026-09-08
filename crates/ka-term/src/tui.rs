@@ -2363,7 +2363,6 @@ async fn app(
                         }
                         continue;
                     }
-                    *sel = None;
                     // Ask dialog captures input first
                     if let Some(ask) = pending.as_mut() {
                         match key.code {
