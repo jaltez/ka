@@ -1,6 +1,7 @@
-//! The `ka` binary. Phase 1 surface: `ka run` (headless NDJSON against real
-//! models), `ka models` (catalog + local discovery), `ka config
-// {schema,print}`. The TUI arrives in Phase 3.
+//! The `ka` binary. Phase 1 surface: `ka run` (headless turn — final
+//! answer to stdout by default, `--print ndjson`/`stream-json` for
+//! event streams), `ka models` (catalog + local discovery), `ka config
+//! {schema,print}`. The TUI arrives in Phase 3.
 
 use clap::{CommandFactory, Parser, Subcommand};
 use ka_agent::config::Config;
@@ -48,7 +49,7 @@ struct Cli {
 
 #[derive(Subcommand, Clone)]
 enum CliCommand {
-    /// Stream one headless turn as NDJSON events
+    /// Run one headless turn; prints the final answer (see --print)
     Run {
         /// Prompt text (omitted: read from stdin)
         prompt: Option<String>,
@@ -79,8 +80,8 @@ enum CliCommand {
         /// JSON-schema file the reply must satisfy (structured output)
         #[arg(long, value_name = "PATH")]
         schema: Option<PathBuf>,
-        /// Output format: text (ka NDJSON events) or stream-json
-        /// (Claude-Code-shaped NDJSON)
+        /// Output format: text (final answer only, default), ndjson
+        /// (ka event stream), or stream-json (Claude-Code-shaped NDJSON)
         #[arg(long, default_value = "text")]
         print: String,
     },
@@ -535,6 +536,7 @@ async fn run_headless(
 
     let mut stdout = std::io::stdout().lock();
     let mut final_stop: Option<Stop> = None;
+    let mut final_text = String::new();
     let mut sj = StreamJsonPrinter::with_model(cfg_model.clone());
     while let Some(event) = handle.events.recv().await {
         // headless policy: permission asks auto-deny (last option = deny)
@@ -549,20 +551,28 @@ async fn run_headless(
                 .map_err(|_| "engine closed during ask")?;
         }
         match &event {
+            Event::Delta {
+                kind: ka_protocol::DeltaKind::Text(t),
+            } => final_text.push_str(t),
             Event::TurnFinished { stop, .. } => final_stop = Some(*stop),
             Event::Idle => break,
             _ => {}
         }
-        if print == "stream-json" {
-            for line in sj.map_event(&event) {
-                use std::io::Write;
-                writeln!(stdout, "{line}").map_err(|e| format!("stdout: {e}"))?;
-            }
-            continue;
+        for line in headless_sink(&print, &event, &mut sj, &mut final_text)? {
+            use std::io::Write;
+            writeln!(stdout, "{line}").map_err(|e| format!("stdout: {e}"))?;
         }
-        let line = to_line(&event).map_err(|e| format!("serialize event: {e}"))?;
-        std::io::Write::write_all(&mut stdout, line.as_bytes())
-            .map_err(|e| format!("stdout: {e}"))?;
+        // text mode has no event stream: surface hard errors on stderr
+        if print == "text" {
+            if let Event::Error {
+                message,
+                retryable: false,
+                ..
+            } = &event
+            {
+                eprintln!("ka: {message}");
+            }
+        }
     }
     // stream-json: the terminating result line (after the loop so cost
     // and stop reason are final)
@@ -572,11 +582,42 @@ async fn run_headless(
             writeln!(stdout, "{line}").map_err(|e| format!("stdout: {e}"))?;
         }
     }
+    // text: the final answer only
+    if print == "text" && !final_text.is_empty() {
+        use std::io::Write;
+        writeln!(stdout, "{final_text}").map_err(|e| format!("stdout: {e}"))?;
+    }
     std::io::Write::flush(&mut stdout).map_err(|e| format!("stdout: {e}"))?;
     match final_stop {
         Some(Stop::Aborted) => Ok(ExitCode::from(2)),
         Some(Stop::Error) => Ok(ExitCode::from(1)),
         _ => Ok(ExitCode::SUCCESS),
+    }
+}
+
+/// One event's stdout contribution for a headless run. All modes
+/// accumulate text deltas into `final_text`; `ndjson` emits the raw ka
+/// event as one NDJSON line, `stream-json` maps onto the Claude-Code
+/// shape, and `text` (default) emits nothing — the caller prints the
+/// collected final answer after the loop.
+fn headless_sink(
+    print: &str,
+    event: &Event,
+    sj: &mut StreamJsonPrinter,
+    final_text: &mut String,
+) -> Result<Vec<String>, String> {
+    if let Event::Delta {
+        kind: ka_protocol::DeltaKind::Text(t),
+    } = event
+    {
+        final_text.push_str(t);
+    }
+    match print {
+        "stream-json" => Ok(sj.map_event(event)),
+        "ndjson" => to_line(event)
+            .map(|l| vec![l])
+            .map_err(|e| format!("serialize event: {e}")),
+        _ => Ok(Vec::new()),
     }
 }
 
@@ -1344,5 +1385,80 @@ mod print_tests {
         let lines = sj.finish(Some(Stop::Error));
         let result: serde_json::Value = serde_json::from_str(&lines[0]).unwrap();
         assert_eq!(result["subtype"], "error");
+    }
+
+    #[test]
+    fn text_mode_collects_the_final_answer_only() {
+        let mut sj = StreamJsonPrinter::default();
+        let mut final_text = String::new();
+        let events = [
+            Event::TurnStarted {
+                context: ka_protocol::ContextMeter::default(),
+            },
+            Event::Delta {
+                kind: ka_protocol::DeltaKind::Text("hel".into()),
+            },
+            Event::Delta {
+                kind: ka_protocol::DeltaKind::Text("lo".into()),
+            },
+            Event::TurnFinished {
+                stop: Stop::Done,
+                usage: ka_protocol::Usage::default(),
+            },
+        ];
+        for e in &events {
+            assert!(
+                headless_sink("text", e, &mut sj, &mut final_text)
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+        assert_eq!(final_text, "hello");
+    }
+
+    #[test]
+    fn ndjson_mode_emits_one_line_per_event() {
+        let mut sj = StreamJsonPrinter::default();
+        let mut final_text = String::new();
+        let events = [
+            Event::Delta {
+                kind: ka_protocol::DeltaKind::Text("hi".into()),
+            },
+            Event::TurnFinished {
+                stop: Stop::Done,
+                usage: ka_protocol::Usage::default(),
+            },
+        ];
+        let mut lines = 0;
+        for e in &events {
+            lines += headless_sink("ndjson", e, &mut sj, &mut final_text)
+                .unwrap()
+                .len();
+        }
+        assert_eq!(lines, events.len(), "one NDJSON line per event");
+        assert_eq!(final_text, "hi", "deltas still accumulate");
+    }
+
+    #[test]
+    fn ndjson_lines_are_parseable_ka_events() {
+        let mut sj = StreamJsonPrinter::default();
+        let mut final_text = String::new();
+        let line = headless_sink(
+            "ndjson",
+            &Event::Delta {
+                kind: ka_protocol::DeltaKind::Text("hey".into()),
+            },
+            &mut sj,
+            &mut final_text,
+        )
+        .unwrap()
+        .remove(0);
+        let parsed: ka_protocol::Event = ka_protocol::from_line(&line).unwrap();
+        assert!(matches!(
+            parsed,
+            ka_protocol::Event::Delta {
+                kind: ka_protocol::DeltaKind::Text(_)
+            }
+        ));
     }
 }
