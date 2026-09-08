@@ -1121,7 +1121,7 @@ mod tests {
             "string: {rendered}"
         );
         assert!(
-            rendered.contains(&format!("{:?}", palette::ACCENT)),
+            rendered.contains(&format!("{:?}", palette::SYNTAX_KEYWORD)),
             "keyword: {rendered}"
         );
         assert!(
@@ -1175,7 +1175,7 @@ mod tests {
         let spans = highlight("let count = 42; // note");
         let joined = format!("{spans:?}");
         assert!(
-            joined.contains(&format!("{:?}", palette::ACCENT)),
+            joined.contains(&format!("{:?}", palette::SYNTAX_KEYWORD)),
             "keyword: {joined}"
         );
         assert!(
@@ -1447,7 +1447,7 @@ mod tests {
         );
         let joined = format!("{out:?}");
         assert!(
-            joined.contains(&format!("{:?}", palette::ACCENT)),
+            joined.contains(&format!("{:?}", palette::SYNTAX_KEYWORD)),
             "keyword: {joined}"
         );
         assert!(
@@ -1470,7 +1470,7 @@ mod tests {
             "json string: {joined}"
         );
         assert!(
-            joined.contains(&format!("{:?}", palette::ACCENT)),
+            joined.contains(&format!("{:?}", palette::SYNTAX_KEYWORD)),
             "true keyword: {joined}"
         );
         assert!(
@@ -1494,7 +1494,10 @@ mod tests {
         push_code_block(&mut out, &["for f in *.md; do echo $f; done".into()], "sh");
         let joined = format!("{out:?}");
         assert!(
-            joined.matches(&format!("{:?}", palette::ACCENT)).count() >= 3,
+            joined
+                .matches(&format!("{:?}", palette::SYNTAX_KEYWORD))
+                .count()
+                >= 3,
             "shell keywords (for/in/do/done): {joined}"
         );
     }
@@ -1516,7 +1519,7 @@ mod tests {
         let text: String = second.spans.iter().map(|s| s.content.to_string()).collect();
         assert_eq!(text, "still comment */ let x = 1;");
         assert!(
-            format!("{second:?}").contains(&format!("{:?}", palette::ACCENT)),
+            format!("{second:?}").contains(&format!("{:?}", palette::SYNTAX_KEYWORD)),
             "let styled after the close: {second:?}"
         );
 
@@ -1528,7 +1531,7 @@ mod tests {
             "rust",
         );
         assert!(
-            format!("{:?}", out[2]).contains(&format!("{:?}", palette::ACCENT)),
+            format!("{:?}", out[2]).contains(&format!("{:?}", palette::SYNTAX_KEYWORD)),
             "next line keywords styled: {:?}",
             out[2]
         );
@@ -1573,7 +1576,7 @@ mod tests {
         let mut out: Vec<TuiLine> = Vec::new();
         push_code_block(&mut out, &["let x = 1".to_string()], "");
         assert!(
-            format!("{out:?}").contains(&format!("{:?}", palette::ACCENT)),
+            format!("{out:?}").contains(&format!("{:?}", palette::SYNTAX_KEYWORD)),
             "generic keyword: {out:?}"
         );
         // apostrophes glued to a word never open a string in rust fences

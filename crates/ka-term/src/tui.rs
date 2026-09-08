@@ -763,8 +763,10 @@ fn render_line(line: &Line, width: u16) -> Vec<ratatui::text::Line<'static>> {
             // carry the same fill, giving the card inner top/bottom air
             let bg = crate::palette::BG_OUTPUT;
             out.push(surface_blank(width, bg));
-            let mut rows = crate::markdown::render(text, width);
-            apply_output_surface(&mut rows, width, bg);
+            let inner = width.saturating_sub(2 * CARD_MARGIN as u16);
+            let mut rows = crate::markdown::render(text, inner);
+            apply_output_surface(&mut rows, inner, bg);
+            inset_rows(&mut rows, width, bg);
             out.extend(rows);
             out.push(surface_blank(width, bg));
         }
@@ -2146,12 +2148,16 @@ pub async fn run(
 ) -> std::io::Result<Exit> {
     let _ = AGENTS.set(agents.clone());
     let mut terminal = ratatui::init();
+    let mut sel: Option<TextSel> = None;
+    let frame_window: std::cell::RefCell<Vec<ratatui::text::Line<'static>>> =
+        std::cell::RefCell::new(Vec::new());
+    let frame_origin: std::cell::Cell<(u16, u16)> = std::cell::Cell::new((0, 0));
     // Kitty keyboard protocol: Shift+Enter as a distinct key + bracketed
     // paste. Best effort — hosts without support degrade to plain Enter;
-    // Ctrl+J always works as the newline fallback. Mouse capture starts
-    // ON so the wheel scrolls the transcript out of the box; Ctrl+M
-    // releases it for native selection (shift+drag selects under
-    // capture too).
+    // Ctrl+J always works as the newline fallback. Mouse capture stays
+    // ON permanently: the app draws its own selection over the
+    // transcript and copies on mouse release (OSC52), while the wheel
+    // keeps scrolling.
     let _ = crossterm::execute!(
         std::io::stdout(),
         crossterm::event::PushKeyboardEnhancementFlags(
@@ -2175,6 +2181,9 @@ pub async fn run(
         models,
         agents,
         header_glyph,
+        &mut sel,
+        &frame_window,
+        &frame_origin,
     )
     .await;
     let _ = std::io::stdout().write_all(b"\x1b[?1003l");
@@ -2186,7 +2195,12 @@ pub async fn run(
         crossterm::event::DisableMouseCapture
     );
     ratatui::restore();
-    result
+    let (exit, resume) = result?;
+    if let Some(hint) = resume {
+        println!();
+        println!("{hint}");
+    }
+    Ok(exit)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2199,14 +2213,16 @@ async fn app(
     mut models: Vec<ModelInfo>,
     agents: Vec<(String, String)>,
     header_glyph: &str,
-) -> std::io::Result<Exit> {
+    sel: &mut Option<TextSel>,
+    frame_window: &std::cell::RefCell<Vec<ratatui::text::Line<'static>>>,
+    frame_origin: &std::cell::Cell<(u16, u16)>,
+) -> std::io::Result<(Exit, Option<String>)> {
     use crossterm::event::{Event as TermEvent, KeyCode, KeyModifiers};
     let _ = agents.clone();
 
     let mut scroll: Option<usize> = None;
     let mut transcript = Transcript::default();
 
-    let mut mouse_capture = true;
     let mut view_rows;
     let mut input = InputBuffer::default();
     let mut meters = Meters {
@@ -2324,6 +2340,9 @@ async fn app(
                 &sidebar,
                 &sidebar_zone,
                 &title_arrows,
+                sel,
+                frame_window,
+                frame_origin,
             );
         })?;
 
@@ -2344,6 +2363,7 @@ async fn app(
                         }
                         continue;
                     }
+                    *sel = None;
                     // Ask dialog captures input first
                     if let Some(ask) = pending.as_mut() {
                         match key.code {
@@ -2783,13 +2803,11 @@ async fn app(
                                                     Some(pager) => run_external(
                                                         &pager,
                                                         &[path.as_str()],
-                                                        mouse_capture,
                                                         terminal,
                                                     ),
                                                     None => run_external(
                                                         "less",
                                                         &["-R", path.as_str()],
-                                                        mouse_capture,
                                                         terminal,
                                                     ),
                                                 };
@@ -2940,33 +2958,15 @@ async fn app(
                             let _ = terminal.clear();
                             continue;
                         }
-                        (KeyCode::Char('m'), KeyModifiers::CONTROL) => {
-                            // capture on by default (wheel scrolling);
-                            // toggling releases the mouse for native
-                            // text selection. Motion tracking (1003)
-                            // follows capture so hover never leaks.
-                            mouse_capture = !mouse_capture;
-                            let _ = if mouse_capture {
-                                std::io::stdout()
-                                    .write_all(b"\x1b[?1003h")
-                                    .and_then(|_| std::io::stdout().flush())
-                                    .and_then(|_| {
-                                        crossterm::execute!(
-                                            std::io::stdout(),
-                                            crossterm::event::EnableMouseCapture
-                                        )
-                                    })
-                            } else {
-                                std::io::stdout()
-                                    .write_all(b"\x1b[?1003l")
-                                    .and_then(|_| std::io::stdout().flush())
-                                    .and_then(|_| {
-                                        crossterm::execute!(
-                                            std::io::stdout(),
-                                            crossterm::event::DisableMouseCapture
-                                        )
-                                    })
-                            };
+                        (KeyCode::Char('v'), KeyModifiers::CONTROL) => {
+                            // ctrl+v reads the system clipboard into
+                            // the input; terminals that intercept
+                            // ctrl+v deliver it as bracketed paste
+                            // instead
+                            if modal.is_none() && pending.is_none() {
+                                let text = clipboard_text().await;
+                                input.insert_str(&text);
+                            }
                         }
                         // Reverse history search: while active it captures
                         // editing keys, so its arms sit ahead of the
@@ -3578,7 +3578,6 @@ async fn app(
                                     match run_external(
                                         &editor,
                                         &[path_str.as_str()],
-                                        mouse_capture,
                                         terminal,
                                     ) {
                                         Err(e) => transcript.push_separated(Line::Note(format!("editor failed: {e}"))),
@@ -3701,11 +3700,8 @@ async fn app(
                     }
                 } else if let Some(Ok(TermEvent::Mouse(mouse))) = maybe_term {
                     // the wheel scrolls the chat; overlays keep focus. Line
-                    // granularity (page keys keep their page step). With
-                    // capture off (Ctrl+M) the terminal owns the mouse
-                    // (native selection).
-                    if mouse_capture
-                        && modal.is_none()
+                    // granularity (page keys keep their page step).
+                    if modal.is_none()
                         && pending.is_none()
                         && slash_popup.is_none()
                         && path_popup.is_none()
@@ -3737,10 +3733,26 @@ async fn app(
                                     .is_some_and(|z| z.hit(mouse.column, mouse.row))
                                 {
                                     sidebar.skills_open = !sidebar.skills_open;
+                                } else {
+                                    // start transcript text selection
+                                    *sel = Some(TextSel {
+                                        anchor: (mouse.column, mouse.row),
+                                        head: (mouse.column, mouse.row),
+                                    });
                                 }
                             }
                             // hover affordance: only re-render when the
                             // pointer actually crosses the header boundary
+                            crossterm::event::MouseEventKind::Down(
+                                crossterm::event::MouseButton::Right,
+                            ) => {
+                                // right click pastes the clipboard into
+                                // the input
+                                if modal.is_none() && pending.is_none() {
+                                    let text = clipboard_text().await;
+                                    input.insert_str(&text);
+                                }
+                            }
                             crossterm::event::MouseEventKind::Moved
                             | crossterm::event::MouseEventKind::Drag(
                                 crossterm::event::MouseButton::Left,
@@ -3751,6 +3763,22 @@ async fn app(
                                 if sidebar.skills_hover != hit {
                                     sidebar.skills_hover = hit;
                                 }
+                                if let Some(s) = sel.as_mut() {
+                                    s.head = (mouse.column, mouse.row);
+                                }
+                            }
+                            crossterm::event::MouseEventKind::Up(
+                                crossterm::event::MouseButton::Left,
+                            ) => {
+                                // release ends the selection: copy it to
+                                // the clipboard (OSC52) and clear the
+                                // highlight
+                                copy_selection(
+                                    sel,
+                                    frame_window,
+                                    frame_origin,
+                                    &mut transcript,
+                                );
                             }
                             crossterm::event::MouseEventKind::ScrollUp => {
                                 line_up(&mut scroll, transcript.total_rows(), view_rows);
@@ -3759,6 +3787,12 @@ async fn app(
                                 line_down(&mut scroll, transcript.total_rows(), view_rows);
                             }
                             _ => {}
+                        }
+                    } else if let Some(Ok(TermEvent::Paste(text))) = maybe_term {
+                        // bracketed paste: lands on the input draft. Ask
+                        // forms and modals capture keys, not pastes.
+                        if modal.is_none() && pending.is_none() {
+                            input.insert_str(&text);
                         }
                     }
                 }
@@ -3845,7 +3879,23 @@ async fn app(
             _ = spin.tick(), if busy => {}
         }
     }
-    Ok(exit.unwrap_or(Exit::Quit))
+    let exit = exit.unwrap_or(Exit::Quit);
+    let resume = resume_hint(&meters.session, meters.turns, busy);
+    Ok((exit, resume))
+}
+
+/// The after-exit resume hint: the command that brings this session
+/// back. Worth printing whenever the session exists and something
+/// happened in it — a finished turn, or a turn still in flight when
+/// the user quit.
+fn resume_hint(session: &str, turns: u64, busy: bool) -> Option<String> {
+    if session.is_empty() || (turns == 0 && !busy) {
+        return None;
+    }
+    let tag = short_session(session).unwrap_or("?");
+    Some(format!(
+        "⟡ session saved — resume with: ka -c   (or: ka --session {tag})"
+    ))
 }
 
 /// Live in-flight tool call: rolling output preview (live region only)
@@ -4280,13 +4330,12 @@ fn record_spill(spills: &mut Vec<String>, path: &str) {
 
 /// Suspend the TUI (flush, leave raw mode and the alternate screen), run
 /// `program` with inherited stdio, then restore raw mode + alternate
-/// screen and force a full redraw. The mouse-capture state from the
-/// Ctrl+M toggle is preserved. The child's exit status is ignored —
-/// editors and pagers exit non-zero routinely.
+/// screen and force a full redraw. Mouse capture is preserved. The
+/// child's exit status is ignored — editors and pagers exit non-zero
+/// routinely.
 fn run_external(
     program: &str,
     args: &[&str],
-    mouse_capture: bool,
     terminal: &mut ratatui::Terminal<ratatui::backend::CrosstermBackend<std::io::Stdout>>,
 ) -> std::io::Result<()> {
     use std::io::Write as _;
@@ -4299,11 +4348,9 @@ fn run_external(
         .map(|_| ());
     let _ = crossterm::execute!(std::io::stdout(), crossterm::terminal::EnterAlternateScreen);
     let _ = crossterm::terminal::enable_raw_mode();
-    if mouse_capture {
-        let _ = crossterm::execute!(std::io::stdout(), crossterm::event::EnableMouseCapture);
-        let _ = std::io::stdout().write_all(b"\x1b[?1003h");
-        let _ = std::io::stdout().flush();
-    }
+    let _ = crossterm::execute!(std::io::stdout(), crossterm::event::EnableMouseCapture);
+    let _ = std::io::stdout().write_all(b"\x1b[?1003h");
+    let _ = std::io::stdout().flush();
     let _ = terminal.clear();
     res
 }
@@ -5610,6 +5657,9 @@ fn render(
     sidebar: &SidebarState,
     sidebar_zone: &std::cell::Cell<Option<SidebarZone>>,
     title_arrows: &std::cell::Cell<Option<TitleArrows>>,
+    sel: &Option<TextSel>,
+    frame_window: &std::cell::RefCell<Vec<ratatui::text::Line<'static>>>,
+    frame_origin: &std::cell::Cell<(u16, u16)>,
 ) {
     let header_glyph = sidebar.header_glyph.as_str();
     use ratatui::layout::Constraint::{Length, Min};
@@ -5711,6 +5761,12 @@ fn render(
         } else if let Some(row) = live_rows.get(i - cached) {
             window.push(row.clone());
         }
+    }
+    // stash the visible window for mouse-copy; paint the selection
+    frame_origin.set((tx_area.x + 1, tx_area.y + 1));
+    *frame_window.borrow_mut() = window.clone();
+    if let Some(s) = *sel {
+        apply_sel_highlight(&mut window, tx_area.y + 1, s.anchor, s.head);
     }
     let title = if pinned {
         header_glyph.to_string()
@@ -5972,7 +6028,12 @@ fn render(
     } else if busy {
         hint_spans(&[(" enter", "interject"), (" +", "defer"), (" esc", "abort")])
     } else {
-        hint_spans(&[(" enter", "send"), (" /", "commands")])
+        hint_spans(&[
+            (" enter", "send"),
+            (" /", "commands"),
+            (" drag", "select"),
+            (" ctrl+c", "copy"),
+        ])
     };
     let right = status_right(meters);
     let w = unicode_width::UnicodeWidthStr::width;
@@ -6665,12 +6726,37 @@ fn surface_blank(width: u16, bg: ratatui::style::Color) -> ratatui::text::Line<'
     )])
 }
 
+/// Horizontal inset (columns) between a message block's background
+/// edges and its text — the band reads as a block, characters never
+/// touch its borders.
+const CARD_MARGIN: usize = 2;
+
+/// Inset surface-filled rows by [`CARD_MARGIN`] columns on both sides:
+/// prepends and appends margin spans carrying the band background.
+/// Rows must already be surface-filled to exactly `width` columns
+/// (empty rows become full-width blanks).
+fn inset_rows(rows: &mut [ratatui::text::Line<'static>], width: u16, bg: ratatui::style::Color) {
+    let m = CARD_MARGIN.min(width as usize / 4);
+    if m == 0 {
+        return;
+    }
+    let style = ratatui::style::Style::new().bg(bg);
+    for row in rows.iter_mut() {
+        if row.spans.is_empty() {
+            *row = surface_blank(width, bg);
+            continue;
+        }
+        row.spans
+            .insert(0, ratatui::text::Span::styled(" ".repeat(m), style));
+        row.spans
+            .push(ratatui::text::Span::styled(" ".repeat(m), style));
+    }
+}
 /// Full-width band for user messages — the only edge-to-edge role
 /// (OMP userMsgBg: warm dark, amber prompt glyph, bold text).
 fn push_block(out: &mut Vec<ratatui::text::Line<'static>>, text: &str, width: u16) {
     use ratatui::text::Line as TuiLine;
     use ratatui::text::Span;
-
     // one blank band row above the text: the user card reads as a pad
     // above AND below (the trailing blank below closes the card)
     out.push(surface_blank(width, crate::palette::BG_USER));
@@ -6680,7 +6766,11 @@ fn push_block(out: &mut Vec<ratatui::text::Line<'static>>, text: &str, width: u1
     let body_style = ratatui::style::Style::new()
         .bg(crate::palette::BG_USER)
         .add_modifier(ratatui::style::Modifier::BOLD);
-    let usable = width as usize;
+    // horizontal margin: the band reads as a block, the text never
+    // touches its edges
+    let m = CARD_MARGIN.min(width as usize / 4);
+    let margin_span = Span::styled(" ".repeat(m), body_style);
+    let usable = width as usize - 2 * m;
     for (li, raw) in text.lines().enumerate() {
         // wrap long lines at the band width (char boundary)
         let mut start = 0;
@@ -6697,12 +6787,14 @@ fn push_block(out: &mut Vec<ratatui::text::Line<'static>>, text: &str, width: u1
             let segment: String = chars[start..end].iter().collect();
             let pad = usable.saturating_sub(segment.chars().count() + 2);
             let mut spans = vec![
+                margin_span.clone(),
                 Span::styled(lead.to_string(), lead_style),
                 Span::styled(segment, body_style),
             ];
             if pad > 0 {
                 spans.push(Span::styled(" ".repeat(pad), body_style));
             }
+            spans.push(margin_span.clone());
             out.push(TuiLine::from(spans));
             if end >= chars.len() {
                 break;
@@ -6762,6 +6854,157 @@ fn centered(width: u16, height: u16, area: ratatui::layout::Rect) -> ratatui::la
 /// kiss the border glyphs or the frame edge.
 fn padded_title(title: impl Into<String>) -> ratatui::text::Line<'static> {
     ratatui::text::Line::from(format!(" {} ", title.into())).style(crate::palette::META)
+}
+
+/// In-progress transcript text selection in frame coordinates
+/// (column, row).
+#[derive(Debug, Clone, Copy)]
+pub struct TextSel {
+    anchor: (u16, u16),
+    head: (u16, u16),
+}
+
+/// Read the system clipboard as text: wayland → X11 → WSL2/Windows.
+async fn clipboard_text() -> String {
+    for (program, args) in [
+        ("wl-paste", vec!["--no-newline"]),
+        ("xclip", vec!["-selection", "clipboard", "-o"]),
+    ] {
+        if let Ok(out) = tokio::process::Command::new(program)
+            .args(&args)
+            .output()
+            .await
+        {
+            if out.status.success() && !out.stdout.is_empty() {
+                return String::from_utf8_lossy(&out.stdout)
+                    .trim_end_matches(['\r', '\n'])
+                    .to_string();
+            }
+        }
+    }
+    if let Ok(out) = tokio::process::Command::new("powershell.exe")
+        .args(["-NoProfile", "-Command", "Get-Clipboard"])
+        .output()
+        .await
+    {
+        if out.status.success() && !out.stdout.is_empty() {
+            return String::from_utf8_lossy(&out.stdout)
+                .trim_end_matches(['\r', '\n'])
+                .to_string();
+        }
+    }
+    String::new()
+}
+
+/// Extract the text a mouse selection covers, from the stashed visible
+/// window (`origin` = screen coords of the first text column of the
+/// first row). Partial first/last rows respect the anchor columns;
+/// rows trim trailing spaces and join with newlines.
+fn selection_text(
+    win: &[ratatui::text::Line<'static>],
+    origin: (u16, u16),
+    a: (u16, u16),
+    h: (u16, u16),
+) -> Option<String> {
+    use unicode_width::UnicodeWidthStr;
+    let line_text = |l: &ratatui::text::Line<'static>| -> String {
+        l.spans.iter().map(|s| s.content.to_string()).collect()
+    };
+    let cell_slice = |text: &str, from: usize, to: usize| -> String {
+        let mut out = String::new();
+        let mut acc = 0usize;
+        for ch in text.chars() {
+            let start = acc;
+            acc += unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
+            if acc > from && start < to {
+                out.push(ch);
+            }
+        }
+        out
+    };
+    let (r1, c1, r2, c2) = if (a.1, a.0) <= (h.1, h.0) {
+        (a.1, a.0, h.1, h.0)
+    } else {
+        (h.1, h.0, a.1, a.0)
+    };
+    if r2 < origin.1 || win.is_empty() {
+        return None;
+    }
+    let i1 = ((r1 - origin.1) as usize).min(win.len() - 1);
+    let i2 = ((r2 - origin.1) as usize).min(win.len() - 1);
+    let mut parts: Vec<String> = Vec::new();
+    for (off, line) in win[i1..=i2].iter().enumerate() {
+        let text = line_text(line);
+        let from = if off == 0 {
+            (c1 - origin.0) as usize
+        } else {
+            0
+        };
+        let to = if off == i2 - i1 {
+            ((c2 - origin.0) as usize + 1).min(text.width())
+        } else {
+            text.width()
+        };
+        let seg = cell_slice(&text, from, to);
+        let trimmed = seg.trim_end();
+        if !trimmed.is_empty() {
+            parts.push(trimmed.to_string());
+        } else if off == 0 || off == i2 - i1 {
+            parts.push(String::new());
+        }
+    }
+    let out = parts.join("\n").trim().to_string();
+    (!out.is_empty()).then_some(out)
+}
+
+/// Copy the live transcript selection to the clipboard (OSC52) and
+/// clear it. No-op without a selection.
+fn copy_selection(
+    sel: &mut Option<TextSel>,
+    frame_window: &std::cell::RefCell<Vec<ratatui::text::Line<'static>>>,
+    frame_origin: &std::cell::Cell<(u16, u16)>,
+    transcript: &mut Transcript,
+) {
+    if let Some(s) = *sel {
+        let win = frame_window.borrow();
+        let origin = frame_origin.get();
+        if let Some(text) = selection_text(&win, origin, s.anchor, s.head) {
+            let n = text.chars().count();
+            if n > 0 {
+                let mut out = std::io::stdout().lock();
+                let _ = out.write_all(b"\x1b]52;c;");
+                let _ = out.write_all(b64encode(text.as_bytes()).as_bytes());
+                let _ = out.write_all(b"\x07");
+                let _ = out.flush();
+                transcript.push_separated(Line::Note(format!("copied {n} chars to the clipboard")));
+            }
+        }
+    }
+    *sel = None;
+}
+
+/// Restyle the window rows inside the selection rectangle with the
+/// selection bar colors (whole rows; the text itself is untouched).
+fn apply_sel_highlight(
+    window: &mut [ratatui::text::Line<'static>],
+    oy: u16,
+    a: (u16, u16),
+    h: (u16, u16),
+) {
+    let (r1, r2) = if a.1 <= h.1 { (a.1, h.1) } else { (h.1, a.1) };
+    if r2 < oy {
+        return;
+    }
+    let i1 = ((r1 - oy) as usize).min(window.len());
+    let i2 = (((r2 - oy) as usize) + 1).min(window.len());
+    for row in &mut window[i1..i2] {
+        for span in row.spans.iter_mut() {
+            span.style = span
+                .style
+                .fg(crate::palette::SEL_FG)
+                .bg(crate::palette::SEL_BG);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -7467,6 +7710,47 @@ mod tests {
     }
 
     #[test]
+    fn resume_hint_needs_a_session_and_a_turn() {
+        let hint = resume_hint("s19a4f2e1b0-3f9c2a81d4b7", 1, false).unwrap();
+        assert!(hint.contains("ka -c"), "{hint}");
+        assert!(hint.contains("ka --session 3f9c2a81"), "{hint}");
+        // quitting mid-turn (turns == 0, still busy) still resumes
+        assert!(resume_hint("s19a4f2e1b0-3f9c2a81d4b7", 0, true).is_some());
+        // a session with no turns, idle: not worth resuming
+        assert!(resume_hint("s19a4f2e1b0-3f9c2a81d4b7", 0, false).is_none());
+        // no session id (engine died at bootstrap): nothing to print
+        assert!(resume_hint("", 3, false).is_none());
+    }
+
+    #[test]
+    fn selection_text_extracts_rows_and_partial_edges() {
+        use ratatui::text::Line as TuiLine;
+        let win = vec![
+            TuiLine::raw("first row"),
+            TuiLine::raw("middle row"),
+            TuiLine::raw("last row"),
+        ];
+        // transcript text starts at col 2; the first row sits at row 5
+        let origin = (2u16, 5u16);
+        // full rows
+        assert_eq!(
+            selection_text(&win, origin, (2, 5), (20, 6)).as_deref(),
+            Some("first row\nmiddle row")
+        );
+        // single partial row: cols 6..10 over "first row" → "t row"
+        assert_eq!(
+            selection_text(&win, origin, (6, 5), (10, 5)).as_deref(),
+            Some("t row")
+        );
+        // reversed anchor/head normalizes
+        assert_eq!(
+            selection_text(&win, origin, (20, 6), (2, 5)).as_deref(),
+            Some("first row\nmiddle row")
+        );
+        // a selection entirely above the viewport selects nothing
+        assert!(selection_text(&win, origin, (2, 2), (20, 3)).is_none());
+    }
+    #[test]
     fn session_picker_marks_the_current_session() {
         let picker = SessionPicker {
             current: Some("s1-bbbb22221111".to_string()),
@@ -8005,7 +8289,7 @@ mod tests {
         }
         // the first content row keeps the surface fill
         let content = &out[1];
-        assert_eq!(row_text(content).trim_end(), "hi there");
+        assert_eq!(row_text(content).trim(), "hi there");
         assert_eq!(cols(content), 40, "surface fills the width");
         let slab = format!("{content:?}");
         assert!(slab.contains(&format!("{surface:?}")), "output bg: {slab}");
@@ -8033,9 +8317,9 @@ mod tests {
             );
             assert!(text(pad).trim().is_empty(), "pad row is blank");
         }
-        assert!(text(&out[1]).starts_with("❯ alpha"));
+        assert!(text(&out[1]).starts_with("  ❯ alpha"));
         assert!(
-            text(&out[2]).starts_with("  beta"),
+            text(&out[2]).starts_with("    beta"),
             "second source line indents"
         );
         assert_eq!(out.len(), 4, "pad + two rows + pad");
@@ -10231,6 +10515,64 @@ mod tests {
     }
 
     #[test]
+    fn selection_paints_selected_rows_with_the_bar_colors() {
+        use ratatui::backend::TestBackend;
+        let mut transcript = Transcript::default();
+        transcript.set_width(60);
+        transcript.push_separated(Line::Assistant("hello".into()));
+        let mut terminal = ratatui::Terminal::new(TestBackend::new(120, 40)).unwrap();
+        terminal
+            .draw(|f| {
+                super::render(
+                    f,
+                    &transcript,
+                    None,
+                    "",
+                    0,
+                    false,
+                    None,
+                    Instant::now(),
+                    0,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    &Meters::default(),
+                    &SidebarState::default(),
+                    &std::cell::Cell::new(None),
+                    &std::cell::Cell::new(None),
+                    &Some(super::TextSel {
+                        anchor: (0, 2),
+                        head: (80, 3),
+                    }),
+                    &std::cell::RefCell::new(Vec::new()),
+                    &std::cell::Cell::new((2, 2)),
+                )
+            })
+            .unwrap();
+        let buf = terminal.backend().buffer();
+        // the selection paints the reply row with the bar colors — and
+        // nothing outside the transcript region
+        let mut sel_cells = 0;
+        let mut outside = false;
+        for y in 0..40u16 {
+            for x in 0..120u16 {
+                if buf[(x, y)].style().bg == Some(crate::palette::SEL_BG) {
+                    sel_cells += 1;
+                    if y < 2 {
+                        outside = true;
+                    }
+                }
+            }
+        }
+        assert!(sel_cells > 0, "selection must paint the transcript");
+        assert!(!outside, "selection must not paint the header");
+    }
+
+    #[test]
     fn frame_has_top_margin_glyph_title_and_rounded_input() {
         use ratatui::backend::TestBackend;
         let mut terminal = ratatui::Terminal::new(TestBackend::new(120, 40)).unwrap();
@@ -10257,6 +10599,9 @@ mod tests {
                     &SidebarState::default(),
                     &std::cell::Cell::new(None),
                     &std::cell::Cell::new(None),
+                    &None,
+                    &std::cell::RefCell::new(Vec::new()),
+                    &std::cell::Cell::new((0, 0)),
                 )
             })
             .unwrap();
@@ -10313,6 +10658,9 @@ mod tests {
                         &SidebarState::default(),
                         &std::cell::Cell::new(None),
                         &arrows,
+                        &None,
+                        &std::cell::RefCell::new(Vec::new()),
+                        &std::cell::Cell::new((0, 0)),
                     )
                 })
                 .unwrap();
