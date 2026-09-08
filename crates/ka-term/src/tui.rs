@@ -6860,31 +6860,38 @@ pub struct TextSel {
 
 /// Read the system clipboard as text: wayland → X11 → WSL2/Windows.
 async fn clipboard_text() -> String {
-    for (program, args) in [
-        ("wl-paste", vec!["--no-newline"]),
-        ("xclip", vec!["-selection", "clipboard", "-o"]),
-    ] {
-        if let Ok(out) = tokio::process::Command::new(program)
-            .args(&args)
-            .output()
-            .await
-        {
-            if out.status.success() && !out.stdout.is_empty() {
-                return String::from_utf8_lossy(&out.stdout)
-                    .trim_end_matches(['\r', '\n'])
-                    .to_string();
-            }
-        }
-    }
-    if let Ok(out) = tokio::process::Command::new("powershell.exe")
-        .args(["-NoProfile", "-Command", "Get-Clipboard"])
-        .output()
-        .await
+    // Every probe is capped (a hanging xclip against an unresponsive
+    // selection owner must not freeze the event loop).
+    const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+    let run = |program: &str, args: &[&str]| {
+        tokio::time::timeout(
+            TIMEOUT,
+            tokio::process::Command::new(program).args(args).output(),
+        )
+    };
+    // WSL2 first: the Windows clipboard lives behind powershell.exe.
+    if let Ok(Ok(out)) = run(
+        "powershell.exe",
+        &["-NoProfile", "-Command", "Get-Clipboard"],
+    )
+    .await
     {
         if out.status.success() && !out.stdout.is_empty() {
             return String::from_utf8_lossy(&out.stdout)
                 .trim_end_matches(['\r', '\n'])
                 .to_string();
+        }
+    }
+    for (program, args) in [
+        ("wl-paste", vec!["--no-newline"]),
+        ("xclip", vec!["-selection", "clipboard", "-o"]),
+    ] {
+        if let Ok(Ok(out)) = run(program, &args).await {
+            if out.status.success() && !out.stdout.is_empty() {
+                return String::from_utf8_lossy(&out.stdout)
+                    .trim_end_matches(['\r', '\n'])
+                    .to_string();
+            }
         }
     }
     String::new()
