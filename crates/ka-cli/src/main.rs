@@ -82,7 +82,7 @@ enum CliCommand {
         schema: Option<PathBuf>,
         /// Output format: text (final answer only, default), ndjson
         /// (ka event stream), or stream-json (Claude-Code-shaped NDJSON)
-        #[arg(long, default_value = "text")]
+        #[arg(long, default_value = "text", value_parser = ["text", "ndjson", "stream-json"])]
         print: String,
     },
     /// Serve the Agent Client Protocol on stdin/stdout
