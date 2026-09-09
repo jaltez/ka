@@ -59,7 +59,6 @@ pub const ACCENT: Color = BUTTER; // titles, cursor, key hints, user ❯, spinne
 pub const WARN: Color = FLAME; // #FF8A5C
 pub const OK: Color = SAGE; // #23D5AB success
 pub const ERR: Color = CORAL; // #FF5370 errors
-pub const CHERRY: Color = Color::Rgb(255, 61, 109); // #FF3D6D hot pink: raw danger
 pub const TOOL: Color = STEEL; // #7AA2F7 → tool headers
 pub const SEL_BG: Color = Color::Rgb(220, 117, 181); // #DC75B5 pink selection bar
 pub const SEL_FG: Color = Color::Rgb(27, 14, 24); // #1B0E18 near-black on the pink bar

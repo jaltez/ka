@@ -1,7 +1,7 @@
 //! Markdown renderer for the TUI transcript. One accent color for
 //! headings, faint fence lines around syntax-colored code, quiet gutters
-//! for quotes, and pure font-modifier emphasis on cream text — all tuned
-//! to the complementary cream/charcoal palette in [`crate::palette`]. The only
+//! for quotes, and bright-tinted bold/italic emphasis (strike stays a
+//! pure modifier) — all tuned to the sunset palette in [`crate::palette`]. The only
 //! dependency beyond ratatui is unicode-width, already in the tree via
 //! ratatui.
 
@@ -331,9 +331,9 @@ fn parse_table(rows: &[&str]) -> Option<(Vec<String>, Vec<Vec<String>>)> {
 }
 
 /// Render a parsed table as a sharp box-drawn grid (OMP `table` symbols)
-/// fitted to `width`. Bars/rules sit in the dim border color; the header is
-/// bold on default text. Cells clip with `…`, never overflow. Inner
-/// rules separate every body row.
+/// fitted to `width`. Bars/rules sit in the dim border color; the header
+/// is bold in the accent color. Cells clip with `…`, never overflow.
+/// Inner rules separate every body row.
 fn render_table(
     header: &[String],
     body: &[Vec<String>],
@@ -493,8 +493,8 @@ fn is_numbered_item(s: &str) -> bool {
 }
 
 /// Inline markdown: `**bold**`, `*italic*`, `` `code` ``, `~~strike~~`,
-/// `[text](url)` links, `![alt](url)` images, `\`-escapes. Emphasis is pure
-/// font modifiers on default text (OMP: `theme.bold`/`theme.italic`).
+/// `[text](url)` links, `![alt](url)` images, `\`-escapes. Bold/italic
+/// runs tint with the strong foreground; strike stays a pure modifier.
 pub fn inline_spans(s: &str) -> Vec<Span<'static>> {
     let mut spans: Vec<Span<'static>> = Vec::new();
     let mut plain = String::new();

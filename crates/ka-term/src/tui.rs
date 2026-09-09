@@ -215,6 +215,19 @@ impl InputBuffer {
 
     /// Snapshot (text, cursor) BEFORE a mutation so `undo` restores the
     /// state preceding the op. Cap at 100 entries (drop the oldest).
+    /// Clear the whole draft (Ctrl+C on a non-empty input). Routed
+    /// through the undo stack and kill ring like every destructive
+    /// edit, so Ctrl+Z restores and Ctrl+Y yanks it back.
+    pub fn clear_draft(&mut self) {
+        if self.text.is_empty() {
+            return;
+        }
+        self.push_undo();
+        let killed = std::mem::take(&mut self.text);
+        self.cursor = 0;
+        self.kill_push(Some(killed));
+    }
+
     fn push_undo(&mut self) {
         if self.undo.len() >= 100 {
             self.undo.remove(0);
@@ -1123,11 +1136,6 @@ pub struct SidebarState {
     pub cwd: String,
     /// Git branch when cheaply detectable at startup.
     pub branch: Option<String>,
-    /// Skills section expanded? Collapsed via a mouse click on its
-    /// header; the header keeps rendering as `skills (+N)`.
-    pub skills_open: bool,
-    /// Cursor is over the skills header (drives the hover affordance).
-    pub skills_hover: bool,
     /// Window/sidebar title glyph ([tui] header_glyph, default ◆).
     pub header_glyph: String,
     /// The active session's display title ([`Event::Title`]; stored
@@ -1142,8 +1150,6 @@ impl Default for SidebarState {
             todos: Vec::new(),
             cwd: String::new(),
             branch: None,
-            skills_open: true,
-            skills_hover: false,
             title: None,
             header_glyph: "◆".to_string(),
         }
@@ -1153,55 +1159,6 @@ impl Default for SidebarState {
 /// A clickable sidebar region, recorded at render time so the mouse
 /// handler can hit-test without duplicating the layout math. New
 /// collapsible sections add a variant here.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SidebarZone {
-    /// The skills section header row (spans the sidebar's full width).
-    SkillsHeader(ratatui::layout::Rect),
-}
-
-impl SidebarZone {}
-
-/// Clickable ▲▼ jump targets on the transcript title row (recorded at
-/// render time like [`SidebarZone`]).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct TitleArrows {
-    /// ▲ — jump to the previous user message.
-    up: ratatui::layout::Rect,
-    /// ▼ — jump to the next user message.
-    down: ratatui::layout::Rect,
-}
-
-/// Sidebar skills header text: bare when expanded, count-marked when
-/// collapsed (the ` ▾`/` ▸` affordance rides separately as a dim span).
-fn skills_header_label(open: bool, count: usize) -> String {
-    if open {
-        "skills".to_string()
-    } else {
-        format!("skills (+{count})")
-    }
-}
-
-/// Full skills header line: label plus the ` ▾`/` ▸` disclosure arrow.
-/// Hover lifts the whole header onto the modal surface tint (ACCENT on
-/// BG_SURFACE); at rest the label keeps its accent-bold look and the
-/// arrow stays dim META.
-fn skills_header_line(open: bool, hover: bool, count: usize) -> ratatui::text::Line<'static> {
-    use ratatui::text::{Line as TuiLine, Span};
-    let label = skills_header_label(open, count);
-    let arrow = if open { " ▾" } else { " ▸" };
-    if hover {
-        let st = ratatui::style::Style::new()
-            .fg(crate::palette::ACCENT)
-            .bg(crate::palette::BG_SURFACE);
-        TuiLine::from(vec![Span::styled(label, st), Span::styled(arrow, st)])
-    } else {
-        TuiLine::from(vec![
-            Span::styled(label, crate::palette::ACCENT_BOLD),
-            Span::styled(arrow, crate::palette::META),
-        ])
-    }
-}
-
 /// Sidebar column width when shown.
 const SIDEBAR_WIDTH: u16 = 26;
 /// Minimum terminal width for the sidebar; below it the transcript keeps
@@ -1268,15 +1225,11 @@ fn detect_branch() -> Option<String> {
     let branch = String::from_utf8_lossy(&out.stdout).trim().to_string();
     (out.status.success() && !branch.is_empty()).then_some(branch)
 }
-/// `hit`: when given, the cell receives the skills header's on-screen
-/// rectangle (or `None` when no skills header is on screen), so the
-/// mouse handler can hit-test with render-time truth.
 fn sidebar_rows(
     sidebar: &SidebarState,
     meters: &Meters,
     width: usize,
     height: usize,
-    hit: Option<(&std::cell::Cell<Option<SidebarZone>>, ratatui::layout::Rect)>,
 ) -> Vec<ratatui::text::Line<'static>> {
     use ratatui::style::{Modifier, Style};
     use ratatui::text::{Line as TuiLine, Span};
@@ -1372,23 +1325,7 @@ fn sidebar_rows(
             .chain(items.iter().map(|s| plain(trunc_cols(s, width))))
             .collect::<Vec<_>>()
     };
-    // collapsed skills render their header alone, with the count moved
-    // into the label; the header carries the disclosure arrow and the
-    // hover affordance
-    let skills = if sidebar.skills_open {
-        let mut rows = names("skills", &sidebar.inventory.skills);
-        if !rows.is_empty() {
-            rows[0] =
-                skills_header_line(true, sidebar.skills_hover, sidebar.inventory.skills.len());
-        }
-        rows
-    } else {
-        vec![skills_header_line(
-            false,
-            sidebar.skills_hover,
-            sidebar.inventory.skills.len(),
-        )]
-    };
+    let skills = names("skills", &sidebar.inventory.skills);
     let agents = names("agents", &sidebar.inventory.agents);
 
     // ── info: one `cwd-short:branch` row at the bottom; without a
@@ -1402,20 +1339,15 @@ fn sidebar_rows(
     // capping any list section that would overflow the remaining height.
     // Air: one blank row after each header and one between sections;
     // priorities keep their top-down order, the rest truncates.
-    const SKILLS_SECTION: usize = 3;
     let sections = [session, todos, mcp, skills, agents, info];
     let mut out: Vec<TuiLine> = Vec::with_capacity(height.min(40));
     let mut room = height;
     let mut placed = false;
-    let mut skills_header_row: Option<usize> = None;
-    for (si, section) in sections.into_iter().enumerate() {
+    for section in sections.into_iter() {
         let Some((head, body)) = section.split_first() else {
             continue;
         };
-        // a collapsed skills section carries no body but its header
-        // must still land on screen
-        let forced = si == SKILLS_SECTION && !sidebar.skills_open && body.is_empty();
-        if body.is_empty() && !forced {
+        if body.is_empty() {
             continue; // empty sections vanish
         }
         if placed {
@@ -1426,13 +1358,10 @@ fn sidebar_rows(
             room -= 1;
         }
         let show = (room - 2).min(body.len());
-        if show == 0 && !forced {
+        if show == 0 {
             break; // not even one body row fits under the header air
         }
         placed = true;
-        if si == SKILLS_SECTION {
-            skills_header_row = Some(out.len());
-        }
         out.push(head.clone());
         out.push(TuiLine::default()); // blank under the header
         if show < body.len() {
@@ -1446,18 +1375,6 @@ fn sidebar_rows(
             out.extend(body.iter().cloned());
         }
         room -= 2 + show;
-    }
-    if let Some((cell, area)) = hit {
-        cell.set(skills_header_row.map(|row| {
-            SidebarZone::SkillsHeader(ratatui::layout::Rect {
-                x: area.x,
-                // the block title consumes the area's first row, so a
-                // rendered row lives one below area.y
-                y: area.y + 1 + row as u16,
-                width: area.width,
-                height: 1,
-            })
-        }));
     }
     out
 }
@@ -2170,10 +2087,6 @@ async fn app(
     let mut find_last: Option<(String, usize)> = None;
     let mut modal: Option<Modal> = None;
     let mut mode_picker: Option<ModePicker> = None;
-    // clickable sidebar regions, refreshed every frame by render()
-    let sidebar_zone: std::cell::Cell<Option<SidebarZone>> = std::cell::Cell::new(None);
-    // clickable ▲▼ user-message jump targets on the title row
-    let title_arrows: std::cell::Cell<Option<TitleArrows>> = std::cell::Cell::new(None);
     let mut term_events = crossterm::event::EventStream::new();
     let mut spin = tokio::time::interval(Duration::from_millis(120));
 
@@ -2242,8 +2155,6 @@ async fn app(
                 mode_picker.as_ref(),
                 &meters,
                 &sidebar,
-                &sidebar_zone,
-                &title_arrows,
             );
         })?;
 
@@ -2266,8 +2177,7 @@ async fn app(
                             input.search_cancel();
                             quit_armed = None;
                         } else if !input.text.is_empty() {
-                            input.text.clear();
-                            input.cursor = 0;
+                            input.clear_draft();
                             slash_popup = update_suggestions(&input.text);
                             quit_armed = None;
                         } else if quit_armed
@@ -2975,6 +2885,19 @@ async fn app(
                                 }
                                 continue;
                             }
+                            if text.trim() == "/context" {
+                                // mid-turn the engine cannot serve the
+                                // breakdown (the turn owns the command
+                                // channel) — gate it like /retry
+                                if busy {
+                                    transcript.push_separated(Line::Note(
+                                        "⏳ turn running — /context works when idle".into(),
+                                    ));
+                                } else {
+                                    let _ = commands.send(Command::ContextBreakdown).await;
+                                }
+                                continue;
+                            }
                             if text.trim() == "/copy" {
                                 let last = transcript
                                     .entries()
@@ -3169,44 +3092,9 @@ async fn app(
                                             } else {
                                                 Some(meters.session.clone())
                                             };
-                                            let mut ids: Vec<String> =
-                                                current.clone().map(|c| vec![c]).unwrap_or_default();
-                                            let mut i = 0;
-                                            while i < ids.len() {
-                                                let frontier = ids.clone();
-                                                for s in &all {
-                                                    if s.parent
-                                                        .as_deref()
-                                                        .is_some_and(|p| frontier.iter().any(|id| id == p))
-                                                        && !ids.contains(&s.id)
-                                                    {
-                                                        ids.push(s.id.clone());
-                                                    }
-                                                }
-                                                i += 1;
-                                                if i > all.len() + 1 {
-                                                    break;
-                                                }
-                                            }
-                                            let mut items = Vec::new();
-                                            let mut targets = Vec::new();
-                                            for s in &all {
-                                                if !ids.contains(&s.id) {
-                                                    continue;
-                                                }
-                                                let date =
-                                                    s.ts.get(..10).unwrap_or(&s.ts).to_string();
-                                                let marker = if Some(&s.id) == current.as_ref() {
-                                                    "▸ "
-                                                } else {
-                                                    ""
-                                                };
-                                                items.push(format!(
-                                                    "{marker}{} · {date} · {} msgs",
-                                                    s.title, s.messages
-                                                ));
-                                                targets.push(s.id.clone());
-                                            }
+                                            let inner_w = 68usize.saturating_sub(4);
+                                            let (items, targets) =
+                                                tree_modal_rows(&all, current.as_deref(), inner_w);
                                             Modal::Tree {
                                                 items,
                                                 targets,
@@ -3577,10 +3465,7 @@ async fn app(
                         path_popup = None;
                         input.insert_str(&text);
                         slash_popup = update_suggestions(&input.text);
-                    } else if !input.searching()
-                        && text.trim().chars().filter(|c| !c.is_whitespace()).count() == 1
-                        && text.trim().chars().all(|c| !c.is_whitespace())
-                    {
+                    } else if !input.searching() && text.split_whitespace().count() == 1 {
                         // bracketed paste carrying exactly one existing
                         // image path: attach it instead of inserting text
                         let trimmed = text.trim();
@@ -5233,7 +5118,7 @@ then write a concrete numbered implementation plan to .ka/plans/plan.md. Task: {
         }),
         "/context" => Some(Slash {
             note: None,
-            event: Some(Command::ContextBreakdown),
+            event: None, // dispatched by the busy gate in the app loop
             quit: false,
             followup: None,
             modal: None,
@@ -5372,8 +5257,8 @@ fn append_tool_note(row: &mut String, excerpt: &str, is_error: bool) {
     }
 }
 
-/// The one selection identity of the whole TUI: a full-row petrol bar
-/// carrying cream text (pad_to_width fills the row with SEL_BG).
+/// The one selection identity of the whole TUI: a full-row pink bar
+/// carrying near-black text (pad_to_width fills the row with SEL_BG).
 fn selection_style() -> ratatui::style::Style {
     use ratatui::style::Modifier;
     ratatui::style::Style::new()
@@ -5475,8 +5360,6 @@ fn render(
     picker: Option<&ModePicker>,
     meters: &Meters,
     sidebar: &SidebarState,
-    sidebar_zone: &std::cell::Cell<Option<SidebarZone>>,
-    title_arrows: &std::cell::Cell<Option<TitleArrows>>,
 ) {
     let header_glyph = sidebar.header_glyph.as_str();
     use ratatui::layout::Constraint::{Length, Min};
@@ -5484,7 +5367,7 @@ fn render(
     use ratatui::text::{Line as TuiLine, Span};
     use ratatui::widgets::{Block, BorderType, Borders, Paragraph, Wrap};
     // ── canvas: paint the whole frame before any widget so the app sits
-    // on the charcoal ground with cream prose, whatever the terminal
+    // on the indigo ground with lavender prose, whatever the terminal
     // theme paints behind it ──
     frame.render_widget(Block::new().style(crate::palette::CANVAS), frame.area());
     // one column of air on each side of the frame; rows stay edge to
@@ -5555,8 +5438,12 @@ fn render(
             live_rows.push(surface_blank(tx_inner, crate::palette::BG_OUTPUT));
         }
         // transient tail of the live region: the working indicator
-        // rides below the last live row and is never cached
+        // rides below the last live row and is never cached; blank
+        // rows above and below give it a little air so it never
+        // crowds the live card or the input box
+        live_rows.push(TuiLine::default());
         live_rows.push(working_row(ask, busy_since, now));
+        live_rows.push(TuiLine::default());
     }
 
     let cached = transcript.total_rows();
@@ -5584,8 +5471,6 @@ fn render(
     } else {
         format!("{header_glyph} · ↑{} above (pgdn/esc)", start)
     };
-    // cells the padded title occupies (one space of air each side)
-    let title_cells = title.chars().count() + 2;
     let widget = Paragraph::new(window).block(
         Block::default()
             .borders(Borders::TOP)
@@ -5594,48 +5479,6 @@ fn render(
             .padding(ratatui::widgets::Padding::horizontal(1)),
     );
     frame.render_widget(widget, tx_area);
-
-    // ── ▲▼ user-message jump arrows at the end of the title row ──
-    // Only once the user has sent a message (nothing to jump to
-    // before), and only when the pane is wide enough that the arrows
-    // never collide with the title text. ▲ steps to the previous user
-    // message, ▼ to the next; both zones are recorded for the mouse
-    // handler.
-    title_arrows.set(None);
-    let has_user = transcript
-        .entries()
-        .iter()
-        .any(|l| matches!(l, Line::User(_)));
-    if has_user && tx_area.width >= 12 {
-        let need = title_cells + 7;
-        if tx_area.width as usize >= need {
-            let y = tx_area.y;
-            let x0 = tx_area.x + tx_area.width - 4; // ' ', '▲', ' ', '▼'
-            let buf = frame.buffer_mut();
-            for (i, sym) in [' ', '▲', ' ', '▼'].iter().enumerate() {
-                if let Some(c) = buf.cell_mut((x0 + i as u16, y)) {
-                    c.set_symbol(&sym.to_string());
-                    if *sym != ' ' {
-                        c.set_style(crate::palette::ACCENT_STYLE);
-                    }
-                }
-            }
-            title_arrows.set(Some(TitleArrows {
-                up: ratatui::layout::Rect {
-                    x: x0,
-                    y,
-                    width: 2,
-                    height: 1,
-                },
-                down: ratatui::layout::Rect {
-                    x: x0 + 2,
-                    y,
-                    width: 2,
-                    height: 1,
-                },
-            }));
-        }
-    }
 
     // ── scrollbar rail: painted into the transcript's always-blank
     // right padding column, so no width math ever learns about it ──
@@ -5671,7 +5514,6 @@ fn render(
             meters,
             (SIDEBAR_WIDTH - 3) as usize,
             sb.height as usize,
-            Some((sidebar_zone, sb)),
         );
         let widget = Paragraph::new(rows)
             .block(
@@ -5683,9 +5525,6 @@ fn render(
             )
             .style(ratatui::style::Style::new().bg(crate::palette::BG_PANEL));
         frame.render_widget(widget, sb);
-    } else {
-        // no sidebar column: no clickable zones this frame
-        sidebar_zone.set(None);
     }
     // ── input ─────────────────────────────────────────────────────
     // a permission ask borrows the box as a form (the draft returns
@@ -5826,7 +5665,7 @@ fn render(
             }
             Modal::Memory { .. } => hint_spans(&[(" esc", "close")]),
             Modal::Usage { .. } => hint_spans(&[(" any", "close")]),
-            Modal::Context { .. } => hint_spans(&[(" any", "close")]),
+            Modal::Context { .. } => hint_spans(&[(" esc", "close")]),
             Modal::Key(_) => hint_spans(&[(" type", "value"), (" ⏎", "save"), (" esc", "cancel")]),
             Modal::Help => hint_spans(&[(" ⏎", "close")]),
         }
@@ -5868,6 +5707,8 @@ fn render(
             width: (chunks[2].width).min(56),
             height: rows,
         };
+        // wipe the covered cells: the paragraph paints only its text
+        frame.render_widget(ratatui::widgets::Clear, rect);
         let inner_w = rect.width.saturating_sub(4) as usize; // borders + padding
         let mut text = Vec::new();
         for (i, (name, desc)) in popup.items.iter().take(7).enumerate() {
@@ -5905,6 +5746,8 @@ fn render(
             width: (chunks[2].width).min(56),
             height: rows,
         };
+        // wipe the covered cells: the paragraph paints only its text
+        frame.render_widget(ratatui::widgets::Clear, rect);
         let inner_w = rect.width.saturating_sub(4) as usize; // borders + padding
         let mut text = Vec::new();
         for (i, (name, is_dir)) in path.entries.iter().take(7).enumerate() {
@@ -5945,14 +5788,22 @@ fn render(
                 let height = (rows.len() as u16 + 5).min(22);
                 let width = 68.min(frame.area().width);
                 let rect = centered(width, height, modal_area);
+                // wipe the covered cells first: the paragraph only paints
+                // its own text, and the transcript would bleed through
+                frame.render_widget(ratatui::widgets::Clear, rect);
                 let mut text = vec![TuiLine::from(vec![
                     Span::styled("filter: ", ratatui::style::Style::default()),
                     Span::styled(picker.filter.clone(), crate::palette::ACCENT_STYLE),
                 ])];
                 let inner_w = width.saturating_sub(4) as usize; // borders + padding
-                for (i, (label, detail)) in rows.iter().take((height as usize) - 5).enumerate() {
+                let cap = (height as usize).saturating_sub(5);
+                let offset = picker
+                    .selected
+                    .saturating_sub(cap.saturating_sub(1))
+                    .min(rows.len().saturating_sub(cap));
+                for (i, (label, detail)) in rows.iter().skip(offset).take(cap).enumerate() {
                     let row = pad_to_width(format!("{label}  —  {detail}"), inner_w);
-                    if i == picker.selected {
+                    if i + offset == picker.selected {
                         text.push(TuiLine::styled(row, selection_style()));
                     } else {
                         text.push(TuiLine::raw(row));
@@ -5978,6 +5829,9 @@ fn render(
                 let height = 10u16.min(frame.area().height.saturating_sub(2));
                 let width = 64.min(frame.area().width);
                 let rect = centered(width, height, modal_area);
+                // wipe the covered cells first: the paragraph only paints
+                // its own text, and the transcript would bleed through
+                frame.render_widget(ratatui::widgets::Clear, rect);
                 let mut text = vec![TuiLine::styled("api key", crate::palette::ACCENT_BOLD)];
                 text.push(TuiLine::from(vec![
                     Span::styled("provider  ", crate::palette::META),
@@ -6022,6 +5876,9 @@ fn render(
                 let height = 34u16.min(frame.area().height.saturating_sub(2));
                 let width = 66.min(frame.area().width);
                 let rect = centered(width, height, modal_area);
+                // wipe the covered cells first: the paragraph only paints
+                // its own text, and the transcript would bleed through
+                frame.render_widget(ratatui::widgets::Clear, rect);
                 let keys = vec![
                     ("Enter", "send · interject mid-turn"),
                     ("Esc / Ctrl-C", "abort turn · close overlays · unpin scroll"),
@@ -6082,6 +5939,9 @@ fn render(
                 let height = (rows.len() as u16 + 5).min(20);
                 let width = 68.min(frame.area().width);
                 let rect = centered(width, height, modal_area);
+                // wipe the covered cells first: the paragraph only paints
+                // its own text, and the transcript would bleed through
+                frame.render_widget(ratatui::widgets::Clear, rect);
                 let mut text = vec![TuiLine::from(vec![
                     Span::styled("filter: ", ratatui::style::Style::default()),
                     Span::styled(picker.filter.clone(), crate::palette::ACCENT_STYLE),
@@ -6151,6 +6011,9 @@ fn render(
                 let height = (rows.len() as u16 + 5).min(20);
                 let width = 68.min(frame.area().width);
                 let rect = centered(width, height, modal_area);
+                // wipe the covered cells first: the paragraph only paints
+                // its own text, and the transcript would bleed through
+                frame.render_widget(ratatui::widgets::Clear, rect);
                 let inner_w = width.saturating_sub(4) as usize; // borders + padding
                 let mut text = vec![TuiLine::from(vec![
                     Span::styled("filter: ", ratatui::style::Style::default()),
@@ -6201,6 +6064,9 @@ fn render(
                 let height = height.min(frame.area().height.saturating_sub(2));
                 let width = 72.min(frame.area().width);
                 let rect = centered(width, height, modal_area);
+                // wipe the covered cells first: the paragraph only paints
+                // its own text, and the transcript would bleed through
+                frame.render_widget(ratatui::widgets::Clear, rect);
                 let dim = ratatui::style::Style::new().fg(crate::palette::META);
                 let inner_w = width.saturating_sub(4) as usize; // borders + padding
                 let mode_str = mode_label(panel.mode);
@@ -6304,6 +6170,9 @@ fn render(
                 let height = (items.len() as u16 + 5).clamp(7, 21);
                 let width = 68.min(frame.area().width);
                 let rect = centered(width, height, modal_area);
+                // wipe the covered cells first: the paragraph only paints
+                // its own text, and the transcript would bleed through
+                frame.render_widget(ratatui::widgets::Clear, rect);
                 let inner_w = width.saturating_sub(4) as usize; // borders + padding
                 let mut text = Vec::new();
                 if items.is_empty() {
@@ -6313,8 +6182,11 @@ fn render(
                     ));
                 }
                 let cap = (height as usize).saturating_sub(5);
-                for (i, path) in items.iter().take(cap).enumerate() {
-                    if i == *selected {
+                let offset = (*selected)
+                    .saturating_sub(cap.saturating_sub(1))
+                    .min(items.len().saturating_sub(cap));
+                for (i, path) in items.iter().skip(offset).take(cap).enumerate() {
+                    if i + offset == *selected {
                         text.push(TuiLine::styled(
                             pad_to_width(path.clone(), inner_w),
                             selection_style(),
@@ -6339,6 +6211,9 @@ fn render(
                 let height = (items.len() as u16 + 5).clamp(7, 21);
                 let width = 68.min(frame.area().width);
                 let rect = centered(width, height, modal_area);
+                // wipe the covered cells first: the paragraph only paints
+                // its own text, and the transcript would bleed through
+                frame.render_widget(ratatui::widgets::Clear, rect);
                 let inner_w = width.saturating_sub(4) as usize;
                 let mut text = Vec::new();
                 if items.is_empty() {
@@ -6348,8 +6223,11 @@ fn render(
                     ));
                 }
                 let cap = (height as usize).saturating_sub(5);
-                for (i, row) in items.iter().take(cap).enumerate() {
-                    if i == *selected {
+                let offset = (*selected)
+                    .saturating_sub(cap.saturating_sub(1))
+                    .min(items.len().saturating_sub(cap));
+                for (i, row) in items.iter().skip(offset).take(cap).enumerate() {
+                    if i + offset == *selected {
                         text.push(TuiLine::styled(
                             pad_to_width(row.clone(), inner_w),
                             selection_style(),
@@ -6374,6 +6252,9 @@ fn render(
                 let height = (rows.len() as u16 + 4).clamp(6, 24);
                 let width = 72.min(frame.area().width);
                 let rect = centered(width, height, modal_area);
+                // wipe the covered cells first: the paragraph only paints
+                // its own text, and the transcript would bleed through
+                frame.render_widget(ratatui::widgets::Clear, rect);
                 let inner_w = width.saturating_sub(4) as usize;
                 let mut text = Vec::new();
                 let cap = (height as usize).saturating_sub(4);
@@ -6403,6 +6284,9 @@ fn render(
                 let height = (rows.len() as u16 + 4).clamp(6, 24);
                 let width = 72.min(frame.area().width);
                 let rect = centered(width, height, modal_area);
+                // wipe the covered cells first: the paragraph only paints
+                // its own text, and the transcript would bleed through
+                frame.render_widget(ratatui::widgets::Clear, rect);
                 let inner_w = width.saturating_sub(4) as usize;
                 let mut text = Vec::new();
                 let cap = (height as usize).saturating_sub(4);
@@ -6432,6 +6316,9 @@ fn render(
                 let height = (rows.len() as u16 + 4).clamp(6, 24);
                 let width = 72.min(frame.area().width);
                 let rect = centered(width, height, modal_area);
+                // wipe the covered cells first: the paragraph only paints
+                // its own text, and the transcript would bleed through
+                frame.render_widget(ratatui::widgets::Clear, rect);
                 let inner_w = width.saturating_sub(4) as usize;
                 let mut text = Vec::new();
                 let cap = (height as usize).saturating_sub(4);
@@ -6465,6 +6352,9 @@ fn render(
                 let height = (items.len() as u16 + 5).clamp(7, 21);
                 let width = 68.min(frame.area().width);
                 let rect = centered(width, height, modal_area);
+                // wipe the covered cells first: the paragraph only paints
+                // its own text, and the transcript would bleed through
+                frame.render_widget(ratatui::widgets::Clear, rect);
                 let inner_w = width.saturating_sub(4) as usize;
                 let mut text = Vec::new();
                 if items.is_empty() {
@@ -6474,14 +6364,20 @@ fn render(
                     ));
                 }
                 let cap = (height as usize).saturating_sub(5);
-                for (i, row) in items.iter().take(cap).enumerate() {
-                    if i == *selected {
-                        text.push(TuiLine::styled(
-                            pad_to_width(row.clone(), inner_w),
-                            selection_style(),
-                        ));
+                // window the list so the selection always stays visible:
+                // long trees scroll instead of hiding the selected row
+                let offset = (*selected)
+                    .saturating_sub(cap.saturating_sub(1))
+                    .min(items.len().saturating_sub(cap));
+                for (i, row) in items.iter().skip(offset).take(cap).enumerate() {
+                    // truncate at the ACTUAL inner width: a narrow
+                    // terminal renders a smaller box than the 64-col
+                    // build assumption, and wrapping must not come back
+                    let row = pad_to_width(trunc_cols(row, inner_w), inner_w);
+                    if i + offset == *selected {
+                        text.push(TuiLine::styled(row, selection_style()));
                     } else {
-                        text.push(TuiLine::raw(row.clone()));
+                        text.push(TuiLine::raw(row));
                     }
                 }
                 let widget = Paragraph::new(text)
@@ -6643,6 +6539,57 @@ fn push_gutter(
             start = end;
         }
     }
+}
+
+/// `/tree` modal rows: the current session's whole family (itself plus
+/// every descendant, found by walking `parent` links level by level).
+/// Rows come out parent-before-child, indented one step per depth, the
+/// current session marked `▸`, each truncated to `width` columns.
+/// Returns (rows, strand ids) in the same order.
+fn tree_modal_rows(
+    all: &[ka_strand::StrandSummary],
+    current: Option<&str>,
+    width: usize,
+) -> (Vec<String>, Vec<String>) {
+    let mut ids: Vec<String> = current.iter().map(|c| c.to_string()).collect();
+    let mut depths: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    if let Some(c) = current {
+        depths.insert(c.to_string(), 0);
+    }
+    let mut level = ids.clone();
+    let mut depth = 0;
+    while !level.is_empty() {
+        let mut next = Vec::new();
+        for s in all {
+            if let Some(p) = &s.parent {
+                if level.contains(p) && !ids.contains(&s.id) {
+                    ids.push(s.id.clone());
+                    depths.insert(s.id.clone(), depth + 1);
+                    next.push(s.id.clone());
+                }
+            }
+        }
+        level = next;
+        depth += 1;
+    }
+    let mut items = Vec::with_capacity(ids.len());
+    let mut targets = Vec::with_capacity(ids.len());
+    for id in &ids {
+        let Some(s) = all.iter().find(|s| &s.id == id) else {
+            continue;
+        };
+        let date = s.ts.get(..10).unwrap_or(&s.ts).to_string();
+        let indent = "  ".repeat(*depths.get(id).unwrap_or(&0));
+        let marker = if Some(id.as_str()) == current {
+            "▸ "
+        } else {
+            ""
+        };
+        let row = format!("{indent}{marker}{} · {date} · {} msgs", s.title, s.messages);
+        items.push(trunc_cols(&row, width));
+        targets.push(id.clone());
+    }
+    (items, targets)
 }
 
 fn centered(width: u16, height: u16, area: ratatui::layout::Rect) -> ratatui::layout::Rect {
@@ -7115,6 +7062,21 @@ mod tests {
         let mut empty = InputBuffer::default();
         empty.yank(); // kill = None: silent no-op
         assert!(empty.text.is_empty());
+    }
+
+    #[test]
+    fn clear_draft_is_undoable_and_yankable() {
+        let mut b = InputBuffer::default();
+        b.insert_str("long draft");
+        b.clear_draft();
+        assert!(b.text.is_empty(), "draft cleared");
+        b.undo();
+        assert_eq!(b.text, "long draft", "ctrl+z restores the cleared draft");
+        assert_eq!(b.cursor, 10);
+        // the cleared text also landed in the kill ring (ctrl+y yanks)
+        b.clear_draft();
+        b.yank();
+        assert_eq!(b.text, "long draft", "ctrl+y yanks the killed draft");
     }
 
     #[test]
@@ -9667,7 +9629,7 @@ mod tests {
             branch: Some("main".into()),
             ..Default::default()
         };
-        let rows = sidebar_rows(&sidebar, &meters_sample(), 24, 40, None);
+        let rows = sidebar_rows(&sidebar, &meters_sample(), 24, 40);
         let text = plain_text(&rows);
         assert_eq!(text[0], "session");
         assert!(text.contains(&"model mockco/mock".to_string()), "{text:?}");
@@ -9721,7 +9683,7 @@ mod tests {
             },
             ..Default::default()
         };
-        let rows = sidebar_rows(&sidebar, &Meters::default(), 24, 40, None);
+        let rows = sidebar_rows(&sidebar, &Meters::default(), 24, 40);
         let text = plain_text(&rows);
         let done = text
             .iter()
@@ -9774,72 +9736,14 @@ mod tests {
         // the whole budget: header + air + show = min(height-2, 30) list
         // rows, where the cut mark replaces the last one. At height 8:
         // header, blank, skill-0..4, mark.
-        let rows = sidebar_rows(&sidebar, &Meters::default(), 24, 8, None);
+        let rows = sidebar_rows(&sidebar, &Meters::default(), 24, 8);
         let text = plain_text(&rows);
         assert_eq!(text.len(), 8, "{text:?}");
-        assert_eq!(text[0], "skills ▾", "{text:?}");
+        assert_eq!(text[0], "skills", "{text:?}");
         assert_eq!(text[1], "", "blank row under the header: {text:?}");
         assert_eq!(text[2], "skill-0", "{text:?}");
         assert_eq!(text[6], "skill-4", "{text:?}");
         assert_eq!(text[7], "(+25)", "{text:?}");
-    }
-
-    #[test]
-    fn skills_header_label_marks_count_when_collapsed() {
-        assert_eq!(skills_header_label(true, 4), "skills");
-        assert_eq!(skills_header_label(false, 0), "skills (+0)");
-        assert_eq!(skills_header_label(false, 12), "skills (+12)");
-    }
-
-    #[test]
-    fn sidebar_collapsed_skills_render_header_alone() {
-        let sidebar = SidebarState {
-            inventory: Inventory {
-                skills: vec!["a".into(), "b".into(), "c".into()],
-                prompts: Vec::new(),
-                ..Default::default()
-            },
-            skills_open: false,
-            ..Default::default()
-        };
-        let rows = sidebar_rows(&sidebar, &Meters::default(), 24, 40, None);
-        let text = plain_text(&rows);
-        let idx = text
-            .iter()
-            .position(|t| t == "skills (+3) ▸")
-            .expect("collapsed header present");
-        // only the header row: the next rendered row is another section's
-        // separating blank / header, never a skill name
-        assert!(!text.iter().any(|t| t == "a" || t == "b" || t == "c"));
-        assert!(idx + 1 < text.len());
-    }
-
-    #[test]
-    fn skills_header_hover_lifts_onto_surface_tint() {
-        use ratatui::style::Modifier;
-        let rest = skills_header_line(true, false, 4);
-        let rest_spans: Vec<_> = rest
-            .spans
-            .iter()
-            .map(|s| (s.content.as_ref(), s.style))
-            .collect();
-        assert_eq!(rest_spans[0].0, "skills");
-        assert_eq!(rest_spans[1].0, " ▾");
-        assert_eq!(rest_spans[0].1.bg, None);
-        // collapsed label keeps its count under hover too
-        let hovered = skills_header_line(false, true, 4);
-        let hovered_spans: Vec<_> = hovered
-            .spans
-            .iter()
-            .map(|s| (s.content.as_ref(), s.style))
-            .collect();
-        assert_eq!(hovered_spans[0].0, "skills (+4)");
-        assert_eq!(hovered_spans[1].0, " ▸");
-        for (_, st) in &hovered_spans {
-            assert_eq!(st.fg, Some(crate::palette::ACCENT));
-            assert_eq!(st.bg, Some(crate::palette::BG_SURFACE));
-            assert!(!st.add_modifier.contains(Modifier::UNDERLINED));
-        }
     }
 
     #[test]
@@ -9853,7 +9757,7 @@ mod tests {
             }],
             ..Default::default()
         };
-        let rows = sidebar_rows(&sidebar, &Meters::default(), 24, 40, None);
+        let rows = sidebar_rows(&sidebar, &Meters::default(), 24, 40);
         let text = plain_text(&rows);
         // every section header is followed by a blank row; a blank row
         // also separates each section from the previous one
@@ -9875,7 +9779,7 @@ mod tests {
             cwd: "…/世界/世界".into(),
             ..Default::default()
         };
-        let rows = sidebar_rows(&sidebar, &Meters::default(), 10, 40, None);
+        let rows = sidebar_rows(&sidebar, &Meters::default(), 10, 40);
         for row in &rows {
             let text: String = row.spans.iter().map(|s| s.content.as_ref()).collect();
             assert!(text.width() <= 10, "{text}");
@@ -10049,7 +9953,7 @@ mod tests {
         assert_eq!(sidebar.title.as_deref(), Some("Fix the parser"));
 
         // the title renders as the first fact row of the session section
-        let rendered = plain_text(&sidebar_rows(&sidebar, &meters, 26, 40, None));
+        let rendered = plain_text(&sidebar_rows(&sidebar, &meters, 26, 40));
         assert!(
             rendered.iter().any(|r| r.contains("Fix the parser")),
             "got: {rendered:?}"
@@ -10059,7 +9963,7 @@ mod tests {
     #[test]
     fn sidebar_without_title_shows_no_title_row() {
         let sidebar = SidebarState::default();
-        let rows = sidebar_rows(&sidebar, &Meters::default(), 26, 40, None);
+        let rows = sidebar_rows(&sidebar, &Meters::default(), 26, 40);
         assert!(rows.is_empty(), "no title → session section starts empty");
     }
 
@@ -10105,8 +10009,6 @@ mod tests {
                     None,
                     &Meters::default(),
                     &SidebarState::default(),
-                    &std::cell::Cell::new(None),
-                    &std::cell::Cell::new(None),
                 )
             })
             .unwrap();
@@ -10131,64 +10033,6 @@ mod tests {
         // the status bar still owns the last row (no bottom margin)
         let last_row: String = (0..120u16).map(|x| buf[(x, 39)].symbol()).collect();
         assert!(last_row.contains("enter"), "status hints on the last row");
-    }
-
-    #[test]
-    fn title_arrows_render_only_after_user_messages() {
-        use ratatui::backend::TestBackend;
-
-        let draw = |t: &Transcript| {
-            let arrows: std::cell::Cell<Option<TitleArrows>> = std::cell::Cell::new(None);
-            let mut terminal = ratatui::Terminal::new(TestBackend::new(120, 40)).unwrap();
-            terminal
-                .draw(|f| {
-                    super::render(
-                        f,
-                        t,
-                        None,
-                        "",
-                        0,
-                        false,
-                        None,
-                        Instant::now(),
-                        0,
-                        None,
-                        None,
-                        None,
-                        None,
-                        None,
-                        None,
-                        None,
-                        &Meters::default(),
-                        &SidebarState::default(),
-                        &std::cell::Cell::new(None),
-                        &arrows,
-                    )
-                })
-                .unwrap();
-            let buf = terminal.backend().buffer();
-            let syms: Vec<String> = (88..93u16).map(|x| buf[(x, 1)].symbol().into()).collect();
-            (arrows.get(), syms)
-        };
-
-        // empty transcript: no arrows, no zone
-        let (zone, syms) = draw(&Transcript::default());
-        assert!(zone.is_none(), "no user message -> no jump arrows");
-        assert!(
-            !syms.iter().any(|c| c == "▲" || c == "▼"),
-            "no glyphs on the title row: {syms:?}"
-        );
-
-        // one user message: arrows drawn at the end of the title row
-        let mut t = Transcript::default();
-        t.set_width(60);
-        for _ in 0..60 {
-            t.push(Line::User("a user message".into()));
-        }
-        let (zone, syms) = draw(&t);
-        assert!(zone.is_some(), "user message -> jump arrows recorded");
-        assert_eq!(syms[2], "▲", "▲ at the end of the title row: {syms:?}");
-        assert_eq!(syms[4], "▼", "▼ at the very edge: {syms:?}");
     }
 
     #[test]
@@ -10255,6 +10099,83 @@ mod tests {
         );
         let text = format!("{:?}", lines.entries());
         assert!(text.contains("digest"), "{text:?}");
+    }
+
+    #[test]
+    fn tree_rows_walk_the_family_parent_before_child() {
+        let all = vec![
+            ka_strand::StrandSummary {
+                path: std::path::PathBuf::new(),
+                id: "root".into(),
+                ts: "2026-01-02T10:00:00Z".into(),
+                title: "the root".into(),
+                messages: 3,
+                cost: 0.0,
+                parent: None,
+                tokens: 0,
+            },
+            ka_strand::StrandSummary {
+                path: std::path::PathBuf::new(),
+                id: "unrelated".into(),
+                ts: "2026-01-03T10:00:00Z".into(),
+                title: "not family".into(),
+                messages: 9,
+                cost: 0.0,
+                parent: None,
+                tokens: 0,
+            },
+            ka_strand::StrandSummary {
+                path: std::path::PathBuf::new(),
+                id: "kid".into(),
+                ts: "2026-01-04T10:00:00Z".into(),
+                title: "a child".into(),
+                messages: 1,
+                cost: 0.0,
+                parent: Some("root".into()),
+                tokens: 0,
+            },
+            ka_strand::StrandSummary {
+                path: std::path::PathBuf::new(),
+                id: "grandkid".into(),
+                ts: "2026-01-05T10:00:00Z".into(),
+                title: "a grandchild".into(),
+                messages: 2,
+                cost: 0.0,
+                parent: Some("kid".into()),
+                tokens: 0,
+            },
+        ];
+        let (rows, targets) = tree_modal_rows(&all, Some("root"), 60);
+        assert_eq!(
+            targets,
+            vec![
+                "root".to_string(),
+                "kid".to_string(),
+                "grandkid".to_string()
+            ]
+        );
+        assert_eq!(rows.len(), 3);
+        assert!(
+            rows[0].starts_with("\u{25b8} "),
+            "current is marked: {:?}",
+            rows[0]
+        );
+        assert!(rows[1].starts_with("  "), "child indented: {:?}", rows[1]);
+        assert!(
+            rows[2].starts_with("    "),
+            "grandchild double-indented: {:?}",
+            rows[2]
+        );
+        assert!(!rows.iter().any(|r| r.contains("not family")));
+        // the walk is descendants-only: from the grandkid the closure is
+        // just itself (fork history stays out, matching the old build)
+        let (rows2, targets2) = tree_modal_rows(&all, Some("grandkid"), 60);
+        assert_eq!(targets2, vec!["grandkid".to_string()]);
+        assert!(rows2[0].starts_with("\u{25b8} "), "{:?}", rows2[0]);
+        // a strand with no family renders alone, unindented
+        let (rows3, targets3) = tree_modal_rows(&all, Some("unrelated"), 60);
+        assert_eq!(targets3, vec!["unrelated".to_string()]);
+        assert!(!rows3[0].starts_with(' '));
     }
 
     #[test]
