@@ -59,7 +59,7 @@ impl Hand for DelegateHand {
         }
         listing.push_str(
             "The agent runs with read-only tools and returns a dense summary. \
-Or pass `tasks` to run several agents concurrently (up to 4 at a time; results return in order).",
+Or pass `tasks` to run several agents concurrently (up to 16 per call, 4 at a time; results return in order).",
         );
         HandDef {
             name: "delegate".to_string(),
@@ -162,6 +162,12 @@ impl DelegateHand {
         if list.is_empty() {
             return ToolOutput::err("delegate: tasks must not be empty");
         }
+        if list.len() > 16 {
+            return ToolOutput::err(format!(
+                "delegate: tasks supports up to 16 entries (got {}); split the work across calls",
+                list.len()
+            ));
+        }
         let mut picked: Vec<Result<FanoutJob, String>> = Vec::with_capacity(list.len());
         for (i, entry) in list.iter().enumerate() {
             let Some(name) = entry.get("agent").and_then(Value::as_str) else {
@@ -201,8 +207,23 @@ impl DelegateHand {
                 }
             }));
         }
-        let mut sections = Vec::with_capacity(handles.len());
-        for (i, h) in handles.into_iter().enumerate() {
+        // Cancelling the fanout future (an engine abort drops it) must
+        // abort still-running workers instead of leaving them detached:
+        // dropping a worker's frame drops its command sender, which ends
+        // the nested agent promptly — the same contract the single-agent
+        // path honors.
+        type FanoutOutcome = (Option<String>, Result<String, String>);
+        struct FanoutGuard(Vec<tokio::task::JoinHandle<FanoutOutcome>>);
+        impl Drop for FanoutGuard {
+            fn drop(&mut self) {
+                for h in self.0.drain(..) {
+                    h.abort(); // no-op for already-finished workers
+                }
+            }
+        }
+        let mut handles = FanoutGuard(handles);
+        let mut sections = Vec::with_capacity(handles.0.len());
+        for (i, h) in handles.0.iter_mut().enumerate() {
             let idx = i + 1;
             match h.await {
                 Ok((Some(name), Ok(summary))) => {

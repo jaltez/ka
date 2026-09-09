@@ -155,6 +155,15 @@ pub struct Voice {
     rules_cfg: Vec<crate::config::Rule>,
     /// Configured hooks.
     hooks_cfg: Vec<crate::config::Hook>,
+    /// Staged by the engine to run just before the terminal
+    /// TurnFinished — auto-commit notes must precede the event ACP
+    /// clients break on. Taken and cleared at every turn exit.
+    /// Staged by the engine to run just before the terminal
+    /// TurnFinished — auto-commit notes must precede the event ACP
+    /// clients break on. Taken and cleared at every turn exit. (Mutex
+    /// keeps `Voice: Sync` — spawned turn futures hold `&Voice`.)
+    pub(crate) pre_finish:
+        Option<parking_lot::Mutex<std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>>>,
     /// Persistent allowlist from `[permissions] allow` (tools that skip
     /// the ask entirely).
     allowed_tools: Vec<String>,
@@ -227,6 +236,7 @@ impl Voice {
             speculative: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
             rules_cfg: Vec::new(),
             hooks_cfg: Vec::new(),
+            pre_finish: None,
             allowed_tools: Vec::new(),
             pathfinder_slot: slot,
             todo: todos,
@@ -312,6 +322,7 @@ impl Voice {
             mode,
             rules_cfg: Vec::new(),
             hooks_cfg: Vec::new(),
+            pre_finish: None,
             allowed_tools: Vec::new(),
             history: Vec::new(),
             model_selector: None,
@@ -520,7 +531,7 @@ impl Voice {
 
     /// Fire `stop` hooks at turn exit and record the stop kind.
     /// Advisory only: failures surface as notes and never fail the turn.
-    async fn stop_hooks(&mut self, events: &mpsc::Sender<Event>, status: &str) {
+    pub(crate) async fn stop_hooks(&mut self, events: &mpsc::Sender<Event>, status: &str) {
         self.last_stop = match status {
             "aborted" => Stop::Aborted,
             "error" => Stop::Error,
@@ -967,10 +978,6 @@ impl Voice {
     }
 
     /// Stop kind of the most recently completed turn.
-    pub fn last_stop(&self) -> Stop {
-        self.last_stop
-    }
-
     /// Debug accessor for the last measured context.
     #[doc(hidden)]
     pub fn debug_last_context(&self) -> u64 {
@@ -1004,7 +1011,10 @@ impl Voice {
     /// Estimated context usage per component (/context). History
     /// buckets use the same chars/ratio heuristic as the context meter;
     /// the residual (system prompt, conventions, digest, tool specs)
-    /// folds into `system`, so the parts sum to `last_context`.
+    /// folds into `system` — so the parts sum to `last_context` whenever
+    /// the estimates fit under it; when they overshoot the measured
+    /// usage (prose-dense history, stingy ratio) `system` floors at zero
+    /// and the buckets can exceed it.
     pub fn context_breakdown(&self) -> Vec<ka_protocol::ContextPart> {
         let ratio = if self.ratio > 0.0 { self.ratio } else { 4.0 };
         let mut user = 0u64;
@@ -1241,7 +1251,21 @@ attempt implementation — the user will review and switch to build mode.",
                     biased;
                     maybe_cmd = commands.recv() => {
                         match maybe_cmd {
-                            None => return Usage::default(),
+                            None => {
+                                // surface gone mid-turn: settle the turn
+                                // as aborted so stop hooks fire and
+                                // last_stop never goes stale (a stale
+                                // Done would green-light auto-commit)
+                                events
+                                    .send(Event::TurnFinished {
+                                        stop: Stop::Aborted,
+                                        usage: Usage::default(),
+                                    })
+                                    .await
+                                    .ok();
+                                self.stop_hooks(events, "aborted").await;
+                                return Usage::default();
+                            }
                             Some(Command::Abort) => {
                                 events.send(Event::TurnFinished {
                                     stop: Stop::Aborted,
@@ -1712,6 +1736,14 @@ attempt implementation — the user will review and switch to build mode.",
                 } else {
                     assistant_text.clone()
                 }));
+        }
+        // run a staged pre-finish future (engine auto-commit) ahead of
+        // the terminal event, so its notes precede TurnFinished
+        let pre = self.pre_finish.take().map(parking_lot::Mutex::into_inner);
+        if final_stop == Stop::Done {
+            if let Some(fut) = pre {
+                fut.await;
+            }
         }
         events
             .send(Event::TurnFinished {

@@ -103,9 +103,11 @@ pub struct Guards {
 )]
 #[serde(deny_unknown_fields, default)]
 pub struct Git {
-    /// Commit tracked changes after each completed engine turn
-    /// (stop = done). Off by default.
-    pub auto_commit: bool,
+    /// After each completed engine turn (stop = done), stage the whole
+    /// worktree — untracked files and anything you staged yourself
+    /// included (`git add -A`) — and commit it as `ka: <first prompt
+    /// line>`. Off by default.
+    pub auto_commit: Option<bool>,
 }
 
 /// Role → model-selector mappings.
@@ -359,8 +361,8 @@ impl Config {
         if !other.hooks.is_empty() {
             self.hooks = other.hooks;
         }
-        if other.git.auto_commit {
-            self.git.auto_commit = true;
+        if other.git.auto_commit.is_some() {
+            self.git.auto_commit = other.git.auto_commit;
         }
     }
     /// Effective step cap (default 20).

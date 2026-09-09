@@ -75,14 +75,20 @@ impl ToolOutput {
 
 /// A unified diff between the old and new content of `path`, capped at
 /// `max_lines` rendered lines (a `… N more lines` trailer notes the
-/// remainder). Either side over 2000 lines diffs only its first 2000
-/// lines, noting the truncation. Unchanged content → empty string.
+/// remainder) and each rendered line at [`LINE_CAP`] chars. Either side
+/// over 2000 lines diffs only its first 2000 lines, noting the
+/// truncation. Unchanged content → empty string; sides differing only
+/// in trailing newline or line endings say so instead of implying
+/// truncation.
 pub fn unified_diff(path: &str, old: &str, new: &str, max_lines: usize) -> String {
     /// Sides are truncated to this many lines before diffing (LCS is
     /// quadratic in side length).
     const SIDE_CAP: usize = 2000;
     /// Context lines shown around each change run.
     const CONTEXT: usize = 3;
+    /// Long lines render truncated to this many chars — a diff row of a
+    /// minified file must not flood an ask card or the model context.
+    const LINE_CAP: usize = 240;
 
     let a: Vec<&str> = old.lines().collect();
     let b: Vec<&str> = new.lines().collect();
@@ -143,10 +149,16 @@ pub fn unified_diff(path: &str, old: &str, new: &str, max_lines: usize) -> Strin
         .map(|(idx, _)| idx)
         .collect();
     if changed.is_empty() {
-        // sides differ only beyond the side cap: no line-level hunks
-        out.push_str(&format!(
-            "@@ … sides over {SIDE_CAP} lines; diff truncated\n"
-        ));
+        if a_trunc || b_trunc {
+            // sides differ only beyond the side cap: no line-level hunks
+            out.push_str(&format!(
+                "@@ … sides over {SIDE_CAP} lines; diff truncated\n"
+            ));
+        } else {
+            // identical line lists, different bytes: a trailing-newline
+            // or line-ending-only change
+            out.push_str("@@ no line-level changes (trailing newline or line endings differ)\n");
+        }
         return out;
     }
     let mut groups: Vec<(usize, usize)> = Vec::new();
@@ -176,7 +188,14 @@ pub fn unified_diff(path: &str, old: &str, new: &str, max_lines: usize) -> Strin
                 '+' => b[*bi],
                 _ => a[*ai],
             };
-            lines_out.push(format!("{tag}{text}"));
+            let rendered: String = if text.chars().count() > LINE_CAP {
+                let cut: String = text.chars().take(LINE_CAP).collect();
+                let more = text.chars().count() - LINE_CAP;
+                format!("{cut} … {more} more chars")
+            } else {
+                text.to_string()
+            };
+            lines_out.push(format!("{tag}{rendered}"));
         }
     }
     if a_trunc || b_trunc {
@@ -413,6 +432,33 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use super::*;
+
+    #[test]
+    fn newline_only_change_reports_itself_not_truncation() {
+        let d = unified_diff("f.rs", "a\nb\n", "a\nb", 24);
+        assert!(
+            d.contains("no line-level changes"),
+            "newline-only change mislabelled: {d}"
+        );
+        assert!(!d.contains("truncated"), "{d}");
+    }
+
+    #[test]
+    fn crlf_lf_change_reports_itself_not_truncation() {
+        let d = unified_diff("f.rs", "a\r\nb\r\n", "a\nb\n", 24);
+        assert!(
+            d.contains("no line-level changes"),
+            "line-ending-only change mislabelled: {d}"
+        );
+    }
+
+    #[test]
+    fn long_diff_lines_render_capped() {
+        let long = "x".repeat(2000);
+        let d = unified_diff("f.rs", "", &format!("{long}\n"), 24);
+        assert!(d.contains("more chars"), "line cap not applied: {d}");
+        assert!(d.chars().count() < 600, "capped line still huge");
+    }
 
     #[test]
     fn unified_diff_empty_when_unchanged() {

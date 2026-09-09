@@ -278,8 +278,8 @@ struct EngineState {
     /// fires once after that turn (fast role configured); resumed
     /// strands never re-title.
     needs_title: bool,
-    /// `[git] auto_commit`: stage + commit tracked changes after each
-    /// completed turn.
+    /// `[git] auto_commit`: stage the whole worktree (`git add -A`) and
+    /// commit after each completed turn.
     auto_commit: bool,
 }
 impl From<Config> for EngineState {
@@ -296,7 +296,7 @@ impl From<Config> for EngineState {
             guards: crate::voice::GuardRuntime::new(c.guards.spend_usd, c.guards.context_pct),
             roles: EngineRoles::default(),
             needs_title: false,
-            auto_commit: c.git.auto_commit,
+            auto_commit: c.git.auto_commit.unwrap_or(false),
         }
     }
 }
@@ -1550,7 +1550,18 @@ async fn dispatch_turn(
     }
     let prompt_head = text.lines().next().unwrap_or("").to_string();
     let usage = if let Some(model) = state.model.clone() {
-        let usage = voice
+        // stage auto-commit to run inside the voice just before its
+        // terminal TurnFinished: ACP clients break on that event, so
+        // the commit (and its notes) must land first
+        voice.pre_finish = state.auto_commit.then(|| {
+            let events = events.clone();
+            let cwd = cwd.to_path_buf();
+            let head = prompt_head.clone();
+            let fut: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> =
+                Box::pin(async move { auto_commit(&events, &cwd, &head).await });
+            parking_lot::Mutex::new(fut)
+        });
+        voice
             .turn(
                 &model,
                 text,
@@ -1562,15 +1573,19 @@ async fn dispatch_turn(
                 schema,
                 images,
             )
-            .await;
-        if state.auto_commit && voice.last_stop() == Stop::Done {
-            auto_commit(events, cwd, &prompt_head).await;
-        }
-        usage
+            .await
     } else {
         let mut history = std::mem::take(&mut voice.history);
-        let usage = turn_canned(commands, events, state, &mut history, text, cwd).await;
+        let (usage, stop) = turn_canned(commands, events, state, &mut history, text, cwd).await;
         voice.history = history;
+        // canned turns get the same stop-hook + last_stop treatment as
+        // model turns
+        let status = if stop == Stop::Done {
+            "done"
+        } else {
+            "aborted"
+        };
+        voice.stop_hooks(events, status).await;
         usage
     };
     // session spend accounting + the persisted Usage record feed the
@@ -1784,7 +1799,7 @@ async fn turn_canned(
     history: &mut Vec<ka_dialect::speaker::TurnMessage>,
     text: String,
     cwd: &std::path::Path,
-) -> Usage {
+) -> (Usage, Stop) {
     let est_in = (text.len() as u64).div_ceil(4);
     events
         .send(Event::TurnStarted {
@@ -1806,8 +1821,16 @@ async fn turn_canned(
             maybe = commands.recv() => {
                 match maybe {
                     None => {
-                        // Surface went away; finish quietly.
-                        return Usage::default();
+                        // Surface went away; settle as aborted so the
+                        // terminal event still fires and stop hooks run.
+                        events
+                            .send(Event::TurnFinished {
+                                stop: Stop::Aborted,
+                                usage: Usage::default(),
+                            })
+                            .await
+                            .ok();
+                        return (Usage::default(), Stop::Aborted);
                     }
                     Some(Command::Abort) => {
                         aborted = true;
@@ -1842,7 +1865,7 @@ async fn turn_canned(
             })
             .await
             .ok();
-        return Usage::default();
+        return (Usage::default(), Stop::Aborted);
     }
 
     // Settling: unhandled interjections become deferrals so they are not lost.
@@ -1870,10 +1893,11 @@ async fn turn_canned(
         })
         .await
         .ok();
-    usage
+    (usage, Stop::Done)
 }
 
-/// `[git] auto_commit`: stage everything and commit tracked changes
+/// `[git] auto_commit`: stage the whole worktree (`git add -A` —
+/// untracked files and anything already staged included) and commit
 /// with a deterministic one-line message (`ka: <first prompt line>`, 72
 /// chars max — no model roundtrip). Outside a repo: silent no-op. Any
 /// git failure is an advisory note, never a turn failure.
@@ -1895,14 +1919,27 @@ async fn auto_commit(events: &mpsc::Sender<Event>, cwd: &std::path::Path, prompt
     if !dirty {
         return;
     }
-    if let Err(e) = git(&["add", "-A"]).await {
-        events
-            .send(Event::Note {
-                message: format!("auto-commit: {e}"),
-            })
-            .await
-            .ok();
-        return;
+    match git(&["add", "-A"]).await {
+        Ok(out) if out.status.success() => {}
+        Ok(out) => {
+            let err = String::from_utf8_lossy(&out.stderr);
+            events
+                .send(Event::Note {
+                    message: format!("auto-commit: git add failed: {}", err.trim()),
+                })
+                .await
+                .ok();
+            return;
+        }
+        Err(e) => {
+            events
+                .send(Event::Note {
+                    message: format!("auto-commit: {e}"),
+                })
+                .await
+                .ok();
+            return;
+        }
     }
     let first_line: String = prompt
         .lines()
@@ -2071,7 +2108,9 @@ mod tests {
         let dir = dirty_repo("on");
         let mut handle = spawn(Config {
             cwd: Some(dir.display().to_string()),
-            git: crate::config::Git { auto_commit: true },
+            git: crate::config::Git {
+                auto_commit: Some(true),
+            },
             ..Default::default()
         });
         handle
@@ -2134,7 +2173,9 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let mut handle = spawn(Config {
             cwd: Some(dir.display().to_string()),
-            git: crate::config::Git { auto_commit: true },
+            git: crate::config::Git {
+                auto_commit: Some(true),
+            },
             ..Default::default()
         });
         handle
