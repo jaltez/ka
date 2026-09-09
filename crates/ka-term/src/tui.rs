@@ -816,32 +816,6 @@ fn window_range(total: usize, visible: usize, scroll: Option<usize>) -> (usize, 
     }
 }
 
-/// Jump the viewport anchor to the previous (up) or next (down) user
-/// message relative to the window top. Up with nothing above is a
-/// no-op; down past the last user message lands on the live tail
-/// (scroll = None) unless the view is already pinned there.
-fn jump_to_user_message(
-    scroll: &mut Option<usize>,
-    user_rows: &[usize],
-    total: usize,
-    visible: usize,
-    up: bool,
-) {
-    if user_rows.is_empty() || visible == 0 {
-        return;
-    }
-    let (start, pinned) = window_range(total, visible, *scroll);
-    if up {
-        if let Some(&r) = user_rows.iter().rev().find(|&&r| r < start) {
-            *scroll = Some(r);
-        }
-    } else if let Some(&r) = user_rows.iter().find(|&&r| r > start) {
-        *scroll = Some(r);
-    } else if !pinned {
-        *scroll = None;
-    }
-}
-
 /// Scrollbar rail geometry for a track of `track_h` cells: returns
 /// `(thumb_pos, thumb_len)` for a viewport showing `visible` of `total`
 /// rows with the window anchored at `start`. The thumb keeps at least
@@ -1093,36 +1067,6 @@ fn page_down(scroll: &mut Option<usize>, total: usize, visible: usize) {
     };
 }
 
-/// Scroll a few lines up from the current anchor (pinned counts from the
-/// tail). Wheel granularity — three lines per notch.
-fn line_up(scroll: &mut Option<usize>, total: usize, visible: usize) {
-    if visible == 0 || total <= visible {
-        *scroll = None;
-        return;
-    }
-    let max_anchor = total - visible;
-    let cur = scroll.unwrap_or(max_anchor);
-    *scroll = Some(cur.saturating_sub(WHEEL_STEP).min(max_anchor));
-}
-
-/// Scroll a few lines down; reaching the tail re-pins (None).
-fn line_down(scroll: &mut Option<usize>, total: usize, visible: usize) {
-    let Some(anchor) = *scroll else { return };
-    if visible == 0 {
-        *scroll = None;
-        return;
-    }
-    let max_anchor = total.saturating_sub(visible);
-    *scroll = if anchor + WHEEL_STEP >= max_anchor {
-        None
-    } else {
-        Some(anchor + WHEEL_STEP)
-    };
-}
-
-/// Transcript rows per mouse-wheel notch.
-const WHEEL_STEP: usize = 3;
-
 /// Footer state shown under the editor.
 #[derive(Debug, Clone, Default)]
 pub struct Meters {
@@ -1215,14 +1159,7 @@ enum SidebarZone {
     SkillsHeader(ratatui::layout::Rect),
 }
 
-impl SidebarZone {
-    /// Does a terminal-cell click land inside this zone?
-    fn hit(&self, x: u16, y: u16) -> bool {
-        match self {
-            SidebarZone::SkillsHeader(rect) => rect.contains(ratatui::layout::Position { x, y }),
-        }
-    }
-}
+impl SidebarZone {}
 
 /// Clickable ▲▼ jump targets on the transcript title row (recorded at
 /// render time like [`SidebarZone`]).
@@ -1232,21 +1169,6 @@ struct TitleArrows {
     up: ratatui::layout::Rect,
     /// ▼ — jump to the next user message.
     down: ratatui::layout::Rect,
-}
-
-impl TitleArrows {
-    /// Does a terminal-cell click land on one of the arrows? Returns
-    /// `Some(true)` for ▲ (previous), `Some(false)` for ▼ (next).
-    fn hit(&self, x: u16, y: u16) -> Option<bool> {
-        let pos = ratatui::layout::Position { x, y };
-        if self.up.contains(pos) {
-            Some(true)
-        } else if self.down.contains(pos) {
-            Some(false)
-        } else {
-            None
-        }
-    }
 }
 
 /// Sidebar skills header text: bare when expanded, count-marked when
@@ -2148,16 +2070,11 @@ pub async fn run(
 ) -> std::io::Result<Exit> {
     let _ = AGENTS.set(agents.clone());
     let mut terminal = ratatui::init();
-    let mut sel: Option<TextSel> = None;
-    let frame_window: std::cell::RefCell<Vec<ratatui::text::Line<'static>>> =
-        std::cell::RefCell::new(Vec::new());
-    let frame_origin: std::cell::Cell<(u16, u16)> = std::cell::Cell::new((0, 0));
     // Kitty keyboard protocol: Shift+Enter as a distinct key + bracketed
     // paste. Best effort — hosts without support degrade to plain Enter;
-    // Ctrl+J always works as the newline fallback. Mouse capture stays
-    // ON permanently: the app draws its own selection over the
-    // transcript and copies on mouse release (OSC52), while the wheel
-    // keeps scrolling.
+    // Ctrl+J always works as the newline fallback. The mouse is left to
+    // the terminal, omp/pi style: any text in the transcript selects and
+    // copies natively, and the transcript scrolls with pgup/pgdn.
     let _ = crossterm::execute!(
         std::io::stdout(),
         crossterm::event::PushKeyboardEnhancementFlags(
@@ -2165,13 +2082,7 @@ pub async fn run(
                 | crossterm::event::KeyboardEnhancementFlags::REPORT_EVENT_TYPES
         ),
         crossterm::event::EnableBracketedPaste,
-        crossterm::event::EnableMouseCapture,
     );
-    // any-event (motion) tracking: crossterm has no wrapper for the raw
-    // `1003` sequence; without it Moved events only flow while a button
-    // is held. Popped at every capture-disable path below.
-    let _ = std::io::stdout().write_all(b"\x1b[?1003h");
-    let _ = std::io::stdout().flush();
     let result = app(
         &mut terminal,
         &mut commands,
@@ -2181,13 +2092,8 @@ pub async fn run(
         models,
         agents,
         header_glyph,
-        &mut sel,
-        &frame_window,
-        &frame_origin,
     )
     .await;
-    let _ = std::io::stdout().write_all(b"\x1b[?1003l");
-    let _ = std::io::stdout().flush();
     let _ = crossterm::execute!(
         std::io::stdout(),
         crossterm::event::PopKeyboardEnhancementFlags,
@@ -2213,9 +2119,6 @@ async fn app(
     mut models: Vec<ModelInfo>,
     agents: Vec<(String, String)>,
     header_glyph: &str,
-    sel: &mut Option<TextSel>,
-    frame_window: &std::cell::RefCell<Vec<ratatui::text::Line<'static>>>,
-    frame_origin: &std::cell::Cell<(u16, u16)>,
 ) -> std::io::Result<(Exit, Option<String>)> {
     use crossterm::event::{Event as TermEvent, KeyCode, KeyModifiers};
     let _ = agents.clone();
@@ -2234,6 +2137,7 @@ async fn app(
     };
     let mut busy = false;
     let mut busy_since: Option<Instant> = None;
+    let mut quit_armed: Option<Instant> = None;
     let mut last_user: Option<String> = None;
     let mut last_error: Option<String> = None;
     let mut live_cache: Option<(String, u16, Vec<ratatui::text::Line<'static>>, Instant)> = None;
@@ -2340,9 +2244,6 @@ async fn app(
                 &sidebar,
                 &sidebar_zone,
                 &title_arrows,
-                sel,
-                frame_window,
-                frame_origin,
             );
         })?;
 
@@ -2353,16 +2254,35 @@ async fn app(
                     if key.kind == crossterm::event::KeyEventKind::Release {
                         continue;
                     }
-                    // Ctrl+C always quits or aborts, ahead of every other
-                    // capture (asks, modals, popups all swallow chars)
+                    // Ctrl+C, ahead of every other capture (asks, modals,
+                    // popups all swallow chars): busy aborts the run; a
+                    // reverse search is cancelled; a non-empty input is
+                    // cleared; an empty input quits on the second press
                     if (key.code, key.modifiers) == (KeyCode::Char('c'), KeyModifiers::CONTROL) {
                         if busy {
                             let _ = commands.send(Command::Abort).await;
-                        } else {
+                            quit_armed = None;
+                        } else if input.searching() {
+                            input.search_cancel();
+                            quit_armed = None;
+                        } else if !input.text.is_empty() {
+                            input.text.clear();
+                            input.cursor = 0;
+                            slash_popup = update_suggestions(&input.text);
+                            quit_armed = None;
+                        } else if quit_armed
+                            .is_some_and(|at| at.elapsed() < std::time::Duration::from_secs(3))
+                        {
                             exit = Some(Exit::Quit);
+                        } else {
+                            quit_armed = Some(Instant::now());
+                            transcript
+                                .push_separated(Line::Note("press ctrl+c again to exit".into()));
                         }
                         continue;
                     }
+                    // any other keypress breaks a quit arm
+                    quit_armed = None;
                     // Ask dialog captures input first
                     if let Some(ask) = pending.as_mut() {
                         match key.code {
@@ -3689,110 +3609,15 @@ async fn app(
                                 }
                             }
                         }
+                        input.insert_str(&text);
                         slash_popup = update_suggestions(&input.text);
                     } else if input.searching() {
                         for c in text.chars().filter(|c| !c.is_whitespace()) {
                             input.search_push(c);
                         }
                     } else {
+                        input.insert_str(&text);
                         slash_popup = update_suggestions(&input.text);
-                    }
-                } else if let Some(Ok(TermEvent::Mouse(mouse))) = maybe_term {
-                    // the wheel scrolls the chat; overlays keep focus. Line
-                    // granularity (page keys keep their page step).
-                    if modal.is_none()
-                        && pending.is_none()
-                        && slash_popup.is_none()
-                        && path_popup.is_none()
-                    {
-                        match mouse.kind {
-                            // a click on the skills header toggles the
-                            // section; checked before the wheel arms so a
-                            // click never also scrolls
-                            crossterm::event::MouseEventKind::Down(
-                                crossterm::event::MouseButton::Left,
-                            ) => {
-                                // ▲▼ jump arrows on the transcript title
-                                // row: step between user messages
-                                if let Some(up) = title_arrows
-                                    .get()
-                                    .and_then(|z| z.hit(mouse.column, mouse.row))
-                                {
-                                    let rows = transcript.user_entry_rows();
-                                    let total = transcript.total_rows();
-                                    jump_to_user_message(
-                                        &mut scroll,
-                                        &rows,
-                                        total,
-                                        view_rows,
-                                        up,
-                                    );
-                                } else if sidebar_zone
-                                    .get()
-                                    .is_some_and(|z| z.hit(mouse.column, mouse.row))
-                                {
-                                    sidebar.skills_open = !sidebar.skills_open;
-                                } else {
-                                    // start transcript text selection
-                                    *sel = Some(TextSel {
-                                        anchor: (mouse.column, mouse.row),
-                                        head: (mouse.column, mouse.row),
-                                    });
-                                }
-                            }
-                            // hover affordance: only re-render when the
-                            // pointer actually crosses the header boundary
-                            crossterm::event::MouseEventKind::Down(
-                                crossterm::event::MouseButton::Right,
-                            ) => {
-                                // right click pastes the clipboard into
-                                // the input
-                                if modal.is_none() && pending.is_none() {
-                                    let text = clipboard_text().await;
-                                    input.insert_str(&text);
-                                }
-                            }
-                            crossterm::event::MouseEventKind::Moved
-                            | crossterm::event::MouseEventKind::Drag(
-                                crossterm::event::MouseButton::Left,
-                            ) => {
-                                let hit = sidebar_zone
-                                    .get()
-                                    .is_some_and(|z| z.hit(mouse.column, mouse.row));
-                                if sidebar.skills_hover != hit {
-                                    sidebar.skills_hover = hit;
-                                }
-                                if let Some(s) = sel.as_mut() {
-                                    s.head = (mouse.column, mouse.row);
-                                }
-                            }
-                            crossterm::event::MouseEventKind::Up(
-                                crossterm::event::MouseButton::Left,
-                            ) => {
-                                // release ends the selection: copy it to
-                                // the clipboard (OSC52) and clear the
-                                // highlight
-                                copy_selection(
-                                    sel,
-                                    frame_window,
-                                    frame_origin,
-                                    &mut transcript,
-                                );
-                            }
-                            crossterm::event::MouseEventKind::ScrollUp => {
-                                line_up(&mut scroll, transcript.total_rows(), view_rows);
-                            }
-                            crossterm::event::MouseEventKind::ScrollDown => {
-                                line_down(&mut scroll, transcript.total_rows(), view_rows);
-                            }
-                            _ => {}
-                        }
-                    } else if let Some(Ok(TermEvent::Paste(text))) = maybe_term {
-                        // bracketed paste: lands on the input draft. Ask
-                        // forms and modals capture keys, not pastes.
-                        if modal.is_none() && pending.is_none() {
-                            input.insert_str(&text);
-                        }
                     }
                 }
             }
@@ -3872,7 +3697,7 @@ async fn app(
                         if replayed {
                             scroll = None;
                         }
-                                    }
+                    }
                 }
             }
             _ = spin.tick(), if busy => {}
@@ -4329,9 +4154,8 @@ fn record_spill(spills: &mut Vec<String>, path: &str) {
 
 /// Suspend the TUI (flush, leave raw mode and the alternate screen), run
 /// `program` with inherited stdio, then restore raw mode + alternate
-/// screen and force a full redraw. Mouse capture is preserved. The
-/// child's exit status is ignored — editors and pagers exit non-zero
-/// routinely.
+/// screen and force a full redraw. The child's exit status is ignored —
+/// editors and pagers exit non-zero routinely.
 fn run_external(
     program: &str,
     args: &[&str],
@@ -4347,9 +4171,6 @@ fn run_external(
         .map(|_| ());
     let _ = crossterm::execute!(std::io::stdout(), crossterm::terminal::EnterAlternateScreen);
     let _ = crossterm::terminal::enable_raw_mode();
-    let _ = crossterm::execute!(std::io::stdout(), crossterm::event::EnableMouseCapture);
-    let _ = std::io::stdout().write_all(b"\x1b[?1003h");
-    let _ = std::io::stdout().flush();
     let _ = terminal.clear();
     res
 }
@@ -5656,9 +5477,6 @@ fn render(
     sidebar: &SidebarState,
     sidebar_zone: &std::cell::Cell<Option<SidebarZone>>,
     title_arrows: &std::cell::Cell<Option<TitleArrows>>,
-    sel: &Option<TextSel>,
-    frame_window: &std::cell::RefCell<Vec<ratatui::text::Line<'static>>>,
-    frame_origin: &std::cell::Cell<(u16, u16)>,
 ) {
     let header_glyph = sidebar.header_glyph.as_str();
     use ratatui::layout::Constraint::{Length, Min};
@@ -5760,12 +5578,6 @@ fn render(
         } else if let Some(row) = live_rows.get(i - cached) {
             window.push(row.clone());
         }
-    }
-    // stash the visible window for mouse-copy; paint the selection
-    frame_origin.set((tx_area.x + 1, tx_area.y + 1));
-    *frame_window.borrow_mut() = window.clone();
-    if let Some(s) = *sel {
-        apply_sel_highlight(&mut window, tx_area.y + 1, s.anchor, s.head);
     }
     let title = if pinned {
         header_glyph.to_string()
@@ -6027,7 +5839,7 @@ fn render(
     } else if busy {
         hint_spans(&[(" enter", "interject"), (" +", "defer"), (" esc", "abort")])
     } else {
-        hint_spans(&[(" enter", "send"), (" /", "commands"), (" drag", "copy")])
+        hint_spans(&[(" enter", "send"), (" /", "commands")])
     };
     let right = status_right(meters);
     let w = unicode_width::UnicodeWidthStr::width;
@@ -6850,14 +6662,6 @@ fn padded_title(title: impl Into<String>) -> ratatui::text::Line<'static> {
     ratatui::text::Line::from(format!(" {} ", title.into())).style(crate::palette::META)
 }
 
-/// In-progress transcript text selection in frame coordinates
-/// (column, row).
-#[derive(Debug, Clone, Copy)]
-pub struct TextSel {
-    anchor: (u16, u16),
-    head: (u16, u16),
-}
-
 /// Read the system clipboard as text: wayland → X11 → WSL2/Windows.
 async fn clipboard_text() -> String {
     // Every probe is capped (a hanging xclip against an unresponsive
@@ -6895,117 +6699,6 @@ async fn clipboard_text() -> String {
         }
     }
     String::new()
-}
-
-/// Extract the text a mouse selection covers, from the stashed visible
-/// window (`origin` = screen coords of the first text column of the
-/// first row). Partial first/last rows respect the anchor columns;
-/// rows trim trailing spaces and join with newlines.
-fn selection_text(
-    win: &[ratatui::text::Line<'static>],
-    origin: (u16, u16),
-    a: (u16, u16),
-    h: (u16, u16),
-) -> Option<String> {
-    use unicode_width::UnicodeWidthStr;
-    let line_text = |l: &ratatui::text::Line<'static>| -> String {
-        l.spans.iter().map(|s| s.content.to_string()).collect()
-    };
-    let cell_slice = |text: &str, from: usize, to: usize| -> String {
-        let mut out = String::new();
-        let mut acc = 0usize;
-        for ch in text.chars() {
-            let start = acc;
-            acc += unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
-            if acc > from && start < to {
-                out.push(ch);
-            }
-        }
-        out
-    };
-    let (r1, c1, r2, c2) = if (a.1, a.0) <= (h.1, h.0) {
-        (a.1, a.0, h.1, h.0)
-    } else {
-        (h.1, h.0, a.1, a.0)
-    };
-    if r2 < origin.1 || win.is_empty() {
-        return None;
-    }
-    let i1 = ((r1 - origin.1) as usize).min(win.len() - 1);
-    let i2 = ((r2 - origin.1) as usize).min(win.len() - 1);
-    let mut parts: Vec<String> = Vec::new();
-    for (off, line) in win[i1..=i2].iter().enumerate() {
-        let text = line_text(line);
-        let from = if off == 0 {
-            (c1 - origin.0) as usize
-        } else {
-            0
-        };
-        let to = if off == i2 - i1 {
-            ((c2 - origin.0) as usize + 1).min(text.width())
-        } else {
-            text.width()
-        };
-        let seg = cell_slice(&text, from, to);
-        let trimmed = seg.trim_end();
-        if !trimmed.is_empty() {
-            parts.push(trimmed.to_string());
-        } else if off == 0 || off == i2 - i1 {
-            parts.push(String::new());
-        }
-    }
-    let out = parts.join("\n").trim().to_string();
-    (!out.is_empty()).then_some(out)
-}
-
-/// Copy the live transcript selection to the clipboard (OSC52) and
-/// clear it. No-op without a selection.
-fn copy_selection(
-    sel: &mut Option<TextSel>,
-    frame_window: &std::cell::RefCell<Vec<ratatui::text::Line<'static>>>,
-    frame_origin: &std::cell::Cell<(u16, u16)>,
-    transcript: &mut Transcript,
-) {
-    if let Some(s) = *sel {
-        let win = frame_window.borrow();
-        let origin = frame_origin.get();
-        if let Some(text) = selection_text(&win, origin, s.anchor, s.head) {
-            let n = text.chars().count();
-            if n > 0 {
-                let mut out = std::io::stdout().lock();
-                let _ = out.write_all(b"\x1b]52;c;");
-                let _ = out.write_all(b64encode(text.as_bytes()).as_bytes());
-                let _ = out.write_all(b"\x07");
-                let _ = out.flush();
-                transcript.push_separated(Line::Note(format!("copied {n} chars to the clipboard")));
-            }
-        }
-    }
-    *sel = None;
-}
-
-/// Restyle the window rows inside the selection rectangle with the
-/// selection bar colors (whole rows; the text itself is untouched).
-fn apply_sel_highlight(
-    window: &mut [ratatui::text::Line<'static>],
-    oy: u16,
-    a: (u16, u16),
-    h: (u16, u16),
-) {
-    let (r1, r2) = if a.1 <= h.1 { (a.1, h.1) } else { (h.1, a.1) };
-    if r2 < oy {
-        return;
-    }
-    let i1 = ((r1 - oy) as usize).min(window.len());
-    let i2 = (((r2 - oy) as usize) + 1).min(window.len());
-    for row in &mut window[i1..i2] {
-        for span in row.spans.iter_mut() {
-            span.style = span
-                .style
-                .fg(crate::palette::SEL_FG)
-                .bg(crate::palette::SEL_BG);
-        }
-    }
 }
 
 #[cfg(test)]
@@ -7578,45 +7271,6 @@ mod tests {
         assert_eq!(window_range(100, 0, Some(10)), (0, true));
     }
     #[test]
-    fn jump_to_user_message_steps_between_user_rows() {
-        // user messages start at rows 5, 40, 100; total 200, visible 20
-        let rows = [5usize, 40, 100];
-        let mut scroll: Option<usize> = None;
-        // pinned at the tail (start 180): up finds the newest message
-        jump_to_user_message(&mut scroll, &rows, 200, 20, true);
-        assert_eq!(scroll, Some(100));
-        // down from there: nothing below the pinned tail stays pinned
-        scroll = None;
-        jump_to_user_message(&mut scroll, &rows, 200, 20, false);
-        assert_eq!(scroll, None);
-        // anchored mid-history: up = previous, down = next
-        scroll = Some(50);
-        jump_to_user_message(&mut scroll, &rows, 200, 20, true);
-        assert_eq!(scroll, Some(40));
-        scroll = Some(50);
-        jump_to_user_message(&mut scroll, &rows, 200, 20, false);
-        assert_eq!(scroll, Some(100));
-        // exactly on a message start: strict comparison steps past it
-        scroll = Some(40);
-        jump_to_user_message(&mut scroll, &rows, 200, 20, false);
-        assert_eq!(scroll, Some(100));
-        // above the first message: up is a no-op
-        scroll = Some(0);
-        jump_to_user_message(&mut scroll, &rows, 200, 20, true);
-        assert_eq!(scroll, Some(0));
-        // past the last message, not pinned: down lands on the live tail
-        scroll = Some(120);
-        jump_to_user_message(&mut scroll, &rows, 200, 20, false);
-        assert_eq!(scroll, None);
-        // no user rows / zero visible: never moves
-        scroll = Some(7);
-        jump_to_user_message(&mut scroll, &[], 200, 20, true);
-        assert_eq!(scroll, Some(7));
-        scroll = Some(7);
-        jump_to_user_message(&mut scroll, &rows, 200, 0, false);
-        assert_eq!(scroll, Some(7));
-    }
-    #[test]
     fn user_entry_rows_tracks_user_message_positions() {
         let mut t = Transcript::default();
         t.set_width(60);
@@ -7682,28 +7336,6 @@ mod tests {
     }
 
     #[test]
-    fn wheel_lines_roundtrip_repins_at_tail() {
-        let mut scroll = None;
-        line_up(&mut scroll, 100, 20);
-        assert_eq!(scroll, Some(80 - 3), "pinned wheel-up unpins 3 rows");
-        line_up(&mut scroll, 100, 20);
-        assert_eq!(scroll, Some(80 - 6));
-        line_down(&mut scroll, 100, 20);
-        assert_eq!(scroll, Some(80 - 3));
-        line_down(&mut scroll, 100, 20);
-        line_down(&mut scroll, 100, 20);
-        assert_eq!(scroll, None, "reaching the tail re-pins");
-        // wheel-down while pinned is a no-op
-        let mut pinned = None;
-        line_down(&mut pinned, 100, 20);
-        assert_eq!(pinned, None);
-        // small transcript: wheel-up is a no-op
-        let mut small = None;
-        line_up(&mut small, 5, 20);
-        assert_eq!(small, None);
-    }
-
-    #[test]
     fn short_session_takes_tail() {
         assert_eq!(short_session("s19a4f2e1b0-3f9c2a81d4b7"), Some("3f9c2a81"));
         assert_eq!(short_session("no-tail"), Some("tail"));
@@ -7723,34 +7355,6 @@ mod tests {
         assert!(resume_hint("", 3, false).is_none());
     }
 
-    #[test]
-    fn selection_text_extracts_rows_and_partial_edges() {
-        use ratatui::text::Line as TuiLine;
-        let win = vec![
-            TuiLine::raw("first row"),
-            TuiLine::raw("middle row"),
-            TuiLine::raw("last row"),
-        ];
-        // transcript text starts at col 2; the first row sits at row 5
-        let origin = (2u16, 5u16);
-        // full rows
-        assert_eq!(
-            selection_text(&win, origin, (2, 5), (20, 6)).as_deref(),
-            Some("first row\nmiddle row")
-        );
-        // single partial row: cols 6..10 over "first row" → "t row"
-        assert_eq!(
-            selection_text(&win, origin, (6, 5), (10, 5)).as_deref(),
-            Some("t row")
-        );
-        // reversed anchor/head normalizes
-        assert_eq!(
-            selection_text(&win, origin, (20, 6), (2, 5)).as_deref(),
-            Some("first row\nmiddle row")
-        );
-        // a selection entirely above the viewport selects nothing
-        assert!(selection_text(&win, origin, (2, 2), (20, 3)).is_none());
-    }
     #[test]
     fn session_picker_marks_the_current_session() {
         let picker = SessionPicker {
@@ -10211,45 +9815,6 @@ mod tests {
     }
 
     #[test]
-    fn sidebar_zone_hit_testing() {
-        let zone = SidebarZone::SkillsHeader(ratatui::layout::Rect {
-            x: 94,
-            y: 5,
-            width: 26,
-            height: 1,
-        });
-        assert!(zone.hit(94, 5));
-        assert!(zone.hit(119, 5), "right edge of the sidebar chunk");
-        assert!(!zone.hit(120, 5), "past the sidebar");
-        assert!(!zone.hit(100, 6), "row below the header");
-        assert!(!zone.hit(93, 5), "left of the sidebar");
-    }
-
-    #[test]
-    fn title_arrows_hit_testing() {
-        let zone = TitleArrows {
-            up: ratatui::layout::Rect {
-                x: 88,
-                y: 1,
-                width: 2,
-                height: 1,
-            },
-            down: ratatui::layout::Rect {
-                x: 90,
-                y: 1,
-                width: 2,
-                height: 1,
-            },
-        };
-        assert_eq!(zone.hit(88, 1), Some(true), "up arrow cell");
-        assert_eq!(zone.hit(89, 1), Some(true), "up zone is two cells wide");
-        assert_eq!(zone.hit(90, 1), Some(false), "down arrow cell");
-        assert_eq!(zone.hit(91, 1), Some(false), "down zone is two cells wide");
-        assert_eq!(zone.hit(92, 1), None, "past the arrows");
-        assert_eq!(zone.hit(88, 2), None, "row below the title");
-    }
-
-    #[test]
     fn skills_header_hover_lifts_onto_surface_tint() {
         use ratatui::style::Modifier;
         let rest = skills_header_line(true, false, 4);
@@ -10516,64 +10081,6 @@ mod tests {
     }
 
     #[test]
-    fn selection_paints_selected_rows_with_the_bar_colors() {
-        use ratatui::backend::TestBackend;
-        let mut transcript = Transcript::default();
-        transcript.set_width(60);
-        transcript.push_separated(Line::Assistant("hello".into()));
-        let mut terminal = ratatui::Terminal::new(TestBackend::new(120, 40)).unwrap();
-        terminal
-            .draw(|f| {
-                super::render(
-                    f,
-                    &transcript,
-                    None,
-                    "",
-                    0,
-                    false,
-                    None,
-                    Instant::now(),
-                    0,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    &Meters::default(),
-                    &SidebarState::default(),
-                    &std::cell::Cell::new(None),
-                    &std::cell::Cell::new(None),
-                    &Some(super::TextSel {
-                        anchor: (0, 2),
-                        head: (80, 3),
-                    }),
-                    &std::cell::RefCell::new(Vec::new()),
-                    &std::cell::Cell::new((2, 2)),
-                )
-            })
-            .unwrap();
-        let buf = terminal.backend().buffer();
-        // the selection paints the reply row with the bar colors — and
-        // nothing outside the transcript region
-        let mut sel_cells = 0;
-        let mut outside = false;
-        for y in 0..40u16 {
-            for x in 0..120u16 {
-                if buf[(x, y)].style().bg == Some(crate::palette::SEL_BG) {
-                    sel_cells += 1;
-                    if y < 2 {
-                        outside = true;
-                    }
-                }
-            }
-        }
-        assert!(sel_cells > 0, "selection must paint the transcript");
-        assert!(!outside, "selection must not paint the header");
-    }
-
-    #[test]
     fn frame_has_top_margin_glyph_title_and_rounded_input() {
         use ratatui::backend::TestBackend;
         let mut terminal = ratatui::Terminal::new(TestBackend::new(120, 40)).unwrap();
@@ -10600,9 +10107,6 @@ mod tests {
                     &SidebarState::default(),
                     &std::cell::Cell::new(None),
                     &std::cell::Cell::new(None),
-                    &None,
-                    &std::cell::RefCell::new(Vec::new()),
-                    &std::cell::Cell::new((0, 0)),
                 )
             })
             .unwrap();
@@ -10659,9 +10163,6 @@ mod tests {
                         &SidebarState::default(),
                         &std::cell::Cell::new(None),
                         &arrows,
-                        &None,
-                        &std::cell::RefCell::new(Vec::new()),
-                        &std::cell::Cell::new((0, 0)),
                     )
                 })
                 .unwrap();
@@ -10685,12 +10186,9 @@ mod tests {
             t.push(Line::User("a user message".into()));
         }
         let (zone, syms) = draw(&t);
-        let z = zone.expect("user message -> jump arrows recorded");
+        assert!(zone.is_some(), "user message -> jump arrows recorded");
         assert_eq!(syms[2], "▲", "▲ at the end of the title row: {syms:?}");
         assert_eq!(syms[4], "▼", "▼ at the very edge: {syms:?}");
-        assert_eq!(z.hit(90, 1), Some(true), "▲ hit zone");
-        assert_eq!(z.hit(92, 1), Some(false), "▼ hit zone");
-        assert_eq!(z.hit(88, 1), None, "air left of the arrows");
     }
 
     #[test]
