@@ -79,7 +79,6 @@ pub const BORDER_STYLE: Style = Style::new().fg(BORDER); // block borders
 pub const BORDER_QUIET_STYLE: Style = Style::new().fg(BORDER_QUIET); // transcript border
 pub const ACCENT_STYLE: Style = Style::new().fg(ACCENT);
 pub const ACCENT_BOLD: Style = Style::new().fg(ACCENT).add_modifier(Modifier::BOLD);
-pub const PLACEHOLDER: Style = Style::new().fg(META).add_modifier(Modifier::ITALIC);
 // thinking sits a tier below normal chrome: mauve, italic
 pub const THOUGHT: Style = Style::new().fg(FAINT).add_modifier(Modifier::ITALIC);
 pub const QUOTE: Style = Style::new().fg(META).add_modifier(Modifier::ITALIC);

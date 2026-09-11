@@ -862,6 +862,7 @@ async fn run_tui(cli: Cli) -> Result<ExitCode, String> {
         let vendor = m.id.split('/').next().unwrap_or_default();
         (ka_dialect::providers::vendor_rank(vendor), m.id.clone())
     });
+    let fresh = matches!(choice, ka_agent::StrandChoice::New);
     let handle = ka_agent::spawn_full(cfg, catalog, choice);
     let ka_agent::EngineHandle { commands, events } = handle;
     let agents: Vec<(String, String)> = ka_agent::agents::AgentDef::discover(&cwd)
@@ -882,6 +883,7 @@ async fn run_tui(cli: Cli) -> Result<ExitCode, String> {
         models,
         agents,
         &cfg_tui_header_glyph,
+        fresh,
     )
     .await
     .map_err(|e| format!("tui: {e}"))?;

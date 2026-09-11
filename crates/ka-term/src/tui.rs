@@ -1976,6 +1976,7 @@ pub struct KeyPrompt {
 }
 
 /// Run the TUI over an engine handle. Blocks until exit.
+#[allow(clippy::too_many_arguments)]
 pub async fn run(
     mut commands: mpsc::Sender<Command>,
     mut events: mpsc::Receiver<Event>,
@@ -1984,6 +1985,7 @@ pub async fn run(
     models: Vec<ModelInfo>,
     agents: Vec<(String, String)>,
     header_glyph: &str,
+    fresh: bool,
 ) -> std::io::Result<Exit> {
     let _ = AGENTS.set(agents.clone());
     let mut terminal = ratatui::init();
@@ -2009,6 +2011,7 @@ pub async fn run(
         models,
         agents,
         header_glyph,
+        fresh,
     )
     .await;
     let _ = crossterm::execute!(
@@ -2036,6 +2039,7 @@ async fn app(
     mut models: Vec<ModelInfo>,
     agents: Vec<(String, String)>,
     header_glyph: &str,
+    mut fresh: bool,
 ) -> std::io::Result<(Exit, Option<String>)> {
     use crossterm::event::{Event as TermEvent, KeyCode, KeyModifiers};
     let _ = agents.clone();
@@ -2155,6 +2159,7 @@ async fn app(
                 mode_picker.as_ref(),
                 &meters,
                 &sidebar,
+                fresh,
             );
         })?;
 
@@ -2284,6 +2289,7 @@ async fn app(
                                 KeyCode::Enter => {
                                     let id = picker.pick();
                                     let target = id.unwrap_or_else(|| "new".to_string());
+                                    fresh = target == "new";
                                     let _ = commands
                                         .send(Command::SwitchStrand { id: target })
                                         .await;
@@ -2559,7 +2565,7 @@ async fn app(
                                 }
                                 KeyCode::Enter => {
                                     if let Some(id) = targets.get(*selected).cloned() {
-                                        modal = None;
+                                        fresh = id == "new";
                                         let _ = commands
                                             .send(Command::SwitchStrand { id })
                                             .await;
@@ -3110,8 +3116,11 @@ async fn app(
                                             }
                         }
                                 if let Some(evt) = cmd.event {
-                                    let is_switch =
-                                        matches!(evt, Command::SwitchStrand { .. });
+                                    let mut is_switch = false;
+                                    if let Command::SwitchStrand { id } = &evt {
+                                        is_switch = true;
+                                        fresh = id == "new";
+                                    }
                                     let _ = commands.send(evt).await;
                                     if is_switch {
                                         busy = true;
@@ -3589,16 +3598,22 @@ async fn app(
         }
     }
     let exit = exit.unwrap_or(Exit::Quit);
-    let resume = resume_hint(&meters.session, meters.turns, busy);
+    let resume = resume_hint(
+        &meters.session,
+        meters.turns,
+        busy,
+        !transcript.entries().is_empty(),
+    );
     Ok((exit, resume))
 }
 
 /// The after-exit resume hint: the command that brings this session
 /// back. Worth printing whenever the session exists and something
-/// happened in it — a finished turn, or a turn still in flight when
-/// the user quit.
-fn resume_hint(session: &str, turns: u64, busy: bool) -> Option<String> {
-    if session.is_empty() || (turns == 0 && !busy) {
+/// happened in it — a finished turn, a turn still in flight when the
+/// user quit, or history replayed from an earlier run: closing an
+/// older chat without a new turn still deserves the way back.
+fn resume_hint(session: &str, turns: u64, busy: bool, has_history: bool) -> Option<String> {
+    if session.is_empty() || (turns == 0 && !busy && !has_history) {
         return None;
     }
     let tag = short_session(session).unwrap_or("?");
@@ -5339,6 +5354,30 @@ fn status_right(meters: &Meters) -> String {
     segs.join(" · ")
 }
 
+/// The fresh-conversation welcome: quiet rows centered in the
+/// transcript pane. Rendered only while the transcript is empty and no
+/// turn is in flight — the first exchange (or a replayed older chat)
+/// replaces it.
+fn welcome_rows(width: usize, glyph: &str) -> Vec<ratatui::text::Line<'static>> {
+    use unicode_width::UnicodeWidthStr;
+    let center = |text: &str, style: ratatui::style::Style| -> ratatui::text::Line<'static> {
+        let pad = width.saturating_sub(text.width()) / 2;
+        ratatui::text::Line::from(vec![
+            ratatui::text::Span::raw(" ".repeat(pad)),
+            ratatui::text::Span::styled(text.to_string(), style),
+        ])
+    };
+    let glyph = if glyph.is_empty() { "◆" } else { glyph };
+    vec![
+        center(&format!("· {glyph} ·"), crate::palette::ACCENT_STYLE),
+        center("new conversation", crate::palette::THOUGHT),
+        center(
+            "/help for keys · /session for past chats",
+            ratatui::style::Style::new().fg(crate::palette::FAINT),
+        ),
+    ]
+}
+
 #[allow(clippy::too_many_arguments)]
 fn render(
     frame: &mut ratatui::Frame,
@@ -5360,6 +5399,7 @@ fn render(
     picker: Option<&ModePicker>,
     meters: &Meters,
     sidebar: &SidebarState,
+    fresh: bool,
 ) {
     let header_glyph = sidebar.header_glyph.as_str();
     use ratatui::layout::Constraint::{Length, Min};
@@ -5465,6 +5505,11 @@ fn render(
         } else if let Some(row) = live_rows.get(i - cached) {
             window.push(row.clone());
         }
+    }
+    // an empty, idle, fresh transcript opens on a quiet welcome — the
+    // first exchange (or a replayed older chat) replaces it
+    if total == 0 && !busy && fresh {
+        window = welcome_rows(tx_inner as usize, header_glyph);
     }
     let title = if pinned {
         header_glyph.to_string()
@@ -5588,8 +5633,6 @@ fn render(
             }
         }
         rows
-    } else if input.is_empty() && !busy && popup.is_none() && path.is_none() && modal.is_none() {
-        vec![TuiLine::styled("ask ka", crate::palette::PLACEHOLDER)]
     } else {
         // shared horizontal window: all rows shift together so the cursor
         // row can always show the cursor
@@ -5883,7 +5926,6 @@ fn render(
                     ("Enter", "send · interject mid-turn"),
                     ("Esc / Ctrl-C", "abort turn · close overlays · unpin scroll"),
                     ("Ctrl+C", "quit (abort the running turn first)"),
-                    ("Ctrl+M", "mouse capture · shift+drag select"),
                     ("Ctrl+R", "search history · ctrl+r next · enter accept"),
                     ("Alt+E", "edit the draft in $EDITOR"),
                     ("PgUp / PgDn", "scroll the transcript"),
@@ -7305,16 +7347,18 @@ mod tests {
     }
 
     #[test]
-    fn resume_hint_needs_a_session_and_a_turn() {
-        let hint = resume_hint("s19a4f2e1b0-3f9c2a81d4b7", 1, false).unwrap();
+    fn resume_hint_needs_a_session_and_activity() {
+        let hint = resume_hint("s19a4f2e1b0-3f9c2a81d4b7", 1, false, false).unwrap();
         assert!(hint.contains("ka -c"), "{hint}");
         assert!(hint.contains("ka --session 3f9c2a81"), "{hint}");
         // quitting mid-turn (turns == 0, still busy) still resumes
-        assert!(resume_hint("s19a4f2e1b0-3f9c2a81d4b7", 0, true).is_some());
-        // a session with no turns, idle: not worth resuming
-        assert!(resume_hint("s19a4f2e1b0-3f9c2a81d4b7", 0, false).is_none());
+        assert!(resume_hint("s19a4f2e1b0-3f9c2a81d4b7", 0, true, false).is_some());
+        // an older chat replayed at startup, closed with no new turn
+        assert!(resume_hint("s19a4f2e1b0-3f9c2a81d4b7", 0, false, true).is_some());
+        // a fresh session with no turns, idle: not worth resuming
+        assert!(resume_hint("s19a4f2e1b0-3f9c2a81d4b7", 0, false, false).is_none());
         // no session id (engine died at bootstrap): nothing to print
-        assert!(resume_hint("", 3, false).is_none());
+        assert!(resume_hint("", 3, false, true).is_none());
     }
 
     #[test]
@@ -10009,6 +10053,7 @@ mod tests {
                     None,
                     &Meters::default(),
                     &SidebarState::default(),
+                    true,
                 )
             })
             .unwrap();
@@ -10033,6 +10078,66 @@ mod tests {
         // the status bar still owns the last row (no bottom margin)
         let last_row: String = (0..120u16).map(|x| buf[(x, 39)].symbol()).collect();
         assert!(last_row.contains("enter"), "status hints on the last row");
+    }
+
+    #[test]
+    fn empty_idle_transcript_shows_the_welcome() {
+        use ratatui::backend::TestBackend;
+        let frame_text = |transcript: &Transcript, busy: bool, fresh: bool| -> String {
+            let mut terminal = ratatui::Terminal::new(TestBackend::new(120, 40)).unwrap();
+            terminal
+                .draw(|f| {
+                    super::render(
+                        f,
+                        transcript,
+                        None,
+                        "",
+                        0,
+                        busy,
+                        None,
+                        Instant::now(),
+                        0,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        &Meters::default(),
+                        &SidebarState::default(),
+                        fresh,
+                    )
+                })
+                .unwrap();
+            terminal
+                .backend()
+                .buffer()
+                .content
+                .iter()
+                .map(|c| c.symbol().to_string())
+                .collect()
+        };
+        let frame = frame_text(&Transcript::default(), false, true);
+        assert!(frame.contains("new conversation"), "welcome on fresh chat");
+        assert!(frame.contains("/help for keys"), "hint row present");
+        // busy, carrying entries, or an older chat still replaying: the
+        // welcome steps aside
+        assert!(
+            !frame_text(&Transcript::default(), true, true).contains("new conversation"),
+            "busy turn: no welcome"
+        );
+        assert!(
+            !frame_text(&Transcript::default(), false, false).contains("new conversation"),
+            "older chat before its replay lands: no welcome"
+        );
+        let mut t = Transcript::default();
+        t.set_width(80);
+        t.push(Line::User("hello".into()));
+        assert!(
+            !frame_text(&t, false, true).contains("new conversation"),
+            "non-empty transcript: no welcome"
+        );
     }
 
     #[test]
