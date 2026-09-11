@@ -2,3 +2,6 @@
 research/repos/
 *.swp
 .test/
+
+# release signing private key (never commit)
+ka-release.key
