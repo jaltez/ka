@@ -1080,6 +1080,36 @@ fn page_down(scroll: &mut Option<usize>, total: usize, visible: usize) {
     };
 }
 
+/// Scroll a few lines up from the current anchor (pinned counts from the
+/// tail). Wheel granularity — three lines per notch.
+fn line_up(scroll: &mut Option<usize>, total: usize, visible: usize) {
+    if visible == 0 || total <= visible {
+        *scroll = None;
+        return;
+    }
+    let max_anchor = total - visible;
+    let cur = scroll.unwrap_or(max_anchor);
+    *scroll = Some(cur.saturating_sub(WHEEL_STEP).min(max_anchor));
+}
+
+/// Scroll a few lines down; reaching the tail re-pins (None).
+fn line_down(scroll: &mut Option<usize>, total: usize, visible: usize) {
+    let Some(anchor) = *scroll else { return };
+    if visible == 0 {
+        *scroll = None;
+        return;
+    }
+    let max_anchor = total.saturating_sub(visible);
+    *scroll = if anchor + WHEEL_STEP >= max_anchor {
+        None
+    } else {
+        Some(anchor + WHEEL_STEP)
+    };
+}
+
+/// Transcript rows per mouse-wheel notch.
+const WHEEL_STEP: usize = 3;
+
 /// Footer state shown under the editor.
 #[derive(Debug, Clone, Default)]
 pub struct Meters {
@@ -1136,6 +1166,11 @@ pub struct SidebarState {
     pub cwd: String,
     /// Git branch when cheaply detectable at startup.
     pub branch: Option<String>,
+    /// Skills section expanded? Collapsed via a mouse click on its
+    /// header (mouse mode); the header keeps rendering as `skills (+N)`.
+    pub skills_open: bool,
+    /// Cursor is over the skills header (drives the hover affordance).
+    pub skills_hover: bool,
     /// Window/sidebar title glyph ([tui] header_glyph, default ◆).
     pub header_glyph: String,
     /// The active session's display title ([`Event::Title`]; stored
@@ -1150,6 +1185,8 @@ impl Default for SidebarState {
             todos: Vec::new(),
             cwd: String::new(),
             branch: None,
+            skills_open: true,
+            skills_hover: false,
             title: None,
             header_glyph: "◆".to_string(),
         }
@@ -1159,6 +1196,76 @@ impl Default for SidebarState {
 /// A clickable sidebar region, recorded at render time so the mouse
 /// handler can hit-test without duplicating the layout math. New
 /// collapsible sections add a variant here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SidebarZone {
+    /// The skills section header row (spans the sidebar's full width).
+    SkillsHeader(ratatui::layout::Rect),
+}
+
+impl SidebarZone {
+    /// Does a terminal-cell click land inside this zone?
+    fn hit(&self, x: u16, y: u16) -> bool {
+        match self {
+            SidebarZone::SkillsHeader(rect) => rect.contains(ratatui::layout::Position { x, y }),
+        }
+    }
+}
+
+/// Clickable ▲▼ jump targets on the transcript title row (recorded at
+/// render time like [`SidebarZone`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TitleArrows {
+    /// ▲ — jump to the previous user message.
+    up: ratatui::layout::Rect,
+    /// ▼ — jump to the next user message.
+    down: ratatui::layout::Rect,
+}
+
+impl TitleArrows {
+    /// Does a terminal-cell click land on one of the arrows? Returns
+    /// `Some(true)` for ▲ (previous), `Some(false)` for ▼ (next).
+    fn hit(&self, x: u16, y: u16) -> Option<bool> {
+        let pos = ratatui::layout::Position { x, y };
+        if self.up.contains(pos) {
+            Some(true)
+        } else if self.down.contains(pos) {
+            Some(false)
+        } else {
+            None
+        }
+    }
+}
+
+/// Sidebar skills header text: bare when expanded, count-marked when
+/// collapsed (the ` ▾`/` ▸` affordance rides separately as a dim span).
+fn skills_header_label(open: bool, count: usize) -> String {
+    if open {
+        "skills".to_string()
+    } else {
+        format!("skills (+{count})")
+    }
+}
+
+/// Full skills header line: label plus the ` ▾`/` ▸` disclosure arrow.
+/// Hover lifts the whole header onto the modal surface tint (ACCENT on
+/// BG_SURFACE); at rest the label keeps its accent-bold look and the
+/// arrow stays dim META.
+fn skills_header_line(open: bool, hover: bool, count: usize) -> ratatui::text::Line<'static> {
+    use ratatui::text::{Line as TuiLine, Span};
+    let label = skills_header_label(open, count);
+    let arrow = if open { " ▾" } else { " ▸" };
+    if hover {
+        let st = ratatui::style::Style::new()
+            .fg(crate::palette::ACCENT)
+            .bg(crate::palette::BG_SURFACE);
+        TuiLine::from(vec![Span::styled(label, st), Span::styled(arrow, st)])
+    } else {
+        TuiLine::from(vec![
+            Span::styled(label, crate::palette::ACCENT_BOLD),
+            Span::styled(arrow, crate::palette::META),
+        ])
+    }
+}
 /// Sidebar column width when shown.
 const SIDEBAR_WIDTH: u16 = 26;
 /// Minimum terminal width for the sidebar; below it the transcript keeps
@@ -1230,6 +1337,10 @@ fn sidebar_rows(
     meters: &Meters,
     width: usize,
     height: usize,
+    // mouse mode drives the collapse affordance + zone recording; the
+    // terminal-native mode renders the plain always-open section
+    mouse: bool,
+    hit: Option<(&std::cell::Cell<Option<SidebarZone>>, ratatui::layout::Rect)>,
 ) -> Vec<ratatui::text::Line<'static>> {
     use ratatui::style::{Modifier, Style};
     use ratatui::text::{Line as TuiLine, Span};
@@ -1325,7 +1436,25 @@ fn sidebar_rows(
             .chain(items.iter().map(|s| plain(trunc_cols(s, width))))
             .collect::<Vec<_>>()
     };
-    let skills = names("skills", &sidebar.inventory.skills);
+    // collapsed skills render their header alone, with the count moved
+    // into the label; the header carries the disclosure arrow and the
+    // hover affordance (mouse mode only — no in-app clicks otherwise)
+    let skills = if !mouse {
+        names("skills", &sidebar.inventory.skills)
+    } else if sidebar.skills_open {
+        let mut rows = names("skills", &sidebar.inventory.skills);
+        if !rows.is_empty() {
+            rows[0] =
+                skills_header_line(true, sidebar.skills_hover, sidebar.inventory.skills.len());
+        }
+        rows
+    } else {
+        vec![skills_header_line(
+            false,
+            sidebar.skills_hover,
+            sidebar.inventory.skills.len(),
+        )]
+    };
     let agents = names("agents", &sidebar.inventory.agents);
 
     // ── info: one `cwd-short:branch` row at the bottom; without a
@@ -1343,11 +1472,16 @@ fn sidebar_rows(
     let mut out: Vec<TuiLine> = Vec::with_capacity(height.min(40));
     let mut room = height;
     let mut placed = false;
-    for section in sections.into_iter() {
+    // section index of skills: a collapsed section carries no body but
+    // its header must still land on screen
+    const SKILLS_SECTION: usize = 3;
+    let mut skills_header_row: Option<usize> = None;
+    for (si, section) in sections.into_iter().enumerate() {
         let Some((head, body)) = section.split_first() else {
             continue;
         };
-        if body.is_empty() {
+        let forced = si == SKILLS_SECTION && !sidebar.skills_open && body.is_empty();
+        if body.is_empty() && !forced {
             continue; // empty sections vanish
         }
         if placed {
@@ -1358,10 +1492,13 @@ fn sidebar_rows(
             room -= 1;
         }
         let show = (room - 2).min(body.len());
-        if show == 0 {
+        if show == 0 && !forced {
             break; // not even one body row fits under the header air
         }
         placed = true;
+        if si == SKILLS_SECTION {
+            skills_header_row = Some(out.len());
+        }
         out.push(head.clone());
         out.push(TuiLine::default()); // blank under the header
         if show < body.len() {
@@ -1375,6 +1512,18 @@ fn sidebar_rows(
             out.extend(body.iter().cloned());
         }
         room -= 2 + show;
+    }
+    if let Some((cell, area)) = hit {
+        cell.set(skills_header_row.map(|row| {
+            SidebarZone::SkillsHeader(ratatui::layout::Rect {
+                x: area.x,
+                // the block title consumes the area's first row, so a
+                // rendered row lives one below area.y
+                y: area.y + 1 + row as u16,
+                width: area.width,
+                height: 1,
+            })
+        }));
     }
     out
 }
@@ -1988,12 +2137,26 @@ pub async fn run(
     fresh: bool,
 ) -> std::io::Result<Exit> {
     let _ = AGENTS.set(agents.clone());
+    // Register raw mode in THIS crate's crossterm before ratatui flips
+    // it through its own (0.28) copy: crossterm's parser decides whether
+    // `\n` means Enter or Ctrl+J by reading its own per-crate raw-mode
+    // flag, and only the copy that called enable_raw_mode knows. Without
+    // this, every lone \n sends the draft instead of breaking the line,
+    // and run_external restores a raw state for editors instead of the
+    // cooked one it started from.
+    let _ = crossterm::terminal::enable_raw_mode();
     let mut terminal = ratatui::init();
+    let mut sel: Option<TextSel> = None;
+    let frame_window: std::cell::RefCell<Vec<ratatui::text::Line<'static>>> =
+        std::cell::RefCell::new(Vec::new());
+    let frame_origin: std::cell::Cell<(u16, u16)> = std::cell::Cell::new((0, 0));
     // Kitty keyboard protocol: Shift+Enter as a distinct key + bracketed
     // paste. Best effort — hosts without support degrade to plain Enter;
-    // Ctrl+J always works as the newline fallback. The mouse is left to
-    // the terminal, omp/pi style: any text in the transcript selects and
-    // copies natively, and the transcript scrolls with pgup/pgdn.
+    // Ctrl+J always works as the newline fallback. Mouse capture is ON
+    // by default: the app draws its own selection over the transcript
+    // and copies on release (OSC52), the wheel scrolls, and the ▲▼
+    // arrows / skills header are clickable. Ctrl+M hands the mouse back
+    // to the terminal (native selection) and back again.
     let _ = crossterm::execute!(
         std::io::stdout(),
         crossterm::event::PushKeyboardEnhancementFlags(
@@ -2001,7 +2164,13 @@ pub async fn run(
                 | crossterm::event::KeyboardEnhancementFlags::REPORT_EVENT_TYPES
         ),
         crossterm::event::EnableBracketedPaste,
+        crossterm::event::EnableMouseCapture,
     );
+    // any-event (motion) tracking: crossterm has no wrapper for the raw
+    // `1003` sequence; without it Moved events only flow while a button
+    // is held. Popped at every capture-disable path below.
+    let _ = std::io::stdout().write_all(b"\x1b[?1003h");
+    let _ = std::io::stdout().flush();
     let result = app(
         &mut terminal,
         &mut commands,
@@ -2012,8 +2181,13 @@ pub async fn run(
         agents,
         header_glyph,
         fresh,
+        &mut sel,
+        &frame_window,
+        &frame_origin,
     )
     .await;
+    let _ = std::io::stdout().write_all(b"\x1b[?1003l");
+    let _ = std::io::stdout().flush();
     let _ = crossterm::execute!(
         std::io::stdout(),
         crossterm::event::PopKeyboardEnhancementFlags,
@@ -2040,6 +2214,9 @@ async fn app(
     agents: Vec<(String, String)>,
     header_glyph: &str,
     mut fresh: bool,
+    sel: &mut Option<TextSel>,
+    frame_window: &std::cell::RefCell<Vec<ratatui::text::Line<'static>>>,
+    frame_origin: &std::cell::Cell<(u16, u16)>,
 ) -> std::io::Result<(Exit, Option<String>)> {
     use crossterm::event::{Event as TermEvent, KeyCode, KeyModifiers};
     let _ = agents.clone();
@@ -2091,6 +2268,13 @@ async fn app(
     let mut find_last: Option<(String, usize)> = None;
     let mut modal: Option<Modal> = None;
     let mut mode_picker: Option<ModePicker> = None;
+    // mouse mode: captured (in-app selection/clicks/wheel) vs
+    // terminal-native; toggled with Ctrl+M
+    let mut mouse = true;
+    // clickable sidebar regions + ▲▼ title-row jump targets, refreshed
+    // every frame by render()
+    let sidebar_zone: std::cell::Cell<Option<SidebarZone>> = std::cell::Cell::new(None);
+    let title_arrows: std::cell::Cell<Option<TitleArrows>> = std::cell::Cell::new(None);
     let mut term_events = crossterm::event::EventStream::new();
     let mut spin = tokio::time::interval(Duration::from_millis(120));
 
@@ -2160,6 +2344,12 @@ async fn app(
                 &meters,
                 &sidebar,
                 fresh,
+                &sidebar_zone,
+                &title_arrows,
+                sel,
+                frame_window,
+                frame_origin,
+                mouse,
             );
         })?;
 
@@ -2639,11 +2829,13 @@ async fn app(
                                                         &pager,
                                                         &[path.as_str()],
                                                         terminal,
+                                                        mouse,
                                                     ),
                                                     None => run_external(
                                                         "less",
                                                         &["-R", path.as_str()],
                                                         terminal,
+                                                        mouse,
                                                     ),
                                                 };
                                             if let Err(e) = opened {
@@ -2874,6 +3066,41 @@ async fn app(
                                         find_last = Some((q, from));
                                     }
                                 }
+                                continue;
+                            }
+                            if text.trim() == "/mouse" {
+                                // toggle the mouse between app capture
+                                // (selection, wheel, click targets) and
+                                // the terminal's native selection. A slash
+                                // command, not a key: Ctrl+M is Enter on
+                                // most terminals.
+                                use std::io::Write as _;
+                                mouse = !mouse;
+                                let mut out = std::io::stdout().lock();
+                                if mouse {
+                                    let _ = crossterm::execute!(
+                                        out,
+                                        crossterm::event::EnableMouseCapture
+                                    );
+                                    let _ = out.write_all(b"\x1b[?1003h");
+                                } else {
+                                    sidebar.skills_hover = false;
+                                    *sel = None;
+                                    let _ = crossterm::execute!(
+                                        out,
+                                        crossterm::event::DisableMouseCapture
+                                    );
+                                    let _ = out.write_all(b"\x1b[?1003l");
+                                }
+                                let _ = out.flush();
+                                transcript.push_separated(Line::Note(
+                                    if mouse {
+                                        "mouse captured — drag copies, wheel scrolls, ▲▼ jump"
+                                    } else {
+                                        "mouse released — the terminal owns selection"
+                                    }
+                                    .to_string(),
+                                ));
                                 continue;
                             }
                             if text.trim() == "/retry" {
@@ -3287,6 +3514,19 @@ async fn app(
                         {
                             input.move_up();
                         }
+                        // Ctrl+↑/↓: jump between user messages — the
+                        // keyboard twin of the ▲▼ arrows, works in both
+                        // mouse modes
+                        (KeyCode::Up, KeyModifiers::CONTROL) => {
+                            let rows = transcript.user_entry_rows();
+                            let total = transcript.total_rows();
+                            jump_to_user_message(&mut scroll, &rows, total, view_rows, true);
+                        }
+                        (KeyCode::Down, KeyModifiers::CONTROL) => {
+                            let rows = transcript.user_entry_rows();
+                            let total = transcript.total_rows();
+                            jump_to_user_message(&mut scroll, &rows, total, view_rows, false);
+                        }
                         (KeyCode::Up, _) if !busy => input.history_prev(),
                         (KeyCode::Down, _)
                             if !busy && slash_popup.is_none() && input.text.contains('\n') =>
@@ -3395,6 +3635,7 @@ async fn app(
                                         &editor,
                                         &[path_str.as_str()],
                                         terminal,
+                                        mouse,
                                     ) {
                                         Err(e) => transcript.push_separated(Line::Note(format!("editor failed: {e}"))),
                                         Ok(()) => {
@@ -3512,6 +3753,93 @@ async fn app(
                     } else {
                         input.insert_str(&text);
                         slash_popup = update_suggestions(&input.text);
+                    }
+                } else if let Some(Ok(TermEvent::Mouse(mouse_evt))) = maybe_term {
+                    // captured-mouse interactions: the wheel scrolls the
+                    // chat at line granularity (page keys keep their
+                    // page step); overlays keep focus
+                    if modal.is_none()
+                        && pending.is_none()
+                        && slash_popup.is_none()
+                        && path_popup.is_none()
+                    {
+                        match mouse_evt.kind {
+                            // a click on the skills header toggles the
+                            // section; checked before the wheel arms so a
+                            // click never also scrolls
+                            crossterm::event::MouseEventKind::Down(
+                                crossterm::event::MouseButton::Left,
+                            ) => {
+                                // ▲▼ jump arrows on the transcript title
+                                // row: step between user messages
+                                if let Some(up) = title_arrows
+                                    .get()
+                                    .and_then(|z| z.hit(mouse_evt.column, mouse_evt.row))
+                                {
+                                    let rows = transcript.user_entry_rows();
+                                    let total = transcript.total_rows();
+                                    jump_to_user_message(
+                                        &mut scroll, &rows, total, view_rows, up,
+                                    );
+                                } else if sidebar_zone
+                                    .get()
+                                    .is_some_and(|z| z.hit(mouse_evt.column, mouse_evt.row))
+                                {
+                                    sidebar.skills_open = !sidebar.skills_open;
+                                } else {
+                                    // start transcript text selection
+                                    *sel = Some(TextSel {
+                                        anchor: (mouse_evt.column, mouse_evt.row),
+                                        head: (mouse_evt.column, mouse_evt.row),
+                                    });
+                                }
+                            }
+                            // right click pastes the clipboard into the
+                            // input
+                            crossterm::event::MouseEventKind::Down(
+                                crossterm::event::MouseButton::Right,
+                            ) => {
+                                let text = clipboard_text().await;
+                                input.insert_str(&text);
+                            }
+                            // hover affordance: only re-renders when the
+                            // pointer actually crosses the header boundary
+                            crossterm::event::MouseEventKind::Moved
+                            | crossterm::event::MouseEventKind::Drag(
+                                crossterm::event::MouseButton::Left,
+                            ) => {
+                                let hit = sidebar_zone
+                                    .get()
+                                    .is_some_and(|z| z.hit(mouse_evt.column, mouse_evt.row));
+                                if sidebar.skills_hover != hit {
+                                    sidebar.skills_hover = hit;
+                                }
+                                if let Some(s) = sel.as_mut() {
+                                    eprintln!("DBG sel head {:?}", s.head);
+                                    s.head = (mouse_evt.column, mouse_evt.row);
+                                }
+                            }
+                            crossterm::event::MouseEventKind::Up(
+                                crossterm::event::MouseButton::Left,
+                            ) => {
+                                // release ends the selection: copy it to
+                                // the clipboard (OSC52) and clear the
+                                copy_selection(
+                                    sel,
+                                    frame_window,
+                                    frame_origin,
+                                    &mut transcript,
+                                );
+                                eprintln!("DBG up-copy sel={:?}", sel);
+                            }
+                            crossterm::event::MouseEventKind::ScrollUp => {
+                                line_up(&mut scroll, transcript.total_rows(), view_rows);
+                            }
+                            crossterm::event::MouseEventKind::ScrollDown => {
+                                line_down(&mut scroll, transcript.total_rows(), view_rows);
+                            }
+                            _ => {}
+                        }
                     }
                 }
             }
@@ -4060,17 +4388,30 @@ fn run_external(
     program: &str,
     args: &[&str],
     terminal: &mut ratatui::Terminal<ratatui::backend::CrosstermBackend<std::io::Stdout>>,
+    // recapture the mouse after the child exits (capture mode only)
+    mouse: bool,
 ) -> std::io::Result<()> {
     use std::io::Write as _;
     let _ = std::io::stdout().flush();
     let _ = crossterm::terminal::disable_raw_mode();
-    let _ = crossterm::execute!(std::io::stdout(), crossterm::terminal::LeaveAlternateScreen);
+    let _ = crossterm::execute!(
+        std::io::stdout(),
+        crossterm::terminal::LeaveAlternateScreen,
+        crossterm::event::DisableMouseCapture
+    );
+    let _ = std::io::stdout().write_all(b"\x1b[?1003l");
+    let _ = std::io::stdout().flush();
     let res = std::process::Command::new(program)
         .args(args)
         .status()
         .map(|_| ());
     let _ = crossterm::execute!(std::io::stdout(), crossterm::terminal::EnterAlternateScreen);
     let _ = crossterm::terminal::enable_raw_mode();
+    if mouse {
+        let _ = crossterm::execute!(std::io::stdout(), crossterm::event::EnableMouseCapture);
+        let _ = std::io::stdout().write_all(b"\x1b[?1003h");
+        let _ = std::io::stdout().flush();
+    }
     let _ = terminal.clear();
     res
 }
@@ -4341,6 +4682,10 @@ fn builtin_slash_commands() -> Vec<(String, String)> {
         (
             "/find".to_string(),
             "search the transcript: /find <text>, bare repeats".to_string(),
+        ),
+        (
+            "/mouse".to_string(),
+            "mouse capture ⇄ terminal-native".to_string(),
         ),
         (
             "/spills".to_string(),
@@ -5400,6 +5745,12 @@ fn render(
     meters: &Meters,
     sidebar: &SidebarState,
     fresh: bool,
+    sidebar_zone: &std::cell::Cell<Option<SidebarZone>>,
+    title_arrows: &std::cell::Cell<Option<TitleArrows>>,
+    sel: &Option<TextSel>,
+    frame_window: &std::cell::RefCell<Vec<ratatui::text::Line<'static>>>,
+    frame_origin: &std::cell::Cell<(u16, u16)>,
+    mouse: bool,
 ) {
     let header_glyph = sidebar.header_glyph.as_str();
     use ratatui::layout::Constraint::{Length, Min};
@@ -5511,11 +5862,19 @@ fn render(
     if total == 0 && !busy && fresh {
         window = welcome_rows(tx_inner as usize, header_glyph);
     }
+    // stash the visible window for mouse-copy; paint the selection
+    frame_origin.set((tx_area.x + 1, tx_area.y + 1));
+    *frame_window.borrow_mut() = window.clone();
+    if let Some(s) = *sel {
+        apply_sel_highlight(&mut window, tx_area.y + 1, s.anchor, s.head);
+    }
     let title = if pinned {
         header_glyph.to_string()
     } else {
         format!("{header_glyph} · ↑{} above (pgdn/esc)", start)
     };
+    // cells the padded title occupies (one space of air each side)
+    let title_cells = title.chars().count() + 2;
     let widget = Paragraph::new(window).block(
         Block::default()
             .borders(Borders::TOP)
@@ -5524,6 +5883,48 @@ fn render(
             .padding(ratatui::widgets::Padding::horizontal(1)),
     );
     frame.render_widget(widget, tx_area);
+
+    // ── ▲▼ user-message jump arrows at the end of the title row ──
+    // Only in captured-mouse mode (the zones are click targets), once
+    // the user has sent a message, and only when the pane is wide
+    // enough that the arrows never collide with the title text. ▲
+    // steps to the previous user message, ▼ to the next; Ctrl+↑/↓ are
+    // the keyboard twin.
+    title_arrows.set(None);
+    let has_user = transcript
+        .entries()
+        .iter()
+        .any(|l| matches!(l, Line::User(_)));
+    if mouse && has_user && tx_area.width >= 12 {
+        let need = title_cells + 7;
+        if tx_area.width as usize >= need {
+            let y = tx_area.y;
+            let x0 = tx_area.x + tx_area.width - 4; // ' ', '▲', ' ', '▼'
+            let buf = frame.buffer_mut();
+            for (i, sym) in [' ', '▲', ' ', '▼'].iter().enumerate() {
+                if let Some(c) = buf.cell_mut((x0 + i as u16, y)) {
+                    c.set_symbol(&sym.to_string());
+                    if *sym != ' ' {
+                        c.set_style(crate::palette::ACCENT_STYLE);
+                    }
+                }
+            }
+            title_arrows.set(Some(TitleArrows {
+                up: ratatui::layout::Rect {
+                    x: x0,
+                    y,
+                    width: 2,
+                    height: 1,
+                },
+                down: ratatui::layout::Rect {
+                    x: x0 + 2,
+                    y,
+                    width: 2,
+                    height: 1,
+                },
+            }));
+        }
+    }
 
     // ── scrollbar rail: painted into the transcript's always-blank
     // right padding column, so no width math ever learns about it ──
@@ -5559,6 +5960,8 @@ fn render(
             meters,
             (SIDEBAR_WIDTH - 3) as usize,
             sb.height as usize,
+            mouse,
+            Some((sidebar_zone, sb)),
         );
         let widget = Paragraph::new(rows)
             .block(
@@ -5570,6 +5973,9 @@ fn render(
             )
             .style(ratatui::style::Style::new().bg(crate::palette::BG_PANEL));
         frame.render_widget(widget, sb);
+    } else {
+        // no sidebar column: no clickable zones this frame
+        sidebar_zone.set(None);
     }
     // ── input ─────────────────────────────────────────────────────
     // a permission ask borrows the box as a form (the draft returns
@@ -5721,7 +6127,16 @@ fn render(
     } else if busy {
         hint_spans(&[(" enter", "interject"), (" +", "defer"), (" esc", "abort")])
     } else {
-        hint_spans(&[(" enter", "send"), (" /", "commands")])
+        if mouse {
+            hint_spans(&[
+                (" enter", "send"),
+                (" /", "commands"),
+                (" drag", "copy"),
+                (" /mouse", "native select"),
+            ])
+        } else {
+            hint_spans(&[(" enter", "send"), (" /", "commands"), (" /mouse", "capture")])
+        }
     };
     let right = status_right(meters);
     let w = unicode_width::UnicodeWidthStr::width;
@@ -5926,6 +6341,7 @@ fn render(
                     ("Enter", "send · interject mid-turn"),
                     ("Esc / Ctrl-C", "abort turn · close overlays · unpin scroll"),
                     ("Ctrl+C", "quit (abort the running turn first)"),
+                    ("/mouse", "capture ⇄ terminal-native select"),
                     ("Ctrl+R", "search history · ctrl+r next · enter accept"),
                     ("Alt+E", "edit the draft in $EDITOR"),
                     ("PgUp / PgDn", "scroll the transcript"),
@@ -6649,6 +7065,152 @@ fn centered(width: u16, height: u16, area: ratatui::layout::Rect) -> ratatui::la
 /// kiss the border glyphs or the frame edge.
 fn padded_title(title: impl Into<String>) -> ratatui::text::Line<'static> {
     ratatui::text::Line::from(format!(" {} ", title.into())).style(crate::palette::META)
+}
+
+/// Jump the viewport anchor to the previous (up) or next (down) user
+/// message relative to the window top. Up with nothing above is a
+/// no-op; down past the last user message lands on the live tail
+/// (scroll = None) unless the view is already pinned there.
+fn jump_to_user_message(
+    scroll: &mut Option<usize>,
+    user_rows: &[usize],
+    total: usize,
+    visible: usize,
+    up: bool,
+) {
+    if user_rows.is_empty() || visible == 0 {
+        return;
+    }
+    let (start, pinned) = window_range(total, visible, *scroll);
+    if up {
+        if let Some(&r) = user_rows.iter().rev().find(|&&r| r < start) {
+            *scroll = Some(r);
+        }
+    } else if let Some(&r) = user_rows.iter().find(|&&r| r > start) {
+        *scroll = Some(r);
+    } else if !pinned {
+        *scroll = None;
+    }
+}
+
+/// In-progress transcript text selection in frame coordinates
+/// (column, row).
+#[derive(Debug, Clone, Copy)]
+pub struct TextSel {
+    anchor: (u16, u16),
+    head: (u16, u16),
+}
+
+/// Extract the text a mouse selection covers, from the stashed visible
+/// window (`origin` = screen coords of the first text column of the
+/// first row). Partial first/last rows respect the anchor columns;
+/// rows trim trailing spaces and join with newlines.
+fn selection_text(
+    win: &[ratatui::text::Line<'static>],
+    origin: (u16, u16),
+    a: (u16, u16),
+    h: (u16, u16),
+) -> Option<String> {
+    use unicode_width::UnicodeWidthStr;
+    let line_text = |l: &ratatui::text::Line<'static>| -> String {
+        l.spans.iter().map(|s| s.content.to_string()).collect()
+    };
+    let cell_slice = |text: &str, from: usize, to: usize| -> String {
+        let mut out = String::new();
+        let mut acc = 0usize;
+        for ch in text.chars() {
+            let start = acc;
+            acc += unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
+            if acc > from && start < to {
+                out.push(ch);
+            }
+        }
+        out
+    };
+    let (r1, c1, r2, c2) = if (a.1, a.0) <= (h.1, h.0) {
+        (a.1, a.0, h.1, h.0)
+    } else {
+        (h.1, h.0, a.1, a.0)
+    };
+    if r2 < origin.1 || win.is_empty() {
+        return None;
+    }
+    let i1 = ((r1 - origin.1) as usize).min(win.len() - 1);
+    let i2 = ((r2 - origin.1) as usize).min(win.len() - 1);
+    let mut parts: Vec<String> = Vec::new();
+    for (off, line) in win[i1..=i2].iter().enumerate() {
+        let text = line_text(line);
+        let from = if off == 0 {
+            (c1 - origin.0) as usize
+        } else {
+            0
+        };
+        let to = if off == i2 - i1 {
+            ((c2 - origin.0) as usize + 1).min(text.width())
+        } else {
+            text.width()
+        };
+        let seg = cell_slice(&text, from, to);
+        let trimmed = seg.trim_end();
+        if !trimmed.is_empty() {
+            parts.push(trimmed.to_string());
+        } else if off == 0 || off == i2 - i1 {
+            parts.push(String::new());
+        }
+    }
+    let out = parts.join("\n").trim().to_string();
+    (!out.is_empty()).then_some(out)
+}
+
+/// Copy the live transcript selection to the clipboard (OSC52) and
+/// clear it. No-op without a selection.
+fn copy_selection(
+    sel: &mut Option<TextSel>,
+    frame_window: &std::cell::RefCell<Vec<ratatui::text::Line<'static>>>,
+    frame_origin: &std::cell::Cell<(u16, u16)>,
+    transcript: &mut Transcript,
+) {
+    use std::io::Write as _;
+    if let Some(s) = *sel {
+        let win = frame_window.borrow();
+        let origin = frame_origin.get();
+        if let Some(text) = selection_text(&win, origin, s.anchor, s.head) {
+            let n = text.chars().count();
+            if n > 0 {
+                let mut out = std::io::stdout().lock();
+                let _ = out.write_all(b"\x1b]52;c;");
+                let _ = out.write_all(b64encode(text.as_bytes()).as_bytes());
+                let _ = out.write_all(b"\x07");
+                let _ = out.flush();
+                transcript.push_separated(Line::Note(format!("copied {n} chars to the clipboard")));
+            }
+        }
+    }
+    *sel = None;
+}
+
+/// Restyle the window rows inside the selection rectangle with the
+/// selection bar colors (whole rows; the text itself is untouched).
+fn apply_sel_highlight(
+    window: &mut [ratatui::text::Line<'static>],
+    oy: u16,
+    a: (u16, u16),
+    h: (u16, u16),
+) {
+    let (r1, r2) = if a.1 <= h.1 { (a.1, h.1) } else { (h.1, a.1) };
+    if r2 < oy {
+        return;
+    }
+    let i1 = ((r1 - oy) as usize).min(window.len());
+    let i2 = (((r2 - oy) as usize) + 1).min(window.len());
+    for row in &mut window[i1..i2] {
+        for span in row.spans.iter_mut() {
+            span.style = span
+                .style
+                .fg(crate::palette::SEL_FG)
+                .bg(crate::palette::SEL_BG);
+        }
+    }
 }
 
 /// Read the system clipboard as text: wayland → X11 → WSL2/Windows.
@@ -9673,7 +10235,7 @@ mod tests {
             branch: Some("main".into()),
             ..Default::default()
         };
-        let rows = sidebar_rows(&sidebar, &meters_sample(), 24, 40);
+        let rows = sidebar_rows(&sidebar, &meters_sample(), 24, 40, false, None);
         let text = plain_text(&rows);
         assert_eq!(text[0], "session");
         assert!(text.contains(&"model mockco/mock".to_string()), "{text:?}");
@@ -9727,7 +10289,7 @@ mod tests {
             },
             ..Default::default()
         };
-        let rows = sidebar_rows(&sidebar, &Meters::default(), 24, 40);
+        let rows = sidebar_rows(&sidebar, &Meters::default(), 24, 40, false, None);
         let text = plain_text(&rows);
         let done = text
             .iter()
@@ -9780,7 +10342,7 @@ mod tests {
         // the whole budget: header + air + show = min(height-2, 30) list
         // rows, where the cut mark replaces the last one. At height 8:
         // header, blank, skill-0..4, mark.
-        let rows = sidebar_rows(&sidebar, &Meters::default(), 24, 8);
+        let rows = sidebar_rows(&sidebar, &Meters::default(), 24, 8, false, None);
         let text = plain_text(&rows);
         assert_eq!(text.len(), 8, "{text:?}");
         assert_eq!(text[0], "skills", "{text:?}");
@@ -9801,7 +10363,7 @@ mod tests {
             }],
             ..Default::default()
         };
-        let rows = sidebar_rows(&sidebar, &Meters::default(), 24, 40);
+        let rows = sidebar_rows(&sidebar, &Meters::default(), 24, 40, false, None);
         let text = plain_text(&rows);
         // every section header is followed by a blank row; a blank row
         // also separates each section from the previous one
@@ -9823,7 +10385,7 @@ mod tests {
             cwd: "…/世界/世界".into(),
             ..Default::default()
         };
-        let rows = sidebar_rows(&sidebar, &Meters::default(), 10, 40);
+        let rows = sidebar_rows(&sidebar, &Meters::default(), 10, 40, false, None);
         for row in &rows {
             let text: String = row.spans.iter().map(|s| s.content.as_ref()).collect();
             assert!(text.width() <= 10, "{text}");
@@ -9997,7 +10559,7 @@ mod tests {
         assert_eq!(sidebar.title.as_deref(), Some("Fix the parser"));
 
         // the title renders as the first fact row of the session section
-        let rendered = plain_text(&sidebar_rows(&sidebar, &meters, 26, 40));
+        let rendered = plain_text(&sidebar_rows(&sidebar, &meters, 26, 40, false, None));
         assert!(
             rendered.iter().any(|r| r.contains("Fix the parser")),
             "got: {rendered:?}"
@@ -10007,7 +10569,7 @@ mod tests {
     #[test]
     fn sidebar_without_title_shows_no_title_row() {
         let sidebar = SidebarState::default();
-        let rows = sidebar_rows(&sidebar, &Meters::default(), 26, 40);
+        let rows = sidebar_rows(&sidebar, &Meters::default(), 26, 40, false, None);
         assert!(rows.is_empty(), "no title → session section starts empty");
     }
 
@@ -10054,6 +10616,12 @@ mod tests {
                     &Meters::default(),
                     &SidebarState::default(),
                     true,
+                    &std::cell::Cell::new(None::<SidebarZone>),
+                    &std::cell::Cell::new(None::<TitleArrows>),
+                    &None::<TextSel>,
+                    &std::cell::RefCell::new(Vec::<ratatui::text::Line<'static>>::new()),
+                    &std::cell::Cell::new((0u16, 0u16)),
+                    false,
                 )
             })
             .unwrap();
@@ -10107,6 +10675,12 @@ mod tests {
                         &Meters::default(),
                         &SidebarState::default(),
                         fresh,
+                        &std::cell::Cell::new(None::<SidebarZone>),
+                        &std::cell::Cell::new(None::<TitleArrows>),
+                        &None::<TextSel>,
+                        &std::cell::RefCell::new(Vec::<ratatui::text::Line<'static>>::new()),
+                        &std::cell::Cell::new((0u16, 0u16)),
+                        false,
                     )
                 })
                 .unwrap();
@@ -10138,6 +10712,227 @@ mod tests {
             !frame_text(&t, false, true).contains("new conversation"),
             "non-empty transcript: no welcome"
         );
+    }
+
+    #[test]
+    fn jump_to_user_message_steps_between_user_rows() {
+        // user messages start at rows 5, 40, 100; total 200, visible 20
+        let rows = [5usize, 40, 100];
+        let mut scroll: Option<usize> = None;
+        // pinned at the tail (start 180): up finds the newest message
+        jump_to_user_message(&mut scroll, &rows, 200, 20, true);
+        assert_eq!(scroll, Some(100));
+        // down from there: nothing below the pinned tail stays pinned
+        scroll = None;
+        jump_to_user_message(&mut scroll, &rows, 200, 20, false);
+        assert_eq!(scroll, None);
+        // anchored mid-history: up = previous, down = next
+        scroll = Some(50);
+        jump_to_user_message(&mut scroll, &rows, 200, 20, true);
+        assert_eq!(scroll, Some(40));
+        scroll = Some(50);
+        jump_to_user_message(&mut scroll, &rows, 200, 20, false);
+        assert_eq!(scroll, Some(100));
+        // exactly on a message start: strict comparison steps past it
+        scroll = Some(40);
+        jump_to_user_message(&mut scroll, &rows, 200, 20, false);
+        assert_eq!(scroll, Some(100));
+        // above the first message: up is a no-op
+        scroll = Some(0);
+        jump_to_user_message(&mut scroll, &rows, 200, 20, true);
+        assert_eq!(scroll, Some(0));
+        // past the last message, not pinned: down lands on the live tail
+        scroll = Some(120);
+        jump_to_user_message(&mut scroll, &rows, 200, 20, false);
+        assert_eq!(scroll, None);
+        // no user rows / zero visible: never moves
+        scroll = Some(7);
+        jump_to_user_message(&mut scroll, &[], 200, 20, true);
+        assert_eq!(scroll, Some(7));
+        scroll = Some(7);
+        jump_to_user_message(&mut scroll, &rows, 200, 0, false);
+        assert_eq!(scroll, Some(7));
+    }
+
+    #[test]
+    fn wheel_steps_scroll_and_repin() {
+        let mut scroll = None;
+        line_up(&mut scroll, 100, 20);
+        assert_eq!(scroll, Some(77), "three rows up from the pinned tail");
+        line_down(&mut scroll, 100, 20);
+        assert_eq!(scroll, None, "77+3 reaches the tail anchor: re-pins");
+        scroll = Some(40);
+        line_down(&mut scroll, 100, 20);
+        assert_eq!(scroll, Some(43));
+        line_down(&mut scroll, 10, 20);
+        assert_eq!(scroll, None, "everything visible: always pinned");
+    }
+
+    #[test]
+    fn sidebar_zone_hit_testing() {
+        let zone = SidebarZone::SkillsHeader(ratatui::layout::Rect {
+            x: 94,
+            y: 5,
+            width: 26,
+            height: 1,
+        });
+        assert!(zone.hit(94, 5));
+        assert!(zone.hit(119, 5), "right edge of the sidebar chunk");
+        assert!(!zone.hit(120, 5), "past the sidebar");
+        assert!(!zone.hit(100, 6), "row below the header");
+        assert!(!zone.hit(93, 5), "left of the sidebar");
+    }
+
+    #[test]
+    fn title_arrows_hit_testing() {
+        let zone = TitleArrows {
+            up: ratatui::layout::Rect {
+                x: 88,
+                y: 1,
+                width: 2,
+                height: 1,
+            },
+            down: ratatui::layout::Rect {
+                x: 90,
+                y: 1,
+                width: 2,
+                height: 1,
+            },
+        };
+        assert_eq!(zone.hit(88, 1), Some(true), "up arrow cell");
+        assert_eq!(zone.hit(89, 1), Some(true), "up zone is two cells wide");
+        assert_eq!(zone.hit(90, 1), Some(false), "down arrow cell");
+        assert_eq!(zone.hit(91, 1), Some(false), "down zone is two cells wide");
+        assert_eq!(zone.hit(92, 1), None, "past the arrows");
+        assert_eq!(zone.hit(88, 2), None, "row below the title");
+    }
+
+    #[test]
+    fn skills_header_label_marks_count_when_collapsed() {
+        assert_eq!(skills_header_label(true, 4), "skills");
+        assert_eq!(skills_header_label(false, 0), "skills (+0)");
+        assert_eq!(skills_header_label(false, 12), "skills (+12)");
+    }
+
+    #[test]
+    fn skills_header_hover_lifts_onto_surface_tint() {
+        let rest = skills_header_line(true, false, 4);
+        let rest_spans: Vec<_> = rest
+            .spans
+            .iter()
+            .map(|s| (s.content.as_ref(), s.style))
+            .collect();
+        assert_eq!(rest_spans[0].0, "skills");
+        assert_eq!(rest_spans[1].0, " ▾");
+        assert_eq!(rest_spans[0].1.bg, None);
+        let hover = skills_header_line(true, true, 4);
+        let hover_spans: Vec<_> = hover
+            .spans
+            .iter()
+            .map(|s| (s.content.as_ref(), s.style))
+            .collect();
+        assert_eq!(hover_spans[0].1.fg, Some(crate::palette::ACCENT));
+        assert_eq!(hover_spans[0].1.bg, Some(crate::palette::BG_SURFACE));
+    }
+
+    #[test]
+    fn sidebar_collapsed_skills_render_header_alone() {
+        let sidebar = SidebarState {
+            inventory: Inventory {
+                skills: vec!["a".into(), "b".into(), "c".into()],
+                prompts: Vec::new(),
+                ..Default::default()
+            },
+            skills_open: false,
+            ..Default::default()
+        };
+        let rows = sidebar_rows(&sidebar, &Meters::default(), 24, 40, true, None);
+        let text = plain_text(&rows);
+        let idx = text
+            .iter()
+            .position(|t| t == "skills (+3) ▸")
+            .expect("collapsed header present");
+        // only the header row: the next rendered row is another section's
+        // separating blank / header, never a skill name
+        assert!(!text.iter().any(|t| t == "a" || t == "b" || t == "c"));
+        assert!(idx + 1 < text.len());
+    }
+
+    #[test]
+    fn selection_text_slices_rows_and_columns() {
+        let win = vec![
+            ratatui::text::Line::from("hello world"),
+            ratatui::text::Line::from("second line"),
+        ];
+        let origin = (10u16, 5u16);
+        // full first row + partial second
+        let text = selection_text(&win, origin, (10, 5), (13, 6)).unwrap();
+        assert_eq!(text, "hello world\nseco");
+        // a backwards drag covers the same rectangle
+        assert_eq!(
+            selection_text(&win, origin, (13, 6), (10, 5)).unwrap(),
+            "hello world\nseco"
+        );
+        // entirely above the window: nothing to copy
+        assert!(selection_text(&win, origin, (10, 0), (12, 1)).is_none());
+    }
+
+    #[test]
+    fn title_arrows_render_only_in_mouse_mode() {
+        use ratatui::backend::TestBackend;
+        let mut t = Transcript::default();
+        t.set_width(80);
+        t.push(Line::User("hello".into()));
+        let draw = |mouse: bool| -> (String, Option<TitleArrows>) {
+            let mut terminal = ratatui::Terminal::new(TestBackend::new(120, 40)).unwrap();
+            let sidebar_zone: std::cell::Cell<Option<SidebarZone>> = std::cell::Cell::new(None);
+            let title_arrows: std::cell::Cell<Option<TitleArrows>> = std::cell::Cell::new(None);
+            let sel: Option<TextSel> = None;
+            let frame_window: std::cell::RefCell<Vec<ratatui::text::Line<'static>>> =
+                std::cell::RefCell::new(Vec::new());
+            let frame_origin: std::cell::Cell<(u16, u16)> = std::cell::Cell::new((0, 0));
+            terminal
+                .draw(|f| {
+                    super::render(
+                        f,
+                        &t,
+                        None,
+                        "",
+                        0,
+                        false,
+                        None,
+                        Instant::now(),
+                        0,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        &Meters::default(),
+                        &SidebarState::default(),
+                        true,
+                        &sidebar_zone,
+                        &title_arrows,
+                        &sel,
+                        &frame_window,
+                        &frame_origin,
+                        mouse,
+                    )
+                })
+                .unwrap();
+            let row: String = (0..120u16)
+                .map(|x| terminal.backend().buffer()[(x, 1)].symbol())
+                .collect();
+            (row, title_arrows.get())
+        };
+        let (row, zones) = draw(true);
+        assert!(row.contains('▲') && row.contains('▼'), "{row}");
+        assert!(zones.is_some(), "click zones recorded in mouse mode");
+        let (row, zones) = draw(false);
+        assert!(!row.contains('▲'), "native mode paints no arrows: {row}");
+        assert!(zones.is_none(), "native mode records no click zones");
     }
 
     #[test]
