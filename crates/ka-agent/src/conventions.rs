@@ -13,6 +13,24 @@ pub struct AgentsFile {
     pub content: String,
 }
 
+/// Safe mode (`ka --safe-mode`, or `KA_SAFEMODE=1` in the
+/// environment): all convention discovery returns empty. Built-in
+/// tools, the config chain, rules, and auth stay untouched — a
+/// troubleshooting floor, not a factory reset. The CLI flips the
+/// process-global flag before spawning any runtime threads
+/// (`std::env::set_var` is unsafe in edition 2024 and the workspace
+/// forbids `unsafe`).
+static BARE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Enable safe mode for this process (CLI `--safe-mode`).
+pub fn set_bare_mode(on: bool) {
+    BARE.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn bare_mode() -> bool {
+    BARE.load(std::sync::atomic::Ordering::Relaxed)
+        || std::env::var("KA_SAFEMODE").is_ok_and(|v| v == "1")
+}
 /// Discover AGENTS.md files from the filesystem root side of cwd down to
 /// cwd itself (nearest = last). Stops walking at the home directory or `/`.
 /// One loaded memory file.
@@ -27,6 +45,9 @@ pub struct MemoryFile {
 /// AGENTS.md), then the user-level `~/.config/ka/MEMORY.md`. Missing
 /// files are skipped.
 pub fn discover_memory(cwd: &Path) -> Vec<MemoryFile> {
+    if bare_mode() {
+        return Vec::new();
+    }
     let mut out = Vec::new();
     let project = cwd.join("MEMORY.md");
     if let Ok(content) = std::fs::read_to_string(&project) {
@@ -54,6 +75,9 @@ pub fn discover_memory(cwd: &Path) -> Vec<MemoryFile> {
 }
 
 pub fn discover_agents(cwd: &Path) -> Vec<AgentsFile> {
+    if bare_mode() {
+        return Vec::new();
+    }
     let mut chain: Vec<PathBuf> = vec![cwd.to_path_buf()];
     let mut cur = cwd.to_path_buf();
     let home = std::env::var("HOME").map(PathBuf::from).ok();
@@ -104,6 +128,9 @@ pub struct Skill {
 /// Discover SKILL.md skills across ka-native and ecosystem directories.
 /// Progressive disclosure: only name+description+path reach the prompt.
 pub fn discover_skills(cwd: &Path) -> Vec<Skill> {
+    if bare_mode() {
+        return Vec::new();
+    }
     let project_trusted = crate::trust::project_trusted(cwd);
     let home = std::env::var("HOME").map(PathBuf::from).ok();
     let project = vec![
@@ -218,6 +245,13 @@ mod tests {
         assert_eq!(found[1].content, "mid rules (compat)");
         assert_eq!(found[2].content, "deep rules");
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn bare_mode_defaults_off() {
+        // safe mode is strictly opt-in: no test, layer, or startup path
+        // may leave the process-global flag set for the normal run
+        assert!(!bare_mode());
     }
 
     #[test]

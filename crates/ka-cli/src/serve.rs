@@ -3,7 +3,9 @@
 //! connection per request). Routes:
 //!
 //! - `GET /health` → `{"ok":true}`
-//! - `POST /sessions` → spawn an engine → `{"id":"s1"}`
+//! - `POST /sessions` → spawn an engine → `{"id":"s1"}`; optional body
+//!   `{"resume":"latest"}` or `{"resume":"<strand id/prefix>"}` attaches
+//!   to a strand on disk (replayed over SSE)
 //! - `POST /sessions/{id}/prompt` `{"text":...,"schema":...}` → queues
 //!   the turn → `{"ok":true}`
 //! - `GET /sessions/{id}/events` → SSE stream of ka events as
@@ -19,7 +21,7 @@ use std::process::ExitCode;
 use std::sync::Arc;
 
 use ka_agent::config::Config;
-use ka_agent::spawn;
+use ka_agent::{StrandChoice, spawn_full};
 use ka_protocol::{Command, Event};
 use serde_json::{Value, json};
 use tokio::io::AsyncWriteExt;
@@ -144,9 +146,40 @@ async fn handle_connection(
     match (req.method.as_str(), req.path.as_str()) {
         ("GET", "/health") => respond(&mut socket, 200, r#"{"ok":true}"#).await,
         ("POST", "/sessions") => {
+            // optional body: {"resume": "latest" | "<strand id/prefix>"}
+            // (absent = fresh session, today's behavior)
+            let resume = std::str::from_utf8(&req.body)
+                .ok()
+                .and_then(|t| serde_json::from_str::<Value>(t).ok())
+                .and_then(|v| {
+                    v.get("resume").map(|r| match r.as_str() {
+                        Some(s) => Ok(s.to_string()),
+                        None => Err("resume must be a string".to_string()),
+                    })
+                })
+                .transpose();
+            let resume = match resume {
+                Ok(r) => r,
+                Err(e) => {
+                    respond(&mut socket, 400, &json!({"error": e}).to_string()).await;
+                    return;
+                }
+            };
+            let choice = match resume.as_deref() {
+                None => StrandChoice::New,
+                Some("latest") => StrandChoice::Latest,
+                Some(id) => match resolve_strand(id) {
+                    Ok(choice) => choice,
+                    Err(e) => {
+                        respond(&mut socket, 400, &json!({"error": e}).to_string()).await;
+                        return;
+                    }
+                },
+            };
             let mut sessions = sessions.lock().await;
             let id = format!("s{}", sessions.len() + 1);
-            let ka_agent::EngineHandle { commands, events } = spawn(Config::default());
+            let ka_agent::EngineHandle { commands, events } =
+                spawn_full(Config::default(), ka_dialect::Catalog::embedded(), choice);
             sessions.insert(
                 id.clone(),
                 Arc::new(Session {
@@ -195,6 +228,20 @@ async fn handle_connection(
             }
         }
         _ => respond(&mut socket, 404, r#"{"error":"not found"}"#).await,
+    }
+}
+
+/// Resolve a strand reference (id or prefix) against the server's cwd,
+/// exactly like `ka --session`. `Err` = 400 material.
+fn resolve_strand(id: &str) -> Result<StrandChoice, String> {
+    let cwd = std::env::current_dir().unwrap_or_default();
+    match ka_strand::resolve_id(&cwd, id).map_err(|e| format!("session lookup: {e}"))? {
+        ka_strand::IdMatch::Unique(summary) => Ok(StrandChoice::Path(summary.path)),
+        ka_strand::IdMatch::None => Err(format!("no session matches '{id}'")),
+        ka_strand::IdMatch::Ambiguous(candidates) => {
+            let ids: Vec<String> = candidates.iter().map(|c| c.id.clone()).collect();
+            Err(format!("ambiguous session '{id}': {}", ids.join(", ")))
+        }
     }
 }
 

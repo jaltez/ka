@@ -45,6 +45,11 @@ struct Cli {
     /// Trust this directory's .ka/ka.toml (stores the decision)
     #[arg(long)]
     trust: bool,
+    /// Disable all customizations (AGENTS.md, MEMORY.md, skills,
+    /// agents, commands, hooks, MCP, LSP) keeping built-ins, config,
+    /// and auth
+    #[arg(long)]
+    safe_mode: bool,
 }
 
 #[derive(Subcommand, Clone)]
@@ -175,6 +180,18 @@ enum CliCommand {
         #[command(subcommand)]
         cmd: ConfigCommand,
     },
+
+    /// Hidden trampoline: apply a landlock policy to self, then exec.
+    /// Not for humans — ka-sandbox's wrap_command builds this argv.
+    #[cfg(target_os = "linux")]
+    #[command(hide = true)]
+    KaSandboxExec {
+        /// JSON array of writable roots.
+        policy: String,
+        /// The command to run (everything after `--`).
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        argv: Vec<String>,
+    },
 }
 
 #[derive(Subcommand, Clone)]
@@ -214,6 +231,9 @@ fn ka_data_dir_strands() -> PathBuf {
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
+    if cli.safe_mode {
+        ka_agent::conventions::set_bare_mode(true);
+    }
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -335,6 +355,7 @@ async fn dispatch(cli: Cli) -> Result<ExitCode, String> {
         dialects: cli.dialects,
         no_discovery: cli.no_discovery,
         trust: cli.trust,
+        safe_mode: cli.safe_mode,
     };
     match cli.command {
         Some(CliCommand::Run {
@@ -473,12 +494,85 @@ async fn dispatch(cli: Cli) -> Result<ExitCode, String> {
                 Ok(ExitCode::SUCCESS)
             }
         },
+        #[cfg(target_os = "linux")]
+        Some(CliCommand::KaSandboxExec { policy, argv }) => run_sandbox_exec(&policy, &argv),
         None => {
             Cli::command()
                 .print_help()
                 .map_err(|e| format!("help: {e}"))?;
             Ok(ExitCode::SUCCESS)
         }
+    }
+}
+
+/// Hidden `ka-sandbox-exec <policy-json> -- <argv…>`: apply the landlock
+/// ruleset to this process, then exec the real command (restrictions
+/// survive execve). Fails closed: any landlock error refuses to run.
+#[cfg(target_os = "linux")]
+fn run_sandbox_exec(policy: &str, argv: &[String]) -> Result<ExitCode, String> {
+    use std::os::unix::process::CommandExt;
+
+    let writable: Vec<PathBuf> =
+        serde_json::from_str(policy).map_err(|e| format!("sandbox policy: {e}"))?;
+    let (program, args) = argv
+        .split_first()
+        .ok_or_else(|| "sandbox-exec: no command after --".to_string())?;
+    apply_landlock(&writable)?;
+    // parity with bwrap --clearenv: the sandboxed command must not see
+    // the parent's environment (provider API keys live there). PATH is
+    // re-set to the bare minimum so plain commands still resolve.
+    let mut cmd = std::process::Command::new(program);
+    cmd.args(args);
+    cmd.env_clear();
+    cmd.env("PATH", "/usr/local/bin:/usr/bin:/bin");
+    let err = cmd.exec();
+    // exec() only returns on failure
+    Err(format!("sandbox-exec: {program}: {err}"))
+}
+
+/// Landlock policy: read everything beneath `/`; write only beneath the
+/// allowlist; network (bind/connect) denied when the kernel ABI ≥ 4
+/// (older kernels degrade silently — filesystem enforcement stays).
+/// Mirrors what bwrap's `--unshare-all` gives the fs tier.
+#[cfg(target_os = "linux")]
+fn apply_landlock(writable: &[PathBuf]) -> Result<(), String> {
+    use landlock::{
+        ABI, Access, AccessFs, AccessNet, Compatible, LandlockStatus, Ruleset, RulesetAttr,
+        RulesetCreatedAttr, path_beneath_rules,
+    };
+
+    // newest ABI the crate knows: IoctlDev (V5) and later rights get
+    // denied by default too; BestEffort at restrict_self degrades
+    // gracefully on older kernels (they simply don't have the rights)
+    let abi = ABI::V9;
+    let ruleset = Ruleset::default()
+        .handle_access(AccessFs::from_all(abi))
+        .map_err(|e| format!("sandbox: ruleset: {e}"))?;
+    // handled-but-ungranted network access = denied on ABI ≥ 4;
+    // BestEffort makes these no-ops where the kernel lacks it
+    let ruleset = ruleset
+        .handle_access(AccessNet::BindTcp)
+        .map_err(|e| format!("sandbox: ruleset (net bind): {e}"))?;
+    let ruleset = ruleset
+        .handle_access(AccessNet::ConnectTcp)
+        .map_err(|e| format!("sandbox: ruleset (net connect): {e}"))?;
+    let created = ruleset
+        .create()
+        .map_err(|e| format!("sandbox: ruleset create: {e}"))?
+        .add_rules(path_beneath_rules(["/"], AccessFs::from_read(abi)))
+        .map_err(|e| format!("sandbox: read rules: {e}"))?
+        .add_rules(path_beneath_rules(writable.iter(), AccessFs::from_all(abi)))
+        .map_err(|e| format!("sandbox: write rules: {e}"))?;
+    let status = created
+        .set_compatibility(landlock::CompatLevel::BestEffort)
+        .restrict_self()
+        .map_err(|e| format!("sandbox: landlock enforce: {e}"))?;
+    match status.landlock {
+        LandlockStatus::Available { .. } => Ok(()),
+        LandlockStatus::NotEnabled | LandlockStatus::NotImplemented => Err(
+            "sandbox: kernel landlock not enabled on this host — refusing to run unsandboxed"
+                .to_string(),
+        ),
     }
 }
 #[allow(clippy::too_many_arguments)]
@@ -865,10 +959,14 @@ async fn run_tui(cli: Cli) -> Result<ExitCode, String> {
     let fresh = matches!(choice, ka_agent::StrandChoice::New);
     let handle = ka_agent::spawn_full(cfg, catalog, choice);
     let ka_agent::EngineHandle { commands, events } = handle;
-    let agents: Vec<(String, String)> = ka_agent::agents::AgentDef::discover(&cwd)
-        .into_iter()
-        .map(|a| (a.name, a.description))
-        .collect();
+    let agents: Vec<(String, String)> = if ka_agent::conventions::bare_mode() {
+        Vec::new()
+    } else {
+        ka_agent::agents::AgentDef::discover(&cwd)
+            .into_iter()
+            .map(|a| (a.name, a.description))
+            .collect()
+    };
     let cfg_tui_header_glyph = {
         let trust = trust_for_cwd(false);
         load_config(&cli.configs, cli.model.clone(), cli.mode.clone(), trust)

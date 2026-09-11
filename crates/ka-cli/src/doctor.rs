@@ -53,6 +53,13 @@ pub async fn run(net: bool, json: bool) -> Result<ExitCode, String> {
     // local data: strand count + spills size
     checks.push(local_data_check());
 
+    // lsp: every configured language server command must exist on PATH
+    checks.push(lsp_check(&cfg));
+
+    // sandbox: which fs-mode enforcement engine is active (and whether
+    // the configured mode has one at all)
+    checks.push(sandbox_check(&cfg));
+
     if net {
         checks.push(provider_net_check().await);
         checks.push(mcp_net_check(&cfg).await);
@@ -252,6 +259,81 @@ fn dir_size(path: &Path) -> u64 {
         }
     }
     total
+}
+
+/// LSP health: when enabled, every configured language server command
+/// must resolve on PATH (first whitespace token is the binary).
+fn lsp_check(cfg: &Config) -> Check {
+    if cfg.lsp.enable != Some(true) {
+        return Check {
+            name: "lsp",
+            ok: true,
+            detail: "disabled ([lsp] enable = true to turn on)".to_string(),
+        };
+    }
+    let Some(commands) = cfg.lsp.commands.as_ref() else {
+        return Check {
+            name: "lsp",
+            ok: true,
+            detail: "enabled, no [lsp.commands] configured".to_string(),
+        };
+    };
+    let mut parts: Vec<String> = Vec::with_capacity(commands.len());
+    let mut ok = true;
+    for (lang, command) in commands {
+        let Some(bin) = command.split_whitespace().next() else {
+            parts.push(format!("{lang}: (empty command)"));
+            ok = false;
+            continue;
+        };
+        let found = on_path(bin);
+        ok &= found;
+        parts.push(format!(
+            "{lang}: {bin}{}",
+            if found { "" } else { " (not on PATH)" }
+        ));
+    }
+    Check {
+        name: "lsp",
+        ok,
+        detail: parts.join("; "),
+    }
+}
+
+/// Whether `bin` exists as a file on PATH (or is an explicit path).
+fn on_path(bin: &str) -> bool {
+    if bin.contains('/') {
+        return std::path::Path::new(bin).exists();
+    }
+    std::env::var_os("PATH")
+        .map(|paths| std::env::split_paths(&paths).any(|dir| dir.join(bin).is_file()))
+        .unwrap_or(false)
+}
+
+/// Which fs-mode enforcement engine this host offers. A configured
+/// `[sandbox] mode = "fs"` with no engine is a failure: every bash
+/// call will refuse at runtime.
+fn sandbox_check(cfg: &Config) -> Check {
+    let engine = match ka_sandbox::detect_tool() {
+        Some(ka_sandbox::Tool::Bubblewrap) => "bubblewrap (bwrap)",
+        Some(ka_sandbox::Tool::Firejail) => "firejail",
+        Some(ka_sandbox::Tool::Landlock) => "kernel landlock (re-exec trampoline)",
+        None => "none",
+    };
+    let fs_configured = cfg.sandbox.mode.as_deref() == Some("fs");
+    let ok = !(fs_configured && engine == "none");
+    Check {
+        name: "sandbox",
+        ok,
+        detail: if fs_configured && engine == "none" {
+            "mode \"fs\" configured but no engine (bwrap, firejail, landlock) — bash will refuse"
+                .to_string()
+        } else if fs_configured {
+            format!("mode \"fs\" via {engine}")
+        } else {
+            format!("{engine} (mode \"fs\" would use it)")
+        },
+    }
 }
 
 /// Live `/v1/models` reachability for cloud providers with keys set.

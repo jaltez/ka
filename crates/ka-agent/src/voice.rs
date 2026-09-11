@@ -127,6 +127,10 @@ fn message_tokens(msg: &TurnMessage, ratio: f64) -> u64 {
 /// result receiver).
 type SpecSlot = std::sync::Arc<tokio::sync::Mutex<Option<(usize, oneshot::Receiver<String>)>>>;
 
+/// Shared LSP diagnostics manager (engine-owned, opt-in): edit/write
+/// results get informational diagnostics appended.
+pub(crate) type LspSlot = std::sync::Arc<tokio::sync::Mutex<crate::lsp::LspManager>>;
+
 pub struct Voice {
     catalog: Catalog,
     speakers: HashMap<Wire, std::sync::Arc<dyn Speaker>>,
@@ -186,6 +190,8 @@ pub struct Voice {
     /// Todo list slot shared with the hand; forwarded to surfaces as
     /// `Event::Todos` after each `todo` call.
     todo: crate::hands::todo::TodoSlot,
+    /// Opt-in LSP diagnostics manager (engine bootstrap).
+    lsp: Option<LspSlot>,
 }
 
 impl Voice {
@@ -240,6 +246,7 @@ impl Voice {
             allowed_tools: Vec::new(),
             pathfinder_slot: slot,
             todo: todos,
+            lsp: None,
         }
     }
 
@@ -339,6 +346,7 @@ impl Voice {
             speculative: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
             pathfinder_slot: slot,
             todo: todos,
+            lsp: None,
         }
     }
 
@@ -507,6 +515,11 @@ impl Voice {
         self.hand_ctx.sandbox = policy;
     }
 
+    /// Set the LSP diagnostics manager (engine bootstrap).
+    pub fn set_lsp(&mut self, lsp: LspSlot) {
+        self.lsp = Some(lsp);
+    }
+
     /// Set the bash auto-background threshold in ms (engine bootstrap;
     /// 0 = never background).
     pub fn set_bash_background_ms(&mut self, ms: u64) {
@@ -519,14 +532,38 @@ impl Voice {
         self.hand_ctx.jobs.clone()
     }
     /// Run matching hooks for one event. Returns Err(reason) when a
-    /// pre_tool_use hook blocked the call (exit 2, stderr as reason).
+    /// pre_tool_use hook blocked the call (exit 2, stderr as reason);
+    /// Ok(steering) carries stdout steering when a hook emitted it.
     async fn run_hooks(
         &self,
         event: crate::config::HookEvent,
         tool: &str,
         args: &serde_json::Value,
-    ) -> Result<(), String> {
+    ) -> Result<Option<crate::fshooks::Steering>, String> {
         run_hook_scripts(&self.hooks_cfg, event, tool, args, &self.hand_ctx.cwd).await
+    }
+
+    /// Apply hook steering: switch the gate's permission mode (same
+    /// path as `/mode`, `Event::ModeChanged` keeps surfaces in step)
+    /// and surface the note as a transcript row.
+    async fn apply_steering(
+        &mut self,
+        steer: Option<crate::fshooks::Steering>,
+        events: &mpsc::Sender<Event>,
+    ) {
+        let Some(s) = steer else { return };
+        if let Some(mode) = s.mode {
+            self.mode = mode;
+            events.send(Event::ModeChanged { mode }).await.ok();
+        }
+        if let Some(note) = s.note {
+            events
+                .send(Event::Note {
+                    message: format!("hook: {note}"),
+                })
+                .await
+                .ok();
+        }
     }
 
     /// Fire `stop` hooks at turn exit and record the stop kind.
@@ -1573,8 +1610,18 @@ attempt implementation — the user will review and switch to build mode.",
                     let events = events.clone();
                     let hooks = self.hooks_cfg.clone();
                     let todo = self.todo.clone();
+                    let lsp = self.lsp.clone();
                     let handle = in_flight.spawn(async move {
-                        let output = execute_approved(&hand, &hooks, &call, &ctx, &events).await;
+                        let (mut output, steer) =
+                            execute_approved(&hand, &hooks, &call, &ctx, &events).await;
+                        // LSP diagnostics ride successful edit/write results
+                        // as informational context — never errors (opencode
+                        // #9102: diagnostics must not read as tool failure)
+                        if !output.is_error && (call.tool == "edit" || call.tool == "write") {
+                            if let Some(lsp) = lsp.as_ref() {
+                                enrich_with_lsp(&mut output, &call, &ctx, lsp).await;
+                            }
+                        }
                         // the todo hand owns normalization; surfaces get the
                         // fresh list as a whole-replacement event
                         if call.tool == "todo" && !output.is_error {
@@ -1599,7 +1646,7 @@ attempt implementation — the user will review and switch to build mode.",
                             })
                             .await
                             .ok();
-                        (idx, output)
+                        (idx, output, steer)
                     });
                     task_idx.insert(handle.id(), idx);
                 }
@@ -1620,7 +1667,24 @@ attempt implementation — the user will review and switch to build mode.",
                             Some(_) => {}
                         },
                         joined = in_flight.join_next() => match joined {
-                            Some(Ok((idx, output))) => slots[idx] = Some(output),
+                            Some(Ok((idx, output, steer))) => {
+                                slots[idx] = Some(output);
+                                // post-tool steering: note now, mode via
+                                // the shared seam below
+                                if let Some(s) = steer {
+                                    if let Some(note) = s.note {
+                                        events
+                                            .send(Event::Note {
+                                                message: format!("hook: {note}"),
+                                            })
+                                            .await
+                                            .ok();
+                                    }
+                                    if s.mode.is_some() {
+                                        mode_change = s.mode;
+                                    }
+                                }
+                            }
                             Some(Err(e)) => {
                                 // a panicking hand must not wedge the step
                                 if let Some(idx) = task_idx.remove(&e.id()) {
@@ -1653,6 +1717,7 @@ attempt implementation — the user will review and switch to build mode.",
                 }
                 if let Some(mode) = mode_change {
                     self.set_mode(mode);
+                    events.send(Event::ModeChanged { mode }).await.ok();
                 }
             }
             if aborted {
@@ -1839,8 +1904,9 @@ attempt implementation — the user will review and switch to build mode.",
             self.surface_decided(call, &output, events).await;
             return Err(output);
         };
-        // pre_tool_use hooks: exit 2 blocks before any gate
-        if let Err(reason) = self
+        // pre_tool_use hooks: exit 2 blocks before any gate; stdout may
+        // steer (mode/note)
+        match self
             .run_hooks(
                 crate::config::HookEvent::PreToolUse,
                 &call.tool,
@@ -1848,9 +1914,12 @@ attempt implementation — the user will review and switch to build mode.",
             )
             .await
         {
-            let output = ToolOutput::err(format!("blocked by hook: {reason}"));
-            self.surface_decided(call, &output, events).await;
-            return Err(output);
+            Err(reason) => {
+                let output = ToolOutput::err(format!("blocked by hook: {reason}"));
+                self.surface_decided(call, &output, events).await;
+                return Err(output);
+            }
+            Ok(steer) => self.apply_steering(steer, events).await,
         }
         let verdict = self.gate(hand.clearance_for(&call.arguments), call);
         match verdict {
@@ -1938,23 +2007,28 @@ attempt implementation — the user will review and switch to build mode.",
                 }
             }
         }
-        // convention pre-tool hook: non-zero exit vetoes the call
-        if let Err(reason) = crate::fshooks::run(
+        // convention pre-tool hook: non-zero exit vetoes the call;
+        // clean-exit stdout steers the mode for subsequent calls (the
+        // veto position — after the gate — is unchanged)
+        match crate::fshooks::run(
             crate::fshooks::HookPoint::PreTool,
             &self.hand_ctx.cwd,
             Some(&call.tool),
         )
         .await
         {
-            events
-                .send(Event::Note {
-                    message: reason.clone(),
-                })
-                .await
-                .ok();
-            let output = ToolOutput::err(format!("blocked by pre-tool hook: {reason}"));
-            self.surface_decided(call, &output, events).await;
-            return Err(output);
+            Err(reason) => {
+                events
+                    .send(Event::Note {
+                        message: reason.clone(),
+                    })
+                    .await
+                    .ok();
+                let output = ToolOutput::err(format!("blocked by pre-tool hook: {reason}"));
+                self.surface_decided(call, &output, events).await;
+                return Err(output);
+            }
+            Ok(steer) => self.apply_steering(steer, events).await,
         }
         Ok(hand)
     }
@@ -2042,8 +2116,10 @@ use /build to switch to implementation"
                 if let Some(stop) = hardstop(command, &analysis) {
                     return Gate::Ask {
                         question: format!(
-                            "HARDSTOP — {}: `{}`. Proceed anyway?",
-                            stop.reason, command
+                            "HARDSTOP — {}: `{}`. Proceed anyway?{}",
+                            stop.reason,
+                            command,
+                            self.cost_suffix()
                         ),
                     };
                 }
@@ -2064,14 +2140,46 @@ use /build to switch to implementation"
                 match self.mode {
                     ka_protocol::Mode::Free => Gate::Allow,
                     ka_protocol::Mode::Plan => Gate::Ask {
-                        question: format!("plan mode: run `{command}`? (build with /build)"),
+                        question: format!(
+                            "plan mode: run `{command}`? (build with /build){}",
+                            self.cost_suffix()
+                        ),
                     },
                     ka_protocol::Mode::AcceptEdits | ka_protocol::Mode::Guarded => Gate::Ask {
-                        question: format!("run `{command}`?"),
+                        question: format!("run `{command}`?{}", self.cost_suffix()),
                     },
                 }
             }
         }
+    }
+
+    /// One-line cost estimate appended to exec-tier permission asks:
+    /// current context (chars/ratio) billed at the catalog's input
+    /// price plus an assumed 2 048 output tokens at its output price.
+    /// Empty for unpriced models (pricing honesty: no fake numbers).
+    fn cost_suffix(&self) -> String {
+        let Some(selector) = self.model_selector.as_deref() else {
+            return String::new();
+        };
+        let Ok(parsed) = ka_dialect::parse_selector(selector) else {
+            return String::new();
+        };
+        let Some(dialect) = self.catalog.get(&parsed.model_id()) else {
+            return String::new();
+        };
+        if !dialect.priced {
+            return String::new();
+        }
+        let ratio = if self.ratio > 0.0 { self.ratio } else { 4.0 };
+        let mut ctx_tokens: u64 = self.history.iter().map(|m| message_tokens(m, ratio)).sum();
+        // the digest rides in the system prompt, not history — it counts
+        // toward billed context too
+        if let Some(digest) = &self.digest {
+            ctx_tokens += (digest.len() as f64 / ratio).ceil() as u64;
+        }
+        let est = ctx_tokens as f64 / 1_000_000.0 * dialect.price.input_per_mtok
+            + 2048.0 / 1_000_000.0 * dialect.price.output_per_mtok;
+        format!(" (rough est. ≈ ${est:.3} — pricing is per-Mtok catalog data)")
     }
 }
 
@@ -2085,7 +2193,7 @@ async fn execute_approved(
     call: &ToolCall,
     ctx: &HandContext,
     events: &mpsc::Sender<Event>,
-) -> ToolOutput {
+) -> (ToolOutput, Option<crate::fshooks::Steering>) {
     // bash runs long: pump live preview emissions while the child
     // works. Partials are new-since-last-emission output on the same
     // call id (is_error=false, spill=None, redacted, hard-capped);
@@ -2114,8 +2222,10 @@ async fn execute_approved(
     } else {
         hand.execute(&call.arguments, ctx).await
     };
-    // post_tool_use hooks: exit 2 flags the result as an error
-    if let Err(reason) = run_hook_scripts(
+    let mut steering = None;
+    // post_tool_use hooks: exit 2 flags the result as an error; clean
+    // stdout may steer
+    match run_hook_scripts(
         hooks,
         crate::config::HookEvent::PostToolUse,
         &call.tool,
@@ -2124,14 +2234,72 @@ async fn execute_approved(
     )
     .await
     {
-        output.is_error = true;
-        output
-            .content
-            .push_str(&format!("\n[post-tool hook: {reason}]"));
+        Err(reason) => {
+            output.is_error = true;
+            output
+                .content
+                .push_str(&format!("\n[post-tool hook: {reason}]"));
+        }
+        Ok(steer) => steering = steer,
     }
     // one-way secret redaction before anything reaches the model
     output.content = crate::hands::secrets::redact(&output.content);
-    output
+    (output, steering)
+}
+
+/// Append LSP diagnostics to a successful edit/write result. The file
+/// on disk is authoritative (the hand just wrote it); `touch` feeds it
+/// to the language server and we poll the diagnostics cache for up to
+/// 1.5 s — a cold server that loses the race simply contributes
+/// nothing this edit. The block is omitted when empty and never flips
+/// `is_error`.
+async fn enrich_with_lsp(
+    output: &mut ToolOutput,
+    call: &ToolCall,
+    ctx: &HandContext,
+    lsp: &LspSlot,
+) {
+    let Some(path_arg) = call
+        .arguments
+        .get("path")
+        .and_then(serde_json::Value::as_str)
+    else {
+        return;
+    };
+    let full = crate::hands::read::resolve(ctx, path_arg);
+    let Ok(text) = std::fs::read_to_string(&full) else {
+        return;
+    };
+    let mut mgr = lsp.lock().await;
+    // touch reports whether content actually went to a server; when it
+    // didn't (disabled, unknown language, unconfigured) there is nothing
+    // to poll — skipping the wait keeps default-config edits fast
+    if !mgr.touch(&full, &text).await {
+        return;
+    }
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(1500);
+    // None = server hasn't published for THIS content yet (the cache was
+    // invalidated on touch); a published-empty result also exits the
+    // loop immediately (clean file). The prior edit's diagnostics can
+    // never leak through here.
+    let mut rendered = mgr.diagnostics(&full);
+    while rendered.is_none() && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        rendered = mgr.diagnostics(&full);
+    }
+    let Some(rendered) = rendered else {
+        return;
+    };
+    if rendered.is_empty() {
+        return;
+    }
+    // the block is appended after execute_approved's redaction — apply
+    // the same one-way redaction here (diagnostics quote file text)
+    let block = crate::hands::secrets::redact(&format!(
+        "\n<lsp-diagnostics note=\"informational context — your edit succeeded\">\n{}\n</lsp-diagnostics>",
+        rendered.join("\n")
+    ));
+    output.content.push_str(&block);
 }
 
 /// Run matching hook scripts for one event. Returns Err(reason) when a
@@ -2143,8 +2311,9 @@ async fn run_hook_scripts(
     tool: &str,
     args: &serde_json::Value,
     cwd: &std::path::Path,
-) -> Result<(), String> {
+) -> Result<Option<crate::fshooks::Steering>, String> {
     use tokio::io::AsyncWriteExt;
+    let mut steering = None;
     for hook in hooks {
         if hook.event != event {
             continue;
@@ -2189,8 +2358,20 @@ async fn run_hook_scripts(
                 reason
             });
         }
+        // steering: on a clean exit, a JSON object on stdout may switch
+        // the mode and/or surface a note. Unparsable or empty stdout is
+        // IGNORED — it never erases an earlier hook's steering (only a
+        // hook that actually emits steering wins, latest first).
+        if output.status.success() {
+            if let Some(s) =
+                crate::fshooks::parse_steering(&String::from_utf8_lossy(&output.stdout))
+                    .into_nonempty()
+            {
+                steering = Some(s);
+            }
+        }
     }
-    Ok(())
+    Ok(steering)
 }
 
 /// Run configured `stop` hooks once at turn exit (`status` is `done`,
@@ -3761,6 +3942,151 @@ mod tests {
                 ..
             })
         ));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn exec_ask_appends_cost_estimate_for_priced_models_only() {
+        struct WantsBash;
+        impl Speaker for WantsBash {
+            fn speak<'a>(
+                &'a self,
+                req: SpeakRequest,
+                out: tokio::sync::mpsc::Sender<StreamEvent>,
+            ) -> SpeakFuture<'a> {
+                Box::pin(async move {
+                    let ran = req.messages.iter().any(|m| !m.results.is_empty());
+                    if ran {
+                        out.send(StreamEvent::Text("done".into())).await.ok();
+                    } else {
+                        out.send(StreamEvent::Call(ToolCall {
+                            id: "b1".into(),
+                            tool: "bash".into(),
+                            arguments: serde_json::json!({
+                                "command": "touch priced-marker"
+                            }),
+                        }))
+                        .await
+                        .ok();
+                    }
+                    out.send(StreamEvent::Finished {
+                        stop: ka_protocol::Stop::Done,
+                        usage: Usage::default(),
+                    })
+                    .await
+                    .ok();
+                })
+            }
+        }
+        let dir = std::env::temp_dir().join(format!("ka-cost-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let priced = Catalog::parse(
+            "[dialects.\"test/m\"]\nwire = \"openai_chat\"\nbase_url = \"http://127.0.0.1:1\"\ncontext = 1000\npriced = true\n\n[dialects.\"test/m\".price]\ninput_per_mtok = 1.0\noutput_per_mtok = 0.0\n",
+        )
+        .unwrap();
+        let mut voice = Voice::new(priced, dir.clone(), ka_protocol::Mode::Guarded, 5)
+            .with_speaker(Wire::OpenaiChat, std::sync::Arc::new(WantsBash));
+        let mut guards = GuardRuntime::default();
+        // choice 2 = deny: the ask text is what we assert on
+        let (events, _) = drive_turn(&mut voice, &mut guards, "run it", Some(2)).await;
+        let ask_text = events
+            .iter()
+            .find_map(|e| match e {
+                Event::Ask { questions, .. } => questions.first().map(|q| q.text.clone()),
+                _ => None,
+            })
+            .expect("exec ask fired");
+        assert!(
+            ask_text.contains("rough est. ≈ $"),
+            "priced model ask carries the estimate: {ask_text}"
+        );
+
+        // unpriced row: no estimate, identical question otherwise
+        let unpriced = Catalog::parse(
+            "[dialects.\"test/m\"]\nwire = \"openai_chat\"\nbase_url = \"http://127.0.0.1:1\"\ncontext = 1000\n",
+        )
+        .unwrap();
+        let mut bare = Voice::new(unpriced, dir.clone(), ka_protocol::Mode::Guarded, 5)
+            .with_speaker(Wire::OpenaiChat, std::sync::Arc::new(WantsBash));
+        let (events2, _) = drive_turn(&mut bare, &mut guards, "run it", Some(2)).await;
+        let ask2 = events2
+            .iter()
+            .find_map(|e| match e {
+                Event::Ask { questions, .. } => questions.first().map(|q| q.text.clone()),
+                _ => None,
+            })
+            .expect("ask fired");
+        assert!(
+            !ask2.contains("rough est."),
+            "unpriced model must not show an estimate: {ask2}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn hook_stdout_steers_mode_and_notes() {
+        struct RunsEcho;
+        impl Speaker for RunsEcho {
+            fn speak<'a>(
+                &'a self,
+                req: SpeakRequest,
+                out: tokio::sync::mpsc::Sender<StreamEvent>,
+            ) -> SpeakFuture<'a> {
+                Box::pin(async move {
+                    let ran = req.messages.iter().any(|m| !m.results.is_empty());
+                    if ran {
+                        out.send(StreamEvent::Text("done".into())).await.ok();
+                    } else {
+                        out.send(StreamEvent::Call(ToolCall {
+                            id: "e1".into(),
+                            tool: "bash".into(),
+                            arguments: serde_json::json!({ "command": "echo hi" }),
+                        }))
+                        .await
+                        .ok();
+                    }
+                    out.send(StreamEvent::Finished {
+                        stop: ka_protocol::Stop::Done,
+                        usage: Usage::default(),
+                    })
+                    .await
+                    .ok();
+                })
+            }
+        }
+        let dir = std::env::temp_dir().join(format!("ka-steer-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let catalog = Catalog::parse(
+            "[dialects.\"test/m\"]\nwire = \"openai_chat\"\nbase_url = \"http://127.0.0.1:1\"\ncontext = 1000\n",
+        )
+        .unwrap();
+        let mut voice = Voice::new(catalog, dir.clone(), ka_protocol::Mode::Free, 5)
+            .with_speaker(Wire::OpenaiChat, std::sync::Arc::new(RunsEcho));
+        voice.set_hooks(vec![crate::config::Hook {
+            event: crate::config::HookEvent::PreToolUse,
+            tool: Some("bash".to_string()),
+            command: r#"echo '{"mode":"plan","note":"switching"}'"#.to_string(),
+        }]);
+        let mut guards = GuardRuntime::default();
+        let (events, _) = drive_turn(&mut voice, &mut guards, "run", None).await;
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                Event::ModeChanged {
+                    mode: ka_protocol::Mode::Plan
+                }
+            )),
+            "steering switched the mode: {events:?}"
+        );
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, Event::Note { message } if message == "hook: switching")),
+            "steering surfaced the note: {events:?}"
+        );
+        assert_eq!(voice.mode, ka_protocol::Mode::Plan, "gate mode updated");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -331,12 +331,22 @@ async fn run(
         .map(std::path::PathBuf::from)
         .or_else(|| std::env::current_dir().ok())
         .unwrap_or_else(|| std::path::PathBuf::from("."));
-    let mcp_servers = config.mcp.clone();
+    // safe mode: config-file hooks are customizations too — built-ins,
+    // config chain, rules, and auth stay
+    let mcp_servers = if crate::conventions::bare_mode() {
+        Vec::new()
+    } else {
+        config.mcp.clone()
+    };
     let mode = config.effective_mode();
     let max_steps = config.effective_max_steps();
     let rules = config.rules.clone();
     let allowed_tools = config.permissions.allow.clone();
-    let hooks = config.hooks.clone();
+    let hooks = if crate::conventions::bare_mode() {
+        Vec::new()
+    } else {
+        config.hooks.clone()
+    };
     // roles resolve once at engine start, through the same catalog the
     // main model uses (discovery overlays already applied by the caller)
     let roles = resolve_roles(&catalog, &config.roles, config.model.as_deref());
@@ -353,6 +363,15 @@ async fn run(
     voice.set_context_promote(config.effective_context_promote());
     let sandbox_policy = ka_sandbox::policy_from_config(&config.sandbox.to_policy_config(), &cwd)?;
     voice.set_sandbox(sandbox_policy);
+    // safe mode: [lsp] spawns user-configured executables — same risk
+    // class as hooks/MCP, so the diagnostics tier is inert there too
+    let lsp_cfg = if crate::conventions::bare_mode() {
+        crate::config::Lsp::default()
+    } else {
+        config.lsp.clone()
+    };
+    let lsp = crate::lsp::LspManager::new(&cwd, &lsp_cfg);
+    voice.set_lsp(std::sync::Arc::new(tokio::sync::Mutex::new(lsp)));
     voice.set_web_allow_private(config.effective_web_allow_private());
     {
         let slot = voice.pathfinder_slot();
@@ -372,7 +391,12 @@ async fn run(
         maintenance: maintenance_rx,
     };
     // markdown agents: .ka/agents/*.md etc. become one `delegate` hand
-    let agents = crate::agents::AgentDef::discover(&ctx.cwd);
+    // (empty in safe mode)
+    let agents = if crate::conventions::bare_mode() {
+        Vec::new()
+    } else {
+        crate::agents::AgentDef::discover(&ctx.cwd)
+    };
     let agent_names: Vec<String> = agents.iter().map(|a| a.name.clone()).collect();
     if !agents.is_empty() {
         let slot = ctx.voice.pathfinder_slot();
@@ -1545,8 +1569,11 @@ async fn dispatch_turn(
     strand: &mut ka_strand::StrandFile,
     cwd: &std::path::Path,
 ) {
-    if let Err(note) = crate::fshooks::run(HookPoint::PreTurn, cwd, None).await {
-        events.send(Event::Note { message: note }).await.ok();
+    match crate::fshooks::run(HookPoint::PreTurn, cwd, None).await {
+        Ok(steer) => apply_steering(steer, events, state, voice, strand).await,
+        Err(note) => {
+            events.send(Event::Note { message: note }).await.ok();
+        }
     }
     let prompt_head = text.lines().next().unwrap_or("").to_string();
     let usage = if let Some(model) = state.model.clone() {
@@ -1600,8 +1627,11 @@ async fn dispatch_turn(
         cache_write: usage.cache_write,
     });
     persist_delta(voice, state, strand);
-    if let Err(note) = crate::fshooks::run(HookPoint::PostTurn, cwd, None).await {
-        events.send(Event::Note { message: note }).await.ok();
+    match crate::fshooks::run(HookPoint::PostTurn, cwd, None).await {
+        Ok(steer) => apply_steering(steer, events, state, voice, strand).await,
+        Err(note) => {
+            events.send(Event::Note { message: note }).await.ok();
+        }
     }
     // overflow promotion: apply the same switch path as /model
     if let Some(selector) = voice.take_promotion() {
@@ -1617,6 +1647,38 @@ async fn dispatch_turn(
     }
 }
 
+/// Apply hook steering engine-side: mode reaches the engine's own
+/// record, the voice's gate, surfaces (`Event::ModeChanged`), and the
+/// strand (`Change` record — a steered mode survives restart like a
+/// `/mode` switch); the note surfaces as a transcript row.
+async fn apply_steering(
+    steer: Option<crate::fshooks::Steering>,
+    events: &mpsc::Sender<Event>,
+    state: &mut EngineState,
+    voice: &mut Voice,
+    strand: &mut ka_strand::StrandFile,
+) {
+    let Some(s) = steer else { return };
+    if let Some(mode) = s.mode {
+        state.mode = mode;
+        voice.set_mode(mode);
+        let _ = strand.append(ka_strand::Record::Change {
+            id: ka_strand::new_record_id(),
+            model: None,
+            effort: None,
+            mode: Some(mode),
+        });
+        events.send(Event::ModeChanged { mode }).await.ok();
+    }
+    if let Some(note) = s.note {
+        events
+            .send(Event::Note {
+                message: format!("hook: {note}"),
+            })
+            .await
+            .ok();
+    }
+}
 /// Copy the current strand into a new strand file truncated to drop the
 /// last `turns` user turns (0 = exact copy), titled "<original> (fork)".
 fn fork_strand(

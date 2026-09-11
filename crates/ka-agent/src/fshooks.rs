@@ -37,19 +37,73 @@ impl HookPoint {
     }
 }
 
-/// Per-hook time budget.
 const HOOK_TIMEOUT: Duration = Duration::from_secs(10);
 /// Cap on the stderr tail carried in veto/note messages.
 const TAIL_CHARS: usize = 400;
+/// Cap on steering note length (chars).
+const NOTE_CHARS: usize = 200;
 
-/// Run the convention hook for `event` if one exists. `Ok(())` means
-/// proceed (hook missing, or exited zero); `Err(reason)` means the hook
-/// failed or timed out, with the stderr tail as the reason.
+/// Minimal hook-stdout steering: a JSON object may switch the
+/// permission mode and/or surface a short note. Anything else —
+/// invalid JSON, unknown keys, non-objects — is ignored silently; hook
+/// output never fails a turn. This is deliberately the whole action
+/// language (no rule mutation, no directory adds).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct Steering {
+    pub mode: Option<ka_protocol::Mode>,
+    pub note: Option<String>,
+}
+
+/// Parse steering off a successful hook's trimmed stdout.
+pub(crate) fn parse_steering(stdout: &str) -> Steering {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(stdout.trim()) else {
+        return Steering::default();
+    };
+    if !v.is_object() {
+        return Steering::default();
+    }
+    let mode = v
+        .get("mode")
+        .and_then(|m| m.as_str())
+        .and_then(|s| match s {
+            "guarded" => Some(ka_protocol::Mode::Guarded),
+            "accept-edits" | "accept_edits" => Some(ka_protocol::Mode::AcceptEdits),
+            "free" => Some(ka_protocol::Mode::Free),
+            "plan" => Some(ka_protocol::Mode::Plan),
+            _ => None,
+        });
+    let note = v
+        .get("note")
+        .and_then(|n| n.as_str())
+        .map(|s| s.chars().take(NOTE_CHARS).collect::<String>())
+        .filter(|s| !s.is_empty());
+    Steering { mode, note }
+}
+
+impl Steering {
+    /// `None` when nothing parsed (callers skip empty steering).
+    pub(crate) fn into_nonempty(self) -> Option<Steering> {
+        (self != Steering::default()).then_some(self)
+    }
+}
+
+/// Run the convention hook for `event` if one exists. `Ok(None)` means
+/// proceed without steering (hook missing, or exited zero with no
+/// parseable steering stdout); `Ok(Some(..))` carries stdout steering;
+/// `Err(reason)` means the hook failed or timed out, with the stderr
+/// tail as the reason.
 ///
-/// Convention hooks are project-scope `.ka/` content: they only run in a
-/// trusted project (see [`crate::trust`]). An untrusted project's hook is
-/// silently skipped.
-pub async fn run(event: HookPoint, cwd: &Path, tool: Option<&str>) -> Result<(), String> {
+/// Convention hooks are project-scope `.ka/` content: they only run in
+/// a trusted project (see [`crate::trust`]). An untrusted project's
+/// hook is silently skipped.
+pub async fn run(
+    event: HookPoint,
+    cwd: &Path,
+    tool: Option<&str>,
+) -> Result<Option<Steering>, String> {
+    if crate::conventions::bare_mode() {
+        return Ok(None);
+    }
     run_trusted(event, cwd, tool, crate::trust::project_trusted(cwd)).await
 }
 
@@ -59,12 +113,12 @@ pub async fn run_trusted(
     cwd: &Path,
     tool: Option<&str>,
     project_trusted: bool,
-) -> Result<(), String> {
+) -> Result<Option<Steering>, String> {
     if !project_trusted {
-        return Ok(());
+        return Ok(None);
     }
     let Some(script) = locate(event, cwd) else {
-        return Ok(());
+        return Ok(None);
     };
     let name = event.name();
     let tool = tool.map(str::to_string);
@@ -92,7 +146,13 @@ fn locate(event: HookPoint, cwd: &Path) -> Option<PathBuf> {
 }
 
 /// Execute one hook script synchronously (runs on the blocking pool).
-fn execute(script: &Path, cwd: &Path, name: &str, tool: Option<&str>) -> Result<(), String> {
+/// `Ok(Some(..))` = exited zero with parseable steering stdout.
+fn execute(
+    script: &Path,
+    cwd: &Path,
+    name: &str,
+    tool: Option<&str>,
+) -> Result<Option<Steering>, String> {
     let mut cmd = std::process::Command::new("sh");
     cmd.arg(script)
         .current_dir(cwd)
@@ -107,6 +167,10 @@ fn execute(script: &Path, cwd: &Path, name: &str, tool: Option<&str>) -> Result<
         Ok(child) => child,
         Err(e) => return Err(format!("{name} hook failed to spawn: {e}")),
     };
+    // drain both pipes off-thread so a chatty hook cannot fill the
+    // pipe buffer and deadlock against our wait loop
+    let stdout = read_pipe(child.stdout.take());
+    let stderr = read_pipe(child.stderr.take());
     let started = Instant::now();
     let status = loop {
         match child.try_wait() {
@@ -123,22 +187,47 @@ fn execute(script: &Path, cwd: &Path, name: &str, tool: Option<&str>) -> Result<
         }
     };
     if status.success() {
-        return Ok(());
+        let out = stdout.join().unwrap_or_default();
+        return Ok(parse_steering(&String::from_utf8_lossy(&out)).into_nonempty());
     }
-    let stderr = child
-        .stderr
-        .take()
-        .and_then(|mut pipe| {
-            use std::io::Read;
-            let mut buf = Vec::new();
-            pipe.read_to_end(&mut buf).ok().map(|_| buf)
-        })
-        .unwrap_or_default();
+    let err = stderr.join().unwrap_or_default();
     let code = status
         .code()
         .map(|c| c.to_string())
         .unwrap_or_else(|| "signal".to_string());
-    Err(format!("{name} hook exited {code}: {}", tail(&stderr)))
+    Err(format!("{name} hook exited {code}: {}", tail(&err)))
+}
+
+/// Read one pipe to end on a plain thread → bytes, capped at
+/// [`STEERING_BUDGET`]. Steering payloads are tiny JSON objects; the
+/// budget exists so a chatty hook cannot grow unbounded memory while
+/// the wait loop holds off the 10s timeout.
+const STEERING_BUDGET: usize = 64 * 1024;
+
+fn read_pipe<R: std::io::Read + Send + 'static>(
+    pipe: Option<R>,
+) -> std::thread::JoinHandle<Vec<u8>> {
+    std::thread::spawn(move || {
+        let mut buf = vec![0u8; STEERING_BUDGET];
+        let mut used = 0;
+        if let Some(mut pipe) = pipe {
+            while used < STEERING_BUDGET {
+                match pipe.read(&mut buf[used..]) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => used += n,
+                }
+            }
+            // drain the rest so the child never blocks on a full pipe
+            let mut sink = [0u8; 4096];
+            while let Ok(n) = pipe.read(&mut sink) {
+                if n == 0 {
+                    break;
+                }
+            }
+        }
+        buf.truncate(used);
+        buf
+    })
 }
 
 /// The last `TAIL_CHARS` characters of a stream, trimmed.
@@ -154,6 +243,25 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use super::*;
+
+    #[test]
+    fn steering_parses_mode_and_note() {
+        let s = parse_steering(r#"  {"mode":"plan","note":"switching"}  "#);
+        assert_eq!(s.mode, Some(ka_protocol::Mode::Plan));
+        assert_eq!(s.note.as_deref(), Some("switching"));
+        assert_eq!(
+            parse_steering(r#"{"mode":"accept-edits"}"#).mode,
+            Some(ka_protocol::Mode::AcceptEdits)
+        );
+        assert_eq!(parse_steering(r#"{"mode":"yolo"}"#).mode, None);
+        assert_eq!(parse_steering("not json"), Steering::default());
+        assert_eq!(parse_steering(r#"["array"]"#), Steering::default());
+        assert_eq!(parse_steering(r#"{"unknown":1}"#), Steering::default());
+        // note capped at 200 chars
+        let long = "x".repeat(500);
+        let s = parse_steering(&format!(r#"{{"note":"{long}"}}"#));
+        assert_eq!(s.note.as_deref().map(str::len), Some(200));
+    }
 
     fn hook_dir(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("ka-fshooks-{}-{name}", std::process::id()));

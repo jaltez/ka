@@ -218,6 +218,19 @@ impl Sandbox {
     }
 }
 
+/// Language-server diagnostics ([lsp]).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields, default)]
+pub struct Lsp {
+    /// Enable diagnostics feedback (default false).
+    pub enable: Option<bool>,
+    /// language name → server command (stdio). Only configured
+    /// languages spawn, e.g. { rust = "rust-analyzer", python =
+    /// "pyright-langserver --stdio", typescript =
+    /// "typescript-language-server --stdio" }.
+    pub commands: Option<std::collections::BTreeMap<String, String>>,
+}
+
 /// Context-window policy ([context]).
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields, default)]
@@ -288,6 +301,9 @@ pub struct Config {
     /// Sandbox policy ([sandbox]).
     #[serde(default)]
     pub sandbox: Sandbox,
+    /// Language-server diagnostics ([lsp]).
+    #[serde(default)]
+    pub lsp: Lsp,
     /// TUI appearance ([tui]).
     #[serde(default)]
     pub tui: Tui,
@@ -363,6 +379,15 @@ impl Config {
         }
         if other.git.auto_commit.is_some() {
             self.git.auto_commit = other.git.auto_commit;
+        }
+        if other.lsp.enable.is_some() {
+            self.lsp.enable = other.lsp.enable;
+        }
+        if other.lsp.commands.as_ref().is_some_and(|c| !c.is_empty()) {
+            self.lsp.commands = other.lsp.commands;
+        }
+        if other.sandbox.mode.is_some() {
+            self.sandbox.mode = other.sandbox.mode;
         }
     }
     /// Effective step cap (default 20).
@@ -695,6 +720,42 @@ mod tests {
         assert!(stop.hooks[0].tool.is_none());
         let bad = Config::parse_layer("[[hooks]]\nevent = \"whenever\"\ncommand = \"x\"\n", "u");
         assert!(bad.is_err());
+    }
+
+    #[test]
+    fn lsp_parses_and_overlays() {
+        let c = Config::parse_layer(
+            "[lsp]\nenable = true\n[lsp.commands]\nrust = \"rust-analyzer\"\npython = \"pyright-langserver --stdio\"\n",
+            "user",
+        )
+        .unwrap();
+        assert_eq!(c.lsp.enable, Some(true));
+        let commands = c.lsp.commands.as_ref().expect("commands");
+        assert_eq!(commands.len(), 2);
+        assert_eq!(commands["rust"], "rust-analyzer");
+        // empty upper layer keeps the lower layer's table; set wins
+        let mut base = c.clone();
+        base.overlay(Config::parse_layer("[lsp]\nenable = false\n", "over").unwrap());
+        assert_eq!(base.lsp.enable, Some(false));
+        assert_eq!(base.lsp.commands.as_ref().expect("kept").len(), 2);
+        base.overlay(Config::parse_layer("[lsp.commands]\nrust = \"ra\"\n", "over2").unwrap());
+        assert_eq!(base.lsp.commands.as_ref().expect("replaced")["rust"], "ra");
+        // unknown keys hard-error
+        let err = Config::parse_layer("[lsp]\nenabled = true\n", "user")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("enabled"), "got: {err}");
+    }
+
+    #[test]
+    fn sandbox_mode_overlays() {
+        let mut base = Config::default();
+        base.overlay(Config::parse_layer("[sandbox]\nmode = \"fs\"\n", "project").unwrap());
+        assert_eq!(
+            base.sandbox.to_policy_config().mode.as_deref(),
+            Some("fs"),
+            "project [sandbox] must survive the overlay merge"
+        );
     }
 
     #[test]

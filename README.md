@@ -63,7 +63,39 @@ tool = "write"              # optional filter
 command = "guard.sh"        # {tool, arguments} JSON on stdin
 ```
 
-Dialect overlays add any OpenAI-compatible provider: `ka run --dialects my.toml --model myhost/model "hi"`.
+Hooks may also **steer**: on a clean exit, a JSON object on stdout —
+`{"mode":"plan","note":"why"}` — switches the permission mode
+(persisted to the strand, like `/mode`) and surfaces the note (≤200
+chars) as a transcript row. That is the whole action language; anything
+unparsable is ignored.
+
+`ka --safe-mode` disables all customizations (AGENTS.md, MEMORY.md,
+skills, agents, commands, hooks, MCP, LSP) keeping built-ins, config,
+and auth — the troubleshooting floor. Guarded-mode exec asks append a
+rough per-Mtok cost estimate when the active model is priced.
+
+`ka serve` sessions can resume strands on disk: `POST /sessions` with
+`{"resume":"latest"}` or `{"resume":"<strand id/prefix>"}` replays the
+prior transcript over SSE; `ka acp` `session/load` accepts a strand id
+prefix the same way.
+
+
+## Sandbox & LSP
+
+```toml
+[sandbox]                  # "off" (default) or "fs"
+mode = "fs"                # bash children: read everything, write only
+                           # cwd, /tmp, XDG state/cache — enforced by
+                           # bwrap, firejail, or in-kernel landlock
+
+[lsp]                      # opt-in diagnostics feedback
+enable = true
+[lsp.commands]             # language → stdio server; only configured
+rust = "rust-analyzer"     # languages spawn (hand-rolled client, no
+python = "pyright-langserver --stdio"  # new deps)
+```
+
+`[lsp]` appends the server's latest diagnostics to successful `edit`/`write` results as informational context (never tool errors), capped at 20 lines. `ka doctor` reports whether configured server commands exist on PATH.
 
 ## Conventions ka reads automatically
 

@@ -3291,7 +3291,14 @@ async fn app(
                                         ModalKind::Memory => {
                                             let cwd = std::env::current_dir()
                                                 .unwrap_or_else(|_| std::path::PathBuf::from("."));
-                                            let files = discover_memory_files(&cwd);
+                                            // safe mode: memory is not loaded into
+                                            // the session — the viewer must not
+                                            // pretend otherwise
+                                            let files = if ka_agent::conventions::bare_mode() {
+                                                Vec::new()
+                                            } else {
+                                                discover_memory_files(&cwd)
+                                            };
                                             let mut rows = Vec::new();
                                             if files.is_empty() {
                                                 rows.push("(no memory files)".into());
@@ -4602,7 +4609,13 @@ pub fn available_slash_commands() -> Vec<(String, String)> {
     let mut out = builtin_slash_commands();
     // custom files come after builtins, prefixed so they read as aliases
     let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-    for c in scan_custom_commands(&cwd) {
+    // safe mode: custom commands are customizations — built-ins only
+    let custom = if ka_agent::conventions::bare_mode() {
+        Vec::new()
+    } else {
+        scan_custom_commands(&cwd)
+    };
+    for c in custom {
         let hint = if c.argument_hint.is_empty() {
             String::new()
         } else {
@@ -5133,6 +5146,11 @@ fn parse_command_md(text: &str) -> (String, String, String) {
 }
 
 fn custom_command(head: &str, rest: Option<&str>) -> Option<String> {
+    // safe mode: custom commands are customizations — typed commands
+    // must not load their bodies from disk (built-ins only)
+    if ka_agent::conventions::bare_mode() {
+        return None;
+    }
     let cwd = std::env::current_dir().ok()?;
     let state_home = std::env::var("XDG_STATE_HOME")
         .map(std::path::PathBuf::from)
@@ -6135,7 +6153,11 @@ fn render(
                 (" /mouse", "native select"),
             ])
         } else {
-            hint_spans(&[(" enter", "send"), (" /", "commands"), (" /mouse", "capture")])
+            hint_spans(&[
+                (" enter", "send"),
+                (" /", "commands"),
+                (" /mouse", "capture"),
+            ])
         }
     };
     let right = status_right(meters);
@@ -7271,6 +7293,42 @@ mod tests {
             priced: false,
             plan: false,
         }
+    }
+
+    #[test]
+    fn safe_mode_blocks_custom_command_execution() {
+        // isolated here: ka-term's test binary is its own process, so
+        // flipping the bare-mode atomic cannot disturb ka-agent's tests
+        let dir = std::env::temp_dir().join(format!("ka-tui-safemode-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join(".ka/commands")).unwrap();
+        std::fs::write(dir.join(".ka/commands/ship.md"), "ship body $ARGUMENTS\n").unwrap();
+        let state_home = dir.join("state");
+        // trusted so the normal path would load the body
+        std::fs::create_dir_all(&state_home).unwrap();
+        let trust_file = state_home.join("ka/trust.json");
+        std::fs::create_dir_all(trust_file.parent().unwrap()).unwrap();
+        std::fs::write(&trust_file, format!(r#"{{"paths":["{}"]}}"#, dir.display())).unwrap();
+        // sanity: without safe mode the command resolves (explicit
+        // paths — no process-global cwd mutation in a parallel test
+        // binary)
+        let body = custom_command_in(&dir, &state_home, "/ship", Some("v1"));
+        assert!(body.is_some(), "trusted project loads the command body");
+        // safe mode: execution path refuses even though the popup gate
+        // (available_slash_commands) also hides it
+        ka_agent::conventions::set_bare_mode(true);
+        assert!(
+            custom_command("/ship", Some("v1")).is_none(),
+            "safe mode must not load custom command bodies"
+        );
+        assert!(
+            !available_slash_commands()
+                .iter()
+                .any(|(name, _)| name == "cmd:ship"),
+            "safe mode must not advertise custom commands"
+        );
+        ka_agent::conventions::set_bare_mode(false);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

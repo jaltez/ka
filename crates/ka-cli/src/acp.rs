@@ -117,17 +117,87 @@ where
             }
             Some(m) if m == "session/load" => {
                 let session = msg["params"]["sessionId"].as_str().unwrap_or_default();
-                let sessions = sessions.lock().await;
-                if sessions.contains_key(session) {
-                    out_tx.send(rpc_result(id, json!({}))).ok();
-                } else {
-                    out_tx
-                        .send(rpc_error(
-                            id,
-                            -32602,
-                            format!("unknown session {session:?}"),
-                        ))
-                        .ok();
+                {
+                    let sessions = sessions.lock().await;
+                    if sessions.contains_key(session) {
+                        out_tx.send(rpc_result(id, json!({}))).ok();
+                        continue;
+                    }
+                }
+                // not in memory: try to resume a strand from disk (same
+                // prefix resolution as `ka --session`) in the session's
+                // cwd (falling back to this process's cwd)
+                let cwd = msg["params"]["cwd"]
+                    .as_str()
+                    .map(std::path::PathBuf::from)
+                    .or_else(|| std::env::current_dir().ok())
+                    .unwrap_or_default();
+                let resumed = match ka_strand::resolve_id(&cwd, session) {
+                    Ok(ka_strand::IdMatch::Unique(summary)) => Some(summary),
+                    _ => None,
+                };
+                match resumed {
+                    Some(summary) => {
+                        let cfg = Config {
+                            cwd: Some(cwd.display().to_string()),
+                            ..Config::default()
+                        };
+                        let ka_agent::EngineHandle {
+                            commands,
+                            mut events,
+                        } = ka_agent::spawn_full(
+                            cfg,
+                            ka_dialect::Catalog::embedded(),
+                            ka_agent::StrandChoice::Path(summary.path.clone()),
+                        );
+                        // deliver the bootstrap replay at load time (the
+                        // engine emits it during attach_strand, before
+                        // awaiting any command): drain until the Replay
+                        // row(s) arrive and the channel idles, forwarding
+                        // them to the client; everything else stays in
+                        // the channel for the first prompt's drive_turn
+                        let deadline =
+                            tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+                        let mut replay_seen = false;
+                        let mut idle_ticks = 0u32;
+                        while tokio::time::Instant::now() < deadline {
+                            match events.try_recv() {
+                                Ok(Event::Replay { messages }) => {
+                                    forward_replay(&out_tx, &summary.id, messages).await;
+                                    replay_seen = true;
+                                }
+                                Ok(_) => {}
+                                Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {
+                                    if replay_seen {
+                                        idle_ticks += 1;
+                                        if idle_ticks >= 2 {
+                                            break;
+                                        }
+                                    }
+                                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                                }
+                                Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => break,
+                            }
+                        }
+                        let handle =
+                            Arc::new(Mutex::new(ka_agent::EngineHandle { commands, events }));
+                        let mut sessions = sessions.lock().await;
+                        // key the engine by the full strand id so the
+                        // client's prefix resolves to a canonical handle
+                        sessions.insert(summary.id.clone(), handle);
+                        out_tx
+                            .send(rpc_result(id, json!({"sessionId": summary.id})))
+                            .ok();
+                    }
+                    None => {
+                        out_tx
+                            .send(rpc_error(
+                                id,
+                                -32602,
+                                format!("unknown session {session:?}"),
+                            ))
+                            .ok();
+                    }
                 }
             }
             Some(m) if m == "session/prompt" => {
@@ -334,6 +404,11 @@ async fn drive_turn(
                     .await
                     .ok();
             }
+            Event::Replay { messages } => {
+                // resumed strand: prior rows land on the client as
+                // replayed message chunks (digest boundaries as dividers)
+                forward_replay(&out, &session, messages).await;
+            }
             Event::TurnFinished { stop, .. } => {
                 break match stop {
                     Stop::Done => "end_turn",
@@ -356,6 +431,35 @@ async fn session_update(out: &mpsc::UnboundedSender<Value>, session: &str, updat
         "params": {"sessionId": session, "update": update}
     }))
     .ok();
+}
+
+/// Map replayed messages (bootstrap or prompt-time) onto the client as
+/// message-chunk updates; digest boundaries become divider rows.
+async fn forward_replay(
+    out: &mpsc::UnboundedSender<Value>,
+    session: &str,
+    messages: Vec<ka_protocol::ReplayedMessage>,
+) {
+    for m in messages {
+        let kind = match m.role.as_str() {
+            "user" => "user_message_chunk",
+            _ => "agent_message_chunk",
+        };
+        let text = if m.digest {
+            "— context digest boundary —".to_string()
+        } else {
+            m.content
+        };
+        session_update(
+            out,
+            session,
+            json!({
+                "sessionUpdate": kind,
+                "content": {"type": "text", "text": text}
+            }),
+        )
+        .await;
+    }
 }
 
 /// Extract the concatenated text of a prompt content array (or a bare

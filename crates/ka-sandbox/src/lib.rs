@@ -2,14 +2,15 @@
 //!
 //! `[sandbox] mode = "fs"` restricts bash children to: read everything,
 //! write only the working directory, the OS temp dir, and XDG state/cache
-//! dirs. Enforcement uses an external sandbox tool that applies
+//! dirs. Enforcement prefers an external sandbox tool that applies
 //! `PR_SET_NO_NEW_PRIVS` semantics (bubblewrap, then firejail); when
-//! neither tool exists the policy FAILS CLOSED — the command refuses.
-//!
-//! Deliberate deviation from the roadmap wording: no in-process landlock
-//! (the workspace forbids `unsafe`, and adding the landlock crate is not
-//! sanctioned). Default mode is `off`, so behavior is unchanged unless
-//! the user opts in.
+//! neither tool exists, in-kernel landlock takes over via a self re-exec
+//! trampoline — the hidden `ka ka-sandbox-exec <policy-json> -- <argv…>`
+//! subcommand applies the ruleset to itself and execs the real command
+//! (the workspace forbids `unsafe`, so rules cannot ride
+//! `Command::pre_exec`). When none of the three is available the policy
+//! FAILS CLOSED — the command refuses. Default mode is `off`, so
+//! behavior is unchanged unless the user opts in.
 
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -77,11 +78,15 @@ pub fn policy_from_config(cfg: &SandboxConfig, cwd: &Path) -> Result<Policy, Str
     }
 }
 
-/// Which external sandbox tool is available, if any.
+/// Which sandbox engine is available, if any. Detection order:
+/// bubblewrap, then firejail, then in-kernel landlock (no external
+/// binary needed).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tool {
     Bubblewrap,
     Firejail,
+    /// In-kernel LSM enforcement via the self re-exec trampoline.
+    Landlock,
 }
 
 pub fn detect_tool() -> Option<Tool> {
@@ -97,7 +102,27 @@ pub fn detect_tool() -> Option<Tool> {
             return Some(tool);
         }
     }
-    None
+    landlock_supported().then_some(Tool::Landlock)
+}
+/// Whether the kernel can create landlock rulesets. Probe only:
+/// `Ruleset::create()` issues `landlock_create_ruleset(2)` and returns
+/// an (immediately dropped) fd — nothing is enforced on the caller;
+/// enforcement happens later inside the trampoline process. Preferred
+/// over reading `/sys/kernel/security/lsm`, which is often hidden
+/// (e.g. WSL2) even on landlock-capable kernels.
+fn landlock_supported() -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        use landlock::{ABI, AccessFs, Ruleset, RulesetAttr};
+        Ruleset::default()
+            .handle_access(AccessFs::from_read(ABI::V1))
+            .and_then(|r| r.create().map(|_| ()))
+            .is_ok()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        false
+    }
 }
 
 /// Build the wrapped argv for `command` under the given policy.
@@ -148,9 +173,32 @@ pub fn wrap_command(policy: &Policy, command: &str, cwd: &Path) -> Result<Vec<St
                 let _ = cwd;
                 Ok(argv)
             }
+            Some(Tool::Landlock) => {
+                // self re-exec trampoline: the sandboxed command becomes
+                // `<ka> ka-sandbox-exec <policy-json> -- sh -c <command>`;
+                // the hidden subcommand applies the landlock ruleset to
+                // itself, then execs the real argv (the workspace forbids
+                // `unsafe`, so no Command::pre_exec). The policy JSON is
+                // the allow_write list (+ /dev, matching bwrap's --dev).
+                let mut writable = allow_write.clone();
+                writable.push(PathBuf::from("/dev"));
+                let policy =
+                    serde_json::to_string(&writable).map_err(|e| format!("sandbox policy: {e}"))?;
+                let exe =
+                    std::env::current_exe().map_err(|e| format!("sandbox trampoline: {e}"))?;
+                Ok(vec![
+                    exe.to_string_lossy().into_owned(),
+                    "ka-sandbox-exec".into(),
+                    policy,
+                    "--".into(),
+                    "sh".into(),
+                    "-c".into(),
+                    command.into(),
+                ])
+            }
             None => Err(
-                "sandbox: mode \"fs\" requires bubblewrap (bwrap) or firejail on this host — \
-                 refusing to run unsandboxed"
+                "sandbox: mode \"fs\" requires bubblewrap (bwrap), firejail, or kernel \
+                 landlock on this host — refusing to run unsandboxed"
                     .into(),
             ),
         },
@@ -200,9 +248,18 @@ mod tests {
         };
         match wrap_command(&p, "make", Path::new("/tmp")) {
             Ok(argv) => {
-                // a tool exists on this host: verify it wraps
-                assert!(argv[0] == "bwrap" || argv[0] == "firejail", "{argv:?}");
-                assert!(argv.iter().any(|a| a == "make"));
+                // whichever engine this host offers, it must wrap
+                if argv[0] == "bwrap" || argv[0] == "firejail" {
+                    assert!(argv.iter().any(|a| a == "make"), "{argv:?}");
+                } else {
+                    // landlock trampoline: <exe> ka-sandbox-exec <json> -- sh -c make
+                    assert_eq!(argv[1], "ka-sandbox-exec", "{argv:?}");
+                    let policy: Vec<PathBuf> = serde_json::from_str(&argv[2]).unwrap();
+                    assert!(policy.contains(&PathBuf::from("/tmp")), "{argv:?}");
+                    assert!(policy.contains(&PathBuf::from("/dev")), "{argv:?}");
+                    assert_eq!(argv[3], "--", "{argv:?}");
+                    assert_eq!(argv[6], "make", "{argv:?}");
+                }
             }
             Err(e) => assert!(e.contains("refusing"), "{e}"),
         }

@@ -10,6 +10,7 @@ rust-version.workspace = true
 crossterm = { workspace = true }
 ratatui = { workspace = true }
 futures-util = { workspace = true }
+ka-agent = { workspace = true }
 ka-protocol = { workspace = true }
 ka-strand = { workspace = true }
 tokio = { workspace = true }

@@ -9,6 +9,7 @@ pub mod conventions;
 mod engine;
 mod fshooks;
 pub mod hands;
+pub mod lsp;
 pub mod mcp;
 pub mod trust;
 mod voice;
