@@ -14,6 +14,7 @@ fn main() {
     let rest: Vec<String> = env::args().skip(2).collect();
     let code = match task.as_str() {
         "install" => install(),
+        "publish" => publish(&rest),
         "link" => link(),
         "unlink" => unlink(),
         "dev" => dev(&rest),
@@ -43,6 +44,8 @@ fn print_help() {
         "ka repo automation (cargo xtask <task>)
 
   install   install STABLE ka globally (cargo install --path, --locked)
+  publish   publish the workspace crates to crates.io in dependency
+            order (--dry-run verifies without uploading)
   link      build release + symlink kad -> ./target/release/ka in ~/.cargo/bin (DEV binary)
   unlink    remove the kad symlink
   dev [...] rebuild release, then run the dev binary with any args
@@ -92,11 +95,11 @@ fn run(cmd: &mut Command) -> i32 {
     }
 }
 
-/// `cargo install --path crates/ka-cli --locked` — the stable channel.
+/// `cargo install --path crates/ka-agent --locked` — the stable channel.
 fn install() -> i32 {
     let mut cmd = Command::new("cargo");
     cmd.current_dir(repo_root())
-        .args(["install", "--path", "crates/ka-cli", "--locked"]);
+        .args(["install", "--path", "crates/ka-agent", "--locked"]);
     let code = run(&mut cmd);
     if code == 0 {
         println!("\nstable `ka` installed to {}", cargo_bin_dir().display());
@@ -104,10 +107,48 @@ fn install() -> i32 {
     code
 }
 
+/// Publish the workspace crates to crates.io in dependency order
+/// (leaf first, the `ka-agent` binary last). `--dry-run` packages and
+/// verifies every crate without uploading.
+fn publish(args: &[String]) -> i32 {
+    const ORDER: [&str; 8] = [
+        "ka-protocol",
+        "ka-strand",
+        "ka-dialect",
+        "ka-sandbox",
+        "ka-engine",
+        "ka-index",
+        "ka-term",
+        "ka-agent",
+    ];
+    let dry = args.iter().any(|a| a == "--dry-run");
+    for name in ORDER {
+        let mut cmd = Command::new("cargo");
+        cmd.current_dir(repo_root())
+            .args(["publish", "-p", name, "--locked"]);
+        if dry {
+            // verification runs against the working tree; the real publish
+            // stays strict so a release always ships committed state
+            cmd.args(["--dry-run", "--allow-dirty"]);
+        }
+        let code = run(&mut cmd);
+        if code != 0 {
+            eprintln!("xtask: publish stopped at {name}");
+            return code;
+        }
+    }
+    if dry {
+        println!("\ndry-run passed for all workspace crates");
+    } else {
+        println!("\nall workspace crates published to crates.io");
+    }
+    0
+}
+
 /// Build release and symlink `kad` → repo's target/release/ka (dev channel).
 fn link() -> i32 {
     let build = run(Command::new("cargo")
-        .args(["build", "--release", "-p", "ka-cli"])
+        .args(["build", "--release", "-p", "ka-agent"])
         .current_dir(repo_root()));
     if build != 0 {
         return build;
@@ -155,7 +196,7 @@ fn unlink() -> i32 {
 /// Rebuild and execute the dev binary with passthrough args.
 fn dev(rest: &[String]) -> i32 {
     let build = run(Command::new("cargo")
-        .args(["build", "--release", "-p", "ka-cli"])
+        .args(["build", "--release", "-p", "ka-agent"])
         .current_dir(repo_root()));
     if build != 0 {
         return build;
@@ -197,7 +238,7 @@ fn size() -> i32 {
     let bin = repo_root().join("target/release/ka");
     if !bin.exists() {
         let build = run(Command::new("cargo")
-            .args(["build", "--release", "-p", "ka-cli"])
+            .args(["build", "--release", "-p", "ka-agent"])
             .current_dir(repo_root()));
         if build != 0 {
             return build;
@@ -368,7 +409,7 @@ fn sign(rest: &[String]) -> i32 {
 fn release() -> i32 {
     let target = "x86_64-unknown-linux-musl";
     let code = run(Command::new(cargo_bin_dir().join("cargo"))
-        .args(["build", "-p", "ka-cli", "--release", "--target", target])
+        .args(["build", "-p", "ka-agent", "--release", "--target", target])
         .current_dir(repo_root()));
     if code != 0 {
         return code;
@@ -447,7 +488,7 @@ fn bench(rest: &[String]) -> i32 {
     let bin_path = repo_root().join(&bin);
     if !bin_path.exists() {
         eprintln!(
-            "xtask: {} missing — build it first (cargo build --release -p ka-cli or --bin <path>)",
+            "xtask: {} missing — build it first (cargo build --release -p ka-agent or --bin <path>)",
             bin_path.display()
         );
         return 2;

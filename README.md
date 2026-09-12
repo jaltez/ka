@@ -9,8 +9,9 @@ A model-agnostic, very-low-footprint coding agent in Rust.
 ## Quickstart
 
 ```sh
-cargo build --release -p ka-cli
-alias ka=target/release/ka            # or: cargo install --path crates/ka-cli
+cargo install ka-agent               # from crates.io — installs the `ka` binary
+# from a clone:  cargo install --path crates/ka-agent
+# dev:           cargo build --release -p ka-agent && alias ka=target/release/ka
 
 cd your-project
 ka --model ollama/qwen3.5:9b          # TUI: fresh chat
@@ -138,7 +139,7 @@ Stable owns the name `ka`; dev is always `kad`. Isolate dev sessions with `KA_DA
 
 ## Crates
 
-`ka-protocol` (Command/Event wire contract) · `ka-agent` (engine: turn machine, tools + MCP hands, gate, digests, strands) · `ka-dialect` (catalog + 3 wires + discovery) · `ka-strand` (append-only JSONL sessions) · `ka-term` (ratatui TUI) · `ka-cli` (the binary).
+`ka-protocol` (Command/Event wire contract) · `ka-engine` (engine: turn machine, tools + MCP hands, gate, digests, strands) · `ka-dialect` (catalog + 3 wires + discovery) · `ka-strand` (append-only JSONL sessions) · `ka-term` (ratatui TUI) · `ka-agent` (the binary, published to crates.io).
 
 ## Footprint contract
 

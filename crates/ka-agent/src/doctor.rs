@@ -5,8 +5,8 @@
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use ka_agent::config::Config;
 use ka_dialect::Catalog;
+use ka_engine::config::Config;
 /// One health check row.
 pub struct Check {
     pub name: &'static str,
@@ -411,7 +411,7 @@ async fn mcp_net_check(cfg: &Config) -> Check {
     for server in &cfg.mcp {
         match tokio::time::timeout(
             std::time::Duration::from_secs(20),
-            ka_agent::mcp::McpClient::spawn_connect(server),
+            ka_engine::mcp::McpClient::spawn_connect(server),
         )
         .await
         {

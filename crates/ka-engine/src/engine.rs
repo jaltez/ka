@@ -371,7 +371,7 @@ async fn run(
         config.lsp.clone()
     };
     let lsp = crate::lsp::LspManager::new(&cwd, &lsp_cfg);
-    voice.set_lsp(std::sync::Arc::new(tokio::sync::Mutex::new(lsp)));
+    voice.set_lsp(std::sync::Arc::new(lsp));
     voice.set_web_allow_private(config.effective_web_allow_private());
     {
         let slot = voice.pathfinder_slot();

@@ -678,7 +678,7 @@ mod tests {
 
     #[test]
     fn env_shaped_layer_parses() {
-        // what ka-cli builds from KA_MODEL/KA_MODE before overlaying
+        // what the CLI builds from KA_MODEL/KA_MODE before overlaying
         let c =
             Config::parse_layer("model = \"openai/gpt-5.1\"\nmode = \"free\"\n", "env").unwrap();
         assert_eq!(c.model.as_deref(), Some("openai/gpt-5.1"));

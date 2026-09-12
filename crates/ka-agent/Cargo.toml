@@ -1,28 +1,40 @@
 [package]
 name = "ka-agent"
-description = "ka engine: turn machine over Command/Event queues + layered strict-TOML config"
+description = "ka: a model-agnostic, very-low-footprint coding agent (TUI + headless NDJSON)"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
+repository.workspace = true
+readme = "../../README.md"
+keywords = ["ai", "agent", "cli", "coding-agent", "llm"]
+categories = ["command-line-utilities", "development-tools"]
+
+[[bin]]
+name = "ka"
+path = "src/main.rs"
 
 [dependencies]
+ed25519-dalek = { workspace = true }
 reqwest = { workspace = true }
-ka-protocol = { workspace = true }
+ka-index = { workspace = true, optional = true }
+ka-engine = { workspace = true }
 ka-dialect = { workspace = true }
 ka-strand = { workspace = true }
-serde = { workspace = true }
-serde_json = { workspace = true }
+ka-term = { workspace = true }
+ka-protocol = { workspace = true }
 toml = { workspace = true }
+serde_json = { workspace = true }
+clap = { workspace = true }
 tokio = { workspace = true }
-schemars = { workspace = true }
-ignore = { workspace = true }
-regex = { workspace = true }
 ka-sandbox = { workspace = true }
-parking_lot = { workspace = true }
 
-[dev-dependencies]
-parking_lot = { workspace = true }
+[target.'cfg(target_os = "linux")'.dependencies]
+landlock = "0.4"
 
 [lints]
 workspace = true
+
+[features]
+default = ["index"]
+index = ["dep:ka-index"]

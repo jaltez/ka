@@ -35,7 +35,7 @@ jobs:
         with:
           targets: x86_64-unknown-linux-musl
       - run: sudo apt-get update && sudo apt-get install -y musl-tools
-      - run: cargo build -p ka-cli --release --target x86_64-unknown-linux-musl
+      - run: cargo build -p ka-agent --release --target x86_64-unknown-linux-musl
       - run: ls -l target/x86_64-unknown-linux-musl/release/ka
 
   bench:
@@ -46,7 +46,7 @@ jobs:
         with:
           targets: x86_64-unknown-linux-musl
       - run: sudo apt-get update && sudo apt-get install -y musl-tools time
-      - run: cargo build -p ka-cli --release --target x86_64-unknown-linux-musl
+      - run: cargo build -p ka-agent --release --target x86_64-unknown-linux-musl
       - run: cargo run -p xtask --quiet -- bench --bin target/x86_64-unknown-linux-musl/release/ka
 
   release:
@@ -63,7 +63,7 @@ jobs:
       - name: Build (pubkey embedded for ka update verification)
         env:
           KA_PUBKEY: ${{ secrets.KA_PUBKEY }}
-        run: cargo build -p ka-cli --release --target x86_64-unknown-linux-musl
+        run: cargo build -p ka-agent --release --target x86_64-unknown-linux-musl
       - name: Package
         run: |
           tar czf ka-x86_64-unknown-linux-musl.tar.gz -C target/x86_64-unknown-linux-musl/release ka

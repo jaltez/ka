@@ -1048,29 +1048,10 @@ dependencies = [
 name = "ka-agent"
 version = "0.1.0"
 dependencies = [
- "ignore",
- "ka-dialect",
- "ka-protocol",
- "ka-sandbox",
- "ka-strand",
- "parking_lot",
- "regex",
- "reqwest",
- "schemars",
- "serde",
- "serde_json",
- "tokio",
- "toml",
-]
-
-[[package]]
-name = "ka-cli"
-version = "0.1.0"
-dependencies = [
  "clap",
  "ed25519-dalek",
- "ka-agent",
  "ka-dialect",
+ "ka-engine",
  "ka-index",
  "ka-protocol",
  "ka-sandbox",
@@ -1092,6 +1073,25 @@ dependencies = [
  "keyring",
  "parking_lot",
  "reqwest",
+ "serde",
+ "serde_json",
+ "tokio",
+ "toml",
+]
+
+[[package]]
+name = "ka-engine"
+version = "0.1.0"
+dependencies = [
+ "ignore",
+ "ka-dialect",
+ "ka-protocol",
+ "ka-sandbox",
+ "ka-strand",
+ "parking_lot",
+ "regex",
+ "reqwest",
+ "schemars",
  "serde",
  "serde_json",
  "tokio",
@@ -1140,7 +1140,7 @@ version = "0.1.0"
 dependencies = [
  "crossterm 0.29.0",
  "futures-util",
- "ka-agent",
+ "ka-engine",
  "ka-protocol",
  "ka-strand",
  "ratatui",

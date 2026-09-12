@@ -20,8 +20,8 @@ use std::collections::HashMap;
 use std::process::ExitCode;
 use std::sync::Arc;
 
-use ka_agent::config::Config;
-use ka_agent::{StrandChoice, spawn_full};
+use ka_engine::config::Config;
+use ka_engine::{StrandChoice, spawn_full};
 use ka_protocol::{Command, Event};
 use serde_json::{Value, json};
 use tokio::io::AsyncWriteExt;
@@ -178,7 +178,7 @@ async fn handle_connection(
             };
             let mut sessions = sessions.lock().await;
             let id = format!("s{}", sessions.len() + 1);
-            let ka_agent::EngineHandle { commands, events } =
+            let ka_engine::EngineHandle { commands, events } =
                 spawn_full(Config::default(), ka_dialect::Catalog::embedded(), choice);
             sessions.insert(
                 id.clone(),

@@ -128,8 +128,10 @@ fn message_tokens(msg: &TurnMessage, ratio: f64) -> u64 {
 type SpecSlot = std::sync::Arc<tokio::sync::Mutex<Option<(usize, oneshot::Receiver<String>)>>>;
 
 /// Shared LSP diagnostics manager (engine-owned, opt-in): edit/write
-/// results get informational diagnostics appended.
-pub(crate) type LspSlot = std::sync::Arc<tokio::sync::Mutex<crate::lsp::LspManager>>;
+/// results get informational diagnostics appended. A cheap cloneable
+/// handle — internal state lives behind its own locks, so polls never
+/// hold the server table.
+pub(crate) type LspSlot = std::sync::Arc<crate::lsp::LspManager>;
 
 pub struct Voice {
     catalog: Catalog,
@@ -1604,11 +1606,15 @@ attempt implementation — the user will review and switch to build mode.",
             if !approved.is_empty() {
                 let mut in_flight = tokio::task::JoinSet::new();
                 let mut task_idx: HashMap<tokio::task::Id, usize> = HashMap::new();
+                // the hook table moves into an Arc once per step: each
+                // spawned task then pays an Arc bump, not a Vec<Hook>
+                // deep clone (hand ctx / sender / slots are Arc-cheap)
+                let hooks = std::sync::Arc::new(self.hooks_cfg.clone());
                 for (idx, hand) in approved {
                     let call = step_calls[idx].clone();
                     let ctx = self.hand_ctx.clone();
                     let events = events.clone();
-                    let hooks = self.hooks_cfg.clone();
+                    let hooks = hooks.clone();
                     let todo = self.todo.clone();
                     let lsp = self.lsp.clone();
                     let handle = in_flight.spawn(async move {
@@ -2270,14 +2276,21 @@ async fn enrich_with_lsp(
     let Ok(text) = std::fs::read_to_string(&full) else {
         return;
     };
-    let mut mgr = lsp.lock().await;
+    // the manager is a cheap handle: internal locks are held only per
+    // call, so concurrent edits never serialize on the poll
+    let mgr = lsp.clone();
     // touch reports whether content actually went to a server; when it
-    // didn't (disabled, unknown language, unconfigured) there is nothing
-    // to poll — skipping the wait keeps default-config edits fast
+    // didn't (disabled, unknown language, unconfigured, still starting)
+    // there is nothing to poll — skipping the wait keeps default-config
+    // edits fast
     if !mgr.touch(&full, &text).await {
         return;
     }
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(1500);
+    // 2.5s budget: a warm rust-analyzer flycheck publish measures
+    // ~1.5s after didChange (2026-09 host measurement); the extra
+    // second is headroom. Cold first-ever checks still lose the race
+    // by design — later edits get the diagnostics.
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(2500);
     // None = server hasn't published for THIS content yet (the cache was
     // invalidated on touch); a published-empty result also exits the
     // loop immediately (clean file). The prior edit's diagnostics can

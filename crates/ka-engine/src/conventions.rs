@@ -28,11 +28,13 @@ pub fn set_bare_mode(on: bool) {
 }
 
 pub fn bare_mode() -> bool {
-    BARE.load(std::sync::atomic::Ordering::Relaxed)
-        || std::env::var("KA_SAFEMODE").is_ok_and(|v| v == "1")
+    // the env half is read once: bare_mode is consulted on every hook
+    // run and discovery call, and KA_SAFEMODE never changes mid-process
+    static ENV_BARE: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var("KA_SAFEMODE").is_ok_and(|v| v == "1"));
+    BARE.load(std::sync::atomic::Ordering::Relaxed) || *ENV_BARE
 }
-/// Discover AGENTS.md files from the filesystem root side of cwd down to
-/// cwd itself (nearest = last). Stops walking at the home directory or `/`.
+
 /// One loaded memory file.
 pub struct MemoryFile {
     /// Where it came from.

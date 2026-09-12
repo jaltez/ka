@@ -5,12 +5,13 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
+repository.workspace = true
 
 [dependencies]
 crossterm = { workspace = true }
 ratatui = { workspace = true }
 futures-util = { workspace = true }
-ka-agent = { workspace = true }
+ka-engine = { workspace = true }
 ka-protocol = { workspace = true }
 ka-strand = { workspace = true }
 tokio = { workspace = true }

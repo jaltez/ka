@@ -4,9 +4,9 @@
 //! {schema,print}`. The TUI arrives in Phase 3.
 
 use clap::{CommandFactory, Parser, Subcommand};
-use ka_agent::config::Config;
-use ka_agent::spawn_full;
 use ka_dialect::Catalog;
+use ka_engine::config::Config;
+use ka_engine::spawn_full;
 use ka_protocol::{Command, Event, Stop, to_line};
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -232,7 +232,7 @@ fn ka_data_dir_strands() -> PathBuf {
 fn main() -> ExitCode {
     let cli = Cli::parse();
     if cli.safe_mode {
-        ka_agent::conventions::set_bare_mode(true);
+        ka_engine::conventions::set_bare_mode(true);
     }
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -259,7 +259,7 @@ fn load_config(
 ) -> Result<Config, String> {
     let mut cfg = Config::default();
 
-    let user = Some(ka_agent::config::user_config_path());
+    let user = Some(ka_engine::config::user_config_path());
     let project = if trust_project {
         Some(PathBuf::from(".ka/ka.toml"))
     } else {
@@ -608,14 +608,14 @@ async fn run_headless(
         resolve_session(&cwd, &id)?
     } else if continue_latest {
         let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-        match ka_agent::read_waypoint() {
+        match ka_engine::read_waypoint() {
             Some((way_cwd, path)) if way_cwd == cwd && path.exists() => {
-                ka_agent::StrandChoice::Path(path)
+                ka_engine::StrandChoice::Path(path)
             }
-            _ => ka_agent::StrandChoice::Latest,
+            _ => ka_engine::StrandChoice::Latest,
         }
     } else {
-        ka_agent::StrandChoice::New
+        ka_engine::StrandChoice::New
     };
     let mut handle = spawn_full(cfg, catalog, choice);
     handle
@@ -882,15 +882,15 @@ async fn run_tui(cli: Cli) -> Result<ExitCode, String> {
         resolve_session(&cwd, &id)?
     } else if cli.continue_latest {
         // waypoint first, else newest
-        match ka_agent::read_waypoint() {
+        match ka_engine::read_waypoint() {
             Some((way_cwd, path)) if way_cwd == cwd && path.exists() => {
-                ka_agent::StrandChoice::Path(path)
+                ka_engine::StrandChoice::Path(path)
             }
-            _ => ka_agent::StrandChoice::Latest,
+            _ => ka_engine::StrandChoice::Latest,
         }
     } else {
         // default: a fresh chat; /session inside the TUI lists the rest
-        ka_agent::StrandChoice::New
+        ka_engine::StrandChoice::New
     };
 
     let trust = trust_for_cwd(cli.trust);
@@ -956,13 +956,13 @@ async fn run_tui(cli: Cli) -> Result<ExitCode, String> {
         let vendor = m.id.split('/').next().unwrap_or_default();
         (ka_dialect::providers::vendor_rank(vendor), m.id.clone())
     });
-    let fresh = matches!(choice, ka_agent::StrandChoice::New);
-    let handle = ka_agent::spawn_full(cfg, catalog, choice);
-    let ka_agent::EngineHandle { commands, events } = handle;
-    let agents: Vec<(String, String)> = if ka_agent::conventions::bare_mode() {
+    let fresh = matches!(choice, ka_engine::StrandChoice::New);
+    let handle = ka_engine::spawn_full(cfg, catalog, choice);
+    let ka_engine::EngineHandle { commands, events } = handle;
+    let agents: Vec<(String, String)> = if ka_engine::conventions::bare_mode() {
         Vec::new()
     } else {
-        ka_agent::agents::AgentDef::discover(&cwd)
+        ka_engine::agents::AgentDef::discover(&cwd)
             .into_iter()
             .map(|a| (a.name, a.description))
             .collect()
@@ -991,9 +991,9 @@ async fn run_tui(cli: Cli) -> Result<ExitCode, String> {
 }
 
 /// Resolve a `--session` reference (id, id prefix, or file path).
-fn resolve_session(cwd: &std::path::Path, id: &str) -> Result<ka_agent::StrandChoice, String> {
+fn resolve_session(cwd: &std::path::Path, id: &str) -> Result<ka_engine::StrandChoice, String> {
     match ka_strand::resolve_id(cwd, id).map_err(|e| format!("session lookup: {e}"))? {
-        ka_strand::IdMatch::Unique(summary) => Ok(ka_agent::StrandChoice::Path(summary.path)),
+        ka_strand::IdMatch::Unique(summary) => Ok(ka_engine::StrandChoice::Path(summary.path)),
         ka_strand::IdMatch::None => Err(format!("no session matches '{id}'")),
         ka_strand::IdMatch::Ambiguous(candidates) => {
             let ids: Vec<String> = candidates.iter().map(|c| c.id.clone()).collect();
@@ -1057,7 +1057,7 @@ fn run_undo() -> Result<ExitCode, String> {
     let latest = ka_strand::latest(&cwd)
         .map_err(|e| format!("listing sessions: {e}"))?
         .ok_or_else(|| "no sessions for this directory".to_string())?;
-    let mut snaps = ka_agent::hands::snapshots::Snapshots::open(&cwd);
+    let mut snaps = ka_engine::hands::snapshots::Snapshots::open(&cwd);
     snaps.set_strand(latest.id.clone());
     match snaps.undo() {
         Ok(Some(entry)) => {
@@ -1084,7 +1084,7 @@ fn run_undo() -> Result<ExitCode, String> {
 /// `ka agents`: list discovered markdown agents.
 fn run_agents() -> Result<ExitCode, String> {
     let cwd = std::env::current_dir().map_err(|e| format!("cwd: {e}"))?;
-    let agents = ka_agent::agents::AgentDef::discover(&cwd);
+    let agents = ka_engine::agents::AgentDef::discover(&cwd);
     if agents.is_empty() {
         println!("no agents configured (.ka/agents/*.md, ~/.config/ka/agents/*.md)");
         return Ok(ExitCode::SUCCESS);
@@ -1119,7 +1119,7 @@ async fn run_mcp() -> Result<ExitCode, String> {
         );
         match tokio::time::timeout(
             std::time::Duration::from_secs(20),
-            ka_agent::mcp::McpClient::spawn_connect(server),
+            ka_engine::mcp::McpClient::spawn_connect(server),
         )
         .await
         {
@@ -1210,18 +1210,18 @@ fn has_gateable_ka(cwd: &std::path::Path) -> bool {
 /// Whether the project `.ka/` layer (config, skills, hooks) for `cwd` may
 /// load. Prompts on a TTY (first sighting), skips with a warning
 /// otherwise. `--trust` forces. The store itself lives in
-/// [`ka_agent::trust`]; approval unlocks all three layers.
+/// [`ka_engine::trust`]; approval unlocks all three layers.
 fn project_config_trusted(cwd: &std::path::Path, force_trust: bool) -> bool {
     // nothing to trust — and no prompt — without gateable .ka/ content
     if !has_gateable_ka(cwd) {
         return false;
     }
-    if ka_agent::trust::trusted_in(cwd, &ka_agent::trust::load_trust()) {
+    if ka_engine::trust::trusted_in(cwd, &ka_engine::trust::load_trust()) {
         return true;
     }
     let canonical = std::fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
     if force_trust {
-        ka_agent::trust::approve(cwd);
+        ka_engine::trust::approve(cwd);
         return true;
     }
     // prompt only when interactive
@@ -1234,7 +1234,7 @@ fn project_config_trusted(cwd: &std::path::Path, force_trust: bool) -> bool {
         if std::io::stdin().read_line(&mut line).is_ok() {
             let ans = line.trim().to_lowercase();
             if ans == "y" || ans == "yes" {
-                ka_agent::trust::approve(cwd);
+                ka_engine::trust::approve(cwd);
                 return true;
             }
         }
@@ -1248,7 +1248,7 @@ fn project_config_trusted(cwd: &std::path::Path, force_trust: bool) -> bool {
 /// Startup note: when an untrusted project's `.ka/` would have contributed
 /// skills or hooks (both silently skipped by the engine), say so.
 fn warn_untrusted_conventions(cwd: &std::path::Path) {
-    if ka_agent::trust::project_trusted(cwd) {
+    if ka_engine::trust::project_trusted(cwd) {
         return;
     }
     let mut layers: Vec<&str> = Vec::new();
@@ -1322,15 +1322,15 @@ async fn run_rewind(turns: u32) -> Result<ExitCode, String> {
         .ok_or_else(|| "no strands for this directory".to_string())?;
     println!("rewinding {} turn(s) in {}", turns, latest.path.display());
 
-    let choice = match ka_agent::read_waypoint() {
+    let choice = match ka_engine::read_waypoint() {
         Some((way_cwd, path)) if way_cwd == cwd && path.exists() => {
-            ka_agent::StrandChoice::Path(path)
+            ka_engine::StrandChoice::Path(path)
         }
-        _ => ka_agent::StrandChoice::Path(latest.path.clone()),
+        _ => ka_engine::StrandChoice::Path(latest.path.clone()),
     };
     let cfg = load_config(&[], None, None, true)?;
     let catalog = build_catalog(&[], true).await?;
-    let mut handle = ka_agent::spawn_full(cfg, catalog, choice);
+    let mut handle = ka_engine::spawn_full(cfg, catalog, choice);
     handle
         .commands
         .send(ka_protocol::Command::Rewind { turns })
@@ -1355,10 +1355,10 @@ fn run_export(out: Option<PathBuf>, session: Option<String>) -> Result<ExitCode,
     let cwd = std::env::current_dir().map_err(|e| format!("cwd: {e}"))?;
     let target = match session {
         Some(id) => match resolve_session(&cwd, &id)? {
-            ka_agent::StrandChoice::Path(path) => path,
+            ka_engine::StrandChoice::Path(path) => path,
             _ => unreachable!("resolve_session returns a path"),
         },
-        None => match ka_agent::read_waypoint() {
+        None => match ka_engine::read_waypoint() {
             Some((way_cwd, path)) if way_cwd == cwd && path.exists() => path,
             _ => {
                 ka_strand::latest(&cwd)

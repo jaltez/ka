@@ -1544,7 +1544,7 @@ pub struct PendingAsk {
 }
 
 /// Agent summaries injected by the CLI for `/agents` (ka-term stays
-/// ka-agent-free).
+/// ka-engine-free).
 pub static AGENTS: std::sync::OnceLock<Vec<(String, String)>> = std::sync::OnceLock::new();
 
 /// Short human tag for a strand id: the first 8 chars of its random tail.
@@ -2195,6 +2195,14 @@ pub async fn run(
         crossterm::event::DisableMouseCapture
     );
     ratatui::restore();
+    // Two linked crossterm copies keep separate raw-mode snapshots: our
+    // enable at the top of this function runs first (saving cooked
+    // state), then ratatui::init enables raw again through ratatui's own
+    // 0.28 copy — whose snapshot is therefore already-raw state.
+    // ratatui::restore only unwinds that copy, so disabling through THIS
+    // crate's copy here is what restores cooked mode; without it the
+    // shell is left unable to echo keystrokes.
+    let _ = crossterm::terminal::disable_raw_mode();
     let (exit, resume) = result?;
     if let Some(hint) = resume {
         println!();
@@ -3294,7 +3302,7 @@ async fn app(
                                             // safe mode: memory is not loaded into
                                             // the session — the viewer must not
                                             // pretend otherwise
-                                            let files = if ka_agent::conventions::bare_mode() {
+                                            let files = if ka_engine::conventions::bare_mode() {
                                                 Vec::new()
                                             } else {
                                                 discover_memory_files(&cwd)
@@ -3822,7 +3830,6 @@ async fn app(
                                     sidebar.skills_hover = hit;
                                 }
                                 if let Some(s) = sel.as_mut() {
-                                    eprintln!("DBG sel head {:?}", s.head);
                                     s.head = (mouse_evt.column, mouse_evt.row);
                                 }
                             }
@@ -3837,7 +3844,6 @@ async fn app(
                                     frame_origin,
                                     &mut transcript,
                                 );
-                                eprintln!("DBG up-copy sel={:?}", sel);
                             }
                             crossterm::event::MouseEventKind::ScrollUp => {
                                 line_up(&mut scroll, transcript.total_rows(), view_rows);
@@ -4610,7 +4616,7 @@ pub fn available_slash_commands() -> Vec<(String, String)> {
     // custom files come after builtins, prefixed so they read as aliases
     let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
     // safe mode: custom commands are customizations — built-ins only
-    let custom = if ka_agent::conventions::bare_mode() {
+    let custom = if ka_engine::conventions::bare_mode() {
         Vec::new()
     } else {
         scan_custom_commands(&cwd)
@@ -4982,7 +4988,7 @@ pub fn update_suggestions(input: &str) -> Option<SlashPopup> {
 }
 
 /// The user config path shown in the settings panel (mirrors
-/// ka-agent's `config::user_config_path`).
+/// ka-engine's `config::user_config_path`).
 fn ka_config_path() -> String {
     std::env::var("XDG_CONFIG_HOME")
         .map(std::path::PathBuf::from)
@@ -5148,7 +5154,7 @@ fn parse_command_md(text: &str) -> (String, String, String) {
 fn custom_command(head: &str, rest: Option<&str>) -> Option<String> {
     // safe mode: custom commands are customizations — typed commands
     // must not load their bodies from disk (built-ins only)
-    if ka_agent::conventions::bare_mode() {
+    if ka_engine::conventions::bare_mode() {
         return None;
     }
     let cwd = std::env::current_dir().ok()?;
@@ -7298,7 +7304,7 @@ mod tests {
     #[test]
     fn safe_mode_blocks_custom_command_execution() {
         // isolated here: ka-term's test binary is its own process, so
-        // flipping the bare-mode atomic cannot disturb ka-agent's tests
+        // flipping the bare-mode atomic cannot disturb ka-engine's tests
         let dir = std::env::temp_dir().join(format!("ka-tui-safemode-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join(".ka/commands")).unwrap();
@@ -7316,7 +7322,7 @@ mod tests {
         assert!(body.is_some(), "trusted project loads the command body");
         // safe mode: execution path refuses even though the popup gate
         // (available_slash_commands) also hides it
-        ka_agent::conventions::set_bare_mode(true);
+        ka_engine::conventions::set_bare_mode(true);
         assert!(
             custom_command("/ship", Some("v1")).is_none(),
             "safe mode must not load custom command bodies"
@@ -7327,7 +7333,7 @@ mod tests {
                 .any(|(name, _)| name == "cmd:ship"),
             "safe mode must not advertise custom commands"
         );
-        ka_agent::conventions::set_bare_mode(false);
+        ka_engine::conventions::set_bare_mode(false);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

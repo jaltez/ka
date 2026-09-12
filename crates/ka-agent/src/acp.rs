@@ -11,8 +11,8 @@ use std::process::ExitCode;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use ka_agent::config::Config;
-use ka_agent::{EngineHandle, spawn};
+use ka_engine::config::Config;
+use ka_engine::{EngineHandle, spawn};
 use ka_protocol::{Command, DeltaKind, Event, Stop};
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -142,13 +142,13 @@ where
                             cwd: Some(cwd.display().to_string()),
                             ..Config::default()
                         };
-                        let ka_agent::EngineHandle {
+                        let ka_engine::EngineHandle {
                             commands,
                             mut events,
-                        } = ka_agent::spawn_full(
+                        } = ka_engine::spawn_full(
                             cfg,
                             ka_dialect::Catalog::embedded(),
-                            ka_agent::StrandChoice::Path(summary.path.clone()),
+                            ka_engine::StrandChoice::Path(summary.path.clone()),
                         );
                         // deliver the bootstrap replay at load time (the
                         // engine emits it during attach_strand, before
@@ -180,7 +180,7 @@ where
                             }
                         }
                         let handle =
-                            Arc::new(Mutex::new(ka_agent::EngineHandle { commands, events }));
+                            Arc::new(Mutex::new(ka_engine::EngineHandle { commands, events }));
                         let mut sessions = sessions.lock().await;
                         // key the engine by the full strand id so the
                         // client's prefix resolves to a canonical handle

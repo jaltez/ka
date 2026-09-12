@@ -90,6 +90,12 @@ pub enum Tool {
 }
 
 pub fn detect_tool() -> Option<Tool> {
+    *DETECTED
+}
+
+/// The probes fork bwrap/firejail and create a landlock ruleset fd —
+/// `wrap_command` runs per bash call, so resolve once per process.
+static DETECTED: std::sync::LazyLock<Option<Tool>> = std::sync::LazyLock::new(|| {
     for (bin, tool) in [("bwrap", Tool::Bubblewrap), ("firejail", Tool::Firejail)] {
         if std::process::Command::new(bin)
             .arg("--version")
@@ -103,7 +109,7 @@ pub fn detect_tool() -> Option<Tool> {
         }
     }
     landlock_supported().then_some(Tool::Landlock)
-}
+});
 /// Whether the kernel can create landlock rulesets. Probe only:
 /// `Ruleset::create()` issues `landlock_create_ruleset(2)` and returns
 /// an (immediately dropped) fd — nothing is enforced on the caller;
@@ -184,8 +190,12 @@ pub fn wrap_command(policy: &Policy, command: &str, cwd: &Path) -> Result<Vec<St
                 writable.push(PathBuf::from("/dev"));
                 let policy =
                     serde_json::to_string(&writable).map_err(|e| format!("sandbox policy: {e}"))?;
-                let exe =
-                    std::env::current_exe().map_err(|e| format!("sandbox trampoline: {e}"))?;
+                // readlink(/proc/self/exe) once per process, not per call
+                static EXE: std::sync::LazyLock<Result<PathBuf, String>> =
+                    std::sync::LazyLock::new(|| {
+                        std::env::current_exe().map_err(|e| format!("sandbox trampoline: {e}"))
+                    });
+                let exe = EXE.as_ref().map_err(Clone::clone)?;
                 Ok(vec![
                     exe.to_string_lossy().into_owned(),
                     "ka-sandbox-exec".into(),

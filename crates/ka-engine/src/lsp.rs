@@ -8,6 +8,17 @@
 //! affect tool success, clearance verdicts, or exit codes. Rendering is
 //! capped (20 items / 2 000 bytes) so a noisy server cannot flood the
 //! context window.
+//!
+//! Concurrency model: [`LspManager`] is a cheap cloneable handle over
+//! shared state. `touch` never blocks on a server handshake — the first
+//! touch of a language kicks off `initialize` in a background task and
+//! that edit simply gets no diagnostics; later touches send full-text
+//! didChanges through the ready writer. The diagnostics cache is
+//! version-aware: `touch` invalidates the URI and bumps its document
+//! version, and publishes tagged with an older version are dropped, so
+//! an in-flight publish for the previous edit cannot attach to the
+//! current one (servers that omit the version tag are taken as-is —
+//! eventual consistency, the LSP ceiling).
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -22,7 +33,10 @@ use crate::config::Lsp as LspConfig;
 const MAX_ITEMS: usize = 20;
 /// Max rendered bytes (the `(+N more)` trailer may exceed this).
 const MAX_BYTES: usize = 2_000;
-/// How long `touch` waits for the `initialize` response.
+/// Per-line message cap (chars) — one huge trait-mismatch listing must
+/// not break the byte budget.
+const MESSAGE_CAP: usize = 300;
+/// How long the background starter waits for the `initialize` response.
 const INIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// One cached diagnostic (normalized off the wire).
@@ -97,19 +111,10 @@ pub fn render_diags(diags: &[Diag]) -> Vec<String> {
             4 => "hint",
             _ => "diagnostic",
         };
-        // within-line cap: one huge message (rust-analyzer trait
-        // mismatch listings run long) must not break the byte budget
-        const MESSAGE_CAP: usize = 300;
-        let message = if d.message.chars().count() > MESSAGE_CAP {
-            let cut: String = d.message.chars().take(MESSAGE_CAP).collect();
-            format!("{cut}…")
-        } else {
-            d.message.clone()
-        };
+        let message = truncate_chars(&d.message, MESSAGE_CAP);
         let line = format!(
-            "{label} L{}: {} ({})",
+            "{label} L{}: {message} ({})",
             d.line + 1,
-            message,
             d.source.as_deref().unwrap_or("unknown")
         );
         if shown > 0 && bytes + line.len() > MAX_BYTES {
@@ -126,214 +131,303 @@ pub fn render_diags(diags: &[Diag]) -> Vec<String> {
     lines
 }
 
-/// A live server child for one language.
-struct ServerProc {
-    _child: Child,
-    writer: ChildStdin,
-    /// Per-URI document versions (didChange).
-    versions: HashMap<String, i64>,
+/// Char-boundary-truncate, ellipsis-marked, borrowed when short.
+fn truncate_chars(s: &str, cap: usize) -> std::borrow::Cow<'_, str> {
+    if s.chars().count() > cap {
+        let cut: String = s.chars().take(cap).collect();
+        std::borrow::Cow::Owned(format!("{cut}…"))
+    } else {
+        std::borrow::Cow::Borrowed(s)
+    }
 }
 
-/// Shared diagnostics cache (URI → latest publishDiagnostics). `None`
-/// marks "no publish for the current content yet" (inserted on touch,
-/// replaced by the reader on publish) so a poll never mistakes the
-/// previous edit's diagnostics for the new content's.
+/// Diagnostics cache (URI → latest publish for the current content).
+/// `None` marks "no publish for this content yet".
 type Cache = parking_lot::Mutex<HashMap<String, Option<Vec<Diag>>>>;
+/// Document versions we have sent (URI → version), shared with the
+/// reader tasks for stale-publish filtering.
+type Versions = parking_lot::Mutex<HashMap<String, i64>>;
 
-/// Diagnostics manager. Inert unless `[lsp] enable = true`.
-pub struct LspManager {
-    enabled: bool,
-    cwd: PathBuf,
-    commands: BTreeMap<String, String>,
-    servers: HashMap<String, ServerProc>,
+/// A ready server child for one language.
+struct ServerProc {
+    _child: Child,
+    /// Taken out while a write is in flight so the server-table lock is
+    /// never held across an await (guards are `!Send`).
+    writer: Option<ChildStdin>,
+}
+/// Per-language server lifecycle.
+enum Server {
+    /// Background `initialize` handshake in flight.
+    Starting,
+    Ready(ServerProc),
+}
+
+struct Inner {
+    servers: HashMap<String, Server>,
     /// Languages whose server failed to spawn or initialize; never
     /// retried within the session.
     failed: HashSet<String>,
+}
+
+/// Everything the manager, background starters, and reader tasks share.
+struct Shared {
+    enabled: bool,
+    commands: BTreeMap<String, String>,
+    inner: parking_lot::Mutex<Inner>,
     cache: std::sync::Arc<Cache>,
+    versions: std::sync::Arc<Versions>,
+    cwd: PathBuf,
+}
+
+/// Diagnostics manager: a cheap cloneable handle, inert unless
+/// `[lsp] enable = true`. Servers die with the last handle (children
+/// carry `kill_on_drop`).
+#[derive(Clone)]
+pub struct LspManager {
+    shared: std::sync::Arc<Shared>,
 }
 
 impl LspManager {
     /// New manager; a no-op unless the config enables it.
     pub fn new(cwd: &Path, cfg: &LspConfig) -> Self {
         Self {
-            enabled: cfg.enable == Some(true),
-            cwd: cwd.to_path_buf(),
-            commands: cfg.commands.clone().unwrap_or_default(),
-            servers: HashMap::new(),
-            failed: HashSet::new(),
-            cache: std::sync::Arc::new(parking_lot::Mutex::new(HashMap::new())),
+            shared: std::sync::Arc::new(Shared {
+                enabled: cfg.enable == Some(true),
+                commands: cfg.commands.clone().unwrap_or_default(),
+                inner: parking_lot::Mutex::new(Inner {
+                    servers: HashMap::new(),
+                    failed: HashSet::new(),
+                }),
+                cache: std::sync::Arc::new(parking_lot::Mutex::new(HashMap::new())),
+                versions: std::sync::Arc::new(parking_lot::Mutex::new(HashMap::new())),
+                cwd: cwd.to_path_buf(),
+            }),
         }
     }
 
-    /// Report a file's new content: spawns the language's server on
-    /// first touch (initialize → initialized → didOpen), then sends a
-    /// full-text didChange. Spawns/initialization failures mark the
-    /// language failed for the session; every path is silent — LSP is
-    /// advisory context, never a turn failure. Returns `false` when
-    /// nothing was sent (disabled, unknown language, unconfigured, or
-    /// failed server) so callers can skip polling entirely.
-    pub async fn touch(&mut self, path: &Path, new_text: &str) -> bool {
-        if !self.enabled {
+    /// Report a file's new content. Returns `true` when a didOpen/
+    /// didChange was actually written to a ready server (so callers
+    /// know a publish may follow); `false` covers disabled, unknown
+    /// language, unconfigured, failed, and still-starting servers —
+    /// skip polling entirely. The first touch of a language only kicks
+    /// off the background handshake; that edit gets no diagnostics.
+    pub async fn touch(&self, path: &Path, new_text: &str) -> bool {
+        if !self.shared.enabled {
             return false;
         }
         let Some(lang) = language_for(path) else {
             return false;
         };
-        let Some(command) = self.commands.get(lang).cloned() else {
-            return false;
-        };
-        if self.failed.contains(lang) {
-            return false;
+        let command = self.shared.commands.get(lang).cloned();
+        {
+            let mut inner = self.shared.inner.lock();
+            if inner.failed.contains(lang) {
+                return false;
+            }
+            match inner.servers.get(lang) {
+                Some(Server::Ready(_)) | Some(Server::Starting) => {}
+                None => {
+                    let Some(command) = command else { return false };
+                    inner.servers.insert(lang.to_string(), Server::Starting);
+                    drop(inner);
+                    let shared = self.shared.clone();
+                    let lang = lang.to_string();
+                    let uri = uri_for(path);
+                    let text = new_text.to_string();
+                    tokio::spawn(async move {
+                        start_server(&shared, &lang, &command, &uri, &text).await;
+                    });
+                    return false;
+                }
+            }
         }
-        if !self.servers.contains_key(lang) && !self.spawn(lang, &command).await {
-            return false;
-        }
-        let Some(server) = self.servers.get_mut(lang) else {
-            return false;
-        };
+        // ready: bump version, invalidate the cache, write the
+        // full-text update (lock released while awaiting the pipe)
         let uri = uri_for(path);
-        let version = server.versions.entry(uri.clone()).or_insert(0);
-        *version += 1;
-        let method = if *version == 1 {
-            ("textDocument/didOpen", None)
-        } else {
-            ("textDocument/didChange", Some(*version))
+        let version = {
+            let mut versions = self.shared.versions.lock();
+            let v = versions.entry(uri.clone()).or_insert(0);
+            *v += 1;
+            *v
         };
-        let text_doc = match method.1 {
-            None => serde_json::json!({
-                "uri": uri,
-                "languageId": lang,
-                "version": 1,
-                "text": new_text,
-            }),
-            Some(v) => serde_json::json!({ "uri": uri, "version": v }),
-        };
-        let params = if method.1.is_none() {
-            serde_json::json!({ "textDocument": text_doc })
+        self.shared.cache.lock().insert(uri.clone(), None);
+        let msg = if version == 1 {
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "method": "textDocument/didOpen",
+                "params": {
+                    "textDocument": {
+                        "uri": uri,
+                        "languageId": lang,
+                        "version": 1,
+                        "text": new_text,
+                    }
+                }
+            })
         } else {
             serde_json::json!({
-                "textDocument": text_doc,
-                "contentChanges": [{ "text": new_text }],
+                "jsonrpc": "2.0",
+                "method": "textDocument/didChange",
+                "params": {
+                    "textDocument": { "uri": uri, "version": version },
+                    "contentChanges": [{ "text": new_text }],
+                }
             })
         };
-        let msg = serde_json::json!({
-            "jsonrpc": "2.0",
-            "method": method.0,
-            "params": params,
-        });
-        // invalidate any publish for the previous content BEFORE the
-        // write: a poll between now and the server's republish must see
-        // "nothing yet", never the prior edit's diagnostics
-        self.cache.lock().insert(uri.clone(), None);
-        if write_msg(&mut server.writer, &msg).await.is_err() {
-            // server died: drop it and never retry this session
-            self.servers.remove(lang);
-            self.failed.insert(lang.to_string());
+        // ready: take the writer out so the table lock is never held
+        // across the pipe await
+        let mut writer = {
+            let mut inner = self.shared.inner.lock();
+            inner.servers.get_mut(lang).and_then(|s| match s {
+                Server::Ready(p) => p.writer.take(),
+                _ => None,
+            })
+        };
+        let Some(w) = writer.as_mut() else {
             return false;
+        };
+        if write_msg(w, &msg).await.is_err() {
+            // server died: drop it and never retry this session
+            let mut inner = self.shared.inner.lock();
+            inner.servers.remove(lang);
+            inner.failed.insert(lang.to_string());
+            return false;
+        }
+        let mut inner = self.shared.inner.lock();
+        if let Some(Server::Ready(p)) = inner.servers.get_mut(lang) {
+            p.writer = writer.take();
         }
         true
     }
 
     /// Latest rendered diagnostics for `path` (`None` when the server
     /// has not published for the current content yet — distinguishes
-    /// "wait" from "clean, nothing to report").
+    /// "wait" from "clean, nothing to report"). Locks only the shared
+    /// cache, never the server table.
     pub fn diagnostics(&self, path: &Path) -> Option<Vec<String>> {
-        let uri = uri_for(path);
-        let cache = self.cache.lock();
-        match cache.get(&uri) {
-            Some(Some(diags)) => Some(render_diags(diags)),
-            _ => None,
-        }
-    }
-
-    /// Spawn + initialize one server. `false` = failed (recorded).
-    async fn spawn(&mut self, lang: &str, command: &str) -> bool {
-        let mut argv = command.split_whitespace().map(str::to_string);
-        let Some(program) = argv.next() else {
-            self.failed.insert(lang.to_string());
-            return false;
-        };
-        let args: Vec<String> = argv.collect();
-        let mut child = match tokio::process::Command::new(&program)
-            .args(&args)
-            .current_dir(&self.cwd)
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::null())
-            .kill_on_drop(true)
-            .spawn()
-        {
-            Ok(c) => c,
-            Err(_) => {
-                self.failed.insert(lang.to_string());
-                return false;
-            }
-        };
-        let mut writer = match child.stdin.take() {
-            Some(w) => w,
-            None => {
-                self.failed.insert(lang.to_string());
-                return false;
-            }
-        };
-        let reader = child.stdout.take();
-        let (init_tx, init_rx) = oneshot::channel::<bool>();
-        if let Some(reader) = reader {
-            tokio::spawn(read_loop(
-                BufReader::new(reader),
-                self.cache.clone(),
-                init_tx,
-            ));
-        }
-        let init = serde_json::json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "initialize",
-            "params": {
-                "processId": null,
-                "rootUri": uri_for(&self.cwd),
-                "capabilities": {},
-            },
-        });
-        if write_msg(&mut writer, &init).await.is_err() {
-            self.failed.insert(lang.to_string());
-            return false;
-        }
-        // wait for the initialize response before further traffic
-        let ack = tokio::time::timeout(INIT_TIMEOUT, init_rx).await;
-        let ok = matches!(ack, Ok(Ok(true)));
-        if !ok {
-            self.failed.insert(lang.to_string());
-            return false;
-        }
-        let initialized = serde_json::json!({
-            "jsonrpc": "2.0",
-            "method": "initialized",
-            "params": {},
-        });
-        if write_msg(&mut writer, &initialized).await.is_err() {
-            self.failed.insert(lang.to_string());
-            return false;
-        }
-        self.servers.insert(
-            lang.to_string(),
-            ServerProc {
-                _child: child,
-                writer,
-                versions: HashMap::new(),
-            },
-        );
-        true
+        cached(&self.shared.cache, &uri_for(path))
     }
 }
 
-impl Drop for LspManager {
-    fn drop(&mut self) {
-        // dropping the writers closes stdin (clean server exit); the
-        // Child handles follow with kill_on_drop as backstop
-        self.servers.clear();
-        self.failed.clear();
+/// Read the cache for one URI.
+fn cached(cache: &Cache, uri: &str) -> Option<Vec<String>> {
+    match cache.lock().get(uri) {
+        Some(Some(diags)) => Some(render_diags(diags)),
+        _ => None,
     }
+}
+
+/// Background handshake: spawn the server, `initialize` → `initialized`
+/// → didOpen the first content, then publish it ready. Any failure
+/// marks the language failed for the session (no retries).
+async fn start_server(
+    shared: &Shared,
+    lang: &str,
+    command: &str,
+    first_uri: &str,
+    first_text: &str,
+) {
+    let fail = |shared: &Shared, lang: &str| {
+        let mut inner = shared.inner.lock();
+        inner.servers.remove(lang);
+        inner.failed.insert(lang.to_string());
+    };
+    let mut argv = command.split_whitespace().map(str::to_string);
+    let Some(program) = argv.next() else {
+        fail(shared, lang);
+        return;
+    };
+    let args: Vec<String> = argv.collect();
+    let mut child = match tokio::process::Command::new(&program)
+        .args(&args)
+        .current_dir(&shared.cwd)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(_) => {
+            fail(shared, lang);
+            return;
+        }
+    };
+    let mut writer = match child.stdin.take() {
+        Some(w) => w,
+        None => {
+            fail(shared, lang);
+            return;
+        }
+    };
+    let reader = child.stdout.take();
+    let (init_tx, init_rx) = oneshot::channel::<bool>();
+    let Some(reader) = reader else {
+        fail(shared, lang);
+        return;
+    };
+    tokio::spawn(read_loop(
+        BufReader::new(reader),
+        shared.cache.clone(),
+        shared.versions.clone(),
+        init_tx,
+    ));
+    let init = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {
+            "processId": null,
+            "rootUri": uri_for(&shared.cwd),
+            "capabilities": {},
+        },
+    });
+    if write_msg(&mut writer, &init).await.is_err() {
+        fail(shared, lang);
+        return;
+    }
+    // wait for the initialize response before further traffic
+    if !matches!(
+        tokio::time::timeout(INIT_TIMEOUT, init_rx).await,
+        Ok(Ok(true))
+    ) {
+        fail(shared, lang);
+        return;
+    }
+    let initialized = serde_json::json!({
+        "jsonrpc": "2.0",
+        "method": "initialized",
+        "params": {},
+    });
+    if write_msg(&mut writer, &initialized).await.is_err() {
+        fail(shared, lang);
+        return;
+    }
+    // didOpen the content that kicked us off (version 1)
+    shared.versions.lock().insert(first_uri.to_string(), 1);
+    let open = serde_json::json!({
+        "jsonrpc": "2.0",
+        "method": "textDocument/didOpen",
+        "params": {
+            "textDocument": {
+                "uri": first_uri,
+                "languageId": lang,
+                "version": 1,
+                "text": first_text,
+            }
+        }
+    });
+    if write_msg(&mut writer, &open).await.is_err() {
+        fail(shared, lang);
+        return;
+    }
+    shared.inner.lock().servers.insert(
+        lang.to_string(),
+        Server::Ready(ServerProc {
+            _child: child,
+            writer: Some(writer),
+        }),
+    );
 }
 
 /// Write one framed JSON-RPC message.
@@ -346,11 +440,12 @@ async fn write_msg(w: &mut ChildStdin, msg: &serde_json::Value) -> std::io::Resu
 }
 
 /// Read framed messages off a server's stdout, caching
-/// publishDiagnostics and signaling the initialize response. Runs until
-/// the pipe closes (server exit drops the cache updates).
+/// publishDiagnostics (version-filtered against what we sent) and
+/// signaling the initialize response. Runs until the pipe closes.
 async fn read_loop<R: tokio::io::AsyncRead + Unpin + Send + 'static>(
     mut reader: R,
     cache: std::sync::Arc<Cache>,
+    versions: std::sync::Arc<Versions>,
     init_tx: oneshot::Sender<bool>,
 ) {
     let mut init_tx = Some(init_tx);
@@ -390,6 +485,14 @@ async fn read_loop<R: tokio::io::AsyncRead + Unpin + Send + 'static>(
             let Some(uri) = msg["params"]["uri"].as_str() else {
                 continue;
             };
+            // stale-publish filter: a publish tagged with a version
+            // older than what we last sent describes previous content
+            if let Some(v) = msg["params"]["version"].as_i64() {
+                let current = versions.lock().get(uri).copied().unwrap_or(i64::MAX);
+                if v < current {
+                    continue;
+                }
+            }
             let diags: Vec<Diag> = msg["params"]["diagnostics"]
                 .as_array()
                 .map(|items| {
@@ -419,8 +522,7 @@ async fn read_loop<R: tokio::io::AsyncRead + Unpin + Send + 'static>(
     }
 }
 
-/// Read one header block (to the blank line); `None` = EOF. The
-/// preceding body of the last message must already be consumed.
+/// Read one header block (to the blank line); `None` = EOF.
 async fn read_headers<R: tokio::io::AsyncRead + Unpin>(
     reader: &mut R,
 ) -> std::io::Result<Option<Vec<String>>> {
@@ -464,6 +566,16 @@ mod tests {
         }
     }
 
+    fn live_manager(dir: &Path, command: String) -> LspManager {
+        LspManager::new(
+            dir,
+            &LspConfig {
+                enable: Some(true),
+                commands: Some(BTreeMap::from([("rust".to_string(), command)])),
+            },
+        )
+    }
+
     #[test]
     fn caps_at_20_items() {
         let diags: Vec<Diag> = (0..25).map(|i| diag(1, i, "boom")).collect();
@@ -473,7 +585,7 @@ mod tests {
     }
 
     #[test]
-    fn caps_at_2000_bytes() {
+    fn caps_at_2000_bytes_and_lines() {
         let msg = "x".repeat(300);
         let diags: Vec<Diag> = (0..40).map(|i| diag(1, i, &msg)).collect();
         let lines = render_diags(&diags);
@@ -483,6 +595,13 @@ mod tests {
             lines.last().unwrap().starts_with("(+"),
             "truncation is noted: {:?}",
             lines.last()
+        );
+        // a single pathological message is capped within its line
+        let one = render_diags(&[diag(1, 0, &"y".repeat(5_000))]);
+        assert!(
+            one[0].len() < MESSAGE_CAP + 64,
+            "line capped: {}",
+            one[0].len()
         );
     }
 
@@ -514,7 +633,7 @@ mod tests {
 
     #[tokio::test]
     async fn manager_is_inert_without_enable() {
-        let mut m = LspManager::new(
+        let m = LspManager::new(
             Path::new("/tmp"),
             &LspConfig {
                 enable: None,
@@ -524,37 +643,37 @@ mod tests {
                 )])),
             },
         );
-        m.touch(Path::new("/tmp/x.rs"), "fn a() {}").await;
-        assert!(m.servers.is_empty(), "disabled manager spawns nothing");
         assert!(
             !m.touch(Path::new("/tmp/x.rs"), "fn a() {}").await,
-            "inert touch reports false so callers skip polling"
+            "disabled touch reports false so callers skip polling"
         );
         assert!(m.diagnostics(Path::new("/tmp/x.rs")).is_none());
     }
 
     #[tokio::test]
     async fn dead_command_marks_language_failed_without_panicking() {
-        let mut m = LspManager::new(
-            Path::new("/tmp"),
-            &LspConfig {
-                enable: Some(true),
-                commands: Some(BTreeMap::from([(
-                    "rust".to_string(),
-                    "ka-definitely-missing-lsp-binary".to_string(),
-                )])),
-            },
+        let dir = std::env::temp_dir();
+        let m = live_manager(&dir, "ka-definitely-missing-lsp-binary".to_string());
+        assert!(
+            !m.touch(Path::new("/tmp/x.rs"), "fn a() {}").await,
+            "first touch only kicks the background start"
         );
-        m.touch(Path::new("/tmp/x.rs"), "fn a() {}").await;
-        assert!(m.failed.contains("rust"), "missing binary is recorded");
-        assert!(m.servers.is_empty());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !m.shared.inner.lock().failed.contains("rust") && std::time::Instant::now() < deadline
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        assert!(
+            m.shared.inner.lock().failed.contains("rust"),
+            "missing binary is recorded (asynchronously)"
+        );
     }
 
-    /// A fake stdio server publishing exactly once (on didOpen) and
-    /// staying silent on didChange — the worst-case stale publisher.
-    /// Regression for "the previous edit's diagnostics attach to the
-    /// next edit": touch must invalidate the cache so the poll sees
-    /// "nothing yet", never the old publish.
+    /// A fake stdio server publishing exactly once (right after
+    /// startup) and staying silent on didChange — the worst-case stale
+    /// publisher. Regression for "the previous edit's diagnostics
+    /// attach to the next edit": touch must invalidate the cache so the
+    /// poll sees "nothing yet", never the old publish.
     #[cfg(unix)]
     #[tokio::test]
     async fn touch_invalidates_previous_publish() {
@@ -585,18 +704,14 @@ cat > /dev/null
             perms.set_mode(0o755);
             std::fs::set_permissions(&fake, perms).unwrap();
         }
-        let mut m = LspManager::new(
-            &dir,
-            &LspConfig {
-                enable: Some(true),
-                commands: Some(BTreeMap::from([(
-                    "rust".to_string(),
-                    format!("sh {}", fake.display()),
-                )])),
-            },
-        );
+        let m = live_manager(&dir, format!("sh {}", fake.display()));
         let src = dir.join("x.rs");
-        assert!(m.touch(&src, "let x: u32 = 1;").await, "didOpen sent");
+        // first touch kicks the background handshake; wait for the
+        // publish it triggers
+        assert!(
+            !m.touch(&src, "let x: u32 = 1;").await,
+            "starting server reports false"
+        );
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         let mut first = m.diagnostics(&src);
         while first.is_none() && std::time::Instant::now() < deadline {
