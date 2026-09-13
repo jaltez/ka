@@ -227,4 +227,31 @@ mod tests {
         assert!(out.is_error);
         assert!(out.content.contains("not supported"), "{}", out.content);
     }
+
+    /// The unicode-table trim: `\p{...}` categories/scripts are outside
+    /// the compiled feature set, so the pattern must fail INSTRUCTIVELY
+    /// (a clean tool error naming the problem) — never silently match.
+    #[tokio::test]
+    async fn unicode_category_patterns_error_cleanly() {
+        let ctx = ctx_for(&std::env::temp_dir());
+        let out = GrepHand
+            .execute(&json!({"pattern": "\\p{Greek}"}), &ctx)
+            .await;
+        assert!(out.is_error, "{}", out.content);
+        assert!(
+            out.content.contains("invalid regex"),
+            "the pattern error is surfaced: {}",
+            out.content
+        );
+        // core unicode semantics SURVIVE the trim: perl classes and
+        // case-insensitive folding stay Unicode-aware
+        let out = GrepHand
+            .execute(&json!({"pattern": "(?i)CAFÉ", "path": "*"}), &ctx)
+            .await;
+        assert!(
+            !out.is_error,
+            "unicode-perl/case patterns compile: {}",
+            out.content
+        );
+    }
 }

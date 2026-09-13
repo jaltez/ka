@@ -26,7 +26,15 @@ crossterm = { version = "0.28", features = ["event-stream"] }
 parking_lot = "0.12"
 ratatui = "0.29"
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
-regex = "1"
+# unicode tables trimmed: \w/\s/\d/\b and case-folding stay Unicode-aware
+# (unicode-perl + unicode-case); \p{...} categories/scripts are rejected by
+# the regex compiler — the grep hand surfaces that as its instructive error
+regex = { version = "1", default-features = false, features = [
+    "std",
+    "perf",
+    "unicode-perl",
+    "unicode-case",
+] }
 ignore = "0.4"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
 unicode-width = "0.2"

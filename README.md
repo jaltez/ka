@@ -179,4 +179,4 @@ Stable owns the name `ka`; dev is always `kad`. Isolate dev sessions with `KA_DA
 
 ## Footprint contract
 
-Single binary ≤ 10 MB (currently **6.1 MB**, gated in CI on the musl artifact) · cold start ≤ 50 ms · idle RSS ≤ 15 MB · zero steady-state network. 530 tests (feature contracts included — CI fails if a documented behavior regresses), `clippy -D warnings` clean, musl CI build. Full-text session search ships behind the opt-in `index` cargo feature (`cargo install ka-agent --features index`).
+Single binary ≤ 10 MB (currently **6.0 MB**, gated in CI on the musl artifact) · cold start ≤ 50 ms · idle RSS ≤ 15 MB · zero steady-state network. 530 tests (feature contracts included — CI fails if a documented behavior regresses), `clippy -D warnings` clean, musl CI build. Full-text session search ships behind the opt-in `index` cargo feature (`cargo install ka-agent --features index`).
