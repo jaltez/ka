@@ -90,6 +90,44 @@ summary.";
 
 /// Simple glob match: `*` spans anything, `?` one char, everything else
 /// literal. No path semantics — patterns match raw strings.
+/// One permission rule's pattern against a call's primary argument.
+/// File/bash tools glob the argument verbatim; the web tools match the
+/// URL's host with domain semantics — `example.com` covers the apex
+/// and every subdomain, `*.example.com` covers subdomains (the
+/// claude-code `WebFetch(domain:)` behavior).
+pub fn rule_pattern_matches(pattern: &str, tool: &str, primary: &str) -> bool {
+    if tool != "web_fetch" && tool != "web_search" {
+        return glob_match(pattern, primary);
+    }
+    let Some(host) = url_host(primary) else {
+        return glob_match(pattern, primary);
+    };
+    if glob_match(pattern, &host) {
+        return true;
+    }
+    // `example.com` covers apex + subdomains; `*.example.com` covers
+    // subdomains only (the claude-code WebFetch(domain:) behavior)
+    let star = pattern.starts_with("*.");
+    let domain = pattern.trim_start_matches("*.");
+    if star {
+        host.ends_with(&format!(".{domain}"))
+    } else {
+        host == domain || host.ends_with(&format!(".{domain}"))
+    }
+}
+
+/// Lowercased host of an http(s) URL (None for anything else).
+fn url_host(url: &str) -> Option<String> {
+    let rest = url
+        .strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"))?;
+    let host = rest.split(['/', '?', '#']).next()?;
+    let host = host.split('@').next_back().unwrap_or(host);
+    let host = host.split(':').next().unwrap_or(host);
+    let host = host.trim().to_ascii_lowercase();
+    (!host.is_empty()).then_some(host)
+}
+
 pub fn glob_match(pattern: &str, text: &str) -> bool {
     fn inner(p: &[char], t: &[char]) -> bool {
         match (p.first(), t.first()) {
@@ -194,6 +232,11 @@ pub struct Voice {
     todo: crate::hands::todo::TodoSlot,
     /// Opt-in LSP diagnostics manager (engine bootstrap).
     lsp: Option<LspSlot>,
+    /// [verify] lint rules — see [`crate::config::Verify`].
+    verify: crate::config::Verify,
+    /// Files edited this turn (successful edit/write paths), for the
+    /// [verify] test loop. Shared with the spawned tool tasks.
+    edited: std::sync::Arc<parking_lot::Mutex<Vec<String>>>,
 }
 
 impl Voice {
@@ -249,6 +292,8 @@ impl Voice {
             pathfinder_slot: slot,
             todo: todos,
             lsp: None,
+            verify: crate::config::Verify::default(),
+            edited: std::sync::Arc::new(parking_lot::Mutex::new(Vec::new())),
         }
     }
 
@@ -349,6 +394,8 @@ impl Voice {
             pathfinder_slot: slot,
             todo: todos,
             lsp: None,
+            verify: crate::config::Verify::default(),
+            edited: std::sync::Arc::new(parking_lot::Mutex::new(Vec::new())),
         }
     }
 
@@ -372,6 +419,17 @@ impl Voice {
     /// Set the persistent tool allowlist (`[permissions] allow`).
     pub fn set_allowed_tools(&mut self, tools: Vec<String>) {
         self.allowed_tools = tools;
+    }
+
+    /// Restrict the registry to the named hands (an agent's `tools:`
+    /// frontmatter). Unknown names drop out; an empty list keeps
+    /// everything (a typo cannot mute the agent).
+    pub fn restrict_tools(&mut self, keep: &[String]) {
+        if keep.is_empty() {
+            return;
+        }
+        self.hands
+            .retain(|h| keep.iter().any(|k| k == &h.def().name));
     }
 
     /// Set the fallback model chain ([fallback] models; engine bootstrap).
@@ -520,6 +578,21 @@ impl Voice {
     /// Set the LSP diagnostics manager (engine bootstrap).
     pub fn set_lsp(&mut self, lsp: LspSlot) {
         self.lsp = Some(lsp);
+    }
+
+    /// Set [verify] settings (engine bootstrap).
+    pub fn set_verify(&mut self, verify: crate::config::Verify) {
+        self.verify = verify;
+    }
+
+    /// Files edited this turn; also clears the list (read-once).
+    pub fn take_edited(&self) -> Vec<String> {
+        std::mem::take(&mut *self.edited.lock())
+    }
+
+    /// Stop kind of the most recent turn.
+    pub fn last_stop(&self) -> Stop {
+        self.last_stop
     }
 
     /// Set the bash auto-background threshold in ms (engine bootstrap;
@@ -970,7 +1043,7 @@ impl Voice {
             .find(|r| r.tool == call.tool)
             .filter(|r| match &r.pattern {
                 None => true,
-                Some(pat) => glob_match(pat, &call.primary_arg()),
+                Some(pat) => rule_pattern_matches(pat, &call.tool, &call.primary_arg()),
             })
             .map(|r| r.verdict)
     }
@@ -1094,8 +1167,7 @@ impl Voice {
             .clone()
     }
 
-    /// Inject a speaker for a wire (tests).
-    #[cfg(test)]
+    /// Inject a speaker for a wire (tests and contract suites).
     pub fn with_speaker(mut self, wire: Wire, speaker: std::sync::Arc<dyn Speaker>) -> Self {
         self.speakers.insert(wire, speaker);
         self
@@ -1132,6 +1204,7 @@ impl Voice {
         images: Vec<ka_dialect::ImagePart>,
     ) -> Usage {
         use ka_dialect::parse_selector;
+        self.edited.lock().clear();
         let mut parsed = match parse_selector(model_selector) {
             Ok(p) => p,
             Err(e) => {
@@ -1207,6 +1280,39 @@ impl Voice {
                 memory.path.display(),
                 memory.content
             ));
+        }
+        // glob-scoped rules (.ka/rules/*.md): a rule activates once any
+        // file matching its `paths:` globs has been read this session
+        // (no globs = always active) — TS conventions load when TS files
+        // are actually touched
+        let touched: Vec<String> = self
+            .hand_ctx
+            .ledger
+            .lock()
+            .tracked_paths()
+            .iter()
+            .map(|p| match p.strip_prefix(&self.hand_ctx.cwd) {
+                Ok(rel) => rel.to_string_lossy().replace('\\', "/"),
+                Err(_) => p.to_string_lossy().replace('\\', "/"),
+            })
+            .collect();
+        for rule in crate::conventions::discover_rules(&self.hand_ctx.cwd) {
+            let active = match &rule.globs {
+                None => true,
+                Some(globs) => touched.iter().any(|p| {
+                    let base = p.rsplit('/').next().unwrap_or(p.as_str());
+                    globs
+                        .iter()
+                        .any(|g| glob_match(g, p) || glob_match(g, base))
+                }),
+            };
+            if active {
+                system.push_str(&format!(
+                    "\n<scoped-rules src=\"{}\">\n{}\n</scoped-rules>\n",
+                    rule.path.display(),
+                    rule.content
+                ));
+            }
         }
         // skills: progressive disclosure — names/descriptions/paths only
         let skills = crate::conventions::discover_skills(&self.hand_ctx.cwd);
@@ -1617,16 +1723,27 @@ attempt implementation — the user will review and switch to build mode.",
                     let hooks = hooks.clone();
                     let todo = self.todo.clone();
                     let lsp = self.lsp.clone();
+                    let verify = self.verify.clone();
+                    let edited = self.edited.clone();
                     let handle = in_flight.spawn(async move {
                         let (mut output, steer) =
                             execute_approved(&hand, &hooks, &call, &ctx, &events).await;
-                        // LSP diagnostics ride successful edit/write results
-                        // as informational context — never errors (opencode
-                        // #9102: diagnostics must not read as tool failure)
+                        // LSP diagnostics and [verify] lints ride successful
+                        // edit/write results as informational context — never
+                        // errors (opencode #9102: diagnostics must not read as
+                        // tool failure)
                         if !output.is_error && (call.tool == "edit" || call.tool == "write") {
+                            if let Some(path) = call
+                                .arguments
+                                .get("path")
+                                .and_then(serde_json::Value::as_str)
+                            {
+                                edited.lock().push(path.to_string());
+                            }
                             if let Some(lsp) = lsp.as_ref() {
                                 enrich_with_lsp(&mut output, &call, &ctx, lsp).await;
                             }
+                            enrich_with_lint(&mut output, &call, &ctx, &verify).await;
                         }
                         // the todo hand owns normalization; surfaces get the
                         // fresh list as a whole-replacement event
@@ -2068,6 +2185,23 @@ attempt implementation — the user will review and switch to build mode.",
     }
 
     fn gate(&self, clearance: Clearance, call: &ToolCall) -> Gate {
+        // protected paths are hardstop-class: checked before rules so no
+        // allow-rule or session always-allow can bypass them, and before
+        // mode logic so free mode cannot wave them through. Plan mode is
+        // exempt here — it already denies every write outside .ka/plans/,
+        // which covers everything the protected list contains.
+        if clearance == Clearance::Write && self.mode != ka_protocol::Mode::Plan {
+            if let Some(reason) =
+                crate::hands::protected::reason(&self.hand_ctx.cwd, &call.primary_arg())
+            {
+                return Gate::Ask {
+                    question: format!(
+                        "PROTECTED — {reason}: `{}`. Proceed anyway?",
+                        call.primary_arg()
+                    ),
+                };
+            }
+        }
         // configured rules: first match wins, before mode logic
         if let Some(verdict) = self.match_rule(call) {
             return match verdict {
@@ -2313,6 +2447,78 @@ async fn enrich_with_lsp(
         rendered.join("\n")
     ));
     output.content.push_str(&block);
+}
+
+/// Append the first matching [verify] lint result to a successful
+/// edit/write tool result (aider's auto-lint). Same contract as the
+/// LSP block: informational, never `is_error`, capped output.
+async fn enrich_with_lint(
+    output: &mut ToolOutput,
+    call: &ToolCall,
+    ctx: &HandContext,
+    verify: &crate::config::Verify,
+) {
+    let Some(path) = call
+        .arguments
+        .get("path")
+        .and_then(serde_json::Value::as_str)
+    else {
+        return;
+    };
+    let rel = path.replace('\\', "/");
+    let base = rel.rsplit('/').next().unwrap_or(rel.as_str());
+    let Some(rule) = verify
+        .lints
+        .iter()
+        .find(|r| glob_match(&r.pattern, &rel) || glob_match(&r.pattern, base))
+    else {
+        return;
+    };
+    let command = if rule.command.contains("{file}") {
+        rule.command.replace("{file}", &rel)
+    } else {
+        format!("{} {rel}", rule.command)
+    };
+    let started = std::time::Instant::now();
+    let ran = tokio::time::timeout(
+        std::time::Duration::from_secs(60),
+        tokio::process::Command::new("sh")
+            .arg("-c")
+            .arg(&command)
+            .current_dir(&ctx.cwd)
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await;
+    let note = match ran {
+        Err(_) => Some("timed out after 60s".to_string()),
+        Ok(Err(e)) => Some(format!("failed to spawn: {e}")),
+        Ok(Ok(out)) if !out.status.success() => {
+            let mut text = String::from_utf8_lossy(&out.stdout).to_string();
+            text.push_str(&String::from_utf8_lossy(&out.stderr));
+            let text = text.trim();
+            // tail-bias: lint errors live at the end of the output
+            let chars: Vec<char> = text.chars().collect();
+            let cut: String = if chars.len() > 1_500 {
+                chars[chars.len() - 1_500..].iter().collect()
+            } else {
+                text.to_string()
+            };
+            let code = out.status.code().unwrap_or(-1);
+            Some(format!(
+                "exit {code} — {}",
+                if cut.is_empty() { "(no output)" } else { &cut }
+            ))
+        }
+        _ => None,
+    };
+    if let Some(note) = note {
+        let block = crate::hands::secrets::redact(&format!(
+            "\n<lint note=\"informational context — your edit succeeded\">\n`{command}` {note} ({:.1}s)\n</lint>",
+            started.elapsed().as_secs_f32()
+        ));
+        output.content.push_str(&block);
+    }
 }
 
 /// Run matching hook scripts for one event. Returns Err(reason) when a
@@ -2609,7 +2815,7 @@ mod tests {
     };
     use ka_protocol::{Command, Event, Stop, Usage};
 
-    use super::{GuardRuntime, Voice, call_detail, cost_of, glob_match};
+    use super::{Gate, GuardRuntime, Voice, call_detail, cost_of, glob_match};
 
     #[test]
     fn unpriced_dialects_never_report_cost() {
@@ -5039,5 +5245,140 @@ mod tests {
         voice.note_context_for_tests(400_000);
         assert!(!voice.context_pressure_frac(1_000_000, 80));
         assert!(!voice.start_speculative(None));
+    }
+
+    #[tokio::test]
+    async fn lint_enrichment_appends_failures_only() {
+        use crate::config::{LintRule, Verify};
+        use crate::hands::{HandContext, Ledger, Spill, ToolOutput};
+
+        let ctx = HandContext {
+            cwd: std::env::temp_dir(),
+            ledger: std::sync::Arc::new(parking_lot::Mutex::new(Ledger::default())),
+            spill: std::sync::Arc::new(Spill::new()),
+            snapshots: std::sync::Arc::new(parking_lot::Mutex::new(
+                crate::hands::snapshots::Snapshots::inert(),
+            )),
+            jobs: std::sync::Arc::new(crate::hands::jobs::JobTable::new()),
+            bash_background_ms: 0,
+            max_image_mb: 5,
+            web_allow_private: false,
+            sandbox: ka_sandbox::Policy::Off,
+        };
+        let mk_call = || ToolCall {
+            id: "c1".into(),
+            tool: "edit".into(),
+            arguments: serde_json::json!({"path": "src/a.rs"}),
+        };
+        // failing lint: block appended, command shows the substitution,
+        // output is tailed; the tool result stays non-error
+        let verify = Verify {
+            test: None,
+            lints: vec![LintRule {
+                pattern: "*.rs".to_string(),
+                command: "echo LINT-FAIL >&2; exit 3 {file}".to_string(),
+            }],
+        };
+        let mut output = ToolOutput::ok("the diff");
+        super::enrich_with_lint(&mut output, &mk_call(), &ctx, &verify).await;
+        assert!(!output.is_error, "lint is informational");
+        assert!(output.content.starts_with("the diff"));
+        assert!(
+            output.content.contains("LINT-FAIL"),
+            "stderr captured: {}",
+            output.content
+        );
+        assert!(
+            output.content.contains("exit 3 —"),
+            "exit code reported: {}",
+            output.content
+        );
+        assert!(
+            output
+                .content
+                .contains("echo LINT-FAIL >&2; exit 3 src/a.rs"),
+            "substituted command shown: {}",
+            output.content
+        );
+        // passing lint: nothing appended
+        let verify = Verify {
+            test: None,
+            lints: vec![LintRule {
+                pattern: "*.rs".to_string(),
+                command: "true {file}".to_string(),
+            }],
+        };
+        let mut output = ToolOutput::ok("the diff");
+        super::enrich_with_lint(&mut output, &mk_call(), &ctx, &verify).await;
+        assert_eq!(output.content, "the diff");
+        // no matching rule: nothing appended
+        let verify = Verify {
+            test: None,
+            lints: vec![LintRule {
+                pattern: "*.py".to_string(),
+                command: "false {file}".to_string(),
+            }],
+        };
+        let mut output = ToolOutput::ok("the diff");
+        super::enrich_with_lint(&mut output, &mk_call(), &ctx, &verify).await;
+        assert_eq!(output.content, "the diff");
+    }
+
+    #[test]
+    fn protected_paths_beat_rules_and_free_mode() {
+        use ka_dialect::speaker::ToolCall;
+        let catalog = Catalog::parse(
+            "[dialects.\"test/m\"]\nwire = \"openai_chat\"\nbase_url = \"http://127.0.0.1:1\"\ncontext = 1000000\n",
+        )
+        .unwrap();
+        let mut voice = Voice::new(catalog, std::env::temp_dir(), ka_protocol::Mode::Free, 5);
+        // a blanket allow rule for write must NOT wave protected paths through
+        voice.set_rules(vec![crate::config::Rule {
+            tool: "write".to_string(),
+            pattern: None,
+            verdict: crate::config::Verdict::Allow,
+        }]);
+        voice.set_allowed_tools(vec!["write".to_string()]);
+        let call = ToolCall {
+            id: "c1".into(),
+            tool: "write".into(),
+            arguments: serde_json::json!({"path": ".git/hooks/pre-commit"}),
+        };
+        let gate = voice.gate(crate::hands::Clearance::Write, &call);
+        assert!(
+            matches!(gate, Gate::Ask { .. }),
+            "protected path must ask even with allow-rule + free mode + allowlist: {gate:?}"
+        );
+        // ordinary paths still flow through the rule (allowed)
+        let call = ToolCall {
+            id: "c2".into(),
+            tool: "write".into(),
+            arguments: serde_json::json!({"path": "src/main.rs"}),
+        };
+        let gate = voice.gate(crate::hands::Clearance::Write, &call);
+        assert!(
+            matches!(gate, Gate::Allow),
+            "rule allows ordinary write: {gate:?}"
+        );
+    }
+
+    #[test]
+    fn plan_mode_still_denies_despite_protected_check() {
+        use ka_dialect::speaker::ToolCall;
+        let catalog = Catalog::parse(
+            "[dialects.\"test/m\"]\nwire = \"openai_chat\"\nbase_url = \"http://127.0.0.1:1\"\ncontext = 1000000\n",
+        )
+        .unwrap();
+        let voice = Voice::new(catalog, std::env::temp_dir(), ka_protocol::Mode::Plan, 5);
+        let call = ToolCall {
+            id: "c1".into(),
+            tool: "write".into(),
+            arguments: serde_json::json!({"path": "~/.bashrc"}),
+        };
+        let gate = voice.gate(crate::hands::Clearance::Write, &call);
+        assert!(
+            matches!(gate, Gate::Deny { .. }),
+            "plan mode denies; protected must not downgrade to ask: {gate:?}"
+        );
     }
 }

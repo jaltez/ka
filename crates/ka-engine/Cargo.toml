@@ -25,5 +25,10 @@ parking_lot = { workspace = true }
 [dev-dependencies]
 parking_lot = { workspace = true }
 
+[features]
+# Exposes trust-store test redirection so integration contract suites
+# can approve temp projects without touching the real trust file.
+test-util = []
+
 [lints]
 workspace = true

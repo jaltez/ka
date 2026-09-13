@@ -89,6 +89,10 @@ enum CliCommand {
         /// (ka event stream), or stream-json (Claude-Code-shaped NDJSON)
         #[arg(long, default_value = "text", value_parser = ["text", "ndjson", "stream-json"])]
         print: String,
+        /// Wrap the prompt as a read-only code review of the current
+        /// changes (like the TUI's /review)
+        #[arg(long)]
+        review: bool,
     },
     /// Serve the Agent Client Protocol on stdin/stdout
     Acp,
@@ -215,18 +219,13 @@ mod doctor;
 mod serve;
 mod update;
 
-/// The strands storage root (`<data>/strands`).
+/// The strands storage root (`<data>/strands`). Delegates to
+/// `ka_strand::data_dir()` so the index scans the same tree the writer
+/// uses (the old local copy was missing the `ka` segment and indexed an
+/// empty directory whenever KA_DATA_DIR/XDG_DATA_HOME were unset).
 #[cfg(feature = "index")]
 fn ka_data_dir_strands() -> PathBuf {
-    std::env::var("KA_DATA_DIR")
-        .map(PathBuf::from)
-        .or_else(|_| {
-            std::env::var("XDG_DATA_HOME")
-                .map(PathBuf::from)
-                .or_else(|_| std::env::var("HOME").map(|h| PathBuf::from(h).join(".local/share")))
-        })
-        .unwrap_or_else(|_| PathBuf::from("."))
-        .join("strands")
+    ka_strand::data_dir().join("strands")
 }
 
 fn main() -> ExitCode {
@@ -370,7 +369,20 @@ async fn dispatch(cli: Cli) -> Result<ExitCode, String> {
             trust,
             schema,
             print,
+            review,
         }) => {
+            // --review wraps the prompt (or a default) as a read-only
+            // review of the working tree — same preset as /review
+            let prompt = if review {
+                Some(wrap_review_prompt(prompt.as_deref()))
+            } else {
+                prompt
+            };
+            let mode = if review && mode.is_none() {
+                Some("plan".to_string())
+            } else {
+                mode
+            };
             let schema_value = match schema {
                 Some(path) => {
                     let text = std::fs::read_to_string(&path)
@@ -575,6 +587,22 @@ fn apply_landlock(writable: &[PathBuf]) -> Result<(), String> {
         ),
     }
 }
+/// The `/review` preset as a headless prompt (focus: a base ref or a
+/// review focus; default reviews against the default branch).
+fn wrap_review_prompt(focus: Option<&str>) -> String {
+    let base =
+        "the repository's default branch — main or master, whichever exists; if neither, HEAD";
+    let extra = focus.map(|f| format!("\nFocus: {f}")).unwrap_or_default();
+    format!(
+        "Review the current changes as a strict senior engineer — READ-ONLY, \
+do not modify any files. Compare the working tree against {base} (git diff \
+plus untracked files; read files for full context). Produce: (1) a one-line \
+verdict (ship / fix first / blocked), (2) findings ordered blocker > major > \
+minor > nit, each as `file:line — issue — concrete fix`, (3) what is missing \
+(tests, docs, error handling).{extra}"
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_headless(
     prompt: Option<String>,
@@ -967,11 +995,27 @@ async fn run_tui(cli: Cli) -> Result<ExitCode, String> {
             .map(|a| (a.name, a.description))
             .collect()
     };
-    let cfg_tui_header_glyph = {
+    let (cfg_tui_header_glyph, tui_notify) = {
         let trust = trust_for_cwd(false);
         load_config(&cli.configs, cli.model.clone(), cli.mode.clone(), trust)
-            .map(|c| c.effective_header_glyph())
-            .unwrap_or_else(|_| "\u{25c6}".to_string())
+            .map(|c| {
+                (
+                    c.effective_header_glyph(),
+                    ka_term::tui::NotifySettings {
+                        bell: c.effective_bell(),
+                        command: c.tui.notify.clone(),
+                    },
+                )
+            })
+            .unwrap_or_else(|_| {
+                (
+                    "\u{25c6}".to_string(),
+                    ka_term::tui::NotifySettings {
+                        bell: true,
+                        command: None,
+                    },
+                )
+            })
     };
     let exit = ka_term::tui::run(
         commands,
@@ -981,6 +1025,7 @@ async fn run_tui(cli: Cli) -> Result<ExitCode, String> {
         models,
         agents,
         &cfg_tui_header_glyph,
+        tui_notify,
         fresh,
     )
     .await
@@ -1328,7 +1373,9 @@ async fn run_rewind(turns: u32) -> Result<ExitCode, String> {
         }
         _ => ka_engine::StrandChoice::Path(latest.path.clone()),
     };
-    let cfg = load_config(&[], None, None, true)?;
+    // rewind only reads strand files — it must not silently approve the
+    // project's .ka layer (trust is a side effect no reader should trip)
+    let cfg = load_config(&[], None, None, false)?;
     let catalog = build_catalog(&[], true).await?;
     let mut handle = ka_engine::spawn_full(cfg, catalog, choice);
     handle

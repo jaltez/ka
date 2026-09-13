@@ -508,37 +508,25 @@ pub struct StrandSummary {
 /// full parse for the header line only, `"record":…` prefix tests for
 /// counting/summing, and one partial probe for the title — no
 /// per-record deserialization of calls/results.
+/// Just the fields a summary needs off a message line.
+#[derive(serde::Deserialize)]
+struct TitleProbe {
+    role: Option<Role>,
+    content: Option<String>,
+}
+
+/// Just the fields a summary needs off a usage line.
+#[derive(serde::Deserialize, Default)]
+#[serde(default)]
+struct UsageProbe {
+    cost: f64,
+    input: u64,
+    output: u64,
+    cache_read: u64,
+    cache_write: u64,
+}
+
 pub fn list(cwd: &Path) -> std::io::Result<Vec<StrandSummary>> {
-    /// Just the fields a summary needs off a message line.
-    #[derive(serde::Deserialize)]
-    struct TitleProbe {
-        role: Option<Role>,
-        content: Option<String>,
-    }
-
-    /// Just the fields a summary needs off a usage line.
-    #[derive(serde::Deserialize)]
-    #[serde(default)]
-    struct UsageProbe {
-        cost: f64,
-        input: u64,
-        output: u64,
-        cache_read: u64,
-        cache_write: u64,
-    }
-
-    impl Default for UsageProbe {
-        fn default() -> Self {
-            Self {
-                cost: 0.0,
-                input: 0,
-                output: 0,
-                cache_read: 0,
-                cache_write: 0,
-            }
-        }
-    }
-
     let dir = strand_dir(cwd);
     let mut summaries = Vec::new();
     let entries = match std::fs::read_dir(&dir) {
@@ -551,67 +539,9 @@ pub fn list(cwd: &Path) -> std::io::Result<Vec<StrandSummary>> {
         if path.extension().is_none_or(|e| e != "jsonl") {
             continue;
         }
-        let file = match File::open(&path) {
-            Ok(f) => f,
-            Err(_) => continue,
-        };
-        let mut lines = BufReader::new(file).lines();
-        let Some(Ok(first)) = lines.next() else {
-            continue;
-        };
-        let Ok(Record::Header { id, ts, parent, .. }) = serde_json::from_str(&first) else {
-            continue;
-        };
-        let mut title = String::new();
-        let mut messages = 0usize;
-        let mut cost = 0.0f64;
-        let mut tokens = 0u64;
-        for line in lines.map_while(Result::ok) {
-            if line.starts_with("{\"record\":\"message\"") {
-                messages += 1;
-                if title.is_empty() {
-                    if let Ok(probe) = serde_json::from_str::<TitleProbe>(&line) {
-                        if probe.role == Some(Role::User) {
-                            if let Some(content) = probe.content {
-                                let first_line = content
-                                    .lines()
-                                    .next()
-                                    .unwrap_or("")
-                                    .chars()
-                                    .take(60)
-                                    .collect::<String>();
-                                if !first_line.is_empty() {
-                                    title = first_line;
-                                }
-                            }
-                        }
-                    }
-                }
-            } else if line.starts_with("{\"record\":\"title\"") {
-                // stored title (forks): wins over the first-user-message probe
-                if let Ok(Record::Title { title: t, .. }) = serde_json::from_str(&line) {
-                    title = t;
-                }
-            } else if line.starts_with("{\"record\":\"usage\"") {
-                if let Ok(probe) = serde_json::from_str::<UsageProbe>(&line) {
-                    cost += probe.cost;
-                    tokens += probe.input + probe.output + probe.cache_read + probe.cache_write;
-                }
-            }
+        if let Some(summary) = summarize(&path) {
+            summaries.push(summary);
         }
-        if title.is_empty() {
-            title = "(empty)".to_string();
-        }
-        summaries.push(StrandSummary {
-            path,
-            id: id.0.clone(),
-            ts: ts.clone(),
-            title,
-            messages,
-            cost,
-            tokens,
-            parent,
-        });
     }
     // ids embed millisecond timestamps (s{millis:x}), so they sort newer
     // first even when RFC 3339 timestamps tie at second granularity.
@@ -619,9 +549,103 @@ pub fn list(cwd: &Path) -> std::io::Result<Vec<StrandSummary>> {
     Ok(summaries)
 }
 
-/// Most recent strand for a working directory.
+/// One strand's header (first line only): `(id, ts, parent)`.
+fn header_of(path: &Path) -> Option<(String, String, Option<String>)> {
+    let file = File::open(path).ok()?;
+    let first = BufReader::new(file).lines().next()?.ok()?;
+    let Ok(Record::Header { id, ts, parent, .. }) = serde_json::from_str(&first) else {
+        return None;
+    };
+    Some((id.0, ts, parent))
+}
+
+/// Fully summarize one strand file (title/messages/cost/tokens).
+fn summarize(path: &Path) -> Option<StrandSummary> {
+    let (id, ts, parent) = header_of(path)?;
+    let file = File::open(path).ok()?;
+    let lines = BufReader::new(file).lines();
+    let mut title = String::new();
+    let mut messages = 0usize;
+    let mut cost = 0.0f64;
+    let mut tokens = 0u64;
+    for line in lines.map_while(Result::ok) {
+        if line.starts_with("{\"record\":\"message\"") {
+            messages += 1;
+            if title.is_empty() {
+                if let Ok(probe) = serde_json::from_str::<TitleProbe>(&line) {
+                    if probe.role == Some(Role::User) {
+                        if let Some(content) = probe.content {
+                            let first_line = content
+                                .lines()
+                                .next()
+                                .unwrap_or("")
+                                .chars()
+                                .take(60)
+                                .collect::<String>();
+                            if !first_line.is_empty() {
+                                title = first_line;
+                            }
+                        }
+                    }
+                }
+            }
+        } else if line.starts_with("{\"record\":\"title\"") {
+            // stored title (forks): wins over the first-user-message probe
+            if let Ok(Record::Title { title: t, .. }) = serde_json::from_str(&line) {
+                title = t;
+            }
+        } else if line.starts_with("{\"record\":\"usage\"") {
+            if let Ok(probe) = serde_json::from_str::<UsageProbe>(&line) {
+                cost += probe.cost;
+                tokens += probe.input + probe.output + probe.cache_read + probe.cache_write;
+            }
+        }
+    }
+    if title.is_empty() {
+        title = "(empty)".to_string();
+    }
+    Some(StrandSummary {
+        path: path.to_path_buf(),
+        id,
+        ts,
+        title,
+        messages,
+        cost,
+        tokens,
+        parent,
+    })
+}
+
+/// Every strand file under `cwd`'s strand dir, header-only (first line
+/// each — cheap; ids sort newest-first like [`list`]).
+fn headers(cwd: &Path) -> std::io::Result<Vec<(PathBuf, String)>> {
+    let dir = strand_dir(cwd);
+    let mut out = Vec::new();
+    let entries = match std::fs::read_dir(&dir) {
+        Ok(e) => e,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(out),
+        Err(e) => return Err(e),
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().is_none_or(|e| e != "jsonl") {
+            continue;
+        }
+        if let Some((id, _, _)) = header_of(&path) {
+            out.push((path, id));
+        }
+    }
+    out.sort_by(|a, b| b.1.cmp(&a.1));
+    Ok(out)
+}
+
+/// Most recent strand for a working directory. Header-only directory
+/// scan; just the newest file is fully parsed.
 pub fn latest(cwd: &Path) -> std::io::Result<Option<StrandSummary>> {
-    Ok(list(cwd)?.into_iter().next())
+    Ok(headers(cwd)?
+        .into_iter()
+        .next()
+        .and_then(|(path, _)| summarize(&path)))
 }
 
 /// Outcome of resolving a user-supplied session reference.
@@ -665,14 +689,18 @@ pub fn resolve_id(cwd: &Path, needle: &str) -> std::io::Result<IdMatch> {
 }
 
 fn strands_filter(cwd: &Path, needle: &str) -> std::io::Result<Vec<StrandSummary>> {
-    Ok(list(cwd)?
+    // header-only scan (first line per file); full summaries are built
+    // only for actual matches — a prefix resolve must not read every
+    // byte of every strand
+    Ok(headers(cwd)?
         .into_iter()
-        .filter(|s| {
-            s.id.starts_with(needle)
-                || s.id
+        .filter(|(_, id)| {
+            id.starts_with(needle)
+                || id
                     .split_once('-')
                     .is_some_and(|(_, tail)| tail.starts_with(needle))
         })
+        .filter_map(|(path, _)| summarize(&path))
         .collect())
 }
 
@@ -753,18 +781,29 @@ pub fn read(path: &Path) -> std::io::Result<Vec<Record>> {
         Err(e) => return Err(e),
     };
     let mut out = Vec::new();
-    for (idx, line) in BufReader::new(file).lines().enumerate() {
+    let mut iter = BufReader::new(file).lines().enumerate();
+    while let Some((idx, line)) = iter.next() {
         let line = line?;
         if line.trim().is_empty() {
             continue;
         }
-        let record: Record = serde_json::from_str(&line).map_err(|e| {
-            std::io::Error::other(format!(
-                "{}:{}: malformed record: {e}",
-                path.display(),
-                idx + 1
-            ))
-        })?;
+        let record: Record = match serde_json::from_str(&line) {
+            Ok(r) => r,
+            Err(e) => {
+                // a torn FINAL line (crash mid-append; the writer has no
+                // fsync) must not make the whole session unresumable —
+                // skip it. Mid-file corruption stays a hard error.
+                let exhausted = iter.next().is_none();
+                if exhausted {
+                    break;
+                }
+                return Err(std::io::Error::other(format!(
+                    "{}:{}: malformed record: {e}",
+                    path.display(),
+                    idx + 1
+                )));
+            }
+        };
         out.push(record);
     }
     Ok(out)
@@ -996,6 +1035,39 @@ mod tests {
         assert_eq!(listed.len(), 1, "corrupted tail must not hide the strand");
         assert!(listed[0].title.contains("survives corruption"));
         assert!(listed[0].messages >= 2);
+        let _ = std::fs::remove_dir_all(&data);
+    }
+
+    #[test]
+    fn read_skips_torn_final_line_but_errors_midfile() {
+        let data = temp_data("torn");
+        let cwd = PathBuf::from("/tmp/proj-torn");
+        let mut strand = StrandFile::create(&cwd, None).unwrap();
+        strand
+            .append(Record::Message {
+                id: new_record_id(),
+                role: Role::User,
+                content: "kept".into(),
+                calls: Vec::new(),
+                results: Vec::new(),
+            })
+            .unwrap();
+        let path = strand.path().unwrap().to_path_buf();
+        {
+            use std::io::Write;
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap();
+            f.write_all(b"{\"record\":\"mes").unwrap(); // torn final line
+        }
+        let records = read(&path).unwrap();
+        assert!(records.len() >= 2, "torn tail skipped, session resumable");
+        // mid-file garbage stays a hard error (real corruption)
+        let mut mangled = std::fs::read_to_string(&path).unwrap();
+        mangled.push_str("{\"record\":\"message\"}\n{\"record\":\"usage\"}\n");
+        std::fs::write(&path, mangled).unwrap();
+        assert!(read(&path).is_err(), "mid-file malformed record errors");
         let _ = std::fs::remove_dir_all(&data);
     }
 

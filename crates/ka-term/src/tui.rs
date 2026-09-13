@@ -644,6 +644,33 @@ impl Transcript {
         self.rendered.clear();
     }
 
+    /// Drop every entry from the `nth`-from-last user message onward
+    /// (the visual half of `rewind n`). Returns the dropped prompt when
+    /// the cut happened, `None` when there are fewer user messages.
+    pub fn rewind_user(&mut self, nth_from_end: usize) -> Option<String> {
+        let mut seen = 0usize;
+        let mut cut = self.lines.len();
+        for (i, line) in self.lines.iter().enumerate().rev() {
+            if matches!(line, Line::User(_)) {
+                seen += 1;
+                if seen == nth_from_end {
+                    cut = i;
+                    break;
+                }
+            }
+        }
+        if seen < nth_from_end {
+            return None;
+        }
+        let dropped = match self.lines.get(cut) {
+            Some(Line::User(t)) => Some(t.clone()),
+            _ => None,
+        };
+        self.lines.truncate(cut);
+        self.rendered.truncate(cut);
+        dropped
+    }
+
     /// The source entries, in order.
     pub fn entries(&self) -> &[Line] {
         &self.lines
@@ -1547,6 +1574,53 @@ pub struct PendingAsk {
 /// ka-engine-free).
 pub static AGENTS: std::sync::OnceLock<Vec<(String, String)>> = std::sync::OnceLock::new();
 
+/// Notification settings injected by the CLI ([tui] bell / notify):
+/// the bell rings on turn completion and permission asks; the command
+/// (when set) runs once per finished turn with a small JSON payload on
+/// stdin — `notify-send ka "done"` is the canonical use.
+pub static NOTIFY: std::sync::OnceLock<NotifySettings> = std::sync::OnceLock::new();
+
+/// What the CLI resolves from `[tui]` config before `run`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct NotifySettings {
+    /// Ring the terminal bell on turn completion and asks.
+    pub bell: bool,
+    /// Optional shell command; JSON `{"event","stop"}` on stdin.
+    pub command: Option<String>,
+}
+
+/// Fire turn-completion/ask notifications: bell byte first (terminals
+/// mute it by user choice), then the optional command detached.
+fn fire_notifications(event: &str, stop: &str) {
+    let settings = NOTIFY.get().cloned().unwrap_or_default();
+    if settings.bell {
+        let _ = std::io::Write::write_all(&mut std::io::stdout(), b"\x07");
+        let _ = std::io::Write::flush(&mut std::io::stdout());
+    }
+    let Some(command) = settings.command else {
+        return;
+    };
+    // fixed-vocabulary payload: no user text, no escaping needed
+    let payload = format!("{{\"event\":\"{event}\",\"stop\":\"{stop}\"}}");
+    tokio::spawn(async move {
+        use tokio::io::AsyncWriteExt;
+        let spawned = tokio::process::Command::new("sh")
+            .arg("-c")
+            .arg(&command)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .kill_on_drop(true)
+            .spawn();
+        if let Ok(mut child) = spawned {
+            if let Some(mut stdin) = child.stdin.take() {
+                let _ = stdin.write_all(payload.as_bytes()).await;
+            }
+            let _ = child.wait().await;
+        }
+    });
+}
+
 /// Short human tag for a strand id: the first 8 chars of its random tail.
 pub fn short_session(id: &str) -> Option<&str> {
     id.split_once('-')
@@ -2081,10 +2155,24 @@ pub enum Modal {
         /// Selected row index.
         selected: usize,
     },
-    /// Memory viewer (/memory): project + user memory files.
+    /// Double-Esc rewind menu: pick a past user message to rewind to
+    /// (or edit & resend).
+    Rewind {
+        /// (turns-from-end, prompt text); 1 = most recent.
+        items: Vec<(usize, String)>,
+        /// Selected row.
+        selected: usize,
+    },
+    /// Memory viewer (/memory): project + user memory files, plus the
+    /// staged-inbox review flow (⏎ accept → project, u → user,
+    /// d discard).
     Memory {
         /// Rendered rows (path header + content lines).
         rows: Vec<String>,
+        /// Staged memory proposals from `.ka/memory/inbox.md`.
+        inbox: Vec<String>,
+        /// Selected inbox row.
+        selected: usize,
     },
     /// Usage dashboard (/usage): session + recent session rows.
     Usage {
@@ -2134,9 +2222,11 @@ pub async fn run(
     models: Vec<ModelInfo>,
     agents: Vec<(String, String)>,
     header_glyph: &str,
+    notify: NotifySettings,
     fresh: bool,
 ) -> std::io::Result<Exit> {
     let _ = AGENTS.set(agents.clone());
+    let _ = NOTIFY.set(notify);
     // Register raw mode in THIS crate's crossterm before ratatui flips
     // it through its own (0.28) copy: crossterm's parser decides whether
     // `\n` means Enter or Ctrl+J by reading its own per-crate raw-mode
@@ -2244,6 +2334,8 @@ async fn app(
     let mut busy = false;
     let mut busy_since: Option<Instant> = None;
     let mut quit_armed: Option<Instant> = None;
+    // double-Esc (rewind menu) tracking
+    let mut last_esc: Option<Instant> = None;
     let mut last_user: Option<String> = None;
     let mut last_error: Option<String> = None;
     let mut live_cache: Option<(String, u16, Vec<ratatui::text::Line<'static>>, Instant)> = None;
@@ -2736,9 +2828,81 @@ async fn app(
                                     _ => {}
                                 }
                             }
-                            Modal::Memory { .. } => {
-                                if key.code == KeyCode::Esc {
-                                    modal = None;
+                            Modal::Rewind { items, selected } => {
+                                match key.code {
+                                    KeyCode::Esc => modal = None,
+                                    KeyCode::Up => {
+                                        *selected = selected.saturating_sub(1);
+                                    }
+                                    KeyCode::Down => {
+                                        if *selected + 1 < items.len() {
+                                            *selected += 1;
+                                        }
+                                    }
+                                    KeyCode::Enter | KeyCode::Char('r') | KeyCode::Char('e') => {
+                                        let edit = key.code == KeyCode::Char('e');
+                                        let (turns, prompt) = items[*selected].clone();
+                                        modal = None;
+                                        let _ = commands
+                                            .send(Command::Rewind { turns: turns as u32 })
+                                            .await;
+                                        transcript.rewind_user(turns);
+                                        if edit {
+                                            input.text = prompt;
+                                            input.cursor = input.text.chars().count();
+                                            transcript.push_separated(Line::Note(
+                                                "✎ edit & resend — ⏎ sends when ready"
+                                                    .into(),
+                                            ));
+                                        } else {
+                                            transcript.push_separated(Line::Note(format!(
+                                                "⏪ rewound {turns} turn(s) — files unchanged (/undo restores edits)"
+                                            )));
+                                        }
+                                    }
+                                    _ => {}
+                                }
+                            }
+                            Modal::Memory {
+                                rows,
+                                inbox,
+                                selected,
+                            } => {
+                                match key.code {
+                                    KeyCode::Esc => modal = None,
+                                    KeyCode::Up if !inbox.is_empty() => {
+                                        *selected = selected.saturating_sub(1);
+                                    }
+                                    KeyCode::Down if !inbox.is_empty() => {
+                                        *selected = (*selected + 1).min(inbox.len() - 1);
+                                    }
+                                    KeyCode::Enter
+                                    | KeyCode::Char('a')
+                                    | KeyCode::Char('u')
+                                    | KeyCode::Char('d')
+                                        if !inbox.is_empty() =>
+                                    {
+                                        let cwd = std::env::current_dir()
+                                            .unwrap_or_else(|_| std::path::PathBuf::from("."));
+                                        let line = inbox.remove(*selected);
+                                        if key.code != KeyCode::Char('d') {
+                                            let user = key.code == KeyCode::Char('u');
+                                            // best-effort: a failed append leaves the
+                                            // note staged for a later retry
+                                            if accept_memory_note(&cwd, &line, user).is_ok() {
+                                                write_memory_inbox(&cwd, inbox);
+                                            } else {
+                                                inbox.insert(*selected, line);
+                                            }
+                                        } else {
+                                            write_memory_inbox(&cwd, inbox);
+                                        }
+                                        if *selected >= inbox.len() {
+                                            *selected = inbox.len().saturating_sub(1);
+                                        }
+                                        *rows = memory_modal_rows(&cwd);
+                                    }
+                                    _ => {}
                                 }
                             }
                             Modal::Usage { .. } => {
@@ -3026,6 +3190,42 @@ async fn app(
                         (KeyCode::Esc, _) if busy => {
                             let _ = commands.send(Command::Abort).await;
                         }
+                        (KeyCode::Esc, _)
+                            if !busy
+                                && slash_popup.is_none()
+                                && path_popup.is_none()
+                                && pending.is_none()
+                                && input.text.is_empty() =>
+                        {
+                            // double-Esc on an empty idle input opens the
+                            // rewind menu (claude-code muscle memory)
+                            let now = Instant::now();
+                            let doubled = last_esc
+                                .is_some_and(|t| now.duration_since(t) < Duration::from_millis(600));
+                            if doubled {
+                                last_esc = None;
+                                let items: Vec<(usize, String)> = transcript
+                                    .entries()
+                                    .iter()
+                                    .rev()
+                                    .filter_map(|l| match l {
+                                        Line::User(t) => Some(t.clone()),
+                                        _ => None,
+                                    })
+                                    .take(20)
+                                    .enumerate()
+                                    .map(|(i, t)| (i + 1, t))
+                                    .collect();
+                                if !items.is_empty() {
+                                    modal = Some(Modal::Rewind {
+                                        items,
+                                        selected: 0,
+                                    });
+                                }
+                            } else {
+                                last_esc = Some(now);
+                            }
+                        }
                         (KeyCode::Esc, _) if scroll.is_some() => scroll = None,
                         (KeyCode::Enter, KeyModifiers::SHIFT) => input.newline(),
                         (KeyCode::Char('j'), KeyModifiers::CONTROL) => input.newline(),
@@ -3302,25 +3502,25 @@ async fn app(
                                             // safe mode: memory is not loaded into
                                             // the session — the viewer must not
                                             // pretend otherwise
-                                            let files = if ka_engine::conventions::bare_mode() {
+                                            let rows = if ka_engine::conventions::bare_mode() {
+                                                vec![
+                                                    "(no memory files)".to_string(),
+                                                    "safe mode: memory tiers are not loaded"
+                                                        .to_string(),
+                                                ]
+                                            } else {
+                                                memory_modal_rows(&cwd)
+                                            };
+                                            let inbox = if ka_engine::conventions::bare_mode() {
                                                 Vec::new()
                                             } else {
-                                                discover_memory_files(&cwd)
+                                                read_memory_inbox(&cwd)
                                             };
-                                            let mut rows = Vec::new();
-                                            if files.is_empty() {
-                                                rows.push("(no memory files)".into());
-                                                rows.push(
-                                                    "create ./MEMORY.md or ~/.config/ka/MEMORY.md".into(),
-                                                );
+                                            Modal::Memory {
+                                                rows,
+                                                inbox,
+                                                selected: 0,
                                             }
-                                            for (path, content) in files {
-                                                rows.push(format!("▸ {}", path.display()));
-                                                for line in content.lines() {
-                                                    rows.push(line.to_string());
-                                                }
-                                            }
-                                            Modal::Memory { rows }
                                         }
                                         ModalKind::Usage => {
                                             let sessions = std::env::current_dir()
@@ -3395,6 +3595,20 @@ async fn app(
                                     }
                                     continue;
                                 }
+                            }
+                            // `!` passthrough: run a shell command directly
+                            // (no turn, no gate — the user typed it); output
+                            // lands in the transcript and rides the next
+                            // prompt as context
+                            if let Some(shell_cmd) = text
+                                .strip_prefix('!')
+                                .map(str::trim)
+                                .filter(|c| !c.is_empty())
+                            {
+                                let command = shell_cmd.to_string();
+                                transcript.push_separated(Line::Note(format!("» {command}")));
+                                let _ = commands.send(Command::Shell { command }).await;
+                                continue;
                             }
                             transcript.push_separated(Line::User(text.clone()));
                             let cmd = if busy {
@@ -3704,6 +3918,7 @@ async fn app(
                             }
                             Modal::Prompts { .. } => {}
                             Modal::Memory { .. } => {}
+                            Modal::Rewind { .. } => {}
                             Modal::Tree { .. } => {}
                             Modal::Session(picker) => {
                                 picker.filter.extend(text.chars().filter(|c| !c.is_whitespace()));
@@ -4126,6 +4341,40 @@ fn apply_event(
                     selected: 0,
                 });
             }
+            fire_notifications("permission_ask", "ask");
+        }
+        Event::ShellOutput {
+            command,
+            output,
+            note,
+        } => {
+            // `!` passthrough result: plain rows under the » command row
+            let tail = note
+                .as_deref()
+                .map(|n| format!(" ({n})"))
+                .unwrap_or_default();
+            let body = if output.is_empty() {
+                format!("(no output){tail}")
+            } else {
+                format!("{output}{tail}")
+            };
+            for line in body.lines().take(40) {
+                transcript.push_separated(Line::Report(line.to_string()));
+            }
+            let hidden = body.lines().count().saturating_sub(40);
+            if hidden > 0 {
+                transcript.push_separated(Line::Report(format!("… {hidden} more lines")));
+            }
+            transcript.push_separated(Line::Note(format!(
+                "» {command} — output joins your next prompt"
+            )));
+        }
+        Event::Tasks { rows } => {
+            // /tasks dashboard snapshot rendered as report rows
+            transcript.push_separated(Line::Note("▬ background tasks".into()));
+            for row in rows {
+                transcript.push_separated(Line::Report(row.clone()));
+            }
         }
         Event::TurnFinished { stop, usage } => {
             let elapsed = busy_since.map_or(0.0, |t| t.elapsed().as_secs_f64());
@@ -4159,6 +4408,16 @@ fn apply_event(
             let silent = matches!(stop, ka_protocol::Stop::Done)
                 && usage.input + usage.output + usage.cache_read == 0
                 && usage.cost == 0.0;
+            // silent = replayed turns (resume): no notification for those
+            if !silent {
+                let stop_label = match stop {
+                    ka_protocol::Stop::Done => "done",
+                    ka_protocol::Stop::Aborted => "aborted",
+                    ka_protocol::Stop::Length => "length",
+                    ka_protocol::Stop::Error => "error",
+                };
+                fire_notifications("turn_finished", stop_label);
+            }
             if !silent {
                 let row = match stop {
                     ka_protocol::Stop::Done => Line::Report(format!("done{tail}")),
@@ -4650,6 +4909,10 @@ fn builtin_slash_commands() -> Vec<(String, String)> {
             "/memory".to_string(),
             "show loaded MEMORY.md tiers".to_string(),
         ),
+        (
+            "/tasks".to_string(),
+            "background tasks and jobs snapshot".to_string(),
+        ),
         ("/prompt".to_string(), "run an MCP prompt".to_string()),
         (
             "/provider".to_string(),
@@ -4661,6 +4924,14 @@ fn builtin_slash_commands() -> Vec<(String, String)> {
             "research the task, write .ka/plans/plan.md".to_string(),
         ),
         ("/build".to_string(), "implement the plan file".to_string()),
+        (
+            "/review".to_string(),
+            "read-only review of current changes ([base])".to_string(),
+        ),
+        (
+            "/tasks".to_string(),
+            "background tasks & jobs snapshot".to_string(),
+        ),
         (
             "/approve".to_string(),
             "review the plan file, then build it".to_string(),
@@ -5000,14 +5271,14 @@ fn ka_config_path() -> String {
 }
 
 /// A parsed slash command.
-struct Slash {
-    event: Option<Command>,
-    quit: bool,
-    followup: Option<String>,
+pub struct Slash {
+    pub event: Option<Command>,
+    pub quit: bool,
+    pub followup: Option<String>,
     /// Modal to open instead of sending an event.
-    modal: Option<ModalKind>,
+    pub modal: Option<ModalKind>,
     /// Local transcript note (no engine roundtrip).
-    note: Option<String>,
+    pub note: Option<String>,
 }
 
 /// Modal a slash command opens.
@@ -5200,7 +5471,7 @@ fn custom_command_in(
     None
 }
 
-fn slash_command(text: &str) -> Option<Slash> {
+pub fn slash_command(text: &str) -> Option<Slash> {
     let mut parts = text.splitn(2, ' ');
     let head = parts.next()?.trim();
     let rest = parts.next().map(str::trim).filter(|s| !s.is_empty());
@@ -5227,6 +5498,7 @@ fn slash_command(text: &str) -> Option<Slash> {
             | "/prompt"
             | "/tree"
             | "/memory"
+            | "/tasks"
     ) {
         if let Some(body) = custom_command(head, rest) {
             return Some(Slash {
@@ -5303,6 +5575,31 @@ then write a concrete numbered implementation plan to .ka/plans/plan.md. Task: {
             modal: None,
             followup: Some(build_followup()),
         }),
+        "/review" => {
+            // read-only review preset (codex /review shape): plan-mode
+            // locking + a strict reviewer prompt; the report lands in
+            // chat where /copy and /export can reach it
+            let base = rest
+                .map(str::trim)
+                .filter(|r| !r.is_empty())
+                .unwrap_or("the repository's default branch — main or master, whichever exists; if neither, HEAD");
+            Some(Slash {
+                note: None,
+                event: Some(Command::SetMode {
+                    mode: ka_protocol::Mode::Plan,
+                }),
+                quit: false,
+                modal: None,
+                followup: Some(format!(
+                    "Review the current changes as a strict senior engineer — READ-ONLY, \\
+do not modify any files. Compare the working tree against {base} (git diff plus \\
+untracked files, via the bash tool; read files for full context). Produce: \\
+(1) a one-line verdict (ship / fix first / blocked), (2) findings ordered \\
+blocker > major > minor > nit, each as `file:line — issue — concrete fix`, \\
+(3) what is missing (tests, docs, error handling)."
+                )),
+            })
+        }
         "/approve" => Some(Slash {
             note: None,
             event: Some(Command::SetMode {
@@ -5436,6 +5733,13 @@ then write a concrete numbered implementation plan to .ka/plans/plan.md. Task: {
             quit: false,
             followup: None,
             modal: Some(ModalKind::Help),
+        }),
+        "/tasks" => Some(Slash {
+            note: None,
+            event: Some(Command::ListTasks),
+            quit: false,
+            followup: None,
+            modal: None,
         }),
         "/memory" => Some(Slash {
             note: None,
@@ -5666,6 +5970,91 @@ fn pad_to_width(s: String, width: usize) -> String {
 /// separated by dim ` · `.
 /// Memory tier files for /memory: project MEMORY.md, then the
 /// user-level one. Mirrors the engine's system-prompt fold.
+/// Rows for the /memory modal: loaded MEMORY.md tiers.
+pub fn memory_modal_rows(cwd: &std::path::Path) -> Vec<String> {
+    let files = discover_memory_files(cwd);
+    let mut rows = Vec::new();
+    if files.is_empty() {
+        rows.push("(no memory files)".to_string());
+        rows.push("create ./MEMORY.md or ~/.config/ka/MEMORY.md".to_string());
+    }
+    for (path, content) in files {
+        rows.push(format!("▸ {}", path.display()));
+        for line in content.lines() {
+            rows.push(line.to_string());
+        }
+    }
+    rows
+}
+
+/// The staged-memory inbox file path.
+fn memory_inbox_path(cwd: &std::path::Path) -> std::path::PathBuf {
+    cwd.join(".ka/memory/inbox.md")
+}
+
+/// Staged memory proposals, oldest first.
+pub fn read_memory_inbox(cwd: &std::path::Path) -> Vec<String> {
+    std::fs::read_to_string(memory_inbox_path(cwd))
+        .map(|text| {
+            text.lines()
+                .map(str::trim)
+                .filter(|l| !l.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Persist the inbox after a review action (removed when empty).
+pub fn write_memory_inbox(cwd: &std::path::Path, inbox: &[String]) {
+    let path = memory_inbox_path(cwd);
+    if inbox.is_empty() {
+        let _ = std::fs::remove_file(path);
+        return;
+    }
+    let mut body = inbox.join(
+        "
+",
+    );
+    body.push('\n');
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::write(path, body);
+}
+
+/// Append one staged note to a MEMORY.md tier (project or user).
+/// Strips the `- [stamp] ` prefix before writing.
+pub fn accept_memory_note(cwd: &std::path::Path, staged: &str, user: bool) -> std::io::Result<()> {
+    let note = staged
+        .split_once("] ")
+        .map(|(_, note)| note)
+        .unwrap_or(staged)
+        .trim()
+        .trim_start_matches("- ")
+        .to_string();
+    if note.is_empty() {
+        return Ok(());
+    }
+    let target = if user {
+        std::env::var("HOME")
+            .map(|h| std::path::PathBuf::from(h).join(".config/ka/MEMORY.md"))
+            .unwrap_or_else(|_| cwd.join("MEMORY.md"))
+    } else {
+        cwd.join("MEMORY.md")
+    };
+    if let Some(parent) = target.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut body = std::fs::read_to_string(&target).unwrap_or_default();
+    if !body.is_empty() && !body.ends_with('\n') {
+        body.push('\n');
+    }
+    body.push_str(&note);
+    body.push('\n');
+    std::fs::write(&target, body)
+}
+
 fn discover_memory_files(cwd: &std::path::Path) -> Vec<(std::path::PathBuf, String)> {
     let mut out = Vec::new();
     let project = cwd.join("MEMORY.md");
@@ -6136,7 +6525,25 @@ fn render(
             Modal::Tree { .. } => {
                 hint_spans(&[(" ↑↓", "choose"), (" ⏎", "attach"), (" esc", "close")])
             }
-            Modal::Memory { .. } => hint_spans(&[(" esc", "close")]),
+            Modal::Rewind { .. } => hint_spans(&[
+                (" ↑↓", "choose"),
+                (" ⏎", "rewind"),
+                (" e", "edit"),
+                (" esc", "close"),
+            ]),
+            Modal::Memory { inbox, .. } => {
+                if inbox.is_empty() {
+                    hint_spans(&[(" esc", "close")])
+                } else {
+                    hint_spans(&[
+                        (" ↑↓", "choose"),
+                        (" ⏎", "project"),
+                        (" u", "user"),
+                        (" d", "discard"),
+                        (" esc", "close"),
+                    ])
+                }
+            }
             Modal::Usage { .. } => hint_spans(&[(" any", "close")]),
             Modal::Context { .. } => hint_spans(&[(" esc", "close")]),
             Modal::Key(_) => hint_spans(&[(" type", "value"), (" ⏎", "save"), (" esc", "cancel")]),
@@ -6734,8 +7141,57 @@ fn render(
                     .wrap(Wrap { trim: false });
                 frame.render_widget(widget, rect);
             }
-            Modal::Memory { rows } => {
-                let height = (rows.len() as u16 + 4).clamp(6, 24);
+            Modal::Rewind { items, selected } => {
+                let height = (items.len() as u16 + 5).clamp(6, 22);
+                let width = 76.min(frame.area().width);
+                let rect = centered(width, height, modal_area);
+                frame.render_widget(ratatui::widgets::Clear, rect);
+                let inner_w = width.saturating_sub(4) as usize;
+                let mut text = vec![TuiLine::styled(
+                    pad_to_width(
+                        "pick a message — ⏎/r rewind here · e edit & resend · esc close"
+                            .to_string(),
+                        inner_w,
+                    ),
+                    crate::palette::META,
+                )];
+                let cap = (height as usize).saturating_sub(5);
+                for (i, (turns, prompt)) in items.iter().enumerate().take(cap.max(1)) {
+                    let marker = if i == *selected { "▶ " } else { "  " };
+                    let mut row = format!("{marker}[−{turns}] {prompt}");
+                    if row.chars().count() > inner_w {
+                        row = row
+                            .chars()
+                            .take(inner_w.saturating_sub(1))
+                            .collect::<String>()
+                            + "…";
+                    }
+                    let style = if i == *selected {
+                        crate::palette::FG_STRONG
+                    } else {
+                        crate::palette::META
+                    };
+                    text.push(TuiLine::styled(pad_to_width(row, inner_w), style));
+                }
+                let widget = Paragraph::new(text)
+                    .block(
+                        Block::default()
+                            .borders(Borders::ALL)
+                            .title(padded_title("rewind"))
+                            .border_style(crate::palette::BORDER_STYLE)
+                            .padding(ratatui::widgets::Padding::new(1, 1, 1, 1)),
+                    )
+                    .style(ratatui::style::Style::new().bg(crate::palette::BG_SURFACE))
+                    .wrap(Wrap { trim: false });
+                frame.render_widget(widget, rect);
+            }
+            Modal::Memory {
+                rows,
+                inbox,
+                selected,
+            } => {
+                let extra = if inbox.is_empty() { 0 } else { inbox.len() + 2 };
+                let height = (rows.len() as u16 + extra as u16 + 4).clamp(6, 24);
                 let width = 72.min(frame.area().width);
                 let rect = centered(width, height, modal_area);
                 // wipe the covered cells first: the paragraph only paints
@@ -6744,7 +7200,12 @@ fn render(
                 let inner_w = width.saturating_sub(4) as usize;
                 let mut text = Vec::new();
                 let cap = (height as usize).saturating_sub(4);
-                for row in rows.iter().take(cap) {
+                let mut budget = cap;
+                for row in rows.iter() {
+                    if budget == 0 {
+                        break;
+                    }
+                    budget -= 1;
                     if row.starts_with('▸') {
                         text.push(TuiLine::styled(
                             pad_to_width(row.clone(), inner_w),
@@ -6752,6 +7213,28 @@ fn render(
                         ));
                     } else {
                         text.push(TuiLine::raw(row.clone()));
+                    }
+                }
+                if !inbox.is_empty() && budget >= 2 {
+                    budget -= 2;
+                    text.push(TuiLine::raw(String::new()));
+                    text.push(TuiLine::styled(
+                        "staged memories — ⏎ accept→MEMORY.md · u→user · d discard".to_string(),
+                        crate::palette::META,
+                    ));
+                    for (i, line) in inbox.iter().enumerate() {
+                        if budget == 0 {
+                            break;
+                        }
+                        budget -= 1;
+                        let marker = if i == *selected { "▶ " } else { "  " };
+                        let row = format!("{marker}{line}");
+                        let style = if i == *selected {
+                            crate::palette::FG_STRONG
+                        } else {
+                            crate::palette::META
+                        };
+                        text.push(TuiLine::styled(pad_to_width(row, inner_w), style));
                     }
                 }
                 let widget = Paragraph::new(text)
@@ -7163,17 +7646,24 @@ fn selection_text(
     if r2 < origin.1 || win.is_empty() {
         return None;
     }
+    // clamp to the content area: anchors on the title row or in the
+    // left margin underflow u16 subtraction otherwise. An anchor above
+    // the content promotes the drag to whole-row selection (gutter-click
+    // semantics): full first row through the full head row.
+    let whole_rows = r1 < origin.1;
+    let r1 = r1.max(origin.1);
+    let c1 = c1.max(origin.0);
     let i1 = ((r1 - origin.1) as usize).min(win.len() - 1);
     let i2 = ((r2 - origin.1) as usize).min(win.len() - 1);
     let mut parts: Vec<String> = Vec::new();
     for (off, line) in win[i1..=i2].iter().enumerate() {
         let text = line_text(line);
-        let from = if off == 0 {
-            (c1 - origin.0) as usize
+        let from = if off == 0 && !whole_rows {
+            ((c1 - origin.0) as usize).min(text.width())
         } else {
             0
         };
-        let to = if off == i2 - i1 {
+        let to = if off == i2 - i1 && !whole_rows {
             ((c2 - origin.0) as usize + 1).min(text.width())
         } else {
             text.width()
@@ -7229,6 +7719,10 @@ fn apply_sel_highlight(
     if r2 < oy {
         return;
     }
+    // the anchor may sit on the title/border row (above the first
+    // content row): clamp before subtracting or u16 underflows and the
+    // release-build slice panics
+    let r1 = r1.max(oy);
     let i1 = ((r1 - oy) as usize).min(window.len());
     let i2 = (((r2 - oy) as usize) + 1).min(window.len());
     for row in &mut window[i1..i2] {
@@ -10148,6 +10642,27 @@ mod tests {
             "new call closes the old row"
         );
         assert_eq!(head, "→ read · lib.rs");
+    }
+
+    #[test]
+    fn mouse_selection_anchored_above_content_does_not_panic() {
+        // regression: an anchor on the transcript title row (one above
+        // the first content row) used to underflow u16 subtraction and
+        // slice-panic in release builds
+        let win: Vec<ratatui::text::Line<'static>> = vec![
+            ratatui::text::Line::from("row one"),
+            ratatui::text::Line::from("row two"),
+        ];
+        let origin = (2u16, 5u16);
+        // anchor at row 4 (title row), head dragged to row 6
+        let text = selection_text(&win, origin, (2, 4), (2, 6));
+        assert_eq!(text.as_deref(), Some("row one\nrow two"));
+        // same anchor geometry through the highlight path
+        let mut hl = win.clone();
+        apply_sel_highlight(&mut hl, origin.1, (2, 4), (2, 6));
+        // and a left-margin column anchor
+        let text = selection_text(&win, origin, (0, 4), (0, 6));
+        assert!(text.is_some(), "margin anchor clamps, not panics");
     }
 
     #[test]

@@ -212,7 +212,7 @@ async fn openai_basic_stream_text_and_usage() {
             StreamEvent::Finished {
                 stop: ka_protocol::Stop::Done,
                 usage: ka_protocol::Usage {
-                    input: 12,
+                    input: 8,
                     output: 3,
                     cache_read: 4,
                     cache_write: 0,

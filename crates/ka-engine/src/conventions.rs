@@ -116,6 +116,99 @@ pub fn discover_agents(cwd: &Path) -> Vec<AgentsFile> {
     found
 }
 
+/// One discovered `.ka/rules/*.md` file: glob-scoped project rules.
+pub struct RuleFile {
+    /// Where it came from.
+    pub path: PathBuf,
+    /// The markdown body (frontmatter stripped).
+    pub content: String,
+    /// `paths:` globs from frontmatter — the rule activates once any
+    /// matching file has been read in the session (None = always on).
+    pub globs: Option<Vec<String>>,
+}
+
+/// Discover rule files: project `.ka/rules` (trust-gated, like skills),
+/// plus `.agents/rules`, `.claude/rules`, and the user
+/// `~/.config/ka/rules`. Name-sorted, capped at 12, project wins on
+/// name collisions.
+pub fn discover_rules(cwd: &Path) -> Vec<RuleFile> {
+    if bare_mode() {
+        return Vec::new();
+    }
+    let trusted = crate::trust::project_trusted(cwd);
+    let mut roots: Vec<PathBuf> = Vec::new();
+    if trusted {
+        roots.extend([
+            cwd.join(".ka/rules"),
+            cwd.join(".agents/rules"),
+            cwd.join(".claude/rules"),
+        ]);
+    }
+    if let Ok(home) = std::env::var("HOME") {
+        roots.push(PathBuf::from(home).join(".config/ka/rules"));
+    }
+    let mut rules: Vec<RuleFile> = Vec::new();
+    for root in roots {
+        let Ok(entries) = std::fs::read_dir(&root) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().is_none_or(|e| e != "md") {
+                continue;
+            }
+            let Ok(text) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            let (globs, body) = split_rule_frontmatter(&text);
+            if body.trim().is_empty() {
+                continue;
+            }
+            if rules.iter().any(|r| r.path.file_stem() == path.file_stem()) {
+                continue; // first root wins (project > user)
+            }
+            rules.push(RuleFile {
+                path,
+                content: body.trim().to_string(),
+                globs,
+            });
+        }
+    }
+    rules.sort_by_key(|r| {
+        r.path
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default()
+    });
+    rules.truncate(12);
+    rules
+}
+
+/// Split `paths:` globs off a rule file's frontmatter; the rest is body.
+fn split_rule_frontmatter(text: &str) -> (Option<Vec<String>>, String) {
+    let Some(rest) = text.strip_prefix("---\n") else {
+        return (None, text.to_string());
+    };
+    let Some(end) = rest.find("\n---") else {
+        return (None, text.to_string());
+    };
+    let mut globs: Option<Vec<String>> = None;
+    for line in rest[..end].lines() {
+        if let Some(v) = line.strip_prefix("paths:") {
+            let list: Vec<String> = v
+                .split(',')
+                .map(str::trim)
+                .filter(|g| !g.is_empty())
+                .map(str::to_string)
+                .collect();
+            if !list.is_empty() {
+                globs = Some(list);
+            }
+        }
+    }
+    (globs, rest[end + 4..].to_string())
+}
+
 /// One discovered skill.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Skill {
@@ -284,6 +377,55 @@ mod tests {
             Some("quoted desc".to_string())
         );
         assert_eq!(parse_frontmatter_description("no frontmatter"), None);
+    }
+
+    #[test]
+    fn rules_parse_frontmatter_and_scope() {
+        let (globs, body) =
+            split_rule_frontmatter("---\npaths: **/*.ts, tsconfig.json\n---\nUse pnpm.");
+        assert_eq!(
+            globs,
+            Some(vec!["**/*.ts".to_string(), "tsconfig.json".to_string()])
+        );
+        assert_eq!(body.trim(), "Use pnpm.");
+        // no frontmatter → always active
+        let (globs, body) = split_rule_frontmatter("Always on.");
+        assert_eq!(globs, None);
+        assert_eq!(body.trim(), "Always on.");
+        // frontmatter without paths → always active
+        let (globs, _) = split_rule_frontmatter("---\nname: no-scope\n---\nBody.");
+        assert_eq!(globs, None);
+    }
+
+    #[test]
+    fn rules_discover_capped_sorted_and_skip_empty() {
+        let root = temp_tree("rules");
+        let dir = root.join(".ka/rules");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("b-styles.md"), "Rule B.").unwrap();
+        std::fs::write(dir.join("a-ts.md"), "---\npaths: *.ts\n---\nRule A.").unwrap();
+        std::fs::write(dir.join("empty.md"), "   \n").unwrap();
+        crate::trust::test_support::with_trust_file(|_| {
+            crate::trust::approve(&root);
+            let rules = discover_rules(&root);
+            let names: Vec<String> = rules
+                .iter()
+                .map(|r| {
+                    r.path
+                        .file_stem()
+                        .map(|s| s.to_string_lossy().into_owned())
+                        .unwrap_or_default()
+                })
+                .collect();
+            assert_eq!(
+                names,
+                vec!["a-ts".to_string(), "b-styles".to_string()],
+                "{names:?}"
+            );
+            assert_eq!(rules[0].globs, Some(vec!["*.ts".to_string()]));
+            assert_eq!(rules[1].content, "Rule B.");
+            let _ = std::fs::remove_dir_all(&root);
+        });
     }
 
     #[test]

@@ -19,7 +19,7 @@ fn main() {
         "unlink" => unlink(),
         "dev" => dev(&rest),
         "ci" => ci(),
-        "size" => size(),
+        "size" => size(&rest),
         "models-sync" => models_sync(),
         "keygen" => keygen(&rest),
         "sign" => sign(&rest),
@@ -45,7 +45,9 @@ fn print_help() {
 
   install   install STABLE ka globally (cargo install --path, --locked)
   publish   publish the workspace crates to crates.io in dependency
-            order (--dry-run verifies without uploading)
+            order; skips crates already live at the current version, so
+            a rate-limited run resumes with the same command
+            (--dry-run verifies without uploading)
   link      build release + symlink kad -> ./target/release/ka in ~/.cargo/bin (DEV binary)
   unlink    remove the kad symlink
   dev [...] rebuild release, then run the dev binary with any args
@@ -56,6 +58,9 @@ fn print_help() {
             --force overwrites)
   sign <file>  sign with ka-release.key (or $KA_SIGNING_KEY base64) -> <file>.sig
   release   build musl release, tar.gz it, sign, print artifact paths
+  size [--bin <path>]
+            release binary size vs the 10 MB contract (default
+            target/release/ka; --bin gates any artifact, e.g. musl)
   bench [--update] [--bin <path>]
             p50 `ka --version` latency + peak RSS vs baselines.json
             (±30% tolerance; --update rewrites the baseline)
@@ -108,8 +113,10 @@ fn install() -> i32 {
 }
 
 /// Publish the workspace crates to crates.io in dependency order
-/// (leaf first, the `ka-agent` binary last). `--dry-run` packages and
-/// verifies every crate without uploading.
+/// (leaf first, the `ka-agent` binary last). Crates already live at
+/// the current version are skipped, so a run interrupted by a
+/// crates.io rate limit resumes with the same command.
+/// `--dry-run` packages and verifies every crate without uploading.
 fn publish(args: &[String]) -> i32 {
     const ORDER: [&str; 8] = [
         "ka-protocol",
@@ -123,6 +130,10 @@ fn publish(args: &[String]) -> i32 {
     ];
     let dry = args.iter().any(|a| a == "--dry-run");
     for name in ORDER {
+        if !dry && published_version(name) == Some(current_version()) {
+            println!("skip {name} {} (already on crates.io)", current_version());
+            continue;
+        }
         let mut cmd = Command::new("cargo");
         cmd.current_dir(repo_root())
             .args(["publish", "-p", name, "--locked"]);
@@ -143,6 +154,28 @@ fn publish(args: &[String]) -> i32 {
         println!("\nall workspace crates published to crates.io");
     }
     0
+}
+
+/// The workspace version every crate inherits — xtask shares it via
+/// `version.workspace = true`.
+fn current_version() -> String {
+    env!("CARGO_PKG_VERSION").to_string()
+}
+
+/// Latest version of `name` on crates.io, or None when unpublished or
+/// unreachable (a network hiccup then just defers to cargo publish's
+/// own error).
+fn published_version(name: &str) -> Option<String> {
+    let out = Command::new("cargo")
+        .args(["search", name, "--limit", "1"])
+        .output()
+        .ok()?;
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    // first matching line: `ka-protocol = "0.1.0"    # description`
+    let line = stdout
+        .lines()
+        .find(|l| l.starts_with(&format!("{name} = \"")))?;
+    line.split('"').nth(1).map(str::to_string)
 }
 
 /// Build release and symlink `kad` → repo's target/release/ka (dev channel).
@@ -220,6 +253,7 @@ fn ci() -> i32 {
             "clippy",
             "--workspace",
             "--all-targets",
+            "--all-features",
             "--",
             "-D",
             "warnings",
@@ -229,14 +263,28 @@ fn ci() -> i32 {
         return clippy;
     }
     run(Command::new("cargo")
-        .args(["test", "--workspace"])
+        .args(["test", "--workspace", "--all-features"])
         .current_dir(repo_root()))
 }
 
-/// Release binary size vs the footprint contract.
-fn size() -> i32 {
-    let bin = repo_root().join("target/release/ka");
+/// Release binary size vs the footprint contract (`--bin <path>` gates any
+/// artifact, e.g. the musl build CI ships).
+fn size(rest: &[String]) -> i32 {
+    let bin = match rest.iter().position(|a| a == "--bin") {
+        Some(i) => {
+            let Some(path) = rest.get(i + 1) else {
+                eprintln!("xtask: size --bin missing a path");
+                return 2;
+            };
+            PathBuf::from(path)
+        }
+        None => repo_root().join("target/release/ka"),
+    };
     if !bin.exists() {
+        if rest.iter().any(|a| a == "--bin") {
+            eprintln!("xtask: {} missing — build it first", bin.display());
+            return 2;
+        }
         let build = run(Command::new("cargo")
             .args(["build", "--release", "-p", "ka-agent"])
             .current_dir(repo_root()));

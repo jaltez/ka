@@ -3,7 +3,9 @@
 //! touch an unsigned build and verifies every download before the
 //! atomic binary swap.
 //!
-//! Layout: releases carry tag `ka-<channel>-*` with assets
+//! Layout: the CI release pipeline tags `vX.Y.Z` (assets
+//! `ka-<triple>.tar.gz` + `.sig` + `.sha256`); the legacy
+//! `ka-<channel>-*` tag shape still matches for hand-made releases.
 //! `ka-<target-triple>.tar.gz` (+ `.sig`). Everything is parameterized
 //! so tests can drive a local fixture server and swap a temp file.
 
@@ -22,10 +24,13 @@ const DEFAULT_API: &str = "https://api.github.com";
 pub struct UpdateOutcome {
     /// Version before the update.
     pub old_version: String,
-    /// New version after the swap (None = check-only).
+    /// New version after the swap (None = nothing installed).
     pub new_version: Option<String>,
     /// The release tag that was found/installed.
     pub latest_tag: String,
+    /// True when the newest release is not newer than the running
+    /// version (nothing to do — no download, no reinstall).
+    pub up_to_date: bool,
 }
 
 /// CLI entry: resolve defaults from env/config, then run.
@@ -43,6 +48,12 @@ pub async fn run(channel: &str, check_only: bool, repo: &str) -> Result<String, 
         check_only,
     )
     .await?;
+    if outcome.up_to_date {
+        return Ok(format!(
+            "up to date: {} (latest release: {})",
+            outcome.old_version, outcome.latest_tag
+        ));
+    }
     match outcome.new_version {
         Some(new) => Ok(format!(
             "updated: {} → {new} ({})",
@@ -53,6 +64,22 @@ pub async fn run(channel: &str, check_only: bool, repo: &str) -> Result<String, 
             outcome.old_version, outcome.latest_tag
         )),
     }
+}
+
+/// Parse a `(major, minor, patch)` triple out of a release tag
+/// (`v0.2.0`, `v0.2.0-edge`, `ka-stable-1.2.3`) or the running version
+/// string (`0.1.0 (hash)`).
+fn version_triple(s: &str) -> Option<(u64, u64, u64)> {
+    let token = s.split([' ', '-']).find(|t| {
+        let digits = t.strip_prefix('v').unwrap_or(t);
+        digits.chars().next().is_some_and(|c| c.is_ascii_digit())
+    })?;
+    let digits = token.strip_prefix('v').unwrap_or(token);
+    let mut it = digits.split('.');
+    let major = it.next()?.parse().ok()?;
+    let minor = it.next().unwrap_or("0").parse().ok()?;
+    let patch = it.next().unwrap_or("0").parse().ok()?;
+    Some((major, minor, patch))
 }
 
 /// XDG state dir for downloads (`~/.local/state/ka/update` fallback).
@@ -118,18 +145,35 @@ pub async fn check_and_install(
         .await
         .map_err(|e| format!("releases JSON: {e}"))?;
 
-    let tag_prefix = format!("ka-{channel}");
+    let legacy_prefix = format!("ka-{channel}");
     let release = releases
         .as_array()
         .and_then(|list| {
             list.iter().find(|r| {
-                r["tag_name"]
-                    .as_str()
-                    .is_some_and(|t| t.starts_with(&tag_prefix))
+                r["tag_name"].as_str().is_some_and(|t| {
+                    // CI tags `vX.Y.Z` (version-shaped — a stray `v`
+                    // prefix alone must not match); the legacy
+                    // `ka-<channel>-*` shape still matches too.
+                    (t.starts_with('v') && version_triple(t).is_some())
+                        || t.starts_with(&legacy_prefix)
+                })
             })
         })
-        .ok_or_else(|| format!("no release with tag prefix {tag_prefix:?} in {repo}"))?;
+        .ok_or_else(|| format!("no release tagged v* (or {legacy_prefix:?}) in {repo}"))?;
     let tag = release["tag_name"].as_str().unwrap_or_default().to_string();
+
+    // never reinstall the running version (or downgrade to a
+    // re-published older tag): compare triples before any download
+    if let (Some(new), Some(cur)) = (version_triple(&tag), version_triple(&old_version)) {
+        if new <= cur {
+            return Ok(UpdateOutcome {
+                old_version,
+                new_version: None,
+                latest_tag: tag,
+                up_to_date: true,
+            });
+        }
+    }
 
     let asset_name = format!("ka-{}.tar.gz", artifact_triple());
     let asset_url = |name: &str| -> Result<String, String> {
@@ -175,6 +219,7 @@ pub async fn check_and_install(
             old_version,
             new_version: None,
             latest_tag: tag,
+            up_to_date: false,
         });
     }
 
@@ -221,9 +266,15 @@ pub async fn check_and_install(
                 .map_err(|e| format!("stage {}: {e}", beside.display()))?;
             return Ok(UpdateOutcome {
                 old_version,
-                new_version: None,
+                new_version: Some(format!(
+                    "STAGED at {} — busy executable; swap manually: mv {} {}",
+                    beside.display(),
+                    beside.display(),
+                    exe.display()
+                )),
                 latest_tag: tag,
-            }) /* caller prints the manual-swap instruction */;
+                up_to_date: false,
+            });
         }
         Err(e) => return Err(format!("install: {e}")),
     }
@@ -238,6 +289,7 @@ pub async fn check_and_install(
         old_version,
         new_version: Some(new_version),
         latest_tag: tag,
+        up_to_date: false,
     })
 }
 
@@ -546,5 +598,15 @@ mod tests {
         .unwrap_err();
         assert!(err.contains("unsigned build"), "{err}");
         let _ = std::fs::remove_dir_all(&work);
+    }
+
+    #[test]
+    fn version_triples_parse_all_release_shapes() {
+        assert_eq!(version_triple("v0.2.0"), Some((0, 2, 0)));
+        assert_eq!(version_triple("v0.2.0-edge"), Some((0, 2, 0)));
+        assert_eq!(version_triple("ka-stable-1.2.3"), Some((1, 2, 3)));
+        assert_eq!(version_triple("0.1.0 (2c1f5fb)"), Some((0, 1, 0)));
+        assert_eq!(version_triple("10.0.2"), Some((10, 0, 2)));
+        assert_eq!(version_triple("no-version-here"), None);
     }
 }

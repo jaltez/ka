@@ -954,6 +954,123 @@ impl crate::hands::Hand for McpHand {
     }
 }
 
+/// Lazy-discovery call hand ([tools.mcp] discovery = "lazy"): one hand
+/// stands in for every server's tools, so a fleet of MCP servers costs
+/// one tool definition instead of dozens. Omitting `tool` lists a
+/// server's tools; with `tool` it invokes. Same exec-tier gate as the
+/// eager per-tool hands.
+pub struct McpCallHand {
+    servers: Vec<McpShared>,
+}
+
+impl McpCallHand {
+    /// One hand over every connected server.
+    pub fn new(servers: Vec<McpShared>) -> Self {
+        Self { servers }
+    }
+
+    fn find(&self, server: &str) -> Result<&McpShared, String> {
+        self.servers
+            .iter()
+            .find(|s| s.name() == server)
+            .ok_or_else(|| {
+                format!(
+                    "mcp_call: no such server {server:?} (have: {})",
+                    self.servers
+                        .iter()
+                        .map(|s| s.name())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            })
+    }
+}
+
+impl crate::hands::Hand for McpCallHand {
+    fn def(&self) -> crate::hands::HandDef {
+        let mut listing = String::from(
+            "Call a tool on a configured MCP server (external execution). Omit `tool` \
+             to list that server's tools first. Servers: ",
+        );
+        for s in &self.servers {
+            listing.push_str(&format!("{} ({} tools), ", s.name(), s.tools().len()));
+        }
+        crate::hands::HandDef {
+            name: "mcp_call".to_string(),
+            description: listing,
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "server": {"type": "string", "description": "Server name (required)"},
+                    "tool": {"type": "string", "description": "Tool name from the listing; omit to list tools"},
+                    "arguments": {"type": "object", "description": "Tool arguments (default {})"}
+                },
+                "required": ["server"]
+            }),
+            clearance: crate::hands::Clearance::Exec,
+            read_only: false,
+        }
+    }
+
+    fn execute<'a>(
+        &'a self,
+        args: &'a Value,
+        _ctx: &'a crate::hands::HandContext,
+    ) -> std::pin::Pin<Box<dyn Future<Output = crate::hands::ToolOutput> + Send + 'a>> {
+        Box::pin(async move {
+            let Some(server) = args.get("server").and_then(Value::as_str) else {
+                return crate::hands::ToolOutput::err("mcp_call: missing required 'server'");
+            };
+            let shared = match self.find(server) {
+                Ok(s) => s,
+                Err(e) => return crate::hands::ToolOutput::err(e),
+            };
+            let Some(tool) = args.get("tool").and_then(Value::as_str) else {
+                let mut out = String::new();
+                for t in shared.tools() {
+                    let desc = if t.description.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" — {}", truncate_chars(&t.description, 140))
+                    };
+                    out.push_str(&format!("- {}{desc}\n", t.name));
+                }
+                return if out.is_empty() {
+                    crate::hands::ToolOutput::ok(format!(
+                        "mcp {server}: no tools listed (disconnected?)"
+                    ))
+                } else {
+                    crate::hands::ToolOutput::ok(out)
+                };
+            };
+            let raw = shared
+                .tools()
+                .iter()
+                .find(|t| t.name == tool || t.raw_name == tool)
+                .map(|t| t.raw_name.clone())
+                .unwrap_or_else(|| tool.to_string());
+            let call_args = args.get("arguments").cloned().unwrap_or_else(|| json!({}));
+            match shared.call_tool(&raw, call_args).await {
+                Ok(text) if text.trim().is_empty() => {
+                    crate::hands::ToolOutput::ok("(empty result)".to_string())
+                }
+                Ok(text) => crate::hands::ToolOutput::ok(text),
+                Err(e) => crate::hands::ToolOutput::err(e),
+            }
+        })
+    }
+}
+
+/// Char-boundary truncate with ellipsis (listing caps).
+fn truncate_chars(s: &str, cap: usize) -> String {
+    if s.chars().count() > cap {
+        let cut: String = s.chars().take(cap).collect();
+        format!("{cut}…")
+    } else {
+        s.to_string()
+    }
+}
+
 /// The built-in `mcp` meta-hand: browse server resources and prompts
 /// without burning a model turn on discovery. Read-clearance: listing
 /// and reading never mutate server state.

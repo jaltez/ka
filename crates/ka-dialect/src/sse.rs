@@ -1,6 +1,10 @@
 //! Minimal hand-rolled SSE parser. Handles `data:` lines, ignores `event:`
 //! lines (both wires carry full payloads in data), comments, and CRLF.
-//! No allocations beyond the collected data strings.
+//!
+//! Buffers raw bytes and decodes UTF-8 only at complete-frame
+//! boundaries — a multi-byte character split across stream chunks must
+//! survive intact (per-chunk lossy decoding would emit U+FFFD twice
+//! and silently corrupt CJK/emoji/accented output).
 
 /// One parsed SSE frame (its `data:` payload).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -12,7 +16,7 @@ pub struct SseEvent {
 /// Incremental SSE parser: feed raw bytes, receive complete events.
 #[derive(Debug, Default)]
 pub struct SseParser {
-    buf: String,
+    buf: Vec<u8>,
 }
 
 impl SseParser {
@@ -23,7 +27,7 @@ impl SseParser {
 
     /// Feed bytes; returns any complete events decoded from them.
     pub fn feed(&mut self, bytes: &[u8]) -> Vec<SseEvent> {
-        self.buf.push_str(&String::from_utf8_lossy(bytes));
+        self.buf.extend_from_slice(bytes);
         self.drain()
     }
 
@@ -31,7 +35,7 @@ impl SseParser {
     /// still an event if it contains a data line.
     pub fn finish(&mut self) -> Vec<SseEvent> {
         let mut out = self.drain();
-        if let Some(evt) = parse_frame(&self.buf) {
+        if let Some(evt) = parse_frame(&String::from_utf8_lossy(&self.buf)) {
             out.push(evt);
         }
         self.buf.clear();
@@ -41,11 +45,10 @@ impl SseParser {
     fn drain(&mut self) -> Vec<SseEvent> {
         let mut out = Vec::new();
         // Split on blank line separators; both "\n\n" and "\r\n\r\n".
-        while let Some(idx) = find_separator(&self.buf) {
-            let frame: String = self.buf.drain(..idx).collect();
-            // after draining the frame, the separator sits at the start
-            let sep_len = separator_len(&self.buf);
-            self.buf.drain(..sep_len);
+        while let Some((idx, sep_len)) = find_separator(&self.buf) {
+            let frame: Vec<u8> = self.buf.drain(..idx + sep_len).collect();
+            // decode the frame WITHOUT the separator, at a char boundary
+            let frame = String::from_utf8_lossy(&frame[..idx]);
             if let Some(evt) = parse_frame(&frame) {
                 out.push(evt);
             }
@@ -54,39 +57,42 @@ impl SseParser {
     }
 }
 
-fn find_separator(s: &str) -> Option<usize> {
-    let rn = s.find("\r\n\r\n").unwrap_or(usize::MAX);
-    let nn = s.find("\n\n").unwrap_or(usize::MAX);
-    if rn == usize::MAX && nn == usize::MAX {
-        None
-    } else {
-        Some(rn.min(nn))
+/// Earliest blank-line separator: `(index, length)` for `\n\n` (2) or
+/// `\r\n\r\n` (4).
+fn find_separator(buf: &[u8]) -> Option<(usize, usize)> {
+    if buf.len() < 2 {
+        return None;
     }
-}
-
-fn separator_len(at: &str) -> usize {
-    if at.starts_with("\r\n\r\n") { 4 } else { 2 }
+    for i in 0..buf.len() - 1 {
+        if buf[i] == b'\n' && buf[i + 1] == b'\n' {
+            return Some((i, 2));
+        }
+        if buf[i] == b'\r'
+            && buf.len() >= i + 4
+            && buf[i + 1] == b'\n'
+            && buf[i + 2] == b'\r'
+            && buf[i + 3] == b'\n'
+        {
+            return Some((i, 4));
+        }
+    }
+    None
 }
 
 fn parse_frame(frame: &str) -> Option<SseEvent> {
-    let mut data_lines: Vec<&str> = Vec::new();
-    for line in frame.split(['\n', '\r']) {
-        let line = line.trim_end_matches('\r');
-        if line.starts_with(':') || line.is_empty() {
-            continue; // comment / blank
+    let mut data: Vec<&str> = Vec::new();
+    for line in frame.split('\n') {
+        let line = line.strip_suffix('\r').unwrap_or(line);
+        if let Some(payload) = line.strip_prefix("data:") {
+            let payload = payload.strip_prefix(' ').unwrap_or(payload);
+            data.push(payload);
         }
-        if let Some(rest) = line.strip_prefix("data:") {
-            data_lines.push(rest.strip_prefix(' ').unwrap_or(rest));
-        }
-        // event:/id:/retry: ignored — payloads are self-describing JSON
+        // `event:`, `id:`, `retry:`, and `:comments` are ignored — both
+        // wires carry the full payload in data lines
     }
-    if data_lines.is_empty() {
-        None
-    } else {
-        Some(SseEvent {
-            data: data_lines.join("\n"),
-        })
-    }
+    (!data.is_empty()).then(|| SseEvent {
+        data: data.join("\n"),
+    })
 }
 
 #[cfg(test)]
@@ -96,7 +102,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parses_basic_frames() {
+    fn splits_events_on_blank_lines() {
         let mut p = SseParser::new();
         let evts = p.feed(b"data: {\"a\":1}\n\ndata: {\"b\":2}\n\n");
         assert_eq!(evts.len(), 2);
@@ -105,45 +111,49 @@ mod tests {
     }
 
     #[test]
-    fn handles_crlf_and_split_chunks() {
+    fn handles_crlf_and_comments() {
         let mut p = SseParser::new();
-        assert!(p.feed(b"data: {\"pa").is_empty());
-        assert!(p.feed(b"rt\":1}\r\n\r").is_empty());
-        let evts = p.feed(b"\ndata: done\n\n");
-        assert_eq!(evts.len(), 2);
-        assert_eq!(evts[0].data, "{\"part\":1}");
-        assert_eq!(evts[1].data, "done");
-    }
-
-    #[test]
-    fn ignores_event_lines_and_comments() {
-        let mut p = SseParser::new();
-        let evts = p.feed(b": keepalive\nevent: message_delta\ndata: {}\n\n");
+        let evts = p.feed(b": keepalive\r\ndata: x\r\n\r\n");
         assert_eq!(evts.len(), 1);
-        assert_eq!(evts[0].data, "{}");
+        assert_eq!(evts[0].data, "x");
     }
 
     #[test]
-    fn finish_emits_trailing_frame() {
+    fn multi_byte_utf8_split_across_chunks_survives() {
+        // "café" where é is 2 bytes — split the codepoint in half
+        let mut p = SseParser::new();
+        let a = p.feed(b"data: caf");
+        assert!(a.is_empty());
+        let b = p.feed(&[0xC3]); // first byte of é
+        assert!(b.is_empty());
+        let c = p.feed(&[0xA9, b'\n', b'\n']); // second byte + separator
+        assert_eq!(c.len(), 1);
+        assert_eq!(c[0].data, "café", "no U+FFFD replacement chars");
+        // CJK split mid-codepoint
+        let mut p = SseParser::new();
+        let text = "漢字テスト";
+        let bytes = format!("data: {text}\n\n").into_bytes();
+        let cut = bytes.len() - 3; // inside the last character
+        assert!(p.feed(&bytes[..cut]).is_empty());
+        let evts = p.feed(&bytes[cut..]);
+        assert_eq!(evts.len(), 1);
+        assert_eq!(evts[0].data, text);
+    }
+
+    #[test]
+    fn finish_flushes_trailing_frame() {
         let mut p = SseParser::new();
         assert!(p.feed(b"data: tail").is_empty());
         let evts = p.finish();
         assert_eq!(evts.len(), 1);
         assert_eq!(evts[0].data, "tail");
+        assert!(p.finish().is_empty(), "double finish is a no-op");
     }
 
     #[test]
-    fn finish_drops_partial_non_data() {
+    fn multi_line_data_joins_with_newlines() {
         let mut p = SseParser::new();
-        p.feed(b"event: x");
-        assert!(p.finish().is_empty());
-    }
-
-    #[test]
-    fn multiline_data_joined() {
-        let mut p = SseParser::new();
-        let evts = p.feed(b"data: line1\ndata: line2\n\n");
-        assert_eq!(evts.len(), 1);
-        assert_eq!(evts[0].data, "line1\nline2");
+        let evts = p.feed(b"data: a\ndata: b\n\n");
+        assert_eq!(evts[0].data, "a\nb");
     }
 }

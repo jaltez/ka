@@ -105,7 +105,9 @@ Legend: **[M]** mandatory · **[O]** optional/deferrable. Names refer to the arc
 12. Structured-output mode (schema-constrained replies)
 
 ## Non-goals (explicit, permanent)
-No in-process plugin runtime · no vector DB / semantic indexing · no browser or computer control · no image gen / TTS / voice · no enterprise/MDM/team/cloud tier · no telemetry beyond optional local logs · no eval kernels · **no subscription OAuth in core** (`ka-passport` crate may add it later) · **no git mutation** (read-only awareness only).
+No in-process plugin runtime · no vector DB / semantic indexing · no browser or computer control · no image gen / TTS / voice · no enterprise/MDM/team/cloud tier · no telemetry beyond optional local logs · no eval kernels · **no subscription OAuth in core** (`ka-passport` crate may add it later).
+
+Re-ratified 2026-09-13: **git mutation is no longer a non-goal** — `[git] auto_commit`, checkpoint/restore, and worktree-isolated delegates ship destructive-capable git paths behind explicit config/opt-in, while read-only awareness remains the default posture. The original "no git mutation" line was overtaken by shipped, gated features.
 
 ## Footprint budget (enforced from Phase 0)
 Single static binary ≤ 10MB (musl, stripped) · cold start ≤ 50ms · idle RSS ≤ 15MB · zero network at steady state · children only: user shell, stdio MCP (optional), git (optional).

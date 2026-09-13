@@ -22,8 +22,16 @@ use tokio::sync::{Mutex, mpsc, oneshot};
 /// (engine ask id, answer channel to the drive task).
 type Pending = Arc<Mutex<HashMap<u64, (String, oneshot::Sender<usize>)>>>;
 
-/// Sessions own their engine behind a lock (one turn at a time).
 type SharedEngine = Arc<Mutex<EngineHandle>>;
+
+/// Sessions own their engine behind a lock (one turn at a time). The
+/// command sender rides NEXT TO the locked handle: `session/cancel`
+/// must reach the engine mid-turn, when the turn task holds that lock.
+#[derive(Clone)]
+struct SessionHandle {
+    commands: mpsc::Sender<Command>,
+    engine: SharedEngine,
+}
 
 /// Entry: run the ACP loop over stdin/stdout.
 pub async fn run() -> Result<ExitCode, String> {
@@ -48,7 +56,7 @@ where
         }
     });
 
-    let sessions: Arc<Mutex<HashMap<String, SharedEngine>>> = Arc::default();
+    let sessions: Arc<Mutex<HashMap<String, SessionHandle>>> = Arc::default();
     let pending: Pending = Arc::default();
     let counter = Arc::new(AtomicU64::new(0));
 
@@ -80,7 +88,10 @@ where
                             .as_str()
                             .and_then(|s| s.parse().ok())
                     })
-                    .unwrap_or(1); // default: deny
+                    // engine choice 2 = deny; an unparseable or absent
+                    // answer must NEVER fall back to 1 (always-allow,
+                    // persisted to .ka/ka.toml)
+                    .unwrap_or(2);
                 let mut pending = pending.lock().await;
                 if let Some((_ask_id, tx)) = pending.remove(&req_id) {
                     tx.send(option_id).ok();
@@ -107,10 +118,20 @@ where
                     cwd: Some(cwd.display().to_string()),
                     ..Config::default()
                 };
-                let handle = Arc::new(Mutex::new(spawn(cfg)));
+                let ka_engine::EngineHandle { commands, events } = spawn(cfg);
+                let handle = Arc::new(Mutex::new(ka_engine::EngineHandle {
+                    commands: commands.clone(),
+                    events,
+                }));
                 let mut sessions = sessions.lock().await;
                 let session = format!("s{}", sessions.len() + 1);
-                sessions.insert(session.clone(), handle);
+                sessions.insert(
+                    session.clone(),
+                    SessionHandle {
+                        commands,
+                        engine: handle,
+                    },
+                );
                 out_tx
                     .send(rpc_result(id, json!({"sessionId": session})))
                     .ok();
@@ -119,8 +140,20 @@ where
                 let session = msg["params"]["sessionId"].as_str().unwrap_or_default();
                 {
                     let sessions = sessions.lock().await;
+                    // exact hit …
                     if sessions.contains_key(session) {
                         out_tx.send(rpc_result(id, json!({}))).ok();
+                        continue;
+                    }
+                    // … or a prefix of an in-memory strand id: reuse that
+                    // engine instead of double-attaching the same strand
+                    if let Some(key) = sessions
+                        .keys()
+                        .find(|k| k.starts_with(session) && session.len() >= 2)
+                    {
+                        let key = key.clone();
+                        drop(sessions);
+                        out_tx.send(rpc_result(id, json!({"sessionId": key}))).ok();
                         continue;
                     }
                 }
@@ -179,12 +212,20 @@ where
                                 Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => break,
                             }
                         }
-                        let handle =
-                            Arc::new(Mutex::new(ka_engine::EngineHandle { commands, events }));
+                        let handle = Arc::new(Mutex::new(ka_engine::EngineHandle {
+                            commands: commands.clone(),
+                            events,
+                        }));
                         let mut sessions = sessions.lock().await;
                         // key the engine by the full strand id so the
                         // client's prefix resolves to a canonical handle
-                        sessions.insert(summary.id.clone(), handle);
+                        sessions.insert(
+                            summary.id.clone(),
+                            SessionHandle {
+                                commands,
+                                engine: handle,
+                            },
+                        );
                         out_tx
                             .send(rpc_result(id, json!({"sessionId": summary.id})))
                             .ok();
@@ -212,7 +253,7 @@ where
                     continue;
                 };
                 let sessions = sessions.lock().await;
-                let Some(engine) = sessions.get(&session).cloned() else {
+                let Some(engine) = sessions.get(&session).map(|s| s.engine.clone()) else {
                     out_tx
                         .send(rpc_error(
                             id,
@@ -237,10 +278,16 @@ where
             }
             Some(m) if m == "session/cancel" => {
                 let session = msg["params"]["sessionId"].as_str().unwrap_or_default();
-                let sessions = sessions.lock().await;
-                if let Some(engine) = sessions.get(session) {
-                    let engine = engine.lock().await;
-                    engine.commands.send(Command::Abort).await.ok();
+                // clone the command sender and release BOTH locks before
+                // sending: drive_turn holds the engine mutex for the
+                // whole turn, so locking here would park the stdin loop
+                // until the turn ends — making cancel a no-op
+                let commands = {
+                    let sessions = sessions.lock().await;
+                    sessions.get(session).map(|e| e.commands.clone())
+                };
+                if let Some(commands) = commands {
+                    commands.send(Command::Abort).await.ok();
                 }
             }
             Some(other) => {
@@ -372,10 +419,17 @@ async fn drive_turn(
                     .iter()
                     .enumerate()
                     .map(|(i, o)| {
+                        // engine: 0=allow, 1=always (persistent,
+                        // written to .ka/ka.toml), 2=deny
+                        let kind = match i {
+                            0 => "allow_once",
+                            1 => "allow_always",
+                            _ => "reject_once",
+                        };
                         json!({
                             "optionId": i.to_string(),
                             "name": o,
-                            "kind": if i == 0 { "allow_once" } else { "reject_once" }
+                            "kind": kind,
                         })
                     })
                     .collect();
@@ -394,7 +448,7 @@ async fn drive_turn(
                 .ok();
                 // the main loop resolves us when the client responds
                 // client went away: deny
-                let choice = rx.await.unwrap_or(1);
+                let choice = rx.await.unwrap_or(2);
                 engine
                     .commands
                     .send(Command::Answer {
@@ -416,6 +470,20 @@ async fn drive_turn(
                     Stop::Aborted => "cancelled",
                     Stop::Error => "refusal",
                 };
+            }
+            // engine commentary must reach the editor: errors (otherwise
+            // the client only sees stopReason "refusal" with no reason),
+            // verify results, auto-commit and reconnect notes
+            Event::Error { message, .. } | Event::Note { message } => {
+                session_update(
+                    &out,
+                    &session,
+                    json!({
+                        "sessionUpdate": "agent_message_chunk",
+                        "content": {"type": "text", "text": format!("{message}\n")}
+                    }),
+                )
+                .await;
             }
             _ => {}
         }

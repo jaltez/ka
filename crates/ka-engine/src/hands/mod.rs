@@ -19,10 +19,14 @@ pub mod git;
 pub mod glob;
 pub mod grep;
 pub mod jobs;
+pub mod lsp_tools;
+pub mod memory;
 pub mod pathfinder;
+pub mod protected;
 pub mod read;
 pub mod secrets;
 pub mod snapshots;
+pub mod tasks;
 pub mod todo;
 pub mod web;
 pub mod write;
@@ -332,6 +336,12 @@ impl Ledger {
     /// Whether nothing is tracked.
     pub fn is_empty(&self) -> bool {
         self.stamps.is_empty()
+    }
+
+    /// Paths currently tracked (read this session) — scoped rules
+    /// activate when their globs match one of these.
+    pub fn tracked_paths(&self) -> Vec<PathBuf> {
+        self.stamps.keys().cloned().collect()
     }
 }
 

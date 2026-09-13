@@ -163,8 +163,8 @@ mod tests {
 /// redirection of the trust store path. The workspace forbids `unsafe`,
 /// so the environment itself is never mutated — [`trust_file`] consults
 /// this override when compiled for tests.
-#[cfg(test)]
-pub(crate) mod test_support {
+#[cfg(any(test, feature = "test-util"))]
+pub mod test_support {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use std::path::{Path, PathBuf};
@@ -173,11 +173,11 @@ pub(crate) mod test_support {
 
     static FILE_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
 
-    pub(crate) fn current_file() -> Option<PathBuf> {
+    pub fn current_file() -> Option<PathBuf> {
         TRUST_FILE.lock().clone()
     }
 
-    pub(crate) fn uniq(name: &str) -> PathBuf {
+    pub fn uniq(name: &str) -> PathBuf {
         let d = std::env::temp_dir().join(format!(
             "ka-trust-{name}-{}-{}",
             std::process::id(),
@@ -192,7 +192,7 @@ pub(crate) mod test_support {
 
     /// Runs `f` with the trust store redirected to a fresh temp file.
     /// Serialized: the override is process-global.
-    pub(crate) fn with_trust_file<T>(f: impl FnOnce(&Path) -> T) -> T {
+    pub fn with_trust_file<T>(f: impl FnOnce(&Path) -> T) -> T {
         let _lock = FILE_LOCK.lock();
         let dir = uniq("store");
         let file = dir.join("state/ka/trust.json");
@@ -207,7 +207,7 @@ pub(crate) mod test_support {
     /// across `.await` points in async tests. Holds [`FILE_LOCK`] for the
     /// guard's lifetime, so it is serialized against `with_trust_file`
     /// and other guards.
-    pub(crate) fn trust_guard() -> (PathBuf, TrustGuard) {
+    pub fn trust_guard() -> (PathBuf, TrustGuard) {
         let lock = FILE_LOCK.lock();
         let dir = uniq("store");
         let file = dir.join("state/ka/trust.json");
@@ -221,7 +221,7 @@ pub(crate) mod test_support {
         )
     }
 
-    pub(crate) struct TrustGuard {
+    pub struct TrustGuard {
         dir: Option<PathBuf>,
         _lock: Option<parking_lot::MutexGuard<'static, ()>>,
     }

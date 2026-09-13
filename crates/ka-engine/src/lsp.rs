@@ -38,6 +38,11 @@ const MAX_BYTES: usize = 2_000;
 const MESSAGE_CAP: usize = 300;
 /// How long the background starter waits for the `initialize` response.
 const INIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+/// How long `request` waits for a language to become ready.
+const READY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+/// How long `request` waits for a response (cold rust-analyzer indexes
+/// can make the first workspace query slow).
+const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 
 /// One cached diagnostic (normalized off the wire).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -141,12 +146,194 @@ fn truncate_chars(s: &str, cap: usize) -> std::borrow::Cow<'_, str> {
     }
 }
 
+/// Decode a `file://` URI back to a filesystem path (percent-decoding,
+/// `localhost` authority tolerated). `None` for other schemes.
+pub fn path_of_uri(uri: &str) -> Option<String> {
+    let rest = uri.strip_prefix("file://")?;
+    let path = if let Some(after) = rest.strip_prefix("localhost/") {
+        format!("/{after}")
+    } else if rest.starts_with('/') {
+        rest.to_string()
+    } else {
+        // a non-empty foreign authority is not a local file
+        let slash = rest.find('/')?;
+        rest[slash..].to_string()
+    };
+    let bytes = path.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' {
+            let hex = |b: u8| -> Option<u8> {
+                match b {
+                    b'0'..=b'9' => Some(b - b'0'),
+                    b'a'..=b'f' => Some(b - b'a' + 10),
+                    b'A'..=b'F' => Some(b - b'A' + 10),
+                    _ => None,
+                }
+            };
+            match (
+                bytes.get(i + 1).copied().and_then(hex),
+                bytes.get(i + 2).copied().and_then(hex),
+            ) {
+                (Some(hi), Some(lo)) => {
+                    out.push(hi * 16 + lo);
+                    i += 3;
+                }
+                _ => {
+                    out.push(bytes[i]);
+                    i += 1;
+                }
+            }
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8(out).ok()
+}
+
+/// One `workspace/symbol` hit, normalized off the wire.
+pub struct SymbolHit {
+    pub name: String,
+    /// LSP SymbolKind number.
+    pub kind: u64,
+    pub container: Option<String>,
+    pub uri: String,
+    /// 0-based LSP line.
+    pub line: u64,
+}
+
+/// One normalized location (definition/references results).
+pub struct Loc {
+    pub uri: String,
+    /// 0-based LSP line.
+    pub line: u64,
+    /// 0-based LSP character.
+    pub character: u64,
+}
+
+/// Short label for an LSP SymbolKind number.
+pub fn kind_label(kind: u64) -> &'static str {
+    match kind {
+        1 => "file",
+        2 => "module",
+        3 => "namespace",
+        4 => "package",
+        5 => "class",
+        6 => "method",
+        7 => "property",
+        8 => "field",
+        9 => "ctor",
+        10 => "enum",
+        11 => "interface",
+        12 => "function",
+        13 => "variable",
+        14 => "const",
+        15 => "string",
+        16 => "number",
+        17 => "boolean",
+        18 => "array",
+        19 => "object",
+        20 => "key",
+        21 => "null",
+        22 => "enum-member",
+        23 => "struct",
+        24 => "event",
+        25 => "operator",
+        26 => "type-param",
+        _ => "symbol",
+    }
+}
+
+/// Parse a `workspace/symbol` result (an array of `SymbolInformation`).
+pub fn parse_symbols(result: &serde_json::Value) -> Vec<SymbolHit> {
+    result
+        .as_array()
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|s| {
+                    Some(SymbolHit {
+                        name: s.get("name")?.as_str()?.to_string(),
+                        kind: s
+                            .get("kind")
+                            .and_then(serde_json::Value::as_u64)
+                            .unwrap_or(0),
+                        container: s
+                            .get("containerName")
+                            .and_then(serde_json::Value::as_str)
+                            .map(str::to_string),
+                        uri: s.get("location")?.get("uri")?.as_str()?.to_string(),
+                        line: s["location"]["range"]["start"]["line"]
+                            .as_u64()
+                            .unwrap_or(0),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Parse definition/references results: `null`, one `Location`, an
+/// array of `Location`s, or an array of `LocationLink`s.
+pub fn parse_locations(result: &serde_json::Value) -> Vec<Loc> {
+    let one = |v: &serde_json::Value| -> Option<Loc> {
+        // LocationLink fields take precedence when present
+        let (uri, range) = if v.get("targetUri").is_some() {
+            (v.get("targetUri")?, v.get("targetRange")?)
+        } else {
+            (v.get("uri")?, v.get("range")?)
+        };
+        Some(Loc {
+            uri: uri.as_str()?.to_string(),
+            line: range["start"]["line"].as_u64().unwrap_or(0),
+            character: range["start"]["character"].as_u64().unwrap_or(0),
+        })
+    };
+    match result {
+        serde_json::Value::Null => Vec::new(),
+        serde_json::Value::Array(items) => items.iter().filter_map(one).collect(),
+        v => one(v).into_iter().collect(),
+    }
+}
+
+/// Byte offset of `name` used as a standalone identifier on `line`
+/// (word-boundary checked), `None` when absent.
+pub fn identifier_byte_offset(line: &str, name: &str) -> Option<usize> {
+    let is_word = |c: char| c.is_alphanumeric() || c == '_';
+    let mut from = 0;
+    while let Some(hit) = line[from..].find(name) {
+        let start = from + hit;
+        let end = start + name.len();
+        let before_ok = line[..start]
+            .chars()
+            .next_back()
+            .is_none_or(|c| !is_word(c));
+        let after_ok = line[end..].chars().next().is_none_or(|c| !is_word(c));
+        if before_ok && after_ok {
+            return Some(start);
+        }
+        from = end;
+    }
+    None
+}
+
+/// UTF-16 column (the LSP position unit) for a byte offset in `line`.
+pub fn utf16_column(line: &str, byte_offset: usize) -> u64 {
+    let prefix = line.get(..byte_offset).unwrap_or(line);
+    prefix.encode_utf16().count() as u64
+}
+
 /// Diagnostics cache (URI → latest publish for the current content).
 /// `None` marks "no publish for this content yet".
 type Cache = parking_lot::Mutex<HashMap<String, Option<Vec<Diag>>>>;
 /// Document versions we have sent (URI → version), shared with the
 /// reader tasks for stale-publish filtering.
 type Versions = parking_lot::Mutex<HashMap<String, i64>>;
+/// Request responses owed to callers (id → waiter). The reader task
+/// completes the matching sender; everyone else times out.
+type Pending = parking_lot::Mutex<HashMap<i64, oneshot::Sender<serde_json::Value>>>;
 
 /// A ready server child for one language.
 struct ServerProc {
@@ -176,6 +363,14 @@ struct Shared {
     inner: parking_lot::Mutex<Inner>,
     cache: std::sync::Arc<Cache>,
     versions: std::sync::Arc<Versions>,
+    /// Request ids handed out so far (initialize owns 1).
+    next_id: std::sync::atomic::AtomicI64,
+    pending: std::sync::Arc<Pending>,
+    /// Serializes every pipe writer (touch/didChange, didOpen, and
+    /// requests share one server stdin). Without it, two concurrent
+    /// hands both find the writer taken and one fails spuriously with
+    /// "not writable".
+    write_lock: tokio::sync::Mutex<()>,
     cwd: PathBuf,
 }
 
@@ -200,6 +395,9 @@ impl LspManager {
                 }),
                 cache: std::sync::Arc::new(parking_lot::Mutex::new(HashMap::new())),
                 versions: std::sync::Arc::new(parking_lot::Mutex::new(HashMap::new())),
+                next_id: std::sync::atomic::AtomicI64::new(2),
+                pending: std::sync::Arc::new(parking_lot::Mutex::new(HashMap::new())),
+                write_lock: tokio::sync::Mutex::new(()),
                 cwd: cwd.to_path_buf(),
             }),
         }
@@ -235,7 +433,7 @@ impl LspManager {
                     let uri = uri_for(path);
                     let text = new_text.to_string();
                     tokio::spawn(async move {
-                        start_server(&shared, &lang, &command, &uri, &text).await;
+                        start_server(&shared, &lang, &command, Some((&uri, &text))).await;
                     });
                     return false;
                 }
@@ -274,30 +472,13 @@ impl LspManager {
                 }
             })
         };
-        // ready: take the writer out so the table lock is never held
-        // across the pipe await
-        let mut writer = {
-            let mut inner = self.shared.inner.lock();
-            inner.servers.get_mut(lang).and_then(|s| match s {
-                Server::Ready(p) => p.writer.take(),
-                _ => None,
-            })
-        };
-        let Some(w) = writer.as_mut() else {
-            return false;
-        };
-        if write_msg(w, &msg).await.is_err() {
-            // server died: drop it and never retry this session
-            let mut inner = self.shared.inner.lock();
-            inner.servers.remove(lang);
-            inner.failed.insert(lang.to_string());
-            return false;
+        // ready: write through the shared lock (never holds the table
+        // lock across the pipe await; a dead pipe fails the language
+        // for the session)
+        match self.write_to_server(lang, &msg).await {
+            Ok(()) => true,
+            Err(()) => false,
         }
-        let mut inner = self.shared.inner.lock();
-        if let Some(Server::Ready(p)) = inner.servers.get_mut(lang) {
-            p.writer = writer.take();
-        }
-        true
     }
 
     /// Latest rendered diagnostics for `path` (`None` when the server
@@ -306,6 +487,197 @@ impl LspManager {
     /// cache, never the server table.
     pub fn diagnostics(&self, path: &Path) -> Option<Vec<String>> {
         cached(&self.shared.cache, &uri_for(path))
+    }
+
+    /// Languages with a configured server command (sorted).
+    pub fn configured_languages(&self) -> Vec<String> {
+        self.shared.commands.keys().cloned().collect()
+    }
+
+    /// Eagerly kick off every configured server's handshake (engine
+    /// start). Idempotent — starting/ready/failed languages are skipped.
+    /// Lets the navigation tools work before any file was edited.
+    pub fn start_all(&self) {
+        if !self.shared.enabled {
+            return;
+        }
+        for (lang, command) in self.shared.commands.clone() {
+            {
+                let mut inner = self.shared.inner.lock();
+                if inner.failed.contains(&lang) || inner.servers.contains_key(&lang) {
+                    continue;
+                }
+                inner.servers.insert(lang.clone(), Server::Starting);
+            }
+            let shared = self.shared.clone();
+            tokio::spawn(async move {
+                start_server(&shared, &lang, &command, None).await;
+            });
+        }
+    }
+
+    /// Wait (≤ [`READY_TIMEOUT`]) for `lang`'s server to be ready to
+    /// serve requests, with the reason it cannot.
+    async fn ensure_ready(&self, lang: &str) -> Result<(), String> {
+        if !self.shared.enabled {
+            return Err("lsp disabled — set [lsp] enable = true".to_string());
+        }
+        if !self.shared.commands.contains_key(lang) {
+            return Err(format!("no [lsp.commands] entry for {lang:?}"));
+        }
+        let deadline = std::time::Instant::now() + READY_TIMEOUT;
+        loop {
+            {
+                let inner = self.shared.inner.lock();
+                if inner.failed.contains(lang) {
+                    return Err(format!("{lang} language server failed to start"));
+                }
+                if matches!(inner.servers.get(lang), Some(Server::Ready(_))) {
+                    return Ok(());
+                }
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err(format!(
+                    "{lang} language server still starting; retry shortly"
+                ));
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    }
+
+    /// One JSON-RPC request → result on `lang`'s ready server.
+    pub async fn request(
+        &self,
+        lang: &str,
+        method: &str,
+        params: serde_json::Value,
+    ) -> Result<serde_json::Value, String> {
+        self.ensure_ready(lang).await?;
+        let id = self
+            .shared
+            .next_id
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let (tx, rx) = oneshot::channel::<serde_json::Value>();
+        self.shared.pending.lock().insert(id, tx);
+        let msg = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": method,
+            "params": params,
+        });
+        if self.write_to_server(lang, &msg).await.is_err() {
+            self.shared.pending.lock().remove(&id);
+            return Err(format!("{lang} language server is not writable"));
+        }
+        match tokio::time::timeout(REQUEST_TIMEOUT, rx).await {
+            Ok(Ok(resp)) => {
+                if let Some(err) = resp.get("error") {
+                    let code = err
+                        .get("code")
+                        .and_then(serde_json::Value::as_i64)
+                        .unwrap_or(0);
+                    let text = err
+                        .get("message")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("?");
+                    return Err(format!("server error {code}: {text}"));
+                }
+                Ok(resp
+                    .get("result")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null))
+            }
+            _ => {
+                self.shared.pending.lock().remove(&id);
+                Err(format!("{lang} language server timed out"))
+            }
+        }
+    }
+
+    /// Ensure the language server has `path` open with its on-disk
+    /// content, so position queries (definition/references) see current
+    /// truth. Returns the document URI.
+    pub async fn open_if_needed(&self, path: &Path) -> Result<String, String> {
+        let lang = language_for(path)
+            .ok_or_else(|| format!("no language mapping for {}", path.display()))?
+            .to_string();
+        let uri = uri_for(path);
+        if self.shared.versions.lock().contains_key(&uri) {
+            return Ok(uri);
+        }
+        self.ensure_ready(&lang).await?;
+        let text =
+            std::fs::read_to_string(path).map_err(|e| format!("read {}: {e}", path.display()))?;
+        let version = {
+            let mut versions = self.shared.versions.lock();
+            let v = versions.entry(uri.clone()).or_insert(0);
+            *v += 1;
+            *v
+        };
+        self.shared.cache.lock().insert(uri.clone(), None);
+        let open = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "textDocument/didOpen",
+            "params": {
+                "textDocument": {
+                    "uri": uri,
+                    "languageId": lang,
+                    "version": version,
+                    "text": text,
+                }
+            }
+        });
+        if self.write_to_server(&lang, &open).await.is_err() {
+            return Err(format!("{lang} language server is not writable"));
+        }
+        Ok(uri)
+    }
+
+    /// Write one message to `lang`'s ready server (writer take/put-back
+    /// dance keeps the table lock off the pipe await). A dead pipe
+    /// fails the language for the session — same policy as `touch`.
+    async fn write_to_server(&self, lang: &str, msg: &serde_json::Value) -> Result<(), ()> {
+        let _guard = self.shared.write_lock.lock().await;
+        let mut writer = {
+            let mut inner = self.shared.inner.lock();
+            inner.servers.get_mut(lang).and_then(|s| match s {
+                Server::Ready(p) => p.writer.take(),
+                _ => None,
+            })
+        };
+        let Some(w) = writer.as_mut() else {
+            return Err(());
+        };
+        if write_msg(w, msg).await.is_err() {
+            let mut inner = self.shared.inner.lock();
+            inner.servers.remove(lang);
+            inner.failed.insert(lang.to_string());
+            return Err(());
+        }
+        let mut inner = self.shared.inner.lock();
+        if let Some(Server::Ready(p)) = inner.servers.get_mut(lang) {
+            p.writer = writer.take();
+        }
+        Ok(())
+    }
+
+    /// Snapshot of every file's cached diagnostics (display path,
+    /// non-empty diags), sorted by path — the `diagnostics` hand's
+    /// project view.
+    pub fn all_diagnostics(&self) -> Vec<(String, Vec<Diag>)> {
+        let cache = self.shared.cache.lock();
+        let mut out: Vec<(String, Vec<Diag>)> = cache
+            .iter()
+            .filter_map(|(uri, diags)| {
+                let diags = diags.clone()?;
+                if diags.is_empty() {
+                    return None;
+                }
+                Some((path_of_uri(uri).unwrap_or_else(|| uri.clone()), diags))
+            })
+            .collect();
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        out
     }
 }
 
@@ -318,15 +690,10 @@ fn cached(cache: &Cache, uri: &str) -> Option<Vec<String>> {
 }
 
 /// Background handshake: spawn the server, `initialize` → `initialized`
-/// → didOpen the first content, then publish it ready. Any failure
-/// marks the language failed for the session (no retries).
-async fn start_server(
-    shared: &Shared,
-    lang: &str,
-    command: &str,
-    first_uri: &str,
-    first_text: &str,
-) {
+/// → optionally didOpen the content that kicked us off, then publish it
+/// ready. Any failure marks the language failed for the session (no
+/// retries).
+async fn start_server(shared: &Shared, lang: &str, command: &str, first_doc: Option<(&str, &str)>) {
     let fail = |shared: &Shared, lang: &str| {
         let mut inner = shared.inner.lock();
         inner.servers.remove(lang);
@@ -370,6 +737,7 @@ async fn start_server(
         BufReader::new(reader),
         shared.cache.clone(),
         shared.versions.clone(),
+        shared.pending.clone(),
         init_tx,
     ));
     let init = serde_json::json!({
@@ -403,23 +771,25 @@ async fn start_server(
         fail(shared, lang);
         return;
     }
-    // didOpen the content that kicked us off (version 1)
-    shared.versions.lock().insert(first_uri.to_string(), 1);
-    let open = serde_json::json!({
-        "jsonrpc": "2.0",
-        "method": "textDocument/didOpen",
-        "params": {
-            "textDocument": {
-                "uri": first_uri,
-                "languageId": lang,
-                "version": 1,
-                "text": first_text,
+    // didOpen the content that kicked us off (version 1) when there was one
+    if let Some((first_uri, first_text)) = first_doc {
+        shared.versions.lock().insert(first_uri.to_string(), 1);
+        let open = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "textDocument/didOpen",
+            "params": {
+                "textDocument": {
+                    "uri": first_uri,
+                    "languageId": lang,
+                    "version": 1,
+                    "text": first_text,
+                }
             }
+        });
+        if write_msg(&mut writer, &open).await.is_err() {
+            fail(shared, lang);
+            return;
         }
-    });
-    if write_msg(&mut writer, &open).await.is_err() {
-        fail(shared, lang);
-        return;
     }
     shared.inner.lock().servers.insert(
         lang.to_string(),
@@ -440,12 +810,14 @@ async fn write_msg(w: &mut ChildStdin, msg: &serde_json::Value) -> std::io::Resu
 }
 
 /// Read framed messages off a server's stdout, caching
-/// publishDiagnostics (version-filtered against what we sent) and
-/// signaling the initialize response. Runs until the pipe closes.
+/// publishDiagnostics (version-filtered against what we sent),
+/// signaling the initialize response, and completing pending requests.
+/// Runs until the pipe closes.
 async fn read_loop<R: tokio::io::AsyncRead + Unpin + Send + 'static>(
     mut reader: R,
     cache: std::sync::Arc<Cache>,
     versions: std::sync::Arc<Versions>,
+    pending: std::sync::Arc<Pending>,
     init_tx: oneshot::Sender<bool>,
 ) {
     let mut init_tx = Some(init_tx);
@@ -455,13 +827,22 @@ async fn read_loop<R: tokio::io::AsyncRead + Unpin + Send + 'static>(
             Ok(Some(h)) => h,
             _ => return,
         };
+        // header names are case-insensitive per the LSP base protocol;
+        // a hostile/buggy Content-Length must not drive an allocation
+        const MAX_FRAME: usize = 16 * 1024 * 1024;
         let len: usize = match headers
             .iter()
-            .find_map(|h| h.strip_prefix("Content-Length: "))
-            .and_then(|v| v.trim().parse().ok())
+            .find_map(|h| {
+                let (k, v) = h.split_once(':')?;
+                k.eq_ignore_ascii_case("content-length")
+                    .then(|| v.trim().parse::<usize>().ok())
+                    .flatten()
+            })
+            .unwrap_or(0)
         {
-            Some(l) => l,
-            None => continue,
+            0 => continue,
+            l if l > MAX_FRAME => return, // lie: close the connection
+            l => l,
         };
         // read body
         let mut body = vec![0u8; len];
@@ -471,12 +852,16 @@ async fn read_loop<R: tokio::io::AsyncRead + Unpin + Send + 'static>(
         let Ok(msg) = serde_json::from_slice::<serde_json::Value>(&body) else {
             continue;
         };
-        if let Some(id) = msg.get("id") {
-            // initialize response: true when the server returned a result
-            if id.as_i64() == Some(1) {
-                if let Some(tx) = init_tx.take() {
-                    let ok = msg.get("result").is_some();
-                    let _ = tx.send(ok);
+        // responses carry an id and no method; server→client requests
+        // (id + method, e.g. workspace/configuration) stay ignored
+        if msg.get("method").is_none() {
+            if let Some(id) = msg.get("id").and_then(serde_json::Value::as_i64) {
+                if id == 1 {
+                    if let Some(tx) = init_tx.take() {
+                        let _ = tx.send(msg.get("result").is_some());
+                    }
+                } else if let Some(tx) = pending.lock().remove(&id) {
+                    let _ = tx.send(msg);
                 }
                 continue;
             }

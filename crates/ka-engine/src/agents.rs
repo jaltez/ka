@@ -19,6 +19,16 @@ pub struct AgentDef {
     /// Run this agent in an isolated git worktree (its own branch);
     /// requires a git repository.
     pub isolate: bool,
+    /// Model selector override for this agent (`vendor/model@effort`).
+    /// Default: the parent session's model.
+    pub model: Option<String>,
+    /// Reasoning-effort override applied to the parent model when
+    /// `model` is absent (`off|low|medium|high|max`).
+    pub effort: Option<ka_protocol::Effort>,
+    /// Tool allowlist for the nested voice (comma-separated in
+    /// frontmatter, e.g. `tools: read, grep, glob`). Default: all
+    /// (read-only) hands.
+    pub tools: Option<Vec<String>>,
 }
 
 impl AgentDef {
@@ -29,6 +39,9 @@ impl AgentDef {
         let mut description = String::new();
         let mut max_steps = 12u32;
         let mut isolate = false;
+        let mut model: Option<String> = None;
+        let mut effort: Option<ka_protocol::Effort> = None;
+        let mut tools: Option<Vec<String>> = None;
         let mut body = text.to_string();
 
         if let Some(rest) = text.strip_prefix("---") {
@@ -48,6 +61,20 @@ impl AgentDef {
                             isolate =
                                 matches!(value.to_ascii_lowercase().as_str(), "true" | "yes" | "1");
                         }
+                        "model" if !value.is_empty() => model = Some(value.to_string()),
+                        "effort" if !value.is_empty() => {
+                            effort = parse_effort(value);
+                        }
+                        "tools" if !value.is_empty() => {
+                            tools = Some(
+                                value
+                                    .split(',')
+                                    .map(str::trim)
+                                    .filter(|t| !t.is_empty())
+                                    .map(str::to_string)
+                                    .collect(),
+                            );
+                        }
                         _ => {}
                     }
                 }
@@ -63,6 +90,9 @@ impl AgentDef {
             system: body.trim().to_string(),
             max_steps,
             isolate,
+            model,
+            effort,
+            tools,
         }
     }
 
@@ -116,6 +146,18 @@ impl AgentDef {
     }
 }
 
+/// Frontmatter `effort` value → enum (case-insensitive).
+fn parse_effort(value: &str) -> Option<ka_protocol::Effort> {
+    match value.to_ascii_lowercase().as_str() {
+        "off" | "none" => Some(ka_protocol::Effort::Off),
+        "low" => Some(ka_protocol::Effort::Low),
+        "medium" | "mid" => Some(ka_protocol::Effort::Medium),
+        "high" => Some(ka_protocol::Effort::High),
+        "max" | "ultra" => Some(ka_protocol::Effort::Max),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
@@ -130,6 +172,34 @@ mod tests {
         assert_eq!(def.description, "reviews code for bugs");
         assert_eq!(def.max_steps, 20);
         assert_eq!(def.system, "You are a code reviewer.\nBe harsh.");
+    }
+
+    #[test]
+    fn parses_model_effort_tools_frontmatter() {
+        let md = "---\nname: explorer\nmodel: ollama/qwen3.5:9b\neffort: low\ntools: read, grep, glob\n---\nYou explore.";
+        let def = AgentDef::parse(md, "fallback");
+        assert_eq!(def.model.as_deref(), Some("ollama/qwen3.5:9b"));
+        assert_eq!(def.effort, Some(ka_protocol::Effort::Low));
+        assert_eq!(
+            def.tools,
+            Some(vec![
+                "read".to_string(),
+                "grep".to_string(),
+                "glob".to_string()
+            ])
+        );
+        // effort-only re-arms the parent selector; unknown effort ignored
+        let md = "---\neffort: MAX\n---\nBody.";
+        let def = AgentDef::parse(md, "s");
+        assert_eq!(def.effort, Some(ka_protocol::Effort::Max));
+        let md = "---\neffort: bananas\n---\nBody.";
+        let def = AgentDef::parse(md, "s");
+        assert_eq!(def.effort, None);
+        // model can carry its own @effort
+        let md = "---\nmodel: openai/o3@high\n---\nBody.";
+        let def = AgentDef::parse(md, "s");
+        assert_eq!(def.model.as_deref(), Some("openai/o3@high"));
+        assert_eq!(def.effort, None);
     }
 
     #[test]

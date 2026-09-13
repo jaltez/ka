@@ -23,6 +23,10 @@ pub struct DelegateHand {
     source: Arc<parking_lot::RwLock<super::pathfinder::PathfinderSource>>,
     /// The parent session's permission mode (gates isolated agents).
     parent_mode: ka_protocol::Mode,
+    /// Background-task registry (`background: true` delegates).
+    tasks: Arc<super::tasks::AgentTaskTable>,
+    /// Event sink for completion notes.
+    events: mpsc::Sender<ka_protocol::Event>,
 }
 
 impl DelegateHand {
@@ -31,11 +35,15 @@ impl DelegateHand {
         agents: Vec<AgentDef>,
         source: Arc<parking_lot::RwLock<super::pathfinder::PathfinderSource>>,
         parent_mode: ka_protocol::Mode,
+        tasks: Arc<super::tasks::AgentTaskTable>,
+        events: mpsc::Sender<ka_protocol::Event>,
     ) -> Self {
         Self {
             agents,
             source,
             parent_mode,
+            tasks,
+            events,
         }
     }
 
@@ -55,11 +63,19 @@ impl Hand for DelegateHand {
             } else {
                 &a.description
             };
-            listing.push_str(&format!("- {}: {desc}\n", a.name));
+            let model_note = a
+                .model
+                .as_deref()
+                .filter(|m| !m.is_empty())
+                .map(|m| format!(" [model: {m}]"))
+                .unwrap_or_default();
+            listing.push_str(&format!("- {}: {desc}{model_note}\n", a.name));
         }
         listing.push_str(
             "The agent runs with read-only tools and returns a dense summary. \
-Or pass `tasks` to run several agents concurrently (up to 16 per call, 4 at a time; results return in order).",
+Or pass `tasks` to run several agents concurrently (up to 16 per call, 4 at a time; results return in order). \
+Pass `background: true` (single agent+task only) to start it detached and keep working — \
+track it with the tasks tool.",
         );
         HandDef {
             name: "delegate".to_string(),
@@ -75,6 +91,10 @@ Or pass `tasks` to run several agents concurrently (up to 16 per call, 4 at a ti
                     "task": {
                         "type": "string",
                         "description": "The complete, self-contained task for the agent (required unless `tasks` is given)"
+                    },
+                    "background": {
+                        "type": "boolean",
+                        "description": "Run detached and return immediately (single agent+task only); default false"
                     },
                     "tasks": {
                         "type": "array",
@@ -133,6 +153,40 @@ Or pass `tasks` to run several agents concurrently (up to 16 per call, 4 at a ti
                     known.join(", ")
                 ));
             };
+            // background: register, spawn, return immediately — the
+            // model tracks it via the tasks hand (single tasks only)
+            if args.get("background").and_then(Value::as_bool) == Some(true) {
+                let id = self.tasks.register(agent_name, task);
+                let def = def.clone();
+                let task = task.to_string();
+                let cwd = ctx.cwd.clone();
+                let source = self.source.read().clone();
+                let parent_mode = self.parent_mode;
+                let tasks = self.tasks.clone();
+                let events = self.events.clone();
+                let tasks_in = tasks.clone();
+                let handle = tokio::spawn(async move {
+                    let outcome = run_agent(def, task.clone(), cwd, source, parent_mode).await;
+                    tasks_in.finish(id, outcome.clone());
+                    let (label, note) = match &outcome {
+                        Ok(summary) => ("finished", truncate_for_note(summary, 200)),
+                        Err(reason) => ("failed", truncate_for_note(reason, 200)),
+                    };
+                    events
+                        .send(ka_protocol::Event::Note {
+                            message: format!(
+                                "background t-{id} {label} — full result via the tasks tool: {note}"
+                            ),
+                        })
+                        .await
+                        .ok();
+                });
+                tasks.attach(id, handle);
+                return ToolOutput::ok(format!(
+                    "background task t-{id} started (agent {agent_name}); continue other work \
+                     and check the tasks tool for the result"
+                ));
+            }
             let source = self.source.read().clone();
             match run_agent(
                 def.clone(),
@@ -147,6 +201,16 @@ Or pass `tasks` to run several agents concurrently (up to 16 per call, 4 at a ti
                 Err(e) => ToolOutput::err(e),
             }
         })
+    }
+}
+
+/// Cap a note to `cap` chars with an ellipsis.
+fn truncate_for_note(text: &str, cap: usize) -> String {
+    if text.chars().count() > cap {
+        let cut: String = text.chars().take(cap).collect();
+        format!("{cut}…")
+    } else {
+        text.to_string()
     }
 }
 
@@ -275,9 +339,21 @@ async fn run_agent(
     parent_mode: ka_protocol::Mode,
 ) -> Result<String, String> {
     let agent_name = def.name.as_str();
-    let Some(model) = source.model else {
+    let Some(parent_model) = source.model else {
         return Err("delegate: no model configured for the parent session".to_string());
     };
+    // per-agent model/effort (factory-droids style): the frontmatter
+    // selector wins outright; an effort alone re-arms the parent's
+    // selector (replacing any @effort it carried)
+    let model = match (&def.model, &def.effort) {
+        (Some(m), _) => m.clone(),
+        (None, Some(e)) => {
+            let base = parent_model.split('@').next().unwrap_or_default();
+            format!("{base}@{}", effort_label(e))
+        }
+        (None, None) => parent_model,
+    };
+    let agent_tools = def.tools.clone();
 
     // isolated agents write in a throwaway git worktree on their
     // own branch: they need a repo and write-mode permission
@@ -324,6 +400,9 @@ async fn run_agent(
             )
         };
         voice.set_model_selector(&model, 4.0);
+        if let Some(tools) = &agent_tools {
+            voice.restrict_tools(tools);
+        }
         voice
             .turn(
                 &model,
@@ -384,6 +463,17 @@ async fn run_agent(
     }
     Ok(summary)
 }
+/// Reasoning-effort label for selector assembly.
+fn effort_label(e: &ka_protocol::Effort) -> &'static str {
+    match e {
+        ka_protocol::Effort::Off => "off",
+        ka_protocol::Effort::Low => "low",
+        ka_protocol::Effort::Medium => "medium",
+        ka_protocol::Effort::High => "high",
+        ka_protocol::Effort::Max => "max",
+    }
+}
+
 /// Create an isolated git worktree on its own branch under the state
 /// dir. `Err` when the cwd is not a git repository.
 fn create_worktree(cwd: &std::path::Path, name: &str) -> Result<std::path::PathBuf, String> {
@@ -484,6 +574,9 @@ mod tests {
                 system: "You review.".to_string(),
                 max_steps: 8,
                 isolate: false,
+                model: None,
+                effort: None,
+                tools: None,
             },
             AgentDef {
                 name: "scout".to_string(),
@@ -491,12 +584,18 @@ mod tests {
                 system: "You scout.".to_string(),
                 max_steps: 12,
                 isolate: false,
+                model: None,
+                effort: None,
+                tools: None,
             },
         ];
+        let (events, _rx) = mpsc::channel(16);
         DelegateHand::new(
             agents,
             std::sync::Arc::new(parking_lot::RwLock::new(PathfinderSource::default())),
             ka_protocol::Mode::Free,
+            crate::hands::tasks::AgentTaskTable::new(),
+            events,
         )
     }
 

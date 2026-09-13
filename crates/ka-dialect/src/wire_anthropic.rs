@@ -377,6 +377,28 @@ async fn speak_anthropic(
             }
         }
     }
+    // trailing frame without a final blank line: a dropped
+    // message_delta would silently lose stop_reason + output usage —
+    // drain like the openai wire does
+    for evt in parser.finish() {
+        let Ok(v) = serde_json::from_str::<Value>(&evt.data) else {
+            continue;
+        };
+        if v.get("type").and_then(Value::as_str) == Some("message_delta") {
+            if let Some(reason) = v.pointer("/delta/stop_reason").and_then(Value::as_str) {
+                stop = match reason {
+                    "max_tokens" => Stop::Length,
+                    _ => Stop::Done,
+                };
+            }
+            if let Some(u) = v.pointer("/usage") {
+                usage.output = u
+                    .get("output_tokens")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(usage.output);
+            }
+        }
+    }
     out.send(StreamEvent::Finished { stop, usage }).await.ok();
     Ok(())
 }

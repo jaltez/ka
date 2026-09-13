@@ -187,7 +187,19 @@ pub fn is_private_host(url: &str) -> bool {
         Ok(IpAddr::V4(v4)) => {
             v4.is_loopback() || v4.is_private() || v4.is_link_local() || v4.is_unspecified()
         }
-        Ok(IpAddr::V6(v6)) => v6.is_loopback() || (v6.segments()[0] & 0xfe00) == 0xfc00,
+        Ok(IpAddr::V6(v6)) => {
+            // unique-local fc00::/7, loopback, link-local fe80::/10 ...
+            let scoped = v6.is_loopback()
+                || (v6.segments()[0] & 0xfe00) == 0xfc00
+                || (v6.segments()[0] & 0xffc0) == 0xfe80;
+            // ... and anything IPv4-mapped (e.g. ::ffff:127.0.0.1) judged
+            // by its embedded v4 address — the mapped spelling must not
+            // slip past the v4 checks
+            scoped
+                || v6
+                    .to_ipv4_mapped()
+                    .is_some_and(|v4| v4.is_loopback() || v4.is_private() || v4.is_link_local())
+        }
         Err(_) => false, // public hostname: allowed (SSRF via DNS rebinding
                          // is out of scope for a tool-level guard)
     }
@@ -413,7 +425,24 @@ impl Hand for WebFetchHand {
                      allow_private_hosts = true to override)"
                 ));
             }
-            let client = reqwest::Client::new();
+            // redirect policy: every hop is re-validated — an open
+            // redirect (or shortened URL) pointing at a private host
+            // must fail the fetch, not bypass the guard above
+            let client = reqwest::Client::builder()
+                .redirect(reqwest::redirect::Policy::custom(move |attempt| {
+                    if attempt.previous().len() > 10 {
+                        return attempt.error("web_fetch: too many redirects");
+                    }
+                    if !allow_private && is_private_host(attempt.url().as_str()) {
+                        return attempt
+                            .error("web_fetch: redirect to private/loopback target refused");
+                    }
+                    attempt.follow()
+                }))
+                .build();
+            let Ok(client) = client else {
+                return ToolOutput::err("web_fetch: client build failed");
+            };
             let resp = client
                 .get(url)
                 .header("User-Agent", "ka-web-fetch")
@@ -434,15 +463,21 @@ impl Hand for WebFetchHand {
                 .and_then(|v| v.to_str().ok())
                 .unwrap_or("")
                 .to_string();
-            let body = match resp.bytes().await {
-                Ok(b) => b,
-                Err(e) => return ToolOutput::err(format!("web_fetch: {e}")),
-            };
-            let mut bytes: &[u8] = &body;
-            if bytes.len() > FETCH_CAP {
-                bytes = &bytes[..FETCH_CAP];
+            // stream the body with a hard byte budget — a multi-GB
+            // response must never be fully materialized before capping
+            let mut body: Vec<u8> = Vec::with_capacity(64 * 1024);
+            let mut resp = resp;
+            while body.len() < FETCH_CAP {
+                match resp.chunk().await {
+                    Ok(Some(chunk)) => {
+                        let room = FETCH_CAP - body.len();
+                        body.extend_from_slice(&chunk[..chunk.len().min(room)]);
+                    }
+                    Ok(None) => break,
+                    Err(e) => return ToolOutput::err(format!("web_fetch: {e}")),
+                }
             }
-            let raw = String::from_utf8_lossy(bytes).into_owned();
+            let raw = String::from_utf8_lossy(&body).into_owned();
             let text = if ct.contains("html") || raw.trim_start().starts_with('<') {
                 html_to_text(&raw)
             } else {

@@ -228,17 +228,26 @@ fn local_data_check() -> Check {
         .unwrap_or_else(|_| std::env::temp_dir())
         .join("ka");
 
+    // strands live at <data>/strands/<encoded-cwd>/<id>.jsonl: count
+    // the FILES one level down (the old read_dir counted project
+    // directories and called them strands)
     let strands = data
         .join("strands")
         .read_dir()
-        .map(|entries| entries.filter_map(|e| e.ok()).count())
+        .map(|entries| {
+            entries
+                .flatten()
+                .filter_map(|e| e.path().read_dir().ok())
+                .map(|files| files.filter_map(|f| f.ok()).count())
+                .sum::<usize>()
+        })
         .unwrap_or(0);
     let spills_bytes = dir_size(&data.join("spills"));
     Check {
         name: "data",
         ok: true,
         detail: format!(
-            "{} strand(s) for cwd, {:.1} MB spills at {}",
+            "{} strand file(s), {:.1} MB spills at {}",
             strands,
             spills_bytes as f64 / (1024.0 * 1024.0),
             data.display()

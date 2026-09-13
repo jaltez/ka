@@ -29,8 +29,13 @@ use tokio::sync::{Mutex, mpsc};
 
 struct Session {
     commands: mpsc::Sender<Command>,
-    /// Single-consumer events: taken by the SSE response while streaming.
+    /// Single-consumer events: taken by the SSE response while
+    /// streaming, restored when the stream ends so reconnect (and
+    /// `Last-Event-ID` resume) works.
     events: Mutex<Option<mpsc::Receiver<Event>>>,
+    /// True once a stream has completed and restored the receiver; a
+    /// client's `Last-Event-ID` is only honored on such a resume.
+    resumed: std::sync::atomic::AtomicBool,
 }
 
 /// Entry: bind and serve until the process is stopped.
@@ -68,31 +73,48 @@ struct Request {
     body: Vec<u8>,
 }
 
+/// Read one request: bounded (1 MB), timeout-guarded (15 s), UTF-8
+/// tolerant in the body, Content-Length parsed from the head only.
 async fn read_request(socket: &mut tokio::net::TcpStream) -> Option<Request> {
     use tokio::io::AsyncReadExt;
+    /// One request (headers + body) may not exceed this.
+    const MAX_REQUEST: usize = 1024 * 1024;
+    /// A request must arrive within this window (slowloris bound).
+    const READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
     let mut buf: Vec<u8> = Vec::new();
     let mut tmp = [0u8; 8192];
     loop {
-        match socket.read(&mut tmp).await {
-            Ok(0) | Err(_) => return None,
-            Ok(n) => {
-                buf.extend_from_slice(&tmp[..n]);
-                if let Ok(text) = std::str::from_utf8(&buf) {
-                    if let Some(head_end) = text.find("\r\n\r\n") {
-                        let cl = text
-                            .lines()
-                            .find_map(|l| {
-                                l.strip_prefix("content-length:")
-                                    .or_else(|| l.strip_prefix("Content-Length:"))
-                                    .and_then(|v| v.trim().parse::<usize>().ok())
-                            })
-                            .unwrap_or(0);
-                        if buf.len() >= head_end + 4 + cl {
-                            break;
-                        }
-                    }
-                }
-            }
+        if buf.len() > MAX_REQUEST {
+            return None;
+        }
+        let n = match tokio::time::timeout(READ_TIMEOUT, socket.read(&mut tmp)).await {
+            Err(_) => return None, // read timeout
+            Ok(Ok(0)) | Ok(Err(_)) => return None,
+            Ok(Ok(n)) => n,
+        };
+        buf.extend_from_slice(&tmp[..n]);
+        // the head boundary is a BYTE pattern: the body may be non-UTF8
+        let Some(head_end) = find_subslice(&buf, b"\r\n\r\n") else {
+            continue;
+        };
+        // Content-Length is taken from the HEAD only — a body line
+        // containing `content-length:` must not stall the read
+        let head = String::from_utf8_lossy(&buf[..head_end]);
+        let cl = head
+            .lines()
+            .find_map(|l| {
+                let (k, v) = l.split_once(':')?;
+                k.eq_ignore_ascii_case("content-length")
+                    .then(|| v.trim().parse::<usize>().ok())
+                    .flatten()
+            })
+            .unwrap_or(0);
+        if cl > MAX_REQUEST {
+            return None;
+        }
+        if buf.len() >= head_end + 4 + cl {
+            break;
         }
     }
     let text = String::from_utf8_lossy(&buf).into_owned();
@@ -185,6 +207,7 @@ async fn handle_connection(
                 Arc::new(Session {
                     commands,
                     events: Mutex::new(Some(events)),
+                    resumed: std::sync::atomic::AtomicBool::new(false),
                 }),
             );
             let body = json!({"id": id}).to_string();
@@ -257,10 +280,13 @@ async fn respond(socket: &mut tokio::net::TcpStream, status: u16, body: &str) {
         body.len()
     );
     socket.write_all(resp.as_bytes()).await.ok();
-    socket.shutdown().await.ok();
+    socket.flush().await.ok();
 }
 
-/// Stream session events as SSE until the turn settles (Idle).
+/// Stream session events as SSE until the turn settles (Idle). The
+/// receiver is restored on every exit so a later reconnect (with
+/// `Last-Event-ID`) is possible; a comment ping keeps idle proxies from
+/// dropping the stream mid-turn.
 async fn stream_events(
     socket: &mut tokio::net::TcpStream,
     session: &Session,
@@ -270,43 +296,85 @@ async fn stream_events(
     socket.write_all(head.as_bytes()).await.ok();
     socket.flush().await.ok();
 
-    let Some(mut events) = session.events.lock().await.take() else {
-        let line = sse_line(
-            None,
-            r#"{"type":"error","message":"event stream already in use"}"#,
-        );
-        socket.write_all(line.as_bytes()).await.ok();
-        return;
+    let mut events = match session.events.lock().await.take() {
+        Some(e) => e,
+        None => {
+            let line = sse_line(
+                None,
+                r#"{"type":"error","message":"event stream already in use"}"#,
+            );
+            socket.write_all(line.as_bytes()).await.ok();
+            return;
+        }
     };
 
-    // Last-Event-ID resumes the sequence: earlier events are skipped
-    let mut seq: u64 = last_event_id.unwrap_or(0);
-    if seq > 0 {
+    // Last-Event-ID resumes the sequence — but only on a genuine resume
+    // (a restored receiver): a fresh stream must deliver the buffered
+    // backlog from the start, whatever the client claims to have seen
+    let resumed = session.resumed.load(std::sync::atomic::Ordering::Relaxed);
+    let skip_until = if resumed {
+        last_event_id.unwrap_or(0)
+    } else {
+        0
+    };
+    let mut seq: u64 = skip_until;
+    if skip_until > 0 {
         let marker = sse_line(
-            Some(seq),
-            &format!(r#"{{"type":"replay","resumed_after":{seq}}}"#),
+            Some(skip_until),
+            &format!(r#"{{"type":"replay","resumed_after":{skip_until}}}"#),
         );
         socket.write_all(marker.as_bytes()).await.ok();
     }
 
-    while let Some(evt) = events.recv().await {
-        seq += 1;
-        if seq <= last_event_id.unwrap_or(0) {
-            continue;
-        }
-        let is_idle = matches!(evt, Event::Idle);
-        let line = sse_line(Some(seq), &serde_json::to_string(&evt).unwrap_or_default());
-        socket.write_all(line.as_bytes()).await.ok();
-        socket.flush().await.ok();
-        if is_idle {
-            break;
+    let mut keepalive = tokio::time::interval(std::time::Duration::from_secs(15));
+    keepalive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    keepalive.tick().await; // the first tick fires immediately — consume it
+
+    loop {
+        tokio::select! {
+            _ = keepalive.tick() => {
+                // SSE comment frame: invisible to clients, keeps idle
+                // proxies/timeouts from dropping a mid-turn stream
+                if socket.write_all(b": keepalive\r\n\r\n").await.is_err() {
+                    break;
+                }
+                socket.flush().await.ok();
+            }
+            evt = events.recv() => {
+                let Some(evt) = evt else { break };
+                seq += 1;
+                if seq <= skip_until {
+                    continue;
+                }
+                let is_idle = matches!(evt, Event::Idle);
+                let line = sse_line(Some(seq), &serde_json::to_string(&evt).unwrap_or_default());
+                let client_gone = socket.write_all(line.as_bytes()).await.is_err()
+                    || socket.flush().await.is_err();
+                if client_gone {
+                    break; // keep the receiver's position for reconnect
+                }
+                if is_idle {
+                    break;
+                }
+            }
         }
     }
+
+    *session.events.lock().await = Some(events);
+    session
+        .resumed
+        .store(true, std::sync::atomic::Ordering::Relaxed);
 }
 
 fn sse_line(id: Option<u64>, data: &str) -> String {
     let id_part = id.map(|i| format!("id: {i}\r\n")).unwrap_or_default();
     format!("{id_part}data: {data}\r\n\r\n")
+}
+
+/// First index of `needle` in `hay` (byte-exact; used for the
+/// `\r\n\r\n` head boundary, which must survive a non-UTF8 body).
+fn find_subslice(hay: &[u8], needle: &[u8]) -> Option<usize> {
+    hay.windows(needle.len()).position(|w| w == needle)
 }
 
 #[cfg(test)]

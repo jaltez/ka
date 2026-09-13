@@ -121,9 +121,7 @@ pub struct Roles {
 }
 
 /// Per-tool settings (`[tools]` in a ka.toml layer).
-#[derive(
-    Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema,
-)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields, default)]
 pub struct Tools {
     /// Bash tool settings.
@@ -132,6 +130,19 @@ pub struct Tools {
     pub read: ReadTools,
     /// Web tool settings.
     pub web: WebTools,
+    /// MCP tool settings.
+    pub mcp: McpTools,
+}
+
+/// MCP tool tuning (`[tools.mcp]`).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields, default)]
+pub struct McpTools {
+    /// `"eager"` (default): every server tool becomes its own hand in
+    /// context. `"lazy"`: one `mcp_call` hand stands in for all of them
+    /// — the model lists a server's tools on demand. Prefer lazy when
+    /// servers expose many tools.
+    pub discovery: Option<String>,
 }
 
 /// Read tool tuning (`[tools.read]`).
@@ -201,12 +212,19 @@ pub struct Sandbox {
     pub mode: Option<String>,
 }
 
-/// TUI appearance ([tui]).
+/// TUI appearance and notifications ([tui]).
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields, default)]
 pub struct Tui {
     /// Title glyph for the transcript window and sidebar (default ◆).
     pub header_glyph: Option<String>,
+    /// Ring the terminal bell when a turn finishes or a permission ask
+    /// appears (None = true; terminals mute bells by user choice).
+    pub bell: Option<bool>,
+    /// Command run when a turn finishes, JSON on stdin:
+    /// `{"event":"turn_finished","stop":"done"}`. Example:
+    /// `notify-send ka "turn done"`.
+    pub notify: Option<String>,
 }
 
 impl Sandbox {
@@ -229,6 +247,33 @@ pub struct Lsp {
     /// "pyright-langserver --stdio", typescript =
     /// "typescript-language-server --stdio" }.
     pub commands: Option<std::collections::BTreeMap<String, String>>,
+}
+
+/// Post-edit verification ([verify]): the aider auto-lint/auto-test
+/// loop. Lint commands run per edited file; the test command runs once
+/// after a turn that edited files — a non-zero exit feeds the output
+/// back to the model for one automatic fix round before surfacing.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields, default)]
+pub struct Verify {
+    /// Test command (run in cwd, 15-minute cap). Examples: `cargo test`,
+    /// `npm test`.
+    pub test: Option<String>,
+    /// Lint rules — first matching rule runs per edited file.
+    pub lints: Vec<LintRule>,
+}
+
+/// One lint rule ([[verify.lints]]).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct LintRule {
+    /// Glob matched against the edited file's relative path and its
+    /// basename (`*.rs` matches `src/a.rs`).
+    pub pattern: String,
+    /// Command to run. `{file}` is substituted with the edited path;
+    /// without the placeholder the path is appended. Examples:
+    /// `rustfmt --check {file}`, `cargo fmt --check {file}`.
+    pub command: String,
 }
 
 /// Context-window policy ([context]).
@@ -313,6 +358,9 @@ pub struct Config {
     /// Git automation ([git]).
     #[serde(default)]
     pub git: Git,
+    /// Post-edit verification ([verify]).
+    #[serde(default)]
+    pub verify: Verify,
 }
 
 impl Config {
@@ -389,6 +437,33 @@ impl Config {
         if other.sandbox.mode.is_some() {
             self.sandbox.mode = other.sandbox.mode;
         }
+        if other.tui.bell.is_some() {
+            self.tui.bell = other.tui.bell;
+        }
+        if other.tui.notify.is_some() {
+            self.tui.notify = other.tui.notify;
+        }
+        if other.tools.mcp.discovery.is_some() {
+            self.tools.mcp.discovery = other.tools.mcp.discovery;
+        }
+        if other.verify.test.is_some() {
+            self.verify.test = other.verify.test;
+        }
+        if !other.verify.lints.is_empty() {
+            self.verify.lints = other.verify.lints;
+        }
+        if other.guards.spend_usd.is_some() {
+            self.guards.spend_usd = other.guards.spend_usd;
+        }
+        if !other.search.is_empty() {
+            self.search = other.search;
+        }
+        if other.tools.web.allow_private_hosts.is_some() {
+            self.tools.web.allow_private_hosts = other.tools.web.allow_private_hosts;
+        }
+        if other.tui.header_glyph.is_some() {
+            self.tui.header_glyph = other.tui.header_glyph;
+        }
     }
     /// Effective step cap (default 20).
     pub fn effective_max_steps(&self) -> u32 {
@@ -410,6 +485,11 @@ impl Config {
             .unwrap_or_else(|| "\u{25c6}".to_string())
     }
 
+    /// Whether the bell rings on turn completion and asks (default true).
+    pub fn effective_bell(&self) -> bool {
+        self.tui.bell.unwrap_or(true)
+    }
+
     /// Whether web fetches may target private hosts (default false).
     pub fn effective_web_allow_private(&self) -> bool {
         self.tools.web.allow_private_hosts.unwrap_or(false)
@@ -428,6 +508,11 @@ impl Config {
     /// Effective read-hand image cap in MB (default 5, 0 = unlimited).
     pub fn effective_max_image_mb(&self) -> u32 {
         self.tools.read.max_image_mb.unwrap_or(DEFAULT_MAX_IMAGE_MB)
+    }
+
+    /// Whether MCP tool discovery is lazy (`[tools.mcp] discovery`).
+    pub fn effective_mcp_lazy(&self) -> bool {
+        matches!(self.tools.mcp.discovery.as_deref(), Some("lazy"))
     }
 
     /// The effective permission mode (free unless set in a layer).
@@ -759,6 +844,45 @@ mod tests {
     }
 
     #[test]
+    fn every_documented_setting_survives_the_overlay() {
+        // regression for the overlay-drop class of bug (sandbox,
+        // spend_usd, [[search]], tools.web, and [tui] were each silently
+        // dropped at some point): parse one layer carrying every
+        // previously-dropped knob and assert it reaches the merged cfg
+        let mut cfg = Config::default();
+        cfg.overlay(
+            Config::parse_layer(
+                "[guards]\nspend_usd = 2.5\ncontext_pct = 80\n\n[[search]]\nprovider = \"tavily\"\napi_key_env = \"TAVILY_KEY\"\n\n[tools.web]\nallow_private_hosts = true\n\n[tools.mcp]\ndiscovery = \"lazy\"\n\n[tui]\nheader_glyph = \"*\"\nbell = false\nnotify = \"notify-send ka done\"\n\n[verify]\ntest = \"cargo test\"\n\n[[verify.lints]]\npattern = \"*.rs\"\ncommand = \"rustfmt --check {file}\"\n",
+                "project",
+            )
+            .unwrap(),
+        );
+        assert_eq!(cfg.guards.spend_usd, Some(2.5), "spend guard is live");
+        assert_eq!(cfg.guards.context_pct, Some(80));
+        assert_eq!(cfg.search.len(), 1, "[[search]] provider survives");
+        assert_eq!(
+            cfg.tools.web.allow_private_hosts,
+            Some(true),
+            "web private-host policy survives"
+        );
+        assert_eq!(cfg.tui.header_glyph.as_deref(), Some("*"));
+        // the newer knob classes survive the same way
+        assert!(cfg.effective_mcp_lazy(), "[tools.mcp] discovery survives");
+        assert!(!cfg.effective_bell(), "[tui] bell survives");
+        assert_eq!(
+            cfg.tui.notify.as_deref(),
+            Some("notify-send ka done"),
+            "[tui] notify survives"
+        );
+        assert_eq!(
+            cfg.verify.test.as_deref(),
+            Some("cargo test"),
+            "[verify] test survives"
+        );
+        assert_eq!(cfg.verify.lints.len(), 1, "[[verify.lints]] survive");
+    }
+
+    #[test]
     fn schema_emits() {
         let schema = Config::schema_json().unwrap();
         assert!(schema.contains("\"Config\""), "got: {schema}");
@@ -800,5 +924,40 @@ mod tests {
     fn schema_contains_background_after_ms() {
         let schema = Config::schema_json().unwrap();
         assert!(schema.contains("background_after_ms"), "got: {schema}");
+    }
+
+    #[test]
+    fn verify_parses_and_overlays() {
+        let c = Config::parse_layer(
+            "[verify]\ntest = \"cargo test\"\n\n[[verify.lints]]\npattern = \"*.rs\"\ncommand = \"rustfmt --check {file}\"\n",
+            "user",
+        )
+        .unwrap();
+        assert_eq!(c.verify.test.as_deref(), Some("cargo test"));
+        assert_eq!(c.verify.lints.len(), 1);
+        assert_eq!(c.verify.lints[0].pattern, "*.rs");
+        // set-field overlay: test replaced, empty lints keep lower layer
+        let mut base = c;
+        base.overlay(Config::parse_layer("[verify]\ntest = \"npm test\"\n", "over").unwrap());
+        assert_eq!(base.verify.test.as_deref(), Some("npm test"));
+        assert_eq!(base.verify.lints.len(), 1, "lints survive an unset layer");
+        base.overlay(
+            Config::parse_layer(
+                "[[verify.lints]]\npattern = \"*.ts\"\ncommand = \"tsc --noEmit\"\n",
+                "over2",
+            )
+            .unwrap(),
+        );
+        assert_eq!(base.verify.lints.len(), 1, "non-empty lints replace");
+        assert_eq!(base.verify.lints[0].pattern, "*.ts");
+        // unknown keys hard-error
+        let err = Config::parse_layer("[verify]\ntests = \"x\"\n", "user")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("tests"), "got: {err}");
+        let err = Config::parse_layer("[[verify.lints]]\npattern = \"*.rs\"\n", "user")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("command"), "got: {err}");
     }
 }

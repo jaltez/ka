@@ -78,6 +78,8 @@ fn parse_env_line(line: &str) -> Option<(String, String)> {
     if line.is_empty() || line.starts_with('#') {
         return None;
     }
+    // shell-sourceable env files often carry `export KEY=...`
+    let line = line.strip_prefix("export ").unwrap_or(line).trim_start();
     let (key, value) = line.split_once('=')?;
     let key = key.trim().to_string();
     if key.is_empty() {
@@ -184,6 +186,10 @@ mod tests {
         assert_eq!(parse_env_line("# comment"), None);
         assert_eq!(parse_env_line("noequals"), None);
         assert_eq!(parse_env_line("=value"), None);
+        assert_eq!(
+            parse_env_line("export OPENAI_API_KEY=sk-x"),
+            Some(("OPENAI_API_KEY".into(), "sk-x".into()))
+        );
     }
 
     #[test]

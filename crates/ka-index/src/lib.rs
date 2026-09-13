@@ -109,10 +109,15 @@ pub fn rebuild(strands_root: &Path, db: &Connection) -> Result<RebuildStats, Str
         }
     }
     for file in loose {
-        if index_one_file(&file, db)? {
-            indexed += 1;
-        } else {
-            skipped += 1;
+        // one malformed strand (torn write, future record format) must
+        // not poison the whole index — skip it and keep going
+        match index_one_file(&file, db) {
+            Ok(true) => indexed += 1,
+            Ok(false) => skipped += 1,
+            Err(e) => {
+                skipped += 1;
+                eprintln!("ka index: skipping {}: {e}", file.display());
+            }
         }
     }
     for dir in dirs {
@@ -125,10 +130,13 @@ pub fn rebuild(strands_root: &Path, db: &Connection) -> Result<RebuildStats, Str
             if path.extension().is_none_or(|e| e != "jsonl") {
                 continue;
             }
-            if index_one_file(&path, db)? {
-                indexed += 1;
-            } else {
-                skipped += 1;
+            match index_one_file(&path, db) {
+                Ok(true) => indexed += 1,
+                Ok(false) => skipped += 1,
+                Err(e) => {
+                    skipped += 1;
+                    eprintln!("ka index: skipping {}: {e}", path.display());
+                }
             }
         }
     }

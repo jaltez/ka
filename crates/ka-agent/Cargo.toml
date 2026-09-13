@@ -36,5 +36,5 @@ landlock = "0.4"
 workspace = true
 
 [features]
-default = ["index"]
+default = []
 index = ["dep:ka-index"]

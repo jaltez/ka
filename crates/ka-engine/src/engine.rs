@@ -100,10 +100,36 @@ pub fn spawn_full(
     catalog: ka_dialect::Catalog,
     strand: StrandChoice,
 ) -> EngineHandle {
+    spawn_speaked(config, catalog, strand, None)
+}
+
+/// Spawn with a scripted speaker for one wire (contract tests): the
+/// real turn machine runs against scripted model responses — no
+/// network, no provider. Everything else (gate, tools, verify loop,
+/// hooks) behaves exactly as in production.
+pub fn spawn_with_speaker(
+    config: Config,
+    catalog: ka_dialect::Catalog,
+    strand: StrandChoice,
+    wire: ka_dialect::Wire,
+    speaker: std::sync::Arc<dyn ka_dialect::speaker::Speaker>,
+) -> EngineHandle {
+    spawn_speaked(config, catalog, strand, Some((wire, speaker)))
+}
+
+fn spawn_speaked(
+    config: Config,
+    catalog: ka_dialect::Catalog,
+    strand: StrandChoice,
+    speaker: Option<(
+        ka_dialect::Wire,
+        std::sync::Arc<dyn ka_dialect::speaker::Speaker>,
+    )>,
+) -> EngineHandle {
     let (cmd_tx, cmd_rx) = mpsc::channel(64);
     let (evt_tx, evt_rx) = mpsc::channel(256);
     tokio::spawn(async move {
-        if let Err(e) = run(cmd_rx, evt_tx, config, catalog, strand).await {
+        if let Err(e) = run(cmd_rx, evt_tx, config, catalog, strand, speaker).await {
             // The events channel is gone or the engine hit an unrecoverable
             // state; surface-level diagnostics only.
             eprintln!("ka engine ended: {e}");
@@ -281,6 +307,12 @@ struct EngineState {
     /// `[git] auto_commit`: stage the whole worktree (`git add -A`) and
     /// commit after each completed turn.
     auto_commit: bool,
+    /// `[verify] test` command; runs after edit-carrying turns.
+    verify_test: Option<String>,
+    /// One automatic verify-fix round per user prompt (loop guard).
+    verify_round_done: bool,
+    /// `!` passthrough outputs waiting to ride the next user prompt.
+    shell_context: Vec<String>,
 }
 impl From<Config> for EngineState {
     fn from(c: Config) -> Self {
@@ -297,6 +329,9 @@ impl From<Config> for EngineState {
             roles: EngineRoles::default(),
             needs_title: false,
             auto_commit: c.git.auto_commit.unwrap_or(false),
+            verify_test: c.verify.test.clone(),
+            verify_round_done: false,
+            shell_context: Vec::new(),
         }
     }
 }
@@ -316,6 +351,11 @@ struct Ctx {
     mcp_shared: Vec<crate::mcp::McpShared>,
     /// Watchdog/refresh bookkeeping from MCP supervisors.
     maintenance: mpsc::Receiver<crate::mcp::Maintenance>,
+    /// [tools.mcp] discovery = "lazy": one mcp_call hand instead of a
+    /// hand per server tool.
+    mcp_lazy: bool,
+    /// Background delegate-task registry (/tasks rows).
+    agent_tasks: std::sync::Arc<crate::hands::tasks::AgentTaskTable>,
 }
 
 async fn run(
@@ -324,6 +364,10 @@ async fn run(
     config: Config,
     catalog: ka_dialect::Catalog,
     strand_choice: StrandChoice,
+    speaker: Option<(
+        ka_dialect::Wire,
+        std::sync::Arc<dyn ka_dialect::speaker::Speaker>,
+    )>,
 ) -> Result<(), DynError> {
     let cwd = config
         .cwd
@@ -354,7 +398,11 @@ async fn run(
     let search_provider = config.effective_search();
     let web_allow_private = config.effective_web_allow_private();
     let mut voice = Voice::new(catalog, cwd.clone(), mode, max_steps);
+    if let Some((wire, speaker)) = speaker {
+        voice = voice.with_speaker(wire, speaker);
+    }
     voice.set_rules(rules);
+    voice.set_verify(config.verify.clone());
     voice.set_allowed_tools(allowed_tools);
     voice.set_hooks(hooks);
     voice.set_bash_background_ms(config.effective_bash_background_after_ms());
@@ -370,16 +418,26 @@ async fn run(
     } else {
         config.lsp.clone()
     };
-    let lsp = crate::lsp::LspManager::new(&cwd, &lsp_cfg);
-    voice.set_lsp(std::sync::Arc::new(lsp));
+    let lsp = std::sync::Arc::new(crate::lsp::LspManager::new(&cwd, &lsp_cfg));
+    voice.set_lsp(lsp.clone());
+    // navigation hands (symbols/definition/references/diagnostics) plus
+    // an eager server start, only when the diagnostics tier is live
+    if lsp_cfg.enable == Some(true) && lsp_cfg.commands.as_ref().is_some_and(|c| !c.is_empty()) {
+        lsp.start_all();
+        for hand in crate::hands::lsp_tools::hands(lsp.clone()) {
+            voice.push_hand(hand);
+        }
+    }
     voice.set_web_allow_private(config.effective_web_allow_private());
     {
         let slot = voice.pathfinder_slot();
         slot.write().catalog = pathfinder_catalog;
     }
+    let mcp_lazy = config.effective_mcp_lazy();
     let mut state = EngineState::from(config);
     state.roles = roles;
     let strand = attach_strand(&events, &mut state, &mut voice, &cwd, &strand_choice).await?;
+    let agent_tasks = crate::hands::tasks::AgentTaskTable::new();
     let (maintenance_tx, maintenance_rx) = mpsc::channel(16);
     let mut ctx = Ctx {
         cwd,
@@ -389,6 +447,8 @@ async fn run(
         strand,
         mcp_shared: Vec::new(),
         maintenance: maintenance_rx,
+        mcp_lazy,
+        agent_tasks: agent_tasks.clone(),
     };
     // markdown agents: .ka/agents/*.md etc. become one `delegate` hand
     // (empty in safe mode)
@@ -401,8 +461,24 @@ async fn run(
     if !agents.is_empty() {
         let slot = ctx.voice.pathfinder_slot();
         ctx.voice.push_hand(std::sync::Arc::new(
-            crate::hands::delegate::DelegateHand::new(agents, slot, mode),
+            crate::hands::delegate::DelegateHand::new(
+                agents,
+                slot,
+                mode,
+                agent_tasks.clone(),
+                ctx.events.clone(),
+            ),
         ));
+        ctx.voice
+            .push_hand(std::sync::Arc::new(crate::hands::tasks::TasksHand::new(
+                agent_tasks.clone(),
+            )));
+    }
+    // memory inbox: the model stages durable notes for user review
+    // (customization tier — inert in safe mode)
+    if !crate::conventions::bare_mode() {
+        ctx.voice
+            .push_hand(std::sync::Arc::new(crate::hands::memory::RememberHand));
     }
 
     // MCP servers: spawn, handshake, list; each tool becomes a hand at
@@ -418,12 +494,16 @@ async fn run(
             Ok(Ok((client, tools))) => {
                 let tool_count = tools.len();
                 let shared = crate::mcp::McpShared::new(cfg.clone(), client, tools.clone());
-                for tool in tools {
-                    ctx.voice
-                        .push_hand(std::sync::Arc::new(crate::mcp::McpHand::new(
-                            tool,
-                            shared.clone(),
-                        )));
+                // eager mode: every tool becomes its own hand; lazy mode
+                // registers one mcp_call hand after the loop
+                if !ctx.mcp_lazy {
+                    for tool in tools {
+                        ctx.voice
+                            .push_hand(std::sync::Arc::new(crate::mcp::McpHand::new(
+                                tool,
+                                shared.clone(),
+                            )));
+                    }
                 }
                 ctx.mcp_shared.push(shared.clone());
                 tokio::spawn(crate::mcp::supervise(
@@ -499,6 +579,13 @@ async fn run(
     // web search + fetch hands (search only when a provider is set)
     for hand in crate::hands::web::hands(search_provider, web_allow_private) {
         ctx.voice.push_hand(hand);
+    }
+    // lazy MCP: one hand fronts every server (listing + calls)
+    if ctx.mcp_lazy && !ctx.mcp_shared.is_empty() {
+        ctx.voice
+            .push_hand(std::sync::Arc::new(crate::mcp::McpCallHand::new(
+                ctx.mcp_shared.clone(),
+            )));
     }
     // browse hand over every server: resources + prompts discovery
     if !ctx.mcp_shared.is_empty() {
@@ -583,11 +670,17 @@ async fn handle_maintenance(update: crate::mcp::Maintenance, ctx: &mut Ctx) {
         }
     };
     if let Some(shared) = ctx.mcp_shared.iter().find(|s| s.name() == server).cloned() {
-        let hands: Vec<std::sync::Arc<dyn crate::hands::Hand>> = tools
-            .iter()
-            .map(|t| std::sync::Arc::new(crate::mcp::McpHand::new(t.clone(), shared.clone())) as _)
-            .collect();
-        ctx.voice.replace_server_hands(&server, hands);
+        if !ctx.mcp_lazy {
+            let hands: Vec<std::sync::Arc<dyn crate::hands::Hand>> = tools
+                .iter()
+                .map(|t| {
+                    std::sync::Arc::new(crate::mcp::McpHand::new(t.clone(), shared.clone())) as _
+                })
+                .collect();
+            ctx.voice.replace_server_hands(&server, hands);
+        }
+        // lazy mode: the single mcp_call hand reads the refreshed tool
+        // list through McpShared — nothing to swap
     }
     ctx.events
         .send(Event::Note {
@@ -608,6 +701,16 @@ async fn handle_command(
             schema,
             images,
         } => {
+            // a fresh user prompt earns a fresh verify-fix round
+            ctx.state.verify_round_done = false;
+            // `!` passthrough outputs ride along as leading context
+            let text = if ctx.state.shell_context.is_empty() {
+                text
+            } else {
+                let block = ctx.state.shell_context.join("\n\n");
+                ctx.state.shell_context.clear();
+                format!("{block}\n\n{text}")
+            };
             dispatch_turn(
                 commands,
                 &ctx.events,
@@ -769,8 +872,73 @@ async fn handle_command(
                 .await?;
             ctx.events.send(Event::Idle).await.ok();
         }
+        Command::ListTasks => {
+            // /tasks dashboard rows: background delegates + bash jobs
+            let mut rows = ctx.agent_tasks.rows();
+            for j in ctx.voice.jobs().snapshot() {
+                let state = match j.state {
+                    crate::hands::jobs::JobState::Running => "running".to_string(),
+                    crate::hands::jobs::JobState::Exited(c) => format!("exit {c}"),
+                };
+                let cmd: String = j.cmd.chars().take(60).collect();
+                rows.push(format!("job-{}`  {state}  {cmd}", j.id));
+            }
+            if rows.is_empty() {
+                rows.push("no background tasks or jobs".to_string());
+            }
+            ctx.events.send(Event::Tasks { rows }).await.ok();
+        }
         Command::Interject { text } => ctx.state.interjections.push(text),
         Command::Defer { text } => ctx.state.deferrals.push_back(text),
+        // TRUST INVARIANT: Command::Shell is only ever sent by the local
+        // TUI (see the variant docs in ka-protocol) — that is what makes
+        // running it without the permission gate sound.
+        Command::Shell { command } => {
+            // user-typed `!` passthrough: run it, show it, and stage the
+            // redacted output as context for the next prompt. Runs only
+            // between turns (the voice owns the channel mid-turn).
+            let ran = tokio::time::timeout(
+                std::time::Duration::from_secs(120),
+                tokio::process::Command::new("sh")
+                    .arg("-c")
+                    .arg(&command)
+                    .current_dir(&ctx.cwd)
+                    // the timeout drops the output future: without this,
+                    // a hung child keeps running detached past the bound
+                    .kill_on_drop(true)
+                    .output(),
+            )
+            .await;
+            let (output, note) = match ran {
+                Ok(Ok(out)) => {
+                    let mut text = String::from_utf8_lossy(&out.stdout).to_string();
+                    text.push_str(&String::from_utf8_lossy(&out.stderr));
+                    let note = (!out.status.success())
+                        .then(|| format!("exit {}", out.status.code().unwrap_or(-1)));
+                    (text, note)
+                }
+                Ok(Err(e)) => (String::new(), Some(format!("spawn failed: {e}"))),
+                Err(_) => (String::new(), Some("timed out after 120s".to_string())),
+            };
+            let output = crate::hands::secrets::redact(&tail_chars(output.trim(), 4_000));
+            while ctx.state.shell_context.len() >= 5 {
+                ctx.state.shell_context.remove(0);
+            }
+            ctx.state.shell_context.push(format!(
+                "[the user ran `{command}` in their shell — output follows]\n{output}{}",
+                note.as_deref()
+                    .map(|n| format!("\n({n})"))
+                    .unwrap_or_default()
+            ));
+            ctx.events
+                .send(Event::ShellOutput {
+                    command,
+                    output,
+                    note,
+                })
+                .await
+                .ok();
+        }
         Command::Abort => {}
         Command::Compact { focus } => {
             run_digest(
@@ -1644,6 +1812,121 @@ async fn dispatch_turn(
             mode: None,
         });
         events.send(Event::ModelChanged { selector }).await.ok();
+    }
+    // [verify] test loop (aider's auto-test): after a turn that edited
+    // files, run the configured test command; a failure feeds the
+    // output back to the model for ONE automatic fix round — further
+    // failures surface as notes for the user
+    // drain the edited list unconditionally: with no [verify] test
+    // configured it would otherwise grow unbounded across the session
+    let edited = voice.take_edited();
+    if voice.last_stop() == Stop::Done && !state.verify_round_done {
+        if let Some(test) = state.verify_test.clone() {
+            if !edited.is_empty() {
+                state.verify_round_done = true;
+                // the test can run long: keep serving the command channel
+                // so Esc/abort (and interject/defer queueing) still work —
+                // an abort cancels the test and skips the fix round
+                let test_fut = tokio::time::timeout(
+                    std::time::Duration::from_secs(900),
+                    tokio::process::Command::new("sh")
+                        .arg("-c")
+                        .arg(&test)
+                        .current_dir(cwd)
+                        .kill_on_drop(true)
+                        .output(),
+                );
+                tokio::pin!(test_fut);
+                let mut aborted = false;
+                let ran = loop {
+                    tokio::select! {
+                        biased;
+                        maybe = commands.recv() => match maybe {
+                            None | Some(Command::Abort) => {
+                                aborted = true;
+                                break None;
+                            }
+                            Some(Command::Interject { text }) => state.interjections.push(text),
+                            Some(Command::Defer { text }) => state.deferrals.push_back(text),
+                            Some(_) => {}
+                        },
+                        out = &mut test_fut => break Some(out),
+                    }
+                };
+                let verdict = match ran {
+                    // aborted: the cancel note goes out with the verdict
+                    None => None,
+                    Some(ran) => match ran {
+                        Ok(Ok(out)) if out.status.success() => None,
+                        Ok(Ok(out)) => {
+                            let mut text = String::from_utf8_lossy(&out.stdout).to_string();
+                            text.push_str(&String::from_utf8_lossy(&out.stderr));
+                            Some(format!(
+                                "exit {} — {}",
+                                out.status.code().unwrap_or(-1),
+                                tail_chars(text.trim(), 4_000)
+                            ))
+                        }
+                        Ok(Err(e)) => Some(format!("failed to spawn: {e}")),
+                        Err(_) => Some("timed out after 15 min".to_string()),
+                    },
+                };
+                match verdict {
+                    None if aborted => {
+                        events
+                            .send(Event::Note {
+                                message: format!("[verify] `{test}` cancelled"),
+                            })
+                            .await
+                            .ok();
+                    }
+                    None => {
+                        events
+                            .send(Event::Note {
+                                message: format!("[verify] `{test}` passed"),
+                            })
+                            .await
+                            .ok();
+                    }
+                    Some(failure) => {
+                        events
+                            .send(Event::Note {
+                                message: format!(
+                                    "[verify] `{test}` failed — feeding failures back for one fix round"
+                                ),
+                            })
+                            .await
+                            .ok();
+                        let fix = format!(
+                            "[verify] `{test}` failed after your edits. Fix the failures without expanding scope; if a failure predates your change, say so and stop.\n\n{failure}"
+                        );
+                        Box::pin(dispatch_turn(
+                            commands,
+                            events,
+                            state,
+                            voice,
+                            fix,
+                            None,
+                            Vec::new(),
+                            strand,
+                            cwd,
+                        ))
+                        .await;
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Last `cap` characters of `text` (test output is tail-relevant).
+fn tail_chars(text: &str, cap: usize) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    if chars.len() > cap {
+        let cut: String = chars[chars.len() - cap..].iter().collect();
+        format!("…{cut}")
+    } else {
+        text.to_string()
     }
 }
 
@@ -3002,7 +3285,7 @@ mod tests {
         );
         // 7 built-ins + todo + jobs + delegate + web_fetch (search
         // registers only with a configured [[search]] provider)
-        assert_eq!(tools.len(), 11, "tools: {tools:?}");
+        assert_eq!(tools.len(), 13, "tools: {tools:?}");
         assert!(tools.contains(&"delegate".to_string()), "tools: {tools:?}");
         assert!(tools.contains(&"todo".to_string()), "tools: {tools:?}");
         assert!(tools.contains(&"jobs".to_string()), "tools: {tools:?}");

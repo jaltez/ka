@@ -12,7 +12,9 @@ pub mod hands;
 pub mod lsp;
 pub mod mcp;
 pub mod trust;
-mod voice;
+pub mod voice;
 
 pub use config::{Config, ConfigError};
-pub use engine::{EngineHandle, StrandChoice, read_waypoint, spawn, spawn_full, spawn_with};
+pub use engine::{
+    EngineHandle, StrandChoice, read_waypoint, spawn, spawn_full, spawn_with, spawn_with_speaker,
+};

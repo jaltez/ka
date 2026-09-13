@@ -187,8 +187,22 @@ pub enum Command {
         /// Deferred text.
         text: String,
     },
+    /// Run a user-typed shell command directly (the TUI's `!`
+    /// passthrough). Output shows in the transcript and rides the next
+    /// prompt as context. No permission gate — the user typed it.
+    ///
+    /// TRUST INVARIANT: only the local TUI may send this. Remote
+    /// surfaces (serve, ACP) construct a fixed command subset and must
+    /// never forward arbitrary protocol commands, or this becomes an
+    /// ungated exec primitive for whoever can reach the transport.
+    Shell {
+        /// Command line for `sh -c`.
+        command: String,
+    },
     /// Abort the current turn (partial work is kept).
     Abort,
+    /// Snapshot background tasks/jobs for the /tasks dashboard.
+    ListTasks,
     /// Switch the active model.
     SetModel {
         /// Model selector, e.g. `vendor/model:effort`.
@@ -465,6 +479,23 @@ pub enum Event {
         /// Note text.
         message: String,
     },
+    /// Output of a user `!` shell passthrough (redacted, capped).
+    ShellOutput {
+        /// The command line that ran.
+        command: String,
+        /// Capped combined stdout+stderr (may be empty).
+        output: String,
+        /// Failure note (spawn error / non-zero exit / timeout), when
+        /// there is one.
+        #[serde(default)]
+        note: Option<String>,
+    },
+    /// /tasks dashboard snapshot: background delegate tasks and bash
+    /// jobs, pre-rendered rows.
+    Tasks {
+        /// Rendered rows.
+        rows: Vec<String>,
+    },
     /// Context-usage breakdown (/context): estimated tokens per
     /// component plus the active window.
     ContextBreakdown {
@@ -662,6 +693,18 @@ mod tests {
         });
         roundtrip_event(Event::Note {
             message: "pruned ~2k tokens".into(),
+        });
+        roundtrip_command(Command::Shell {
+            command: "cargo test".into(),
+        });
+        roundtrip_command(Command::ListTasks);
+        roundtrip_event(Event::ShellOutput {
+            command: "cargo test".into(),
+            output: "test result: ok".into(),
+            note: Some("exit 101".into()),
+        });
+        roundtrip_event(Event::Tasks {
+            rows: vec!["t-1  running  12s  reviewer — audit".into()],
         });
         roundtrip_event(Event::Error {
             class: ErrorClass::Unsupported,

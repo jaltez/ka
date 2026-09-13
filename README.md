@@ -22,6 +22,7 @@ ka export --session 3f9c2a81           # export a specific session as markdown
 ka mcp                                 # probe [[mcp]] servers, list tools
 ka providers                          # provider registry + API-key env status
 ka run "summarize the build error"    # headless NDJSON
+ka run --review                       # read-only review of the working tree
 ```
 
 Keys: `Enter` send / interject mid-turn · `+text` defer until turn ends · `Esc`/`Ctrl-C` abort · `↑/↓` history · `/model` without arguments opens a picker over the catalog (filter as you type, key/env status; Enter on an unmatched filter sets it as a custom `vendor/model` selector). Interjections and `+deferrals` post a visible ack line while a turn runs. `PgUp`/`PgDn` scroll the transcript (title shows `↑N above`; `Esc` re-pins to the tail). Rendered rows are cached per entry — streaming redraws only the live region. `/session` (alias `/resume`) opens an in-app session picker with type-to-filter; `/new` starts a fresh session; `/settings` edits model/mode/effort (persist with `s`) and shows every provider's API-key env status. The transcript renders markdown (headers, lists, `code`, fenced blocks with syntax coloring) with role blocks: blue for you, amber for tool calls, dark gray for streamed thinking. NO_COLOR is honored.
@@ -39,7 +40,7 @@ Keys: `Enter` send / interject mid-turn · `+text` defer until turn ends · `Esc
 | `ka init` | starter AGENTS.md from repo shape |
 | `ka config {schema,print}` | resolved config / JSON schema |
 
-TUI slash commands: `/model <sel>` `/mode [tier]` (picker: needs-approval | accept-edits | full-access | plan) `/plan <task>` `/build` `/rewind [N]` `/compact [focus]` `/quit` plus custom `/name` from `.ka/commands/*.md` (`$ARGUMENTS` substituted).
+TUI slash commands: `/model <sel>` `/mode [tier]` (picker: needs-approval | accept-edits | full-access | plan) `/plan <task>` `/build` `/review [base]` `/tasks` `/rewind [N]` `/compact [focus]` `/quit` plus custom `/name` from `.ka/commands/*.md` (`$ARGUMENTS` substituted). Double-Esc on an empty input opens the rewind menu — pick a past message to rewind to, or `e` to edit & resend it. `!cmd` runs a shell command directly (no turn, no gate); its output shows in the transcript and rides the next prompt as context.
 
 ## Selectors & models
 
@@ -96,7 +97,42 @@ rust = "rust-analyzer"     # languages spawn (hand-rolled client, no
 python = "pyright-langserver --stdio"  # new deps)
 ```
 
-`[lsp]` appends the server's latest diagnostics to successful `edit`/`write` results as informational context (never tool errors), capped at 20 lines. `ka doctor` reports whether configured server commands exist on PATH.
+`[lsp]` appends the server's latest diagnostics to successful `edit`/`write` results as informational context (never tool errors), capped at 20 lines. With LSP enabled, four navigation hands join the registry: `symbols` (workspace symbol search — the budget-safe repo map), `definition` / `references` (IDE-style navigation), and `diagnostics` (pull project-wide or per-file findings). Servers start eagerly so navigation works before the first edit. `ka doctor` reports whether configured server commands exist on PATH.
+
+## Verify loop, notifications, memory inbox
+
+```toml
+[verify]                   # aider-style auto-lint / auto-test
+test = "cargo test"        # runs once after a turn that edited files;
+                           # a failure feeds the output back to the model
+                           # for ONE automatic fix round
+[[verify.lints]]
+pattern = "*.rs"           # glob on the edited path (or basename)
+command = "rustfmt --check {file}"
+
+[tui]
+bell = true                # ring the bell on turn completion + asks
+notify = "notify-send ka \"turn done\""   # JSON {event, stop} on stdin
+```
+
+The model can stage durable notes with the `remember` tool; they land in `.ka/memory/inbox.md` and nothing reaches `MEMORY.md` until you accept them in `/memory` (⏎ project · u user · d discard).
+
+## Scoped rules & protected paths
+
+`.ka/rules/*.md` (trust-gated; also `.agents/rules`, `.claude/rules`, `~/.config/ka/rules`) carry optional `paths:` frontmatter — a rule activates once a matching file has been read this session (TS conventions load only when TS files are touched). Rules on the web tools match hosts with domain semantics (`example.com` covers subdomains). Protected paths — `.git/hooks|config|modules`, `~/.ssh`, shell rc files, `.gitconfig`, ka's own config/credentials/trust store — always prompt, even in free mode; bash redirections into them hardstop.
+
+## Agent frontmatter & background delegates
+
+```
+---
+name: explorer
+model: ollama/qwen3.5:9b   # per-agent model (or effort: low alone)
+tools: read, grep, glob    # restrict the nested voice's hands
+---
+You explore code and report where things live.
+```
+
+`delegate {"background": true}` starts an agent detached and returns immediately; the `tasks` hand lists/reads/cancels background work, and `/tasks` in the TUI snapshots tasks + bash jobs.
 
 ## Conventions ka reads automatically
 
@@ -143,4 +179,4 @@ Stable owns the name `ka`; dev is always `kad`. Isolate dev sessions with `KA_DA
 
 ## Footprint contract
 
-Single binary ≤ 10 MB (currently **6.35 MB**) · cold start ≤ 50 ms · idle RSS ≤ 15 MB · zero steady-state network. 113 tests, `clippy -D warnings` clean, musl CI build.
+Single binary ≤ 10 MB (currently **6.1 MB**, gated in CI on the musl artifact) · cold start ≤ 50 ms · idle RSS ≤ 15 MB · zero steady-state network. 530 tests (feature contracts included — CI fails if a documented behavior regresses), `clippy -D warnings` clean, musl CI build. Full-text session search ships behind the opt-in `index` cargo feature (`cargo install ka-agent --features index`).

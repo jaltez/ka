@@ -243,20 +243,24 @@ async fn speak_openai(
                 continue; // malformed chunk: drop, keep streaming
             };
             if let Some(u) = v.get("usage").filter(|u| u.is_object()) {
-                usage.input = u
-                    .get("prompt_tokens")
-                    .and_then(Value::as_u64)
-                    .unwrap_or(usage.input);
-                usage.output = u
-                    .get("completion_tokens")
-                    .and_then(Value::as_u64)
-                    .unwrap_or(usage.output);
+                // OpenAI reports cached_tokens as a SUBSET of
+                // prompt_tokens: keep input cache-exclusive (matching
+                // wire_responses and the Anthropic wire) so consumers
+                // that compute input + cache_read don't double-count
+                let prompt = u.get("prompt_tokens").and_then(Value::as_u64);
                 let cached = u
                     .get("prompt_tokens_details")
                     .and_then(|d| d.get("cached_tokens"))
                     .and_then(Value::as_u64)
                     .or_else(|| u.get("cached_tokens").and_then(Value::as_u64))
                     .unwrap_or(0);
+                if let Some(p) = prompt {
+                    usage.input = p.saturating_sub(cached);
+                }
+                usage.output = u
+                    .get("completion_tokens")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(usage.output);
                 usage.cache_read = cached;
             }
             let Some(choice) = v.pointer("/choices/0") else {
