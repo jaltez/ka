@@ -17,7 +17,7 @@ use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 
 /// Placeholder repo (config `[update] repo` overrides; anything else
 /// fails with the configured name in the error — no guessing).
-pub const DEFAULT_REPO: &str = "kampka/ka";
+pub const DEFAULT_REPO: &str = "jaltez/ka";
 const DEFAULT_API: &str = "https://api.github.com";
 
 /// The update result summary, ready to print.
@@ -719,6 +719,12 @@ mod tests {
         assert!(verify_checksum(b"abc", "deadbeef").is_err());
         assert!(verify_checksum(b"abc", "").is_err());
     }
+    #[test]
+    fn default_repo_is_the_real_repository() {
+        // regression: shipped 0.2.x pointed at kampka/ka and 404'd
+        assert_eq!(DEFAULT_REPO, "jaltez/ka");
+    }
+
     #[test]
     fn version_triples_parse_all_release_shapes() {
         assert_eq!(version_triple("v0.2.0"), Some((0, 2, 0)));

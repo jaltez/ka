@@ -629,6 +629,9 @@ pub struct Transcript {
     /// Thinking blocks expanded? Collapsed entries render their first
     /// line plus a count marker; Alt+T toggles.
     thoughts_open: bool,
+    /// Entry indices toggled against `thoughts_open` — per-block
+    /// click-to-collapse for individual thinking blocks.
+    thought_overrides: std::collections::HashSet<usize>,
     /// Render passes issued (cache-audit in tests).
     renders: usize,
 }
@@ -637,8 +640,9 @@ impl Transcript {
     /// Append an entry; renders it at the current width.
     pub fn push(&mut self, line: Line) {
         let w = self.width;
+        let idx = self.rendered.len();
         self.rendered
-            .push(render_line(&line, w, self.thoughts_open));
+            .push(render_line(&line, w, self.thought_open(idx)));
         self.lines.push(line);
         self.renders += 1;
     }
@@ -652,9 +656,47 @@ impl Transcript {
     }
 
     /// Expand/collapse thinking blocks, rebuilding the cache on change.
+    /// Effective open state for one entry (global XOR per-block override).
+    fn thought_open(&self, entry: usize) -> bool {
+        self.thoughts_open ^ self.thought_overrides.contains(&entry)
+    }
+
+    /// Toggle one thinking block (click target). Only multi-line
+    /// blocks participate — a one-liner has nothing to hide.
+    pub fn toggle_thought(&mut self, entry: usize) {
+        let multi = matches!(self.lines.get(entry), Some(Line::Thought(t)) if t.contains('\n'));
+        if !multi {
+            return;
+        }
+        if !self.thought_overrides.remove(&entry) {
+            self.thought_overrides.insert(entry);
+        }
+        if let Some(line) = self.lines.get(entry).cloned() {
+            let w = self.width;
+            let open = self.thought_open(entry);
+            if let Some(slot) = self.rendered.get_mut(entry) {
+                *slot = render_line(&line, w, open);
+            }
+        }
+    }
+
+    /// Which transcript entry owns a rendered row (click mapping).
+    pub fn entry_at_row(&self, row: usize) -> Option<usize> {
+        let mut acc = 0usize;
+        for (i, rows) in self.rendered.iter().enumerate() {
+            let next = acc + rows.len();
+            if row < next {
+                return Some(i);
+            }
+            acc = next;
+        }
+        None
+    }
+
     pub fn set_thoughts_open(&mut self, open: bool) {
         if open != self.thoughts_open {
             self.thoughts_open = open;
+            self.thought_overrides.clear();
             self.rebuild();
         }
     }
@@ -664,7 +706,8 @@ impl Transcript {
         self.rendered = self
             .lines
             .iter()
-            .map(|l| render_line(l, w, self.thoughts_open))
+            .enumerate()
+            .map(|(i, l)| render_line(l, w, self.thought_open(i)))
             .collect();
         self.renders += self.lines.len();
     }
@@ -708,6 +751,11 @@ impl Transcript {
     }
 
     /// Cached rendered row count.
+    /// Rendered row count of one entry (tests).
+    pub fn rendered_rows_of(&self, entry: usize) -> usize {
+        self.rendered.get(entry).map(Vec::len).unwrap_or(0)
+    }
+
     pub fn total_rows(&self) -> usize {
         self.rendered.iter().map(Vec::len).sum()
     }
@@ -845,11 +893,16 @@ fn render_line(line: &Line, width: u16, thoughts_open: bool) -> Vec<ratatui::tex
         }
         Line::Thought(text) => {
             if thoughts_open || !text.contains('\n') {
-                push_gutter(&mut out, text, width, "⋯ ", crate::palette::THOUGHT);
+                let gutter = if text.contains('\n') {
+                    "⋯ ▾ "
+                } else {
+                    "⋯ "
+                };
+                push_gutter(&mut out, text, width, gutter, crate::palette::THOUGHT);
             } else {
                 // collapsed: first line plus a count marker, one row
                 let lines = text.lines().count();
-                let marker = format!(" (+{lines} lines · Alt+T)");
+                let marker = format!(" (+{lines} lines · click/Alt+T)");
                 let head = trunc_cols(
                     text.lines().next().unwrap_or(""),
                     width.saturating_sub(marker.chars().count() as u16 + 4) as usize,
@@ -858,7 +911,7 @@ fn render_line(line: &Line, width: u16, thoughts_open: bool) -> Vec<ratatui::tex
                     &mut out,
                     &format!("{head}{marker}"),
                     width,
-                    "⋯ ",
+                    "⋯ ▸ ",
                     crate::palette::THOUGHT,
                 );
             }
@@ -2395,6 +2448,11 @@ pub async fn run(
     // chat scrolls with PgUp/PgDn. /mouse and Ctrl+M toggle at runtime.
     if mouse_capture {
         let _ = crossterm::execute!(std::io::stdout(), crossterm::event::EnableMouseCapture);
+    } else {
+        // native mode: alternate scroll translates the wheel to ↑/↓,
+        // which scroll the chat there
+        let _ = std::io::Write::write_all(&mut std::io::stdout(), b"\x1b[?1007h");
+        let _ = std::io::Write::flush(&mut std::io::stdout());
     }
     let result = app(
         &mut terminal,
@@ -2468,9 +2526,6 @@ async fn app(
     let mut quit_armed: Option<Instant> = None;
     // double-Esc (rewind menu) tracking
     let mut last_esc: Option<Instant> = None;
-    // one-time ⇧drag hint: shown on the first captured drag that
-    // selects nothing (the user reaching for native selection)
-    let mut drag_hint_shown = false;
     let mut last_user: Option<String> = None;
     let mut last_error: Option<String> = None;
     let mut live_cache: Option<(String, u16, Vec<ratatui::text::Line<'static>>, Instant)> = None;
@@ -2507,6 +2562,8 @@ async fn app(
     // every frame by render()
     let sidebar_zone: std::cell::Cell<Option<SidebarZone>> = std::cell::Cell::new(None);
     let title_arrows: std::cell::Cell<Option<TitleArrows>> = std::cell::Cell::new(None);
+    let tx_content: std::cell::Cell<Option<(ratatui::layout::Rect, usize)>> =
+        std::cell::Cell::new(None);
     // the transcript width the last render actually used (0 until the
     // first frame): the tick-side markdown cache keys on it so cache
     // and frame can never disagree about the band/surface width
@@ -2591,6 +2648,7 @@ async fn app(
                 fresh,
                 &sidebar_zone,
                 &title_arrows,
+                &tx_content,
                 &tx_width,
             );
         })?;
@@ -3358,7 +3416,10 @@ async fn app(
                             // disambiguates it from Enter; terminals without
                             // it never deliver Ctrl+M separately)
                             mouse_captured = !mouse_captured;
+                            let mut out = std::io::stdout();
                             if mouse_captured {
+                                let _ = std::io::Write::write_all(&mut out, b"\x1b[?1007l");
+                                let _ = std::io::Write::flush(&mut out);
                                 let _ = crossterm::execute!(
                                     std::io::stdout(),
                                     crossterm::event::EnableMouseCapture
@@ -3368,6 +3429,8 @@ async fn app(
                                     std::io::stdout(),
                                     crossterm::event::DisableMouseCapture
                                 );
+                                let _ = std::io::Write::write_all(&mut out, b"\x1b[?1007h");
+                                let _ = std::io::Write::flush(&mut out);
                             }
                         }
                         (KeyCode::Char('r'), KeyModifiers::CONTROL)
@@ -3438,11 +3501,17 @@ async fn app(
                                 continue;
                             }
                             if text.trim() == "/mouse" {
-                                // toggle capture ⇄ native at runtime:
-                                // native = plain drag/paste use the
-                                // terminal's own bindings
+                                // toggle capture ⇄ native at runtime.
+                                // native: plain drag/paste are the terminal's
+                                // own, and 1007 alternate-scroll keeps the
+                                // WHEEL scrolling the chat (the terminal
+                                // translates it to ↑/↓, which scroll in
+                                // native mode); history moves to Ctrl+P/N.
                                 mouse_captured = !mouse_captured;
+                                let mut out = std::io::stdout();
                                 if mouse_captured {
+                                    let _ = std::io::Write::write_all(&mut out, b"\x1b[?1007l");
+                                    let _ = std::io::Write::flush(&mut out);
                                     let _ = crossterm::execute!(
                                         std::io::stdout(),
                                         crossterm::event::EnableMouseCapture
@@ -3452,14 +3521,16 @@ async fn app(
                                         std::io::stdout(),
                                         crossterm::event::DisableMouseCapture
                                     );
+                                    let _ = std::io::Write::write_all(&mut out, b"\x1b[?1007h");
+                                    let _ = std::io::Write::flush(&mut out);
                                 }
                                 transcript.push_separated(Line::Note(format!(
                                     "🖱 mouse {} — {}",
                                     if mouse_captured { "captured" } else { "native" },
                                     if mouse_captured {
-                                        "wheel scrolls, ⇧drag selects, right-click pastes"
+                                        "wheel scrolls, click zones live, ⇧drag selects, right-click pastes; ↑/↓ = prompt history"
                                     } else {
-                                        "plain drag selects/pastes (terminal-native); PgUp/PgDn scrolls"
+                                        "plain drag selects natively; the wheel scrolls the chat; ↑/↓ scroll, Ctrl+P/N = prompt history"
                                     }
                                 )));
                                 continue;
@@ -3949,6 +4020,23 @@ async fn app(
                             let total = transcript.total_rows();
                             jump_to_user_message(&mut scroll, &rows, total, view_rows, false);
                         }
+                        // arrows are mode-dependent: captured (default)
+                        // = prompt history; native = scroll the chat (the
+                        // wheel arrives as ↑/↓ there via alternate-scroll)
+                        (KeyCode::Up, _) if !busy && !mouse_captured => {
+                            line_up(
+                                &mut scroll,
+                                transcript.total_rows(),
+                                view_rows,
+                            );
+                        }
+                        (KeyCode::Down, _) if !busy && !mouse_captured => {
+                            line_down(
+                                &mut scroll,
+                                transcript.total_rows(),
+                                view_rows,
+                            );
+                        }
                         (KeyCode::Up, _) if !busy => input.history_prev(),
                         (KeyCode::Down, _)
                             if !busy && slash_popup.is_none() && input.text.contains('\n') =>
@@ -3956,6 +4044,19 @@ async fn app(
                             input.move_down();
                         }
                         (KeyCode::Down, _) if !busy => input.history_next(),
+                        // Ctrl+P / Ctrl+N: prompt history in every mode
+                        // (readline muscle memory; the only history keys
+                        // in native mode)
+                        (KeyCode::Char('p'), KeyModifiers::CONTROL)
+                            if !busy && slash_popup.is_none() && path_popup.is_none() =>
+                        {
+                            input.history_prev();
+                        }
+                        (KeyCode::Char('n'), KeyModifiers::CONTROL)
+                            if !busy && slash_popup.is_none() && path_popup.is_none() =>
+                        {
+                            input.history_next();
+                        }
                         // Line-editing keys. Alt combos rely on the kitty
                         // keyboard protocol; terminals that ignore it deliver
                         // Esc-then-key, which at idle degrades to a harmless
@@ -4188,20 +4289,6 @@ async fn app(
                         && path_popup.is_none()
                         && mouse_captured
                     {
-                        if !drag_hint_shown
-                            && matches!(
-                                mouse_evt.kind,
-                                crossterm::event::MouseEventKind::Drag(
-                                    crossterm::event::MouseButton::Left
-                                )
-                            )
-                        {
-                            drag_hint_shown = true;
-                            transcript.push_separated(Line::Note(
-                                "🖱 ⇧drag selects natively · /mouse switches to full-native"
-                                    .into(),
-                            ));
-                        }
                         match mouse_evt.kind {
                             // a click on the skills header toggles the
                             // section; checked before the wheel arms so a
@@ -4211,6 +4298,22 @@ async fn app(
                             ) => {
                                 // ▲▼ jump arrows on the transcript title
                                 // row: step between user messages
+                                // click on a thinking block toggles that
+                                // block (collapsed by default, like the
+                                // sidebar's collapsible sections). The
+                                // content area starts below the title row,
+                                // so this never eats the ▲▼ arrow clicks.
+                                if let Some((area, start)) = tx_content.get()
+                                    && area.contains(ratatui::layout::Position {
+                                        x: mouse_evt.column,
+                                        y: mouse_evt.row,
+                                    })
+                                {
+                                    let row = start + (mouse_evt.row - area.y) as usize;
+                                    if let Some(entry) = transcript.entry_at_row(row) {
+                                        transcript.toggle_thought(entry);
+                                    }
+                                }
                                 if let Some(up) = title_arrows
                                     .get()
                                     .and_then(|z| z.hit(mouse_evt.column, mouse_evt.row))
@@ -4409,7 +4512,18 @@ fn append_history_to(path: &std::path::Path, cmd: &str, ts: u64) {
 /// Append the resume command to $HISTFILE. Skips silently when unset;
 /// never fails the exit — history bookkeeping is best effort.
 fn append_shell_history(cmd: &str) {
-    if let Ok(p) = std::env::var("HISTFILE") {
+    // bash and zsh do NOT export HISTFILE to children — falling back to
+    // the conventional files is what makes this work at all there
+    let target = std::env::var("HISTFILE").ok().or_else(|| {
+        let home = std::env::var("HOME").ok()?;
+        let zsh = std::path::Path::new(&home).join(".zsh_history");
+        if zsh.is_file() {
+            return Some(zsh.to_string_lossy().into_owned());
+        }
+        let bash = std::path::Path::new(&home).join(".bash_history");
+        bash.is_file().then(|| bash.to_string_lossy().into_owned())
+    });
+    if let Some(p) = target {
         let ts = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
@@ -6406,6 +6520,8 @@ fn render(
     fresh: bool,
     sidebar_zone: &std::cell::Cell<Option<SidebarZone>>,
     title_arrows: &std::cell::Cell<Option<TitleArrows>>,
+    // content rows + first visible row: click-to-collapse hit mapping
+    tx_content: &std::cell::Cell<Option<(ratatui::layout::Rect, usize)>>,
     // the transcript width this frame adopts, published back to the
     // tick so the markdown cache keys on the real render width
     tx_width: &std::cell::Cell<u16>,
@@ -6556,6 +6672,15 @@ fn render(
     // steps to the previous user message, ▼ to the next; Ctrl+↑/↓ are
     // the keyboard twin.
     title_arrows.set(None);
+    // content rows (below the title) + the first visible transcript row:
+    // click-to-collapse maps screen rows back to entries through this
+    let content_area = ratatui::layout::Rect {
+        x: tx_area.x,
+        y: tx_area.y + 1,
+        width: tx_area.width,
+        height: tx_area.height.saturating_sub(1),
+    };
+    tx_content.set(Some((content_area, start)));
     let has_user = transcript
         .entries()
         .iter()
@@ -6822,7 +6947,11 @@ fn render(
     } else if busy {
         hint_spans(&[(" enter", "interject"), (" +", "defer"), (" esc", "abort")])
     } else {
-        hint_spans(&[(" enter", "send"), (" /", "commands"), (" ⇧drag", "select")])
+        hint_spans(&[
+            (" enter", "send"),
+            (" /", "commands"),
+            (" ^p/^n", "prompts"),
+        ])
     };
     let right = status_right(meters);
     let w = unicode_width::UnicodeWidthStr::width;
@@ -11455,7 +11584,8 @@ mod tests {
             .map(|s| s.content.to_string())
             .collect();
         assert!(text.contains("first line"), "{text}");
-        assert!(text.contains("(+3 lines · Alt+T)"), "{text}");
+        assert!(text.contains("(+3 lines · click/Alt+T)"), "{text}");
+        assert!(text.contains("▸"), "collapsed marker: {text}");
         assert!(
             !text.contains("second line"),
             "hidden when collapsed: {text}"
@@ -11539,6 +11669,7 @@ mod tests {
                     true,
                     &std::cell::Cell::new(None::<SidebarZone>),
                     &std::cell::Cell::new(None::<TitleArrows>),
+                    &std::cell::Cell::new(None::<(ratatui::layout::Rect, usize)>),
                     &std::cell::Cell::new(0u16),
                 )
             })
@@ -11595,6 +11726,7 @@ mod tests {
                         fresh,
                         &std::cell::Cell::new(None::<SidebarZone>),
                         &std::cell::Cell::new(None::<TitleArrows>),
+                        &std::cell::Cell::new(None::<(ratatui::layout::Rect, usize)>),
                         &std::cell::Cell::new(0u16),
                     )
                 })
@@ -11785,6 +11917,7 @@ mod tests {
                     true,
                     &sidebar_zone,
                     &title_arrows,
+                    &std::cell::Cell::new(None::<(ratatui::layout::Rect, usize)>),
                     &std::cell::Cell::new(0u16),
                 )
             })
@@ -11846,6 +11979,7 @@ mod tests {
                         false,
                         &sb_zone,
                         &std::cell::Cell::new(None::<TitleArrows>),
+                        &std::cell::Cell::new(None::<(ratatui::layout::Rect, usize)>),
                         &std::cell::Cell::new(0u16),
                     )
                 })
@@ -12202,5 +12336,42 @@ mod tests {
         let part = image_part_from_bytes(png).unwrap();
         assert_eq!(part.media_type, "image/png");
         assert_eq!(part.data, b64encode(png));
+    }
+    #[test]
+    fn thought_blocks_toggle_individually_and_map_rows() {
+        let mut t = Transcript::default();
+        t.set_width(60);
+        t.push(Line::User("q".into()));
+        t.push(Line::Thought("a\nb\nc".into()));
+        t.push(Line::Thought("solo".into()));
+        t.push(Line::Assistant("ans".into()));
+        // collapsed by default: entry 1 renders 1 row, solo entry 2 = 1 row
+        let rows = t.total_rows();
+        // user(1) + thought(1) + thought(1) + assistant block(>=1)
+        assert!(rows >= 4, "{rows}");
+
+        // toggle block 1 open: its rendered height grows
+        let before = t.rendered_rows_of(1);
+        t.toggle_thought(1);
+        let after = t.rendered_rows_of(1);
+        assert!(after > before, "open block grows: {before} -> {after}");
+
+        // single-line thoughts refuse to toggle
+        let solo_before = t.rendered_rows_of(2);
+        t.toggle_thought(2);
+        assert_eq!(t.rendered_rows_of(2), solo_before);
+
+        // row -> entry mapping: the first row of each entry maps back
+        // to it (user blocks render with padding, so use real heights)
+        let e = t.entry_at_row(0).unwrap();
+        assert_eq!(e, 0, "row 0 is the user block");
+        let first_of_1 = t.rendered_rows_of(0);
+        let e1 = t.entry_at_row(first_of_1).unwrap();
+        assert_eq!(e1, 1, "row {first_of_1} is the thought block");
+
+        // global Alt+T reset clears per-block overrides
+        t.set_thoughts_open(true);
+        let open_rows = t.rendered_rows_of(1);
+        assert!(open_rows == after, "global open respects no overrides");
     }
 }
