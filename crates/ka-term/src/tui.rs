@@ -177,6 +177,21 @@ impl InputBuffer {
         text
     }
 
+    /// Seed the draft history from a resumed session's prompts (oldest
+    /// first). Consecutive duplicates collapse, blank prompts are
+    /// skipped, and the 100-entry cap holds by dropping the oldest.
+    pub fn seed_history(&mut self, items: impl IntoIterator<Item = String>) {
+        for item in items {
+            if item.trim().is_empty() || self.history.back() == Some(&item) {
+                continue;
+            }
+            self.history.push_back(item);
+        }
+        while self.history.len() > 100 {
+            self.history.pop_front();
+        }
+    }
+
     /// Browse history upward (older).
     pub fn history_prev(&mut self) {
         if self.history.is_empty() {
@@ -611,6 +626,9 @@ pub struct Transcript {
     lines: Vec<Line>,
     rendered: Vec<Vec<ratatui::text::Line<'static>>>,
     width: u16,
+    /// Thinking blocks expanded? Collapsed entries render their first
+    /// line plus a count marker; Alt+T toggles.
+    thoughts_open: bool,
     /// Render passes issued (cache-audit in tests).
     renders: usize,
 }
@@ -619,7 +637,8 @@ impl Transcript {
     /// Append an entry; renders it at the current width.
     pub fn push(&mut self, line: Line) {
         let w = self.width;
-        self.rendered.push(render_line(&line, w));
+        self.rendered
+            .push(render_line(&line, w, self.thoughts_open));
         self.lines.push(line);
         self.renders += 1;
     }
@@ -632,9 +651,21 @@ impl Transcript {
         }
     }
 
+    /// Expand/collapse thinking blocks, rebuilding the cache on change.
+    pub fn set_thoughts_open(&mut self, open: bool) {
+        if open != self.thoughts_open {
+            self.thoughts_open = open;
+            self.rebuild();
+        }
+    }
+
     fn rebuild(&mut self) {
         let w = self.width;
-        self.rendered = self.lines.iter().map(|l| render_line(l, w)).collect();
+        self.rendered = self
+            .lines
+            .iter()
+            .map(|l| render_line(l, w, self.thoughts_open))
+            .collect();
         self.renders += self.lines.len();
     }
 
@@ -791,8 +822,10 @@ fn separate_before(transcript: &mut Transcript, incoming: Family) {
     }
     transcript.push(Line::Report(String::new()));
 }
-/// Render one transcript entry into styled rows at `width`.
-fn render_line(line: &Line, width: u16) -> Vec<ratatui::text::Line<'static>> {
+/// Render one transcript entry into styled rows at `width`. Thinking
+/// entries collapse to their first line plus a count marker unless
+/// `thoughts_open`.
+fn render_line(line: &Line, width: u16, thoughts_open: bool) -> Vec<ratatui::text::Line<'static>> {
     use ratatui::text::Line as TuiLine;
     let mut out: Vec<TuiLine> = Vec::new();
     match line {
@@ -810,7 +843,26 @@ fn render_line(line: &Line, width: u16) -> Vec<ratatui::text::Line<'static>> {
             out.extend(rows);
             out.push(surface_blank(width, bg));
         }
-        Line::Thought(text) => push_gutter(&mut out, text, width, "⋯ ", crate::palette::THOUGHT),
+        Line::Thought(text) => {
+            if thoughts_open || !text.contains('\n') {
+                push_gutter(&mut out, text, width, "⋯ ", crate::palette::THOUGHT);
+            } else {
+                // collapsed: first line plus a count marker, one row
+                let lines = text.lines().count();
+                let marker = format!(" (+{lines} lines · Alt+T)");
+                let head = trunc_cols(
+                    text.lines().next().unwrap_or(""),
+                    width.saturating_sub(marker.chars().count() as u16 + 4) as usize,
+                );
+                push_gutter(
+                    &mut out,
+                    &format!("{head}{marker}"),
+                    width,
+                    "⋯ ",
+                    crate::palette::THOUGHT,
+                );
+            }
+        }
         // finished tool calls cache as ONE full-width band row, so tool
         // activity reads as its own stratum (the live block's band)
         Line::Tool(text) => out.push(TuiLine::from(vec![ratatui::text::Span::styled(
@@ -892,7 +944,12 @@ fn input_height(row_count: usize) -> u16 {
 /// Rows the input area needs: while a permission ask is up the form
 /// (question lines + one options row) borrows the box from the draft,
 /// and the /mode picker borrows it for its four tier rows.
-fn input_area_rows(ask: Option<&PendingAsk>, picker: Option<&ModePicker>, draft: &str) -> usize {
+fn input_area_rows(
+    ask: Option<&PendingAsk>,
+    picker: Option<&ModePicker>,
+    draft: &str,
+    width: usize,
+) -> usize {
     match ask {
         Some(a) => {
             let q = a.question.split('\n').count();
@@ -907,8 +964,84 @@ fn input_area_rows(ask: Option<&PendingAsk>, picker: Option<&ModePicker>, draft:
                 })
         }
         None if picker.is_some() => MODE_CHOICES.len(),
-        None => draft.split('\n').count(),
+        None => wrap_rows(draft, width).len(),
     }
+}
+
+/// One wrapped display row of the draft: the row's text plus the char
+/// index in the draft where the row starts (cursor mapping).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct VisualRow {
+    text: String,
+    start: usize,
+}
+
+/// Wrap a draft into display rows at `width` display columns
+/// (unicode-width aware): explicit newlines always break, long lines
+/// break at the last space that fits, over-long tokens hard-break.
+/// The draft itself is never mutated — this is a display fold.
+fn wrap_rows(text: &str, width: usize) -> Vec<VisualRow> {
+    let width = width.max(1);
+    let mut out: Vec<VisualRow> = Vec::new();
+    let mut base = 0usize; // char index where the current line starts
+    for line in text.split('\n') {
+        // row = (char offset within the line, char)
+        let mut row: Vec<(usize, char)> = Vec::new();
+        let mut cols = 0usize;
+        for (i, ch) in line.chars().enumerate() {
+            let w = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
+            if cols + w > width && !row.is_empty() {
+                // prefer breaking at the last space within the row
+                // (never at position 0 — that would loop forever)
+                match row.iter().rposition(|(_, c)| *c == ' ').filter(|&p| p > 0) {
+                    Some(p) => {
+                        let carry: Vec<(usize, char)> = row[p + 1..].to_vec();
+                        row.truncate(p);
+                        let start = base + row.first().map(|(i, _)| *i).unwrap_or(0);
+                        out.push(VisualRow {
+                            text: row.iter().map(|(_, c)| c).collect(),
+                            start,
+                        });
+                        cols = carry
+                            .iter()
+                            .map(|(_, c)| unicode_width::UnicodeWidthChar::width(*c).unwrap_or(0))
+                            .sum();
+                        row = carry;
+                    }
+                    None => {
+                        let start = base + row.first().map(|(i, _)| *i).unwrap_or(0);
+                        out.push(VisualRow {
+                            text: row.iter().map(|(_, c)| c).collect(),
+                            start,
+                        });
+                        row.clear();
+                        cols = 0;
+                    }
+                }
+            }
+            row.push((i, ch));
+            cols += w;
+        }
+        let start = base + row.first().map(|(i, _)| *i).unwrap_or(0);
+        out.push(VisualRow {
+            text: row.iter().map(|(_, c)| c).collect(),
+            start,
+        });
+        base += line.chars().count() + 1; // +1 for the newline
+    }
+    out
+}
+
+/// The visual row containing char position `cursor`: the last row
+/// whose start is at or before it.
+fn visual_cursor_row(rows: &[VisualRow], cursor: usize) -> usize {
+    rows.iter().rposition(|r| r.start <= cursor).unwrap_or(0)
+}
+
+/// Inner text width of the input box at terminal width `term_w`:
+/// 2 outer margin cols + 2 borders + 2 horizontal padding.
+fn input_inner_w(term_w: u16) -> usize {
+    term_w.saturating_sub(6) as usize
 }
 
 /// Max rows of diff detail shown in an ask form. The input box grows
@@ -1193,11 +1326,10 @@ pub struct SidebarState {
     pub cwd: String,
     /// Git branch when cheaply detectable at startup.
     pub branch: Option<String>,
-    /// Skills section expanded? Collapsed via a mouse click on its
-    /// header (mouse mode); the header keeps rendering as `skills (+N)`.
+    /// Skills section expanded? Folded by default; toggled with Ctrl+T
+    /// or a click on its header. Collapsed, the header renders as
+    /// `skills (+N) ▸`.
     pub skills_open: bool,
-    /// Cursor is over the skills header (drives the hover affordance).
-    pub skills_hover: bool,
     /// Window/sidebar title glyph ([tui] header_glyph, default ◆).
     pub header_glyph: String,
     /// The active session's display title ([`Event::Title`]; stored
@@ -1212,8 +1344,7 @@ impl Default for SidebarState {
             todos: Vec::new(),
             cwd: String::new(),
             branch: None,
-            skills_open: true,
-            skills_hover: false,
+            skills_open: false,
             title: None,
             header_glyph: "◆".to_string(),
         }
@@ -1274,24 +1405,15 @@ fn skills_header_label(open: bool, count: usize) -> String {
 }
 
 /// Full skills header line: label plus the ` ▾`/` ▸` disclosure arrow.
-/// Hover lifts the whole header onto the modal surface tint (ACCENT on
-/// BG_SURFACE); at rest the label keeps its accent-bold look and the
-/// arrow stays dim META.
-fn skills_header_line(open: bool, hover: bool, count: usize) -> ratatui::text::Line<'static> {
+/// The label keeps its accent-bold look; the arrow stays dim META.
+fn skills_header_line(open: bool, count: usize) -> ratatui::text::Line<'static> {
     use ratatui::text::{Line as TuiLine, Span};
     let label = skills_header_label(open, count);
     let arrow = if open { " ▾" } else { " ▸" };
-    if hover {
-        let st = ratatui::style::Style::new()
-            .fg(crate::palette::ACCENT)
-            .bg(crate::palette::BG_SURFACE);
-        TuiLine::from(vec![Span::styled(label, st), Span::styled(arrow, st)])
-    } else {
-        TuiLine::from(vec![
-            Span::styled(label, crate::palette::ACCENT_BOLD),
-            Span::styled(arrow, crate::palette::META),
-        ])
-    }
+    TuiLine::from(vec![
+        Span::styled(label, crate::palette::ACCENT_BOLD),
+        Span::styled(arrow, crate::palette::META),
+    ])
 }
 /// Sidebar column width when shown.
 const SIDEBAR_WIDTH: u16 = 26;
@@ -1364,9 +1486,6 @@ fn sidebar_rows(
     meters: &Meters,
     width: usize,
     height: usize,
-    // mouse mode drives the collapse affordance + zone recording; the
-    // terminal-native mode renders the plain always-open section
-    mouse: bool,
     hit: Option<(&std::cell::Cell<Option<SidebarZone>>, ratatui::layout::Rect)>,
 ) -> Vec<ratatui::text::Line<'static>> {
     use ratatui::style::{Modifier, Style};
@@ -1386,15 +1505,8 @@ fn sidebar_rows(
         format!("ctx {used}")
     };
     for row in [
-        sidebar
-            .title
-            .as_deref()
-            .filter(|t| !t.is_empty())
-            .map(str::to_string),
-        (!meters.model.is_empty()).then(|| format!("model {}", meters.model)),
-        (!meters.mode.is_empty()).then(|| format!("mode {}", meters.mode)),
-        (!meters.effort.is_empty()).then(|| format!("effort {}", meters.effort)),
         short_session(&meters.session).map(|t| format!("#{t}")),
+        (!meters.effort.is_empty()).then(|| format!("effort {}", meters.effort)),
         (meters.cost > 0.0).then(|| format!("${:.4}", meters.cost)),
         (used > 0).then_some(ctx_row),
     ]
@@ -1463,24 +1575,19 @@ fn sidebar_rows(
             .chain(items.iter().map(|s| plain(trunc_cols(s, width))))
             .collect::<Vec<_>>()
     };
-    // collapsed skills render their header alone, with the count moved
-    // into the label; the header carries the disclosure arrow and the
-    // hover affordance (mouse mode only — no in-app clicks otherwise)
-    let skills = if !mouse {
-        names("skills", &sidebar.inventory.skills)
+    // skills render folded by default: the collapsed section shows its
+    // header alone, with the count moved into the label; Ctrl+T or a
+    // click on the header unfolds. Without skills the section vanishes.
+    let skills = if sidebar.inventory.skills.is_empty() {
+        Vec::new()
     } else if sidebar.skills_open {
         let mut rows = names("skills", &sidebar.inventory.skills);
         if !rows.is_empty() {
-            rows[0] =
-                skills_header_line(true, sidebar.skills_hover, sidebar.inventory.skills.len());
+            rows[0] = skills_header_line(true, sidebar.inventory.skills.len());
         }
         rows
     } else {
-        vec![skills_header_line(
-            false,
-            sidebar.skills_hover,
-            sidebar.inventory.skills.len(),
-        )]
+        vec![skills_header_line(false, sidebar.inventory.skills.len())]
     };
     let agents = names("agents", &sidebar.inventory.agents);
 
@@ -1977,8 +2084,9 @@ pub struct ModelPicker {
     /// vendor's models are listed and Esc returns to the provider stage.
     pub vendor: Option<String>,
     /// List only models of configured providers (keyless or key
-    /// present). Both the flat `/model` list and the post-connect drill
-    /// set this.
+    /// present). The vendor-locked post-connect drill sets this; the
+    /// unified `/model` list leaves it off and partitions
+    /// configured-first instead.
     pub configured_only: bool,
     /// Selected row.
     pub selected: usize,
@@ -2017,18 +2125,45 @@ impl ModelPicker {
     /// Rows after filtering. A vendor lock (the provider stage of
     /// `/provider`) narrows the pool, `configured_only` drops models
     /// whose key is missing, and the substring filter applies last.
+    /// The unified list (no vendor lock, `configured_only` off) puts
+    /// models of configured providers first — keyless or keyed-in —
+    /// the rest after; order is stable within both groups.
     pub fn rows(&self) -> Vec<&ModelInfo> {
         let f = self.filter.to_lowercase();
-        self.models
-            .iter()
-            .filter(|m| {
-                self.vendor
-                    .as_deref()
-                    .is_none_or(|v| m.id.split('/').next() == Some(v))
-            })
-            .filter(|m| !self.configured_only || m.key_env.is_empty() || m.key_set)
-            .filter(|m| f.is_empty() || m.id.to_lowercase().contains(&f))
-            .collect()
+        let matches = |m: &ModelInfo| {
+            self.vendor
+                .as_deref()
+                .is_none_or(|v| m.id.split('/').next() == Some(v))
+                && (!self.configured_only || m.key_env.is_empty() || m.key_set)
+                && (f.is_empty() || m.id.to_lowercase().contains(&f))
+        };
+        if self.unified() {
+            let mut configured: Vec<&ModelInfo> = Vec::new();
+            let mut rest: Vec<&ModelInfo> = Vec::new();
+            for m in self.models.iter().filter(|m| matches(m)) {
+                if Self::configured(m) {
+                    configured.push(m);
+                } else {
+                    rest.push(m);
+                }
+            }
+            configured.extend(rest);
+            configured
+        } else {
+            self.models.iter().filter(|m| matches(m)).collect()
+        }
+    }
+
+    /// The unified `/model` list: no vendor lock, configured-only off.
+    fn unified(&self) -> bool {
+        !self.configured_only && self.vendor.is_none()
+    }
+
+    /// A model of a configured provider: keyless, or its key is set.
+    /// Drives the partition in [`rows`](Self::rows) and the
+    /// `─ not configured ─` separator in the modal render.
+    fn configured(m: &ModelInfo) -> bool {
+        m.key_env.is_empty() || m.key_set
     }
 
     /// The selector Enter applies: the selected row's id, or — when the
@@ -2210,6 +2345,9 @@ pub struct KeyPrompt {
     pub input: String,
     /// Vendor to drill into (its model list) once the key is saved.
     pub drill: Option<String>,
+    /// Model selector to apply once the key saves (the unified
+    /// `/model` pick on a keyed-but-unset vendor).
+    pub pending_model: Option<String>,
 }
 
 /// Run the TUI over an engine handle. Blocks until exit.
@@ -2223,6 +2361,7 @@ pub async fn run(
     agents: Vec<(String, String)>,
     header_glyph: &str,
     notify: NotifySettings,
+    mouse_capture: bool,
     fresh: bool,
 ) -> std::io::Result<Exit> {
     let _ = AGENTS.set(agents.clone());
@@ -2236,17 +2375,12 @@ pub async fn run(
     // cooked one it started from.
     let _ = crossterm::terminal::enable_raw_mode();
     let mut terminal = ratatui::init();
-    let mut sel: Option<TextSel> = None;
-    let frame_window: std::cell::RefCell<Vec<ratatui::text::Line<'static>>> =
-        std::cell::RefCell::new(Vec::new());
-    let frame_origin: std::cell::Cell<(u16, u16)> = std::cell::Cell::new((0, 0));
     // Kitty keyboard protocol: Shift+Enter as a distinct key + bracketed
     // paste. Best effort — hosts without support degrade to plain Enter;
     // Ctrl+J always works as the newline fallback. Mouse capture is ON
-    // by default: the app draws its own selection over the transcript
-    // and copies on release (OSC52), the wheel scrolls, and the ▲▼
-    // arrows / skills header are clickable. Ctrl+M hands the mouse back
-    // to the terminal (native selection) and back again.
+    // by default: the wheel scrolls and the ▲▼ arrows / skills header
+    // are clickable; Shift+drag always selects natively (the terminal
+    // bypasses the capture protocol on Shift); /mouse flips to native.
     let _ = crossterm::execute!(
         std::io::stdout(),
         crossterm::event::PushKeyboardEnhancementFlags(
@@ -2254,13 +2388,14 @@ pub async fn run(
                 | crossterm::event::KeyboardEnhancementFlags::REPORT_EVENT_TYPES
         ),
         crossterm::event::EnableBracketedPaste,
-        crossterm::event::EnableMouseCapture,
     );
-    // any-event (motion) tracking: crossterm has no wrapper for the raw
-    // `1003` sequence; without it Moved events only flow while a button
-    // is held. Popped at every capture-disable path below.
-    let _ = std::io::stdout().write_all(b"\x1b[?1003h");
-    let _ = std::io::stdout().flush();
+    // capture ON by default (wheel scroll, ▲▼/skills clicks, right-click
+    // paste; ⇧drag selects natively). `[tui] mouse = "native"` starts
+    // uncaptured — plain drag/paste use the terminal's own bindings,
+    // chat scrolls with PgUp/PgDn. /mouse and Ctrl+M toggle at runtime.
+    if mouse_capture {
+        let _ = crossterm::execute!(std::io::stdout(), crossterm::event::EnableMouseCapture);
+    }
     let result = app(
         &mut terminal,
         &mut commands,
@@ -2270,14 +2405,10 @@ pub async fn run(
         models,
         agents,
         header_glyph,
+        mouse_capture,
         fresh,
-        &mut sel,
-        &frame_window,
-        &frame_origin,
     )
     .await;
-    let _ = std::io::stdout().write_all(b"\x1b[?1003l");
-    let _ = std::io::stdout().flush();
     let _ = crossterm::execute!(
         std::io::stdout(),
         crossterm::event::PopKeyboardEnhancementFlags,
@@ -2294,9 +2425,12 @@ pub async fn run(
     // shell is left unable to echo keystrokes.
     let _ = crossterm::terminal::disable_raw_mode();
     let (exit, resume) = result?;
-    if let Some(hint) = resume {
+    if let Some((hint, resume_cmd)) = resume {
         println!();
         println!("{hint}");
+        // the shell's ↑ should offer the way back too (best effort —
+        // bash only shows it in new shells / after `history -n`)
+        append_shell_history(&resume_cmd);
     }
     Ok(exit)
 }
@@ -2311,11 +2445,9 @@ async fn app(
     mut models: Vec<ModelInfo>,
     agents: Vec<(String, String)>,
     header_glyph: &str,
+    mut mouse_captured: bool,
     mut fresh: bool,
-    sel: &mut Option<TextSel>,
-    frame_window: &std::cell::RefCell<Vec<ratatui::text::Line<'static>>>,
-    frame_origin: &std::cell::Cell<(u16, u16)>,
-) -> std::io::Result<(Exit, Option<String>)> {
+) -> std::io::Result<(Exit, Option<(String, String)>)> {
     use crossterm::event::{Event as TermEvent, KeyCode, KeyModifiers};
     let _ = agents.clone();
 
@@ -2336,6 +2468,9 @@ async fn app(
     let mut quit_armed: Option<Instant> = None;
     // double-Esc (rewind menu) tracking
     let mut last_esc: Option<Instant> = None;
+    // one-time ⇧drag hint: shown on the first captured drag that
+    // selects nothing (the user reaching for native selection)
+    let mut drag_hint_shown = false;
     let mut last_user: Option<String> = None;
     let mut last_error: Option<String> = None;
     let mut live_cache: Option<(String, u16, Vec<ratatui::text::Line<'static>>, Instant)> = None;
@@ -2368,13 +2503,14 @@ async fn app(
     let mut find_last: Option<(String, usize)> = None;
     let mut modal: Option<Modal> = None;
     let mut mode_picker: Option<ModePicker> = None;
-    // mouse mode: captured (in-app selection/clicks/wheel) vs
-    // terminal-native; toggled with Ctrl+M
-    let mut mouse = true;
     // clickable sidebar regions + ▲▼ title-row jump targets, refreshed
     // every frame by render()
     let sidebar_zone: std::cell::Cell<Option<SidebarZone>> = std::cell::Cell::new(None);
     let title_arrows: std::cell::Cell<Option<TitleArrows>> = std::cell::Cell::new(None);
+    // the transcript width the last render actually used (0 until the
+    // first frame): the tick-side markdown cache keys on it so cache
+    // and frame can never disagree about the band/surface width
+    let tx_width: std::cell::Cell<u16> = std::cell::Cell::new(0);
     let mut term_events = crossterm::event::EventStream::new();
     let mut spin = tokio::time::interval(Duration::from_millis(120));
 
@@ -2387,12 +2523,20 @@ async fn app(
             Ok(s) => (s.width, s.height),
             Err(_) => (80, 24),
         };
-        let md_width = transcript_width(term_w);
-        transcript.set_width(md_width);
+        // the markdown cache keys on the width render actually used
+        // (one tick of staleness after a resize is fine: the surface
+        // fill re-pads live rows at the frame's width)
+        let last_w = tx_width.get();
+        let md_width = if last_w == 0 {
+            transcript_width(term_w)
+        } else {
+            last_w
+        };
         let input_h = input_height(input_area_rows(
             ask.as_ref(),
             mode_picker.as_ref(),
             &input.text,
+            input_inner_w(term_w),
         ));
         view_rows = visible_rows(term_h, input_h);
         let live = if busy_now {
@@ -2414,7 +2558,8 @@ async fn app(
             }
             live_cache.as_ref().map(|(_, _, rows, _)| LiveBlock {
                 thought: current_thought.clone(),
-                tool: tool_live_rows(current_tool.as_str(), live_tool.as_ref(), md_width as usize),
+                tool_header: current_tool.clone(),
+                live_tool: live_tool.clone(),
                 md: rows.clone(),
             })
         } else {
@@ -2426,7 +2571,7 @@ async fn app(
         terminal.draw(|frame| {
             render(
                 frame,
-                &transcript,
+                &mut transcript,
                 scroll,
                 &input_snapshot,
                 cursor,
@@ -2446,10 +2591,7 @@ async fn app(
                 fresh,
                 &sidebar_zone,
                 &title_arrows,
-                sel,
-                frame_window,
-                frame_origin,
-                mouse,
+                &tx_width,
             );
         })?;
 
@@ -2603,6 +2745,8 @@ async fn app(
                                     let value = prompt.input.trim().to_string();
                                     let drill = prompt.drill.clone();
                                     let env_var = prompt.env_var.clone();
+                                    let pending_model = prompt.pending_model.clone();
+                                    let apply = pending_model.filter(|_| !value.is_empty());
                                     if !value.is_empty() {
                                         let _ = commands
                                             .send(Command::SaveApiKey {
@@ -2615,15 +2759,33 @@ async fn app(
                                         // lists so ✓/✗ marks stay truthful
                                         mark_key_set(&mut models, &mut providers, &env_var);
                                     }
-                                    modal = drill.map(|vendor| {
-                                        Modal::Model(ModelPicker {
-                                            models: models.clone(),
-                                            vendor: Some(vendor),
-                                            configured_only: true,
-                                            selected: 0,
-                                            filter: String::new(),
-                                        })
-                                    });
+                                    if let Some(selector) = apply {
+                                        // the key unblocked this unified
+                                        // `/model` pick: apply it now
+                                        let _ = commands
+                                            .send(Command::SetModel {
+                                                selector: selector.clone(),
+                                            })
+                                            .await;
+                                        let _ = commands
+                                            .send(Command::SaveSettings {
+                                                model: Some(selector),
+                                                effort: None,
+                                                mode: None,
+                                            })
+                                            .await;
+                                        modal = None;
+                                    } else {
+                                        modal = drill.map(|vendor| {
+                                            Modal::Model(ModelPicker {
+                                                models: models.clone(),
+                                                vendor: Some(vendor),
+                                                configured_only: true,
+                                                selected: 0,
+                                                filter: String::new(),
+                                            })
+                                        });
+                                    }
                                 }
                                 KeyCode::Char(c) => prompt.input.push(c),
                                 _ => {}
@@ -2673,6 +2835,7 @@ async fn app(
                                                 doc_url,
                                                 input: String::new(),
                                                 drill: Some(p.name),
+                                                pending_model: None,
                                             }));
                                         }
                                         None => modal = None,
@@ -2708,25 +2871,20 @@ async fn app(
                                 }
                                 KeyCode::Enter => {
                                     if let Some(selector) = picker.pick() {
-                                        let _ = commands
-                                            .send(Command::SetModel {
-                                                selector: selector.clone(),
-                                            })
-                                            .await;
-                                        // the pick also becomes the default for
-                                        // future conversations
-                                        let _ = commands
-                                            .send(Command::SaveSettings {
-                                                model: Some(selector.clone()),
-                                                effort: None,
-                                                mode: None,
-                                            })
-                                            .await;
-                                        // a keyed model without a key asks for one
-                                        if let Some(m) =
-                                            picker.models.iter().find(|m| m.id == selector)
-                                        {
-                                            if !m.key_set && !m.key_env.is_empty() {
+                                        // a keyed model without its key
+                                        // asks for one first; the pick
+                                        // applies once the key saves
+                                        let missing = picker
+                                            .models
+                                            .iter()
+                                            .find(|m| m.id == selector)
+                                            .is_some_and(|m| {
+                                                !m.key_set && !m.key_env.is_empty()
+                                            });
+                                        if missing {
+                                            if let Some(m) =
+                                                picker.models.iter().find(|m| m.id == selector)
+                                            {
                                                 modal = Some(Modal::Key(KeyPrompt {
                                                     env_var: m.key_env.clone(),
                                                     provider: selector
@@ -2737,10 +2895,25 @@ async fn app(
                                                     doc_url: m.doc_url.clone(),
                                                     input: String::new(),
                                                     drill: None,
+                                                    pending_model: Some(selector.clone()),
                                                 }));
                                                 continue;
                                             }
                                         }
+                                        let _ = commands
+                                            .send(Command::SetModel {
+                                                selector: selector.clone(),
+                                            })
+                                            .await;
+                                        // the pick also becomes the default for
+                                        // future conversations
+                                        let _ = commands
+                                            .send(Command::SaveSettings {
+                                                model: Some(selector),
+                                                effort: None,
+                                                mode: None,
+                                            })
+                                            .await;
                                     }
                                     modal = None;
                                 }
@@ -3001,13 +3174,11 @@ async fn app(
                                                         &pager,
                                                         &[path.as_str()],
                                                         terminal,
-                                                        mouse,
                                                     ),
                                                     None => run_external(
                                                         "less",
                                                         &["-R", path.as_str()],
                                                         terminal,
-                                                        mouse,
                                                     ),
                                                 };
                                             if let Err(e) = opened {
@@ -3157,6 +3328,16 @@ async fn app(
                             let _ = terminal.clear();
                             continue;
                         }
+                        (KeyCode::Char('t'), KeyModifiers::CONTROL) => {
+                            // fold/unfold the sidebar skills section
+                            sidebar.skills_open = !sidebar.skills_open;
+                            continue;
+                        }
+                        (KeyCode::Char('t'), KeyModifiers::ALT) => {
+                            // fold/unfold thinking blocks in the transcript
+                            transcript.set_thoughts_open(!transcript.thoughts_open);
+                            continue;
+                        }
                         (KeyCode::Char('v'), KeyModifiers::CONTROL) => {
                             // ctrl+v reads the system clipboard into
                             // the input; terminals that intercept
@@ -3170,6 +3351,25 @@ async fn app(
                         // Reverse history search: while active it captures
                         // editing keys, so its arms sit ahead of the
                         // standard Esc/Enter/Backspace/char handling.
+                        (KeyCode::Char('m'), KeyModifiers::CONTROL)
+                            if !busy && slash_popup.is_none() && path_popup.is_none() =>
+                        {
+                            // Ctrl+M: same toggle as /mouse (kitty protocol
+                            // disambiguates it from Enter; terminals without
+                            // it never deliver Ctrl+M separately)
+                            mouse_captured = !mouse_captured;
+                            if mouse_captured {
+                                let _ = crossterm::execute!(
+                                    std::io::stdout(),
+                                    crossterm::event::EnableMouseCapture
+                                );
+                            } else {
+                                let _ = crossterm::execute!(
+                                    std::io::stdout(),
+                                    crossterm::event::DisableMouseCapture
+                                );
+                            }
+                        }
                         (KeyCode::Char('r'), KeyModifiers::CONTROL)
                             if input.searching()
                                 || (!busy && slash_popup.is_none() && path_popup.is_none()) =>
@@ -3237,6 +3437,33 @@ async fn app(
                             if text.trim().is_empty() {
                                 continue;
                             }
+                            if text.trim() == "/mouse" {
+                                // toggle capture ⇄ native at runtime:
+                                // native = plain drag/paste use the
+                                // terminal's own bindings
+                                mouse_captured = !mouse_captured;
+                                if mouse_captured {
+                                    let _ = crossterm::execute!(
+                                        std::io::stdout(),
+                                        crossterm::event::EnableMouseCapture
+                                    );
+                                } else {
+                                    let _ = crossterm::execute!(
+                                        std::io::stdout(),
+                                        crossterm::event::DisableMouseCapture
+                                    );
+                                }
+                                transcript.push_separated(Line::Note(format!(
+                                    "🖱 mouse {} — {}",
+                                    if mouse_captured { "captured" } else { "native" },
+                                    if mouse_captured {
+                                        "wheel scrolls, ⇧drag selects, right-click pastes"
+                                    } else {
+                                        "plain drag selects/pastes (terminal-native); PgUp/PgDn scrolls"
+                                    }
+                                )));
+                                continue;
+                            }
                             if text.trim() == "/find" || text.trim().starts_with("/find ") {
                                 // transcript search: purely local, no engine
                                 // roundtrip. Fresh query starts at the scroll
@@ -3274,41 +3501,6 @@ async fn app(
                                         find_last = Some((q, from));
                                     }
                                 }
-                                continue;
-                            }
-                            if text.trim() == "/mouse" {
-                                // toggle the mouse between app capture
-                                // (selection, wheel, click targets) and
-                                // the terminal's native selection. A slash
-                                // command, not a key: Ctrl+M is Enter on
-                                // most terminals.
-                                use std::io::Write as _;
-                                mouse = !mouse;
-                                let mut out = std::io::stdout().lock();
-                                if mouse {
-                                    let _ = crossterm::execute!(
-                                        out,
-                                        crossterm::event::EnableMouseCapture
-                                    );
-                                    let _ = out.write_all(b"\x1b[?1003h");
-                                } else {
-                                    sidebar.skills_hover = false;
-                                    *sel = None;
-                                    let _ = crossterm::execute!(
-                                        out,
-                                        crossterm::event::DisableMouseCapture
-                                    );
-                                    let _ = out.write_all(b"\x1b[?1003l");
-                                }
-                                let _ = out.flush();
-                                transcript.push_separated(Line::Note(
-                                    if mouse {
-                                        "mouse captured — drag copies, wheel scrolls, ▲▼ jump"
-                                    } else {
-                                        "mouse released — the terminal owns selection"
-                                    }
-                                    .to_string(),
-                                ));
                                 continue;
                             }
                             if text.trim() == "/retry" {
@@ -3446,6 +3638,7 @@ async fn app(
                         doc_url: m.doc_url.clone(),
                         input: String::new(),
                         drill: None,
+                        pending_model: None,
                     })
                 });
                 match prompt {
@@ -3472,7 +3665,7 @@ async fn app(
                                         ModalKind::Model => Modal::Model(ModelPicker {
                                             models: models.clone(),
                                             vendor: None,
-                                            configured_only: true,
+                                            configured_only: false,
                                             selected: 0,
                                             filter: String::new(),
                                         }),
@@ -3864,7 +4057,6 @@ async fn app(
                                         &editor,
                                         &[path_str.as_str()],
                                         terminal,
-                                        mouse,
                                     ) {
                                         Err(e) => transcript.push_separated(Line::Note(format!("editor failed: {e}"))),
                                         Ok(()) => {
@@ -3987,12 +4179,29 @@ async fn app(
                 } else if let Some(Ok(TermEvent::Mouse(mouse_evt))) = maybe_term {
                     // captured-mouse interactions: the wheel scrolls the
                     // chat at line granularity (page keys keep their
-                    // page step); overlays keep focus
+                    // page step); overlays keep focus. In native mode no
+                    // mouse events arrive at all — drag/paste are the
+                    // terminal's own.
                     if modal.is_none()
                         && pending.is_none()
                         && slash_popup.is_none()
                         && path_popup.is_none()
+                        && mouse_captured
                     {
+                        if !drag_hint_shown
+                            && matches!(
+                                mouse_evt.kind,
+                                crossterm::event::MouseEventKind::Drag(
+                                    crossterm::event::MouseButton::Left
+                                )
+                            )
+                        {
+                            drag_hint_shown = true;
+                            transcript.push_separated(Line::Note(
+                                "🖱 ⇧drag selects natively · /mouse switches to full-native"
+                                    .into(),
+                            ));
+                        }
                         match mouse_evt.kind {
                             // a click on the skills header toggles the
                             // section; checked before the wheel arms so a
@@ -4016,12 +4225,6 @@ async fn app(
                                     .is_some_and(|z| z.hit(mouse_evt.column, mouse_evt.row))
                                 {
                                     sidebar.skills_open = !sidebar.skills_open;
-                                } else {
-                                    // start transcript text selection
-                                    *sel = Some(TextSel {
-                                        anchor: (mouse_evt.column, mouse_evt.row),
-                                        head: (mouse_evt.column, mouse_evt.row),
-                                    });
                                 }
                             }
                             // right click pastes the clipboard into the
@@ -4031,34 +4234,6 @@ async fn app(
                             ) => {
                                 let text = clipboard_text().await;
                                 input.insert_str(&text);
-                            }
-                            // hover affordance: only re-renders when the
-                            // pointer actually crosses the header boundary
-                            crossterm::event::MouseEventKind::Moved
-                            | crossterm::event::MouseEventKind::Drag(
-                                crossterm::event::MouseButton::Left,
-                            ) => {
-                                let hit = sidebar_zone
-                                    .get()
-                                    .is_some_and(|z| z.hit(mouse_evt.column, mouse_evt.row));
-                                if sidebar.skills_hover != hit {
-                                    sidebar.skills_hover = hit;
-                                }
-                                if let Some(s) = sel.as_mut() {
-                                    s.head = (mouse_evt.column, mouse_evt.row);
-                                }
-                            }
-                            crossterm::event::MouseEventKind::Up(
-                                crossterm::event::MouseButton::Left,
-                            ) => {
-                                // release ends the selection: copy it to
-                                // the clipboard (OSC52) and clear the
-                                copy_selection(
-                                    sel,
-                                    frame_window,
-                                    frame_origin,
-                                    &mut transcript,
-                                );
                             }
                             crossterm::event::MouseEventKind::ScrollUp => {
                                 line_up(&mut scroll, transcript.total_rows(), view_rows);
@@ -4076,6 +4251,16 @@ async fn app(
                     None => { exit = Some(Exit::EngineEnded); }
                     Some(evt) => {
                         let replayed = matches!(evt, Event::Replay { .. });
+                        if let Event::Replay { messages } = &evt {
+                            // ↑/↓ recall the resumed session's earlier
+                            // prompts: seed the draft history with them
+                            input.seed_history(
+                                messages
+                                    .iter()
+                                    .filter(|m| m.role == "user" && !m.digest)
+                                    .map(|m| m.content.clone()),
+                            );
+                        }
                         apply_event(
                             &evt,
                             &mut transcript,
@@ -4168,14 +4353,69 @@ async fn app(
 /// happened in it — a finished turn, a turn still in flight when the
 /// user quit, or history replayed from an earlier run: closing an
 /// older chat without a new turn still deserves the way back.
-fn resume_hint(session: &str, turns: u64, busy: bool, has_history: bool) -> Option<String> {
+fn resume_hint(
+    session: &str,
+    turns: u64,
+    busy: bool,
+    has_history: bool,
+) -> Option<(String, String)> {
     if session.is_empty() || (turns == 0 && !busy && !has_history) {
         return None;
     }
     let tag = short_session(session).unwrap_or("?");
-    Some(format!(
-        "⟡ session saved — resume with: ka -c   (or: ka --session {tag})"
-    ))
+    let resume_cmd = format!("ka --session {tag}");
+    let hint = format!("⟡ session saved — resume with: ka -c   (or: {resume_cmd})");
+    Some((hint, resume_cmd))
+}
+
+/// Shape of one appended history line, sniffed from the file's last
+/// non-empty line: zsh extended history (`: <start>:<elapsed>;cmd`)
+/// gets the matching `:<ts>:0;<cmd>` shape, anything else (bash is
+/// plain lines, empty file) appends the bare command.
+fn history_line(existing_last: Option<&str>, cmd: &str, ts: u64) -> String {
+    let zsh = existing_last.and_then(|l| {
+        let rest = l.strip_prefix(": ")?;
+        let (start, rest) = rest.split_once(':')?;
+        let (elapsed, _) = rest.split_once(';')?;
+        (!start.is_empty()
+            && start.chars().all(|c| c.is_ascii_digit())
+            && !elapsed.is_empty()
+            && elapsed.chars().all(|c| c.is_ascii_digit()))
+        .then_some(())
+    });
+    match zsh {
+        Some(()) => format!(":{ts}:0;{cmd}"),
+        None => cmd.to_string(),
+    }
+}
+
+/// Append to an explicit history file (missing/unreadable files are
+/// skipped — never created here).
+fn append_history_to(path: &std::path::Path, cmd: &str, ts: u64) {
+    let Ok(content) = std::fs::read_to_string(path) else {
+        return;
+    };
+    let last = content.lines().rev().find(|l| !l.trim().is_empty());
+    let line = history_line(last, cmd, ts);
+    let mut out = content;
+    if !out.is_empty() && !out.ends_with('\n') {
+        out.push('\n');
+    }
+    out.push_str(&line);
+    out.push('\n');
+    let _ = std::fs::write(path, out);
+}
+
+/// Append the resume command to $HISTFILE. Skips silently when unset;
+/// never fails the exit — history bookkeeping is best effort.
+fn append_shell_history(cmd: &str) {
+    if let Ok(p) = std::env::var("HISTFILE") {
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        append_history_to(std::path::Path::new(&p), cmd, ts);
+    }
 }
 
 /// Live in-flight tool call: rolling output preview (live region only)
@@ -4502,7 +4742,20 @@ fn apply_event(
                 }
                 if m.role == "user" {
                     transcript.push_separated(Line::User(m.content.clone()));
-                } else {
+                    continue;
+                }
+                // assistant: dim thought first, then one row per tool
+                // call with its merged result note, then the text block
+                // when present
+                if let Some(t) = m.thinking.clone().filter(|t| !t.trim().is_empty()) {
+                    transcript.push_separated(Line::Thought(t));
+                }
+                for c in &m.calls {
+                    let mut row = tool_header(&c.tool, &c.detail);
+                    append_tool_note(&mut row, c.result.as_deref().unwrap_or(""), c.is_error);
+                    transcript.push_separated(Line::Tool(row));
+                }
+                if !m.content.trim().is_empty() {
                     transcript.push_separated(Line::Assistant(m.content.clone()));
                 }
             }
@@ -4660,8 +4913,6 @@ fn run_external(
     program: &str,
     args: &[&str],
     terminal: &mut ratatui::Terminal<ratatui::backend::CrosstermBackend<std::io::Stdout>>,
-    // recapture the mouse after the child exits (capture mode only)
-    mouse: bool,
 ) -> std::io::Result<()> {
     use std::io::Write as _;
     let _ = std::io::stdout().flush();
@@ -4671,19 +4922,13 @@ fn run_external(
         crossterm::terminal::LeaveAlternateScreen,
         crossterm::event::DisableMouseCapture
     );
-    let _ = std::io::stdout().write_all(b"\x1b[?1003l");
-    let _ = std::io::stdout().flush();
     let res = std::process::Command::new(program)
         .args(args)
         .status()
         .map(|_| ());
     let _ = crossterm::execute!(std::io::stdout(), crossterm::terminal::EnterAlternateScreen);
     let _ = crossterm::terminal::enable_raw_mode();
-    if mouse {
-        let _ = crossterm::execute!(std::io::stdout(), crossterm::event::EnableMouseCapture);
-        let _ = std::io::stdout().write_all(b"\x1b[?1003h");
-        let _ = std::io::stdout().flush();
-    }
+    let _ = crossterm::execute!(std::io::stdout(), crossterm::event::EnableMouseCapture);
     let _ = terminal.clear();
     res
 }
@@ -4933,6 +5178,10 @@ fn builtin_slash_commands() -> Vec<(String, String)> {
             "background tasks & jobs snapshot".to_string(),
         ),
         (
+            "/mouse".to_string(),
+            "toggle mouse capture (native select) / chat wheel".to_string(),
+        ),
+        (
             "/approve".to_string(),
             "review the plan file, then build it".to_string(),
         ),
@@ -4972,10 +5221,6 @@ fn builtin_slash_commands() -> Vec<(String, String)> {
         (
             "/find".to_string(),
             "search the transcript: /find <text>, bare repeats".to_string(),
-        ),
-        (
-            "/mouse".to_string(),
-            "mouse capture ⇄ terminal-native".to_string(),
         ),
         (
             "/spills".to_string(),
@@ -5860,7 +6105,12 @@ blocker > major > minor > nit, each as `file:line — issue — concrete fix`, \
 #[derive(Debug, Clone)]
 struct LiveBlock {
     thought: String,
-    tool: Vec<ratatui::text::Line<'static>>,
+    /// Running tool header (`→ tool · detail`); empty while no call is
+    /// in flight. The band folds from this + the live preview at the
+    /// RENDER width (prebuilt rows would survive a resize stale).
+    tool_header: String,
+    /// The in-flight call's rolling output preview.
+    live_tool: Option<LiveTool>,
     md: Vec<ratatui::text::Line<'static>>,
 }
 
@@ -5892,11 +6142,7 @@ fn observe_preview(window: &mut Vec<String>, excerpt: &str) {
 /// Width-truncate one preview row to `width` chars (chars, not bytes),
 /// marking the cut with an ellipsis.
 fn preview_row(line: &str, width: usize) -> String {
-    let mut out: String = line.chars().take(width.saturating_sub(1)).collect();
-    if out.chars().count() < line.chars().count() {
-        out.push('…');
-    }
-    out
+    trunc_cols(line, width.saturating_sub(1))
 }
 
 /// Live tool block rows on the tool band: the `→ {tool}` header plus up
@@ -6139,7 +6385,7 @@ fn welcome_rows(width: usize, glyph: &str) -> Vec<ratatui::text::Line<'static>> 
 #[allow(clippy::too_many_arguments)]
 fn render(
     frame: &mut ratatui::Frame,
-    transcript: &Transcript,
+    transcript: &mut Transcript,
     scroll: Option<usize>,
     input: &str,
     cursor: usize,
@@ -6160,10 +6406,9 @@ fn render(
     fresh: bool,
     sidebar_zone: &std::cell::Cell<Option<SidebarZone>>,
     title_arrows: &std::cell::Cell<Option<TitleArrows>>,
-    sel: &Option<TextSel>,
-    frame_window: &std::cell::RefCell<Vec<ratatui::text::Line<'static>>>,
-    frame_origin: &std::cell::Cell<(u16, u16)>,
-    mouse: bool,
+    // the transcript width this frame adopts, published back to the
+    // tick so the markdown cache keys on the real render width
+    tx_width: &std::cell::Cell<u16>,
 ) {
     let header_glyph = sidebar.header_glyph.as_str();
     use ratatui::layout::Constraint::{Length, Min};
@@ -6183,7 +6428,12 @@ fn render(
     let chunks = ratatui::layout::Layout::vertical([
         Length(1),
         Min(3),
-        Length(input_height(input_area_rows(ask, picker, input))),
+        Length(input_height(input_area_rows(
+            ask,
+            picker,
+            input,
+            input_inner_w(frame.area().width),
+        ))),
         Length(1),
     ])
     .split(outer);
@@ -6202,6 +6452,10 @@ fn render(
         (chunks[1], None)
     };
     let tx_inner = tx_area.width.saturating_sub(2);
+    // single width authority: the frame's own layout decides the cache
+    // and band width — never a tick-side terminal.size() guess
+    tx_width.set(tx_inner);
+    transcript.set_width(tx_inner);
     // modals center within the transcript pane, one col clear of its
     // edges: they never touch the sidebar border, the input box, or the
     // status bar
@@ -6224,7 +6478,11 @@ fn render(
                 live_rows.push(TuiLine::styled(format!("⋯ {l}"), crate::palette::THOUGHT));
             }
         }
-        live_rows.extend(lb.tool.iter().cloned());
+        live_rows.extend(tool_live_rows(
+            lb.tool_header.as_str(),
+            lb.live_tool.as_ref(),
+            tx_inner as usize,
+        ));
         // cached markdown rows (clone-on-append; the cache stays cursor-free)
         // live markdown rows get the same surface as final output; the
         // cursor is appended first so the surface pads around it, and
@@ -6275,12 +6533,6 @@ fn render(
     if total == 0 && !busy && fresh {
         window = welcome_rows(tx_inner as usize, header_glyph);
     }
-    // stash the visible window for mouse-copy; paint the selection
-    frame_origin.set((tx_area.x + 1, tx_area.y + 1));
-    *frame_window.borrow_mut() = window.clone();
-    if let Some(s) = *sel {
-        apply_sel_highlight(&mut window, tx_area.y + 1, s.anchor, s.head);
-    }
     let title = if pinned {
         header_glyph.to_string()
     } else {
@@ -6308,7 +6560,7 @@ fn render(
         .entries()
         .iter()
         .any(|l| matches!(l, Line::User(_)));
-    if mouse && has_user && tx_area.width >= 12 {
+    if has_user && tx_area.width >= 12 {
         let need = title_cells + 7;
         if tx_area.width as usize >= need {
             let y = tx_area.y;
@@ -6373,7 +6625,6 @@ fn render(
             meters,
             (SIDEBAR_WIDTH - 3) as usize,
             sb.height as usize,
-            mouse,
             Some((sidebar_zone, sb)),
         );
         let widget = Paragraph::new(rows)
@@ -6410,6 +6661,30 @@ fn render(
     } else {
         crate::palette::BORDER_STYLE
     };
+    // textarea wrap: display rows fold at the box width; the visible
+    // window ends at the cursor's visual row and the terminal cursor
+    // rides its offset inside that window
+    let (draft_window, cursor_vis): (Option<Vec<TuiLine>>, Option<(usize, usize)>) =
+        if ask.is_none() && picker.is_none() {
+            let inner_w = chunks[2].width.saturating_sub(4) as usize; // borders + padding
+            let rows = wrap_rows(input, inner_w);
+            let cur_row = visual_cursor_row(&rows, cursor);
+            let vis = rows.len().min(6);
+            let start = cur_row.saturating_sub(vis - 1).min(rows.len() - vis);
+            let window: Vec<TuiLine> = rows[start..start + vis]
+                .iter()
+                .map(|r| TuiLine::from(r.text.clone()))
+                .collect();
+            let col: usize = rows[cur_row]
+                .text
+                .chars()
+                .take(cursor - rows[cur_row].start)
+                .map(|c| unicode_width::UnicodeWidthChar::width(c).unwrap_or(0))
+                .sum();
+            (Some(window), Some((cur_row - start, col)))
+        } else {
+            (None, None)
+        };
     let body: Vec<TuiLine> = if let Some(ask) = ask {
         // question text, then one options row: the selected option is
         // inverse video, every option carries a single leading space so
@@ -6453,15 +6728,7 @@ fn render(
         }
         rows
     } else {
-        // shared horizontal window: all rows shift together so the cursor
-        // row can always show the cursor
-        let (_, cur_col) = cursor_row_col(input, cursor);
-        let inner_w = chunks[2].width.saturating_sub(4) as usize; // borders + padding
-        let scroll_col = cur_col.saturating_sub(inner_w.saturating_sub(1).max(1));
-        input
-            .split('\n')
-            .map(|r| TuiLine::from(r.chars().skip(scroll_col).collect::<String>()))
-            .collect()
+        draft_window.clone().unwrap_or_default()
     };
     let input_widget = Paragraph::new(body)
         .block(
@@ -6474,14 +6741,11 @@ fn render(
         )
         .style(ratatui::style::Style::new().bg(crate::palette::BG_PANEL));
     frame.render_widget(input_widget, chunks[2]);
-    if ask.is_none() && picker.is_none() {
-        let (cur_row, cur_col) = cursor_row_col(input, cursor);
-        let inner_w = chunks[2].width.saturating_sub(4) as usize; // borders + padding
-        let scroll_col = cur_col.saturating_sub(inner_w.saturating_sub(1).max(1));
+    if let (Some(_), Some((row_off, col))) = (&draft_window, cursor_vis) {
         let area = chunks[2];
         frame.set_cursor_position((
-            area.x + 2 + (cur_col - scroll_col) as u16,
-            area.y + 1 + cur_row.min(area.height.saturating_sub(2) as usize) as u16,
+            area.x + 2 + col as u16,
+            area.y + 1 + row_off.min(area.height.saturating_sub(2) as usize) as u16,
         ));
     }
 
@@ -6558,20 +6822,7 @@ fn render(
     } else if busy {
         hint_spans(&[(" enter", "interject"), (" +", "defer"), (" esc", "abort")])
     } else {
-        if mouse {
-            hint_spans(&[
-                (" enter", "send"),
-                (" /", "commands"),
-                (" drag", "copy"),
-                (" /mouse", "native select"),
-            ])
-        } else {
-            hint_spans(&[
-                (" enter", "send"),
-                (" /", "commands"),
-                (" /mouse", "capture"),
-            ])
-        }
+        hint_spans(&[(" enter", "send"), (" /", "commands"), (" ⇧drag", "select")])
     };
     let right = status_right(meters);
     let w = unicode_width::UnicodeWidthStr::width;
@@ -6776,9 +7027,12 @@ fn render(
                     ("Enter", "send · interject mid-turn"),
                     ("Esc / Ctrl-C", "abort turn · close overlays · unpin scroll"),
                     ("Ctrl+C", "quit (abort the running turn first)"),
-                    ("/mouse", "capture ⇄ terminal-native select"),
-                    ("Ctrl+R", "search history · ctrl+r next · enter accept"),
-                    ("Alt+E", "edit the draft in $EDITOR"),
+                    (
+                        "⇧drag",
+                        "terminal-native text selection (bypasses wheel capture)",
+                    ),
+                    ("Ctrl+T", "fold skills"),
+                    ("Alt+T", "expand/collapse thinking"),
                     ("PgUp / PgDn", "scroll the transcript"),
                     ("↑ ↓", "history · navigate pickers"),
                     ("Tab", "complete slash command"),
@@ -6841,7 +7095,29 @@ fn render(
                 ])];
                 let cap = (height as usize).saturating_sub(5);
                 let inner_w = width.saturating_sub(4) as usize; // borders + padding
-                for (i, m) in rows.iter().take(cap).enumerate() {
+                // the unified list splits configured from unconfigured
+                // models with one dim separator row (the same predicate
+                // rows() partitions on)
+                let unified = picker.unified();
+                let split = if unified {
+                    rows.iter()
+                        .take_while(|m| ModelPicker::configured(m))
+                        .count()
+                } else {
+                    rows.len()
+                };
+                let mut shown = 0usize;
+                for (i, m) in rows.iter().enumerate() {
+                    if shown >= cap {
+                        break;
+                    }
+                    if unified && i == split && i > 0 {
+                        text.push(TuiLine::styled("─ not configured ─", crate::palette::META));
+                        shown += 1;
+                        if shown >= cap {
+                            break;
+                        }
+                    }
                     let ctx = if m.context > 0 {
                         format!("{}k", m.context / 1000)
                     } else {
@@ -6862,6 +7138,7 @@ fn render(
                             ratatui::style::Style::default()
                         },
                     ));
+                    shown += 1;
                 }
                 if rows.is_empty() {
                     if picker.configured_only && picker.filter.trim().is_empty() {
@@ -7604,137 +7881,6 @@ fn jump_to_user_message(
     }
 }
 
-/// In-progress transcript text selection in frame coordinates
-/// (column, row).
-#[derive(Debug, Clone, Copy)]
-pub struct TextSel {
-    anchor: (u16, u16),
-    head: (u16, u16),
-}
-
-/// Extract the text a mouse selection covers, from the stashed visible
-/// window (`origin` = screen coords of the first text column of the
-/// first row). Partial first/last rows respect the anchor columns;
-/// rows trim trailing spaces and join with newlines.
-fn selection_text(
-    win: &[ratatui::text::Line<'static>],
-    origin: (u16, u16),
-    a: (u16, u16),
-    h: (u16, u16),
-) -> Option<String> {
-    use unicode_width::UnicodeWidthStr;
-    let line_text = |l: &ratatui::text::Line<'static>| -> String {
-        l.spans.iter().map(|s| s.content.to_string()).collect()
-    };
-    let cell_slice = |text: &str, from: usize, to: usize| -> String {
-        let mut out = String::new();
-        let mut acc = 0usize;
-        for ch in text.chars() {
-            let start = acc;
-            acc += unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
-            if acc > from && start < to {
-                out.push(ch);
-            }
-        }
-        out
-    };
-    let (r1, c1, r2, c2) = if (a.1, a.0) <= (h.1, h.0) {
-        (a.1, a.0, h.1, h.0)
-    } else {
-        (h.1, h.0, a.1, a.0)
-    };
-    if r2 < origin.1 || win.is_empty() {
-        return None;
-    }
-    // clamp to the content area: anchors on the title row or in the
-    // left margin underflow u16 subtraction otherwise. An anchor above
-    // the content promotes the drag to whole-row selection (gutter-click
-    // semantics): full first row through the full head row.
-    let whole_rows = r1 < origin.1;
-    let r1 = r1.max(origin.1);
-    let c1 = c1.max(origin.0);
-    let i1 = ((r1 - origin.1) as usize).min(win.len() - 1);
-    let i2 = ((r2 - origin.1) as usize).min(win.len() - 1);
-    let mut parts: Vec<String> = Vec::new();
-    for (off, line) in win[i1..=i2].iter().enumerate() {
-        let text = line_text(line);
-        let from = if off == 0 && !whole_rows {
-            ((c1 - origin.0) as usize).min(text.width())
-        } else {
-            0
-        };
-        let to = if off == i2 - i1 && !whole_rows {
-            ((c2 - origin.0) as usize + 1).min(text.width())
-        } else {
-            text.width()
-        };
-        let seg = cell_slice(&text, from, to);
-        let trimmed = seg.trim_end();
-        if !trimmed.is_empty() {
-            parts.push(trimmed.to_string());
-        } else if off == 0 || off == i2 - i1 {
-            parts.push(String::new());
-        }
-    }
-    let out = parts.join("\n").trim().to_string();
-    (!out.is_empty()).then_some(out)
-}
-
-/// Copy the live transcript selection to the clipboard (OSC52) and
-/// clear it. No-op without a selection.
-fn copy_selection(
-    sel: &mut Option<TextSel>,
-    frame_window: &std::cell::RefCell<Vec<ratatui::text::Line<'static>>>,
-    frame_origin: &std::cell::Cell<(u16, u16)>,
-    transcript: &mut Transcript,
-) {
-    use std::io::Write as _;
-    if let Some(s) = *sel {
-        let win = frame_window.borrow();
-        let origin = frame_origin.get();
-        if let Some(text) = selection_text(&win, origin, s.anchor, s.head) {
-            let n = text.chars().count();
-            if n > 0 {
-                let mut out = std::io::stdout().lock();
-                let _ = out.write_all(b"\x1b]52;c;");
-                let _ = out.write_all(b64encode(text.as_bytes()).as_bytes());
-                let _ = out.write_all(b"\x07");
-                let _ = out.flush();
-                transcript.push_separated(Line::Note(format!("copied {n} chars to the clipboard")));
-            }
-        }
-    }
-    *sel = None;
-}
-
-/// Restyle the window rows inside the selection rectangle with the
-/// selection bar colors (whole rows; the text itself is untouched).
-fn apply_sel_highlight(
-    window: &mut [ratatui::text::Line<'static>],
-    oy: u16,
-    a: (u16, u16),
-    h: (u16, u16),
-) {
-    let (r1, r2) = if a.1 <= h.1 { (a.1, h.1) } else { (h.1, a.1) };
-    if r2 < oy {
-        return;
-    }
-    // the anchor may sit on the title/border row (above the first
-    // content row): clamp before subtracting or u16 underflows and the
-    // release-build slice panics
-    let r1 = r1.max(oy);
-    let i1 = ((r1 - oy) as usize).min(window.len());
-    let i2 = (((r2 - oy) as usize) + 1).min(window.len());
-    for row in &mut window[i1..i2] {
-        for span in row.spans.iter_mut() {
-            span.style = span
-                .style
-                .fg(crate::palette::SEL_FG)
-                .bg(crate::palette::SEL_BG);
-        }
-    }
-}
-
 /// Read the system clipboard as text: wayland → X11 → WSL2/Windows.
 async fn clipboard_text() -> String {
     // Every probe is capped (a hanging xclip against an unresponsive
@@ -7873,6 +8019,71 @@ mod tests {
         second.filter = "claude".to_string();
         second.selected = 0;
         assert_eq!(second.pick().as_deref(), Some("anthropic/claude-sonnet-5"));
+
+        // the unified list partitions: configured models lead, the rest
+        // follow; order is stable within both groups
+        let mut mixed = picker.clone();
+        mixed.models[1].key_set = true; // openai connected
+        let ids: Vec<&str> = mixed.rows().iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec![
+                "openai/gpt-5.1",
+                "ollama/qwen3-32b",
+                "anthropic/claude-sonnet-5"
+            ],
+            "configured vendor's models lead"
+        );
+        // the render's separator splits at the same predicate
+        assert_eq!(
+            mixed
+                .rows()
+                .iter()
+                .take_while(|m| ModelPicker::configured(m))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn model_picker_unified_partitions_configured_first() {
+        let mut models = vec![
+            model("zai/glm-5.3", 200_000),      // keyed, no key → unconfigured
+            model("ollama/qwen3-32b", 131_072), // keyless → configured
+            model("openai/gpt-5.1", 400_000),   // keyed + key set → configured
+            model("anthropic/claude-sonnet-5", 200_000), // keyed, no key
+        ];
+        models[0].key_env = "ZAI_API_KEY".to_string();
+        models[1].key_env = String::new();
+        models[2].key_set = true;
+        let picker = ModelPicker {
+            models,
+            vendor: None,
+            configured_only: false,
+            selected: 0,
+            filter: String::new(),
+        };
+        let ids: Vec<&str> = picker.rows().iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec![
+                "ollama/qwen3-32b",
+                "openai/gpt-5.1",
+                "zai/glm-5.3",
+                "anthropic/claude-sonnet-5",
+            ],
+            "configured models lead (stable), unconfigured follow (stable)"
+        );
+        // the filter spans the whole pool, unconfigured group included
+        let mut f = picker.clone();
+        f.filter = "glm".to_string();
+        assert_eq!(f.pick().as_deref(), Some("zai/glm-5.3"));
+
+        // the vendor-locked drill list never partitions
+        let mut locked = picker.clone();
+        locked.vendor = Some("zai".to_string());
+        let ids: Vec<&str> = locked.rows().iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(ids, vec!["zai/glm-5.3"]);
     }
 
     fn provider(name: &str, env_var: &str, key_set: bool) -> ProviderInfo {
@@ -8468,9 +8679,13 @@ mod tests {
 
     #[test]
     fn resume_hint_needs_a_session_and_activity() {
-        let hint = resume_hint("s19a4f2e1b0-3f9c2a81d4b7", 1, false, false).unwrap();
+        let (hint, cmd) = resume_hint("s19a4f2e1b0-3f9c2a81d4b7", 1, false, false).unwrap();
         assert!(hint.contains("ka -c"), "{hint}");
         assert!(hint.contains("ka --session 3f9c2a81"), "{hint}");
+        assert_eq!(
+            cmd, "ka --session 3f9c2a81",
+            "the command lands in $HISTFILE"
+        );
         // quitting mid-turn (turns == 0, still busy) still resumes
         assert!(resume_hint("s19a4f2e1b0-3f9c2a81d4b7", 0, true, false).is_some());
         // an older chat replayed at startup, closed with no new turn
@@ -8479,6 +8694,59 @@ mod tests {
         assert!(resume_hint("s19a4f2e1b0-3f9c2a81d4b7", 0, false, false).is_none());
         // no session id (engine died at bootstrap): nothing to print
         assert!(resume_hint("", 3, false, true).is_none());
+    }
+
+    #[test]
+    fn history_line_sniffs_zsh_extended_format() {
+        // zsh-style tail → matching extended shape
+        assert_eq!(
+            history_line(
+                Some(": 1700000000:5;cargo run"),
+                "ka --session abc",
+                1700000123
+            ),
+            ":1700000123:0;ka --session abc"
+        );
+        // plain tail (bash) → plain command
+        assert_eq!(
+            history_line(Some("cargo run"), "ka --session abc", 7),
+            "ka --session abc"
+        );
+        // empty file → plain
+        assert_eq!(
+            history_line(None, "ka --session abc", 7),
+            "ka --session abc"
+        );
+        // non-numeric timestamps are not the zsh shape
+        assert_eq!(history_line(Some(": start:5;ls"), "cmd", 9), "cmd");
+    }
+
+    #[test]
+    fn append_history_to_appends_and_never_creates() {
+        let dir = std::env::temp_dir().join(format!("ka-hist-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let hist = dir.join("hist");
+        // missing file: skipped, never created
+        append_history_to(&hist, "ka --session deadbeef", 1);
+        assert!(!hist.exists());
+        // zsh-style file: the extended line appends
+        std::fs::write(&hist, ": 1700000000:5;old cmd").unwrap(); // no trailing newline
+        append_history_to(&hist, "ka --session deadbeef", 1700000123);
+        let out = std::fs::read_to_string(&hist).unwrap();
+        assert!(
+            out.ends_with(":1700000123:0;ka --session deadbeef\n"),
+            "{out:?}"
+        );
+        // plain file: the bare command appends
+        std::fs::write(&hist, "old cmd\n").unwrap();
+        append_history_to(&hist, "ka --session deadbeef", 2);
+        assert!(
+            std::fs::read_to_string(&hist)
+                .unwrap()
+                .ends_with("ka --session deadbeef\n")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -8994,7 +9262,7 @@ mod tests {
         // assistant rows carry the output background and fill the width;
         // blank rows above and below carry the same fill, giving the
         // card inner top/bottom air
-        let out = super::render_line(&Line::Assistant("**hi** there".into()), 40);
+        let out = super::render_line(&Line::Assistant("**hi** there".into()), 40, false);
         assert!(out.len() >= 3, "blank + content + blank, got {}", out.len());
         let surface = crate::palette::BG_OUTPUT;
         let row_text = |l: &ratatui::text::Line<'static>| {
@@ -9632,10 +9900,10 @@ mod tests {
             observe_preview(&mut window, &format!("line-{i}"));
         }
         assert_eq!(window, vec!["line-3", "line-4", "line-5"], "rolling 3");
-        // width truncation is char-based, ellipsis-marked
+        // width truncation is display-width aware, ellipsis-marked
         let wide = "é".repeat(20);
         let row = preview_row(&wide, 10);
-        assert_eq!(row.chars().count(), 10, "{row:?}");
+        assert!(row.width() <= 10, "{row:?}");
         assert!(row.ends_with('…'));
         assert_eq!(preview_row("short", 10), "short");
         // the block renders header + at most the 3 newest dim lines
@@ -10645,27 +10913,6 @@ mod tests {
     }
 
     #[test]
-    fn mouse_selection_anchored_above_content_does_not_panic() {
-        // regression: an anchor on the transcript title row (one above
-        // the first content row) used to underflow u16 subtraction and
-        // slice-panic in release builds
-        let win: Vec<ratatui::text::Line<'static>> = vec![
-            ratatui::text::Line::from("row one"),
-            ratatui::text::Line::from("row two"),
-        ];
-        let origin = (2u16, 5u16);
-        // anchor at row 4 (title row), head dragged to row 6
-        let text = selection_text(&win, origin, (2, 4), (2, 6));
-        assert_eq!(text.as_deref(), Some("row one\nrow two"));
-        // same anchor geometry through the highlight path
-        let mut hl = win.clone();
-        apply_sel_highlight(&mut hl, origin.1, (2, 4), (2, 6));
-        // and a left-margin column anchor
-        let text = selection_text(&win, origin, (0, 4), (0, 6));
-        assert!(text.is_some(), "margin anchor clamps, not panics");
-    }
-
-    #[test]
     fn turn_meta_row_joins_and_caps_at_sixty_columns() {
         assert_eq!(turn_meta_row("m/1", 3.25, 0.0002), "m/1 · 3.2s · $0.0002");
         assert_eq!(turn_meta_row("", 0.0, 0.0), "0.0s · $0.0000");
@@ -10705,15 +10952,21 @@ mod tests {
             selected: 0,
         };
         // question lines + one options row, draft ignored while pending
-        assert_eq!(input_area_rows(Some(&ask), None, "long\ndraft\ntext"), 3);
-        assert_eq!(input_area_rows(None, None, "long\ndraft\ntext"), 3);
-        assert_eq!(input_area_rows(None, None, "one line"), 1);
+        assert_eq!(
+            input_area_rows(Some(&ask), None, "long\ndraft\ntext", 40),
+            3
+        );
+        assert_eq!(input_area_rows(None, None, "long\ndraft\ntext", 40), 3);
+        assert_eq!(input_area_rows(None, None, "one line", 40), 1);
+        // the draft arm folds long lines: 200 cols at width 40 → 5 rows
+        assert_eq!(input_area_rows(None, None, &"x".repeat(200), 40), 5);
         // the picker borrows the box for its four tier rows
         assert_eq!(
             input_area_rows(
                 None,
                 Some(&ModePicker::for_mode(ka_protocol::Mode::Free)),
-                "x"
+                "x",
+                40
             ),
             4
         );
@@ -10749,7 +11002,7 @@ mod tests {
             selected: 0,
             detail: Some("ctx\n+added\n".into()),
         };
-        assert_eq!(input_area_rows(Some(&ask), None, ""), 4);
+        assert_eq!(input_area_rows(Some(&ask), None, "", 40), 4);
         // regression: a huge diff must never push the options row past
         // the input box's six-content-row cap (the choices stay visible)
         let ask = PendingAsk {
@@ -10759,7 +11012,7 @@ mod tests {
             selected: 0,
             detail: Some((0..9).map(|i| format!("+line{i}\n")).collect()),
         };
-        let total = input_area_rows(Some(&ask), None, "");
+        let total = input_area_rows(Some(&ask), None, "", 40);
         assert!(total <= 6, "ask form grew to {total} rows");
         // a four-line question leaves no detail budget (trailer headroom)
         let ask = PendingAsk {
@@ -10769,7 +11022,7 @@ mod tests {
             selected: 0,
             detail: Some("+a\n".into()),
         };
-        assert_eq!(input_area_rows(Some(&ask), None, ""), 5);
+        assert_eq!(input_area_rows(Some(&ask), None, "", 40), 5);
         // six question lines: no budget left, detail omitted entirely
         let ask = PendingAsk {
             id: AskId("a".into()),
@@ -10778,7 +11031,42 @@ mod tests {
             selected: 0,
             detail: Some("+a\n".into()),
         };
-        assert_eq!(input_area_rows(Some(&ask), None, ""), 7);
+        assert_eq!(input_area_rows(Some(&ask), None, "", 40), 7);
+    }
+
+    #[test]
+    fn wrap_rows_breaks_at_spaces_hard_tokens_and_newlines() {
+        // space-preferred breaks
+        let rows = wrap_rows("alpha beta gamma", 6);
+        let texts: Vec<&str> = rows.iter().map(|r| r.text.as_str()).collect();
+        assert_eq!(texts, vec!["alpha", "beta", "gamma"]);
+        assert_eq!(rows[0].start, 0);
+        assert_eq!(rows[1].start, 6, "continuation starts after the space");
+
+        // hard break: a token with no space still wraps
+        let rows = wrap_rows("abcdefghijkl", 5);
+        let texts: Vec<&str> = rows.iter().map(|r| r.text.as_str()).collect();
+        assert_eq!(texts, vec!["abcde", "fghij", "kl"]);
+
+        // wide chars count as two display columns
+        let rows = wrap_rows("世界 world", 5);
+        assert_eq!(rows[0].text, "世界", "{}", rows[0].text);
+        assert_eq!(rows[1].text, "world");
+
+        // explicit newlines always break; empty lines stay rows
+        let rows = wrap_rows("a\n\nb", 10);
+        let texts: Vec<&str> = rows.iter().map(|r| r.text.as_str()).collect();
+        assert_eq!(texts, vec!["a", "", "b"]);
+        assert_eq!(rows[2].start, 3);
+    }
+
+    #[test]
+    fn visual_cursor_row_maps_wrapped_positions() {
+        let rows = wrap_rows("alpha beta", 6);
+        assert_eq!(visual_cursor_row(&rows, 0), 0);
+        assert_eq!(visual_cursor_row(&rows, 5), 0, "end of 'alpha'");
+        assert_eq!(visual_cursor_row(&rows, 6), 1, "cursor after the space");
+        assert_eq!(visual_cursor_row(&rows, 10), 1);
     }
     // ── sidebar ──────────────────────────────────────────────────
     use unicode_width::UnicodeWidthStr;
@@ -10814,12 +11102,11 @@ mod tests {
             branch: Some("main".into()),
             ..Default::default()
         };
-        let rows = sidebar_rows(&sidebar, &meters_sample(), 24, 40, false, None);
+        let rows = sidebar_rows(&sidebar, &meters_sample(), 24, 40, None);
         let text = plain_text(&rows);
-        assert_eq!(text[0], "session");
-        assert!(text.contains(&"model mockco/mock".to_string()), "{text:?}");
-        assert!(text.contains(&"mode free".to_string()), "{text:?}");
-        assert!(text.contains(&"#3f9c2a81".to_string()), "{text:?}");
+        assert_eq!(text[2], "#3f9c2a81", "session id is the first fact row");
+        assert!(!text.contains(&"model mockco/mock".to_string()), "{text:?}");
+        assert!(!text.contains(&"mode free".to_string()), "{text:?}");
         assert!(text.contains(&"$0.0123".to_string()), "{text:?}");
         assert!(
             text.iter().any(|t| t.starts_with("ctx 12000/200000")),
@@ -10868,7 +11155,7 @@ mod tests {
             },
             ..Default::default()
         };
-        let rows = sidebar_rows(&sidebar, &Meters::default(), 24, 40, false, None);
+        let rows = sidebar_rows(&sidebar, &Meters::default(), 24, 40, None);
         let text = plain_text(&rows);
         let done = text
             .iter()
@@ -10882,7 +11169,10 @@ mod tests {
         assert!(pending.starts_with("· "), "{pending}");
         assert!(text.iter().any(|t| t == "demo ✓ 2"), "{text:?}");
         assert!(text.iter().any(|t| t == "jira ✗"), "{text:?}");
-        assert!(text.iter().any(|t| t == "rust-docs"), "{text:?}");
+        assert!(
+            text.iter().any(|t| t == "skills (+1) ▸"),
+            "folded skills render their header alone: {text:?}"
+        );
         // done rows carry the crossed-out modifier, pending rows do not
         let done_idx = rows
             .iter()
@@ -10915,17 +11205,17 @@ mod tests {
                 prompts: Vec::new(),
                 ..Default::default()
             },
+            skills_open: true,
             ..Default::default()
         };
         // Meters::default leaves session/todos/mcp empty, so skills owns
         // the whole budget: header + air + show = min(height-2, 30) list
         // rows, where the cut mark replaces the last one. At height 8:
         // header, blank, skill-0..4, mark.
-        let rows = sidebar_rows(&sidebar, &Meters::default(), 24, 8, false, None);
+        let rows = sidebar_rows(&sidebar, &Meters::default(), 24, 8, None);
         let text = plain_text(&rows);
         assert_eq!(text.len(), 8, "{text:?}");
-        assert_eq!(text[0], "skills", "{text:?}");
-        assert_eq!(text[1], "", "blank row under the header: {text:?}");
+        assert_eq!(text[0], "skills ▾", "{text:?}");
         assert_eq!(text[2], "skill-0", "{text:?}");
         assert_eq!(text[6], "skill-4", "{text:?}");
         assert_eq!(text[7], "(+25)", "{text:?}");
@@ -10942,7 +11232,7 @@ mod tests {
             }],
             ..Default::default()
         };
-        let rows = sidebar_rows(&sidebar, &Meters::default(), 24, 40, false, None);
+        let rows = sidebar_rows(&sidebar, &Meters::default(), 24, 40, None);
         let text = plain_text(&rows);
         // every section header is followed by a blank row; a blank row
         // also separates each section from the previous one
@@ -10964,7 +11254,7 @@ mod tests {
             cwd: "…/世界/世界".into(),
             ..Default::default()
         };
-        let rows = sidebar_rows(&sidebar, &Meters::default(), 10, 40, false, None);
+        let rows = sidebar_rows(&sidebar, &Meters::default(), 10, 40, None);
         for row in &rows {
             let text: String = row.spans.iter().map(|s| s.content.as_ref()).collect();
             assert!(text.width() <= 10, "{text}");
@@ -11137,10 +11427,11 @@ mod tests {
         );
         assert_eq!(sidebar.title.as_deref(), Some("Fix the parser"));
 
-        // the title renders as the first fact row of the session section
-        let rendered = plain_text(&sidebar_rows(&sidebar, &meters, 26, 40, false, None));
+        // the title is stored (for /session) but no longer rendered in
+        // the sidebar session block
+        let rendered = plain_text(&sidebar_rows(&sidebar, &meters, 26, 40, None));
         assert!(
-            rendered.iter().any(|r| r.contains("Fix the parser")),
+            !rendered.iter().any(|r| r.contains("Fix the parser")),
             "got: {rendered:?}"
         );
     }
@@ -11148,13 +11439,63 @@ mod tests {
     #[test]
     fn sidebar_without_title_shows_no_title_row() {
         let sidebar = SidebarState::default();
-        let rows = sidebar_rows(&sidebar, &Meters::default(), 26, 40, false, None);
-        assert!(rows.is_empty(), "no title → session section starts empty");
+        let rows = sidebar_rows(&sidebar, &Meters::default(), 26, 40, None);
+        assert!(rows.is_empty(), "no session facts → the section vanishes");
     }
 
     #[test]
+    fn thinking_blocks_collapse_to_one_row_and_expand() {
+        let thought = Line::Thought("first line\nsecond line\nthird line".into());
+        // collapsed (default): the first line plus a count marker, one row
+        let collapsed = super::render_line(&thought, 60, false);
+        assert_eq!(collapsed.len(), 1, "{collapsed:?}");
+        let text: String = collapsed[0]
+            .spans
+            .iter()
+            .map(|s| s.content.to_string())
+            .collect();
+        assert!(text.contains("first line"), "{text}");
+        assert!(text.contains("(+3 lines · Alt+T)"), "{text}");
+        assert!(
+            !text.contains("second line"),
+            "hidden when collapsed: {text}"
+        );
+
+        // open: every line renders
+        let open = super::render_line(&thought, 60, true);
+        let text: String = open
+            .iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.to_string())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            text.contains("first line") && text.contains("third line"),
+            "{text}"
+        );
+
+        // single-line thoughts never collapse
+        let one = super::render_line(&Line::Thought("just one".into()), 60, false);
+        let text: String = one[0].spans.iter().map(|s| s.content.to_string()).collect();
+        assert!(text.contains("just one") && !text.contains("(+1"), "{text}");
+
+        // the toggle rebuilds the cache: row counts follow the flag
+        let mut t = Transcript::default();
+        t.set_width(60);
+        t.push(thought);
+        assert_eq!(t.total_rows(), 1, "collapsed by default");
+        t.set_thoughts_open(true);
+        assert_eq!(t.total_rows(), 3, "expanded after the toggle");
+        t.set_thoughts_open(false);
+        assert_eq!(t.total_rows(), 1, "collapsed again");
+    }
+    #[test]
     fn cached_tool_row_is_a_single_band_row() {
-        let out = super::render_line(&Line::Tool("→ bash ✓ done".into()), 40);
+        let out = super::render_line(&Line::Tool("→ bash ✓ done".into()), 40, false);
         assert_eq!(out.len(), 1, "exactly one band row, no trailing blank");
         let row = &out[0];
         let text: String = row.spans.iter().map(|s| s.content.to_string()).collect();
@@ -11175,9 +11516,10 @@ mod tests {
         let mut terminal = ratatui::Terminal::new(TestBackend::new(120, 40)).unwrap();
         terminal
             .draw(|f| {
+                let mut t = Transcript::default();
                 super::render(
                     f,
-                    &Transcript::default(),
+                    &mut t,
                     None,
                     "",
                     0,
@@ -11197,10 +11539,7 @@ mod tests {
                     true,
                     &std::cell::Cell::new(None::<SidebarZone>),
                     &std::cell::Cell::new(None::<TitleArrows>),
-                    &None::<TextSel>,
-                    &std::cell::RefCell::new(Vec::<ratatui::text::Line<'static>>::new()),
-                    &std::cell::Cell::new((0u16, 0u16)),
-                    false,
+                    &std::cell::Cell::new(0u16),
                 )
             })
             .unwrap();
@@ -11230,7 +11569,7 @@ mod tests {
     #[test]
     fn empty_idle_transcript_shows_the_welcome() {
         use ratatui::backend::TestBackend;
-        let frame_text = |transcript: &Transcript, busy: bool, fresh: bool| -> String {
+        let frame_text = |transcript: &mut Transcript, busy: bool, fresh: bool| -> String {
             let mut terminal = ratatui::Terminal::new(TestBackend::new(120, 40)).unwrap();
             terminal
                 .draw(|f| {
@@ -11256,10 +11595,7 @@ mod tests {
                         fresh,
                         &std::cell::Cell::new(None::<SidebarZone>),
                         &std::cell::Cell::new(None::<TitleArrows>),
-                        &None::<TextSel>,
-                        &std::cell::RefCell::new(Vec::<ratatui::text::Line<'static>>::new()),
-                        &std::cell::Cell::new((0u16, 0u16)),
-                        false,
+                        &std::cell::Cell::new(0u16),
                     )
                 })
                 .unwrap();
@@ -11271,25 +11607,25 @@ mod tests {
                 .map(|c| c.symbol().to_string())
                 .collect()
         };
-        let frame = frame_text(&Transcript::default(), false, true);
+        let frame = frame_text(&mut Transcript::default(), false, true);
         assert!(frame.contains("new conversation"), "welcome on fresh chat");
         assert!(frame.contains("/help for keys"), "hint row present");
         // busy, carrying entries, or an older chat still replaying: the
         // welcome steps aside
         assert!(
-            !frame_text(&Transcript::default(), true, true).contains("new conversation"),
+            !frame_text(&mut Transcript::default(), true, true).contains("new conversation"),
             "busy turn: no welcome"
         );
         assert!(
-            !frame_text(&Transcript::default(), false, false).contains("new conversation"),
+            !frame_text(&mut Transcript::default(), false, false).contains("new conversation"),
             "older chat before its replay lands: no welcome"
         );
         let mut t = Transcript::default();
         t.set_width(80);
         t.push(Line::User("hello".into()));
         assert!(
-            !frame_text(&t, false, true).contains("new conversation"),
-            "non-empty transcript: no welcome"
+            !frame_text(&mut t, false, true).contains("new conversation"),
+            "carrying entries: no welcome"
         );
     }
 
@@ -11394,27 +11730,6 @@ mod tests {
     }
 
     #[test]
-    fn skills_header_hover_lifts_onto_surface_tint() {
-        let rest = skills_header_line(true, false, 4);
-        let rest_spans: Vec<_> = rest
-            .spans
-            .iter()
-            .map(|s| (s.content.as_ref(), s.style))
-            .collect();
-        assert_eq!(rest_spans[0].0, "skills");
-        assert_eq!(rest_spans[1].0, " ▾");
-        assert_eq!(rest_spans[0].1.bg, None);
-        let hover = skills_header_line(true, true, 4);
-        let hover_spans: Vec<_> = hover
-            .spans
-            .iter()
-            .map(|s| (s.content.as_ref(), s.style))
-            .collect();
-        assert_eq!(hover_spans[0].1.fg, Some(crate::palette::ACCENT));
-        assert_eq!(hover_spans[0].1.bg, Some(crate::palette::BG_SURFACE));
-    }
-
-    #[test]
     fn sidebar_collapsed_skills_render_header_alone() {
         let sidebar = SidebarState {
             inventory: Inventory {
@@ -11425,7 +11740,7 @@ mod tests {
             skills_open: false,
             ..Default::default()
         };
-        let rows = sidebar_rows(&sidebar, &Meters::default(), 24, 40, true, None);
+        let rows = sidebar_rows(&sidebar, &Meters::default(), 24, 40, None);
         let text = plain_text(&rows);
         let idx = text
             .iter()
@@ -11438,52 +11753,89 @@ mod tests {
     }
 
     #[test]
-    fn selection_text_slices_rows_and_columns() {
-        let win = vec![
-            ratatui::text::Line::from("hello world"),
-            ratatui::text::Line::from("second line"),
-        ];
-        let origin = (10u16, 5u16);
-        // full first row + partial second
-        let text = selection_text(&win, origin, (10, 5), (13, 6)).unwrap();
-        assert_eq!(text, "hello world\nseco");
-        // a backwards drag covers the same rectangle
-        assert_eq!(
-            selection_text(&win, origin, (13, 6), (10, 5)).unwrap(),
-            "hello world\nseco"
-        );
-        // entirely above the window: nothing to copy
-        assert!(selection_text(&win, origin, (10, 0), (12, 1)).is_none());
-    }
-
-    #[test]
-    fn title_arrows_render_only_in_mouse_mode() {
+    fn title_arrows_render_and_record_click_zones() {
         use ratatui::backend::TestBackend;
         let mut t = Transcript::default();
         t.set_width(80);
         t.push(Line::User("hello".into()));
-        let draw = |mouse: bool| -> (String, Option<TitleArrows>) {
-            let mut terminal = ratatui::Terminal::new(TestBackend::new(120, 40)).unwrap();
-            let sidebar_zone: std::cell::Cell<Option<SidebarZone>> = std::cell::Cell::new(None);
-            let title_arrows: std::cell::Cell<Option<TitleArrows>> = std::cell::Cell::new(None);
-            let sel: Option<TextSel> = None;
-            let frame_window: std::cell::RefCell<Vec<ratatui::text::Line<'static>>> =
-                std::cell::RefCell::new(Vec::new());
-            let frame_origin: std::cell::Cell<(u16, u16)> = std::cell::Cell::new((0, 0));
+        let mut terminal = ratatui::Terminal::new(TestBackend::new(120, 40)).unwrap();
+        let sidebar_zone: std::cell::Cell<Option<SidebarZone>> = std::cell::Cell::new(None);
+        let title_arrows: std::cell::Cell<Option<TitleArrows>> = std::cell::Cell::new(None);
+        terminal
+            .draw(|f| {
+                super::render(
+                    f,
+                    &mut t,
+                    None,
+                    "",
+                    0,
+                    false,
+                    None,
+                    Instant::now(),
+                    0,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    &Meters::default(),
+                    &SidebarState::default(),
+                    true,
+                    &sidebar_zone,
+                    &title_arrows,
+                    &std::cell::Cell::new(0u16),
+                )
+            })
+            .unwrap();
+        let row: String = (0..120u16)
+            .map(|x| terminal.backend().buffer()[(x, 1)].symbol())
+            .collect();
+        assert!(row.contains('▲') && row.contains('▼'), "{row}");
+        assert!(title_arrows.get().is_some(), "click zones recorded");
+    }
+
+    #[test]
+    fn live_band_stays_inside_the_transcript_across_resizes() {
+        use ratatui::backend::TestBackend;
+        // a cached tool row plus a live block streaming wide chars and a
+        // 200-col token, while the terminal drags across the sidebar
+        // threshold: the band must fold at each frame's own width (no
+        // wrap-driven row drift, no band/surface bg outside the
+        // transcript pane)
+        let mut t = Transcript::default();
+        t.push(Line::Tool("→ bash ✓ done".into()));
+        let live = LiveBlock {
+            thought: "thinking".into(),
+            tool_header: "→ bash · cargo build".into(),
+            live_tool: Some(LiveTool {
+                id: "c1".into(),
+                preview: vec![
+                    format!("{} {}", "世界".repeat(30), "x".repeat(200)),
+                    "second line".to_string(),
+                ],
+                last: None,
+            }),
+            md: crate::markdown::render("# heading\ntext", 60),
+        };
+        for width in [99u16, 100, 101] {
+            let mut terminal = ratatui::Terminal::new(TestBackend::new(width, 24)).unwrap();
+            let sb_zone = std::cell::Cell::new(None::<SidebarZone>);
             terminal
                 .draw(|f| {
                     super::render(
                         f,
-                        &t,
+                        &mut t,
                         None,
                         "",
                         0,
-                        false,
-                        None,
+                        true,
+                        Some(Instant::now()),
                         Instant::now(),
                         0,
                         None,
-                        None,
+                        Some(&live),
                         None,
                         None,
                         None,
@@ -11491,27 +11843,41 @@ mod tests {
                         None,
                         &Meters::default(),
                         &SidebarState::default(),
-                        true,
-                        &sidebar_zone,
-                        &title_arrows,
-                        &sel,
-                        &frame_window,
-                        &frame_origin,
-                        mouse,
+                        false,
+                        &sb_zone,
+                        &std::cell::Cell::new(None::<TitleArrows>),
+                        &std::cell::Cell::new(0u16),
                     )
                 })
                 .unwrap();
-            let row: String = (0..120u16)
-                .map(|x| terminal.backend().buffer()[(x, 1)].symbol())
-                .collect();
-            (row, title_arrows.get())
-        };
-        let (row, zones) = draw(true);
-        assert!(row.contains('▲') && row.contains('▼'), "{row}");
-        assert!(zones.is_some(), "click zones recorded in mouse mode");
-        let (row, zones) = draw(false);
-        assert!(!row.contains('▲'), "native mode paints no arrows: {row}");
-        assert!(zones.is_none(), "native mode records no click zones");
+            let buf = terminal.backend().buffer();
+            let area = buf.area;
+            // band keeps its header + PREVIEW_WINDOW rows at every width
+            let band_rows = (0..area.height)
+                .filter(|&y| (0..area.width).any(|x| buf[(x, y)].bg == crate::palette::BG_TOOL))
+                .count();
+            assert_eq!(band_rows, 1 + PREVIEW_WINDOW, "band rows at width {width}");
+            // nothing band- or output-colored lands at or right of the
+            // sidebar's left border column once the sidebar shows
+            if width >= SIDEBAR_MIN_WIDTH {
+                let sb_left = area.width - SIDEBAR_WIDTH - 1;
+                for y in 0..area.height {
+                    for x in sb_left..area.width {
+                        let cell = &buf[(x, y)];
+                        assert_ne!(
+                            cell.bg,
+                            crate::palette::BG_TOOL,
+                            "tool bleed at {x},{y} w{width}"
+                        );
+                        assert_ne!(
+                            cell.bg,
+                            crate::palette::BG_OUTPUT,
+                            "output bleed at {x},{y} w{width}"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[test]
@@ -11567,17 +11933,78 @@ mod tests {
                         role: "digest".into(),
                         content: String::new(),
                         digest: true,
+                        thinking: None,
+                        calls: Vec::new(),
                     },
                     ka_protocol::ReplayedMessage {
                         role: "user".into(),
                         content: "after the digest".into(),
                         digest: false,
+                        thinking: None,
+                        calls: Vec::new(),
                     },
                 ],
             },
         );
         let text = format!("{:?}", lines.entries());
         assert!(text.contains("digest"), "{text:?}");
+        assert!(text.contains("after the digest"), "{text:?}");
+    }
+
+    #[test]
+    fn replay_renders_thought_tool_rows_and_assistant_text() {
+        let mut lines = Transcript::default();
+        feed(
+            &mut lines,
+            &Event::Replay {
+                messages: vec![
+                    ka_protocol::ReplayedMessage {
+                        role: "user".into(),
+                        content: "list files".into(),
+                        digest: false,
+                        thinking: None,
+                        calls: Vec::new(),
+                    },
+                    ka_protocol::ReplayedMessage {
+                        role: "assistant".into(),
+                        content: "found it".into(),
+                        digest: false,
+                        thinking: Some("scanning the tree".into()),
+                        calls: vec![ka_protocol::ReplayedCall {
+                            id: "c1".into(),
+                            tool: "read".into(),
+                            detail: "lib.rs".into(),
+                            result: Some("fn main() {}".into()),
+                            is_error: false,
+                        }],
+                    },
+                ],
+            },
+        );
+        let text = format!("{:?}", lines.entries());
+        assert!(text.contains("scanning the tree"), "thought row: {text:?}");
+        assert!(text.contains("→ read · lib.rs"), "tool header: {text:?}");
+        assert!(
+            text.contains("✓ fn main() {}"),
+            "merged result note: {text:?}"
+        );
+        assert!(text.contains("found it"), "assistant text: {text:?}");
+    }
+
+    #[test]
+    fn seed_history_dedups_consecutive_and_caps() {
+        let mut b = InputBuffer::default();
+        b.seed_history(["a".into(), "a".into(), "b".into(), "a".into()]);
+        assert_eq!(b.history.len(), 3, "consecutive duplicates collapse");
+        b.history_prev();
+        assert_eq!(b.text, "a", "the newest seeded item recalls first");
+
+        // cap: 150 distinct prompts → the newest 100 survive
+        let mut c = InputBuffer::default();
+        c.seed_history((0..150).map(|i| format!("p{i}")));
+        assert_eq!(c.history.len(), 100);
+        c.history_prev();
+        assert_eq!(c.text, "p149", "newest survives the cap");
     }
 
     #[test]

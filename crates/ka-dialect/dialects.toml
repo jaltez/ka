@@ -1,5 +1,6 @@
 # ka dialect catalog — seed rows shipped in the binary.
-# Pricing values are PLACEHOLDERS: verify against vendor pricing before any release.
+# Rows default to placeholder pricing (priced = false — surfaces never show
+# costs from unverified rows); vendor-verified rows set priced = true.
 
 [dialects."anthropic/claude-sonnet-5"]
 wire = "anthropic_messages"
@@ -80,3 +81,16 @@ input = ["text", "image"]
 cache = "off"
 ratio = 4.0
 priced = false
+
+[dialects."deepseek/deepseek-flash"]
+wire = "openai_chat"
+base_url = "https://api.deepseek.com"
+api_key_env = "DEEPSEEK_API_KEY"
+doc_url = "https://api-docs.deepseek.com/quick_start/pricing"
+context = 1_000_000
+max_output = 384_000
+input = ["text", "image"]
+priced = true
+[dialects."deepseek/deepseek-flash".price]
+input_per_mtok = 0.30
+output_per_mtok = 1.20

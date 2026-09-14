@@ -995,7 +995,7 @@ async fn run_tui(cli: Cli) -> Result<ExitCode, String> {
             .map(|a| (a.name, a.description))
             .collect()
     };
-    let (cfg_tui_header_glyph, tui_notify) = {
+    let (cfg_tui_header_glyph, tui_notify, tui_mouse_capture) = {
         let trust = trust_for_cwd(false);
         load_config(&cli.configs, cli.model.clone(), cli.mode.clone(), trust)
             .map(|c| {
@@ -1005,6 +1005,7 @@ async fn run_tui(cli: Cli) -> Result<ExitCode, String> {
                         bell: c.effective_bell(),
                         command: c.tui.notify.clone(),
                     },
+                    c.effective_mouse_capture(),
                 )
             })
             .unwrap_or_else(|_| {
@@ -1014,6 +1015,7 @@ async fn run_tui(cli: Cli) -> Result<ExitCode, String> {
                         bell: true,
                         command: None,
                     },
+                    true,
                 )
             })
     };
@@ -1026,6 +1028,7 @@ async fn run_tui(cli: Cli) -> Result<ExitCode, String> {
         agents,
         &cfg_tui_header_glyph,
         tui_notify,
+        tui_mouse_capture,
         fresh,
     )
     .await

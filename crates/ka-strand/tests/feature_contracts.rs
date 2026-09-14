@@ -34,6 +34,7 @@ fn append_reopen_replays_records() {
             content: "hello world".into(),
             calls: Vec::new(),
             results: Vec::new(),
+            thinking: None,
         })
         .unwrap();
     let path = strand.path().unwrap().to_path_buf();
@@ -66,6 +67,7 @@ fn render_markdown_includes_roles_and_content() {
             content: "what is this repo".into(),
             calls: Vec::new(),
             results: Vec::new(),
+            thinking: None,
         },
         Record::Message {
             id: ka_strand::new_record_id(),
@@ -73,6 +75,7 @@ fn render_markdown_includes_roles_and_content() {
             content: "a rust workspace".into(),
             calls: Vec::new(),
             results: Vec::new(),
+            thinking: None,
         },
     ];
     let md = ka_strand::render_markdown(&records);
@@ -103,6 +106,7 @@ fn resolve_id_unique_ambiguous_none() {
                 content: "materialize".into(),
                 calls: Vec::new(),
                 results: Vec::new(),
+                thinking: None,
             })
             .unwrap();
     }
@@ -160,6 +164,7 @@ fn synthesize_aborted_marks_dangling_turn() {
             content: "start something".into(),
             calls: Vec::new(),
             results: Vec::new(),
+            thinking: None,
         })
         .unwrap();
     let path = strand.path().unwrap().to_path_buf();
@@ -203,6 +208,7 @@ fn fork_parent_pointer_survives_listing() {
             content: "trunk conversation".into(),
             calls: Vec::new(),
             results: Vec::new(),
+            thinking: None,
         })
         .unwrap();
     drop(parent);
@@ -218,6 +224,7 @@ fn fork_parent_pointer_survives_listing() {
             content: "offshoot".into(),
             calls: Vec::new(),
             results: Vec::new(),
+            thinking: None,
         })
         .unwrap();
     drop(child);

@@ -26,7 +26,7 @@ pub async fn run(net: bool, json: bool) -> Result<ExitCode, String> {
         detail: match crate::PUBLIC_KEY {
             Some(_) => format!("{} (signed build)", env!("KA_VERSION")),
             None => format!(
-                "{} (unsigned build — `ka update` disabled)",
+                "{} (unsigned build — `ka update` verifies sha256 only)",
                 env!("KA_VERSION")
             ),
         },

@@ -1,7 +1,8 @@
-//! `ka update`: self-update against GitHub releases. Artifacts are
-//! ed25519-signed (see `cargo xtask sign`); this module refuses to
-//! touch an unsigned build and verifies every download before the
-//! atomic binary swap.
+//! `ka update`: self-update against GitHub releases. Signed release
+//! builds verify every download against the embedded ed25519 public key
+//! (see `cargo xtask sign`); unsigned (e.g. cargo-installed) builds fall
+//! back to the CI-published `.sha256` checksum. Either way the artifact
+//! is verified before the atomic binary swap.
 //!
 //! Layout: the CI release pipeline tags `vX.Y.Z` (assets
 //! `ka-<triple>.tar.gz` + `.sig` + `.sha256`); the legacy
@@ -125,10 +126,17 @@ pub async fn check_and_install(
     check_only: bool,
 ) -> Result<UpdateOutcome, String> {
     let old_version = current_version();
-    let Some(pubkey) = pubkey else {
-        return Err("unsigned build: refusing to update (rebuild with KA_PUBKEY set)".to_string());
+    let verifying = match pubkey {
+        Some(pk) => Some(verifying_key(pk)?),
+        None => {
+            eprintln!(
+                "ka: unsigned build (cargo install builds carry no release key): \
+                 verifying sha256 only. For signature-verified self-updates \
+                 install a release binary: https://github.com/jaltez/ka/releases"
+            );
+            None
+        }
     };
-    let verifying = verifying_key(pubkey)?;
 
     let client = reqwest::Client::new();
     let url = format!("{api_base}/repos/{repo}/releases");
@@ -209,10 +217,18 @@ pub async fn check_and_install(
         }
     };
     let tarball = download(tar_url).await?;
-    let sig_bytes = download(sig_url).await?;
-    let sig_b64 = String::from_utf8_lossy(&sig_bytes).into_owned();
-
-    verify(&tarball, sig_b64.trim(), &verifying)?;
+    match &verifying {
+        Some(key) => {
+            let sig_bytes = download(sig_url).await?;
+            let sig_b64 = String::from_utf8_lossy(&sig_bytes).into_owned();
+            verify(&tarball, sig_b64.trim(), key)?;
+        }
+        None => {
+            let sha_bytes = download(asset_url(&format!("{asset_name}.sha256"))?).await?;
+            let sha_text = String::from_utf8_lossy(&sha_bytes).into_owned();
+            verify_checksum(&tarball, &sha_text)?;
+        }
+    }
 
     if check_only {
         return Ok(UpdateOutcome {
@@ -305,6 +321,25 @@ fn verify(payload: &[u8], sig_b64: &str, verifying: &VerifyingKey) -> Result<(),
     Ok(())
 }
 
+/// Verify tarball bytes against a CI-published `sha256sum` line
+/// (hex digest as the first whitespace token).
+fn verify_checksum(payload: &[u8], sha_line: &str) -> Result<(), String> {
+    use sha2::{Digest, Sha256};
+    let expected = sha_line
+        .split_whitespace()
+        .next()
+        .ok_or_else(|| "checksum asset: empty".to_string())?;
+    let mut hasher = Sha256::new();
+    hasher.update(payload);
+    let got = format!("{:x}", hasher.finalize());
+    if got != expected.to_ascii_lowercase() {
+        return Err(format!(
+            "update checksum mismatch: expected {expected}, got {got}"
+        ));
+    }
+    Ok(())
+}
+
 fn verifying_key(pubkey_b64: &str) -> Result<VerifyingKey, String> {
     let bytes: [u8; 32] = unb64(pubkey_b64)
         .ok_or_else(|| "KA_PUBKEY: not base64".to_string())?
@@ -389,6 +424,7 @@ mod tests {
         server_addr: std::net::SocketAddr,
         tarball: Vec<u8>,
         sig: String,
+        sha: String,
         wrong_sig: bool,
     ) {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -417,7 +453,9 @@ mod tests {
                         {"name": format!("ka-{TARGET}.tar.gz"),
                          "browser_download_url": format!("http://{server_addr}/artifact")},
                         {"name": format!("ka-{TARGET}.tar.gz.sig"),
-                         "browser_download_url": format!("http://{server_addr}/signature")}
+                         "browser_download_url": format!("http://{server_addr}/signature")},
+                        {"name": format!("ka-{TARGET}.tar.gz.sha256"),
+                         "browser_download_url": format!("http://{server_addr}/checksum")}
                     ]}
                 ]);
                 releases.to_string().into_bytes()
@@ -429,6 +467,8 @@ mod tests {
                 } else {
                     format!("{sig}\n").into_bytes()
                 }
+            } else if req.starts_with("GET /checksum") {
+                format!("{sha}\n").into_bytes()
             } else {
                 b"not found".to_vec()
             };
@@ -484,6 +524,7 @@ mod tests {
             addr,
             tampered_tarball,
             sig.clone(),
+            String::new(),
             false,
         ));
 
@@ -517,6 +558,7 @@ mod tests {
             addr,
             tarball.clone(),
             sig.clone(),
+            String::new(),
             true,
         ));
         let err = check_and_install(
@@ -540,6 +582,7 @@ mod tests {
             addr,
             tarball.clone(),
             sig.clone(),
+            String::new(),
             false,
         ));
         let outcome = check_and_install(
@@ -562,7 +605,14 @@ mod tests {
         // check-only: reports without touching the exe
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        tokio::spawn(fixture_server(listener, addr, tarball, sig, false));
+        tokio::spawn(fixture_server(
+            listener,
+            addr,
+            tarball,
+            sig,
+            String::new(),
+            false,
+        ));
         let outcome = check_and_install(
             &format!("http://{addr}"),
             "owner/ka",
@@ -580,26 +630,95 @@ mod tests {
         let _ = std::fs::remove_dir_all(&work);
     }
 
+    fn sha256_hex(data: &[u8]) -> String {
+        use sha2::{Digest, Sha256};
+        let mut h = Sha256::new();
+        h.update(data);
+        format!("{:x}", h.finalize())
+    }
+
+    /// Unsigned builds update via the published sha256: correct digest
+    /// installs, wrong digest refuses without touching the exe.
     #[tokio::test]
-    async fn unsigned_build_refuses_before_network() {
+    async fn unsigned_build_verifies_sha256() {
         let work = std::env::temp_dir().join(format!("ka-update-unsigned-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&work);
         std::fs::create_dir_all(&work).unwrap();
+
+        let marker = "KA-BINARY-V999-UNSIGNED\n";
+        let tarball = make_tarball(&work, marker);
+        let good_sha = sha256_hex(&tarball);
+
+        let state = work.join("state");
+        let exe = work.join("installed-ka");
+        std::fs::write(&exe, "OLD").unwrap();
+
+        // wrong digest: refuse, exe untouched
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(fixture_server(
+            listener,
+            addr,
+            tarball.clone(),
+            String::new(),
+            format!("{:0>64}", "0"),
+            false,
+        ));
         let err = check_and_install(
-            "http://127.0.0.1:1",
+            &format!("http://{addr}"),
             "owner/ka",
             "stable",
             None,
-            &work,
-            &work.join("ka"),
+            &state,
+            &exe,
             false,
         )
         .await
         .unwrap_err();
-        assert!(err.contains("unsigned build"), "{err}");
+        assert!(err.contains("checksum mismatch"), "{err}");
+        assert_eq!(std::fs::read(&exe).unwrap(), b"OLD");
+
+        // correct digest: installs
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(fixture_server(
+            listener,
+            addr,
+            tarball,
+            String::new(),
+            good_sha,
+            false,
+        ));
+        let outcome = check_and_install(
+            &format!("http://{addr}"),
+            "owner/ka",
+            "stable",
+            None,
+            &state,
+            &exe,
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(outcome.latest_tag, "ka-stable-9.9.9");
+        assert_eq!(std::fs::read(&exe).unwrap(), marker.as_bytes());
+
         let _ = std::fs::remove_dir_all(&work);
     }
 
+    #[test]
+    fn checksum_parses_first_token_case_insensitive() {
+        assert!(verify_checksum(b"abc", &format!("{}\n", sha256_hex(b"abc"))).is_ok());
+        assert!(
+            verify_checksum(
+                b"abc",
+                &format!("  {}  extra", sha256_hex(b"abc").to_uppercase())
+            )
+            .is_ok()
+        );
+        assert!(verify_checksum(b"abc", "deadbeef").is_err());
+        assert!(verify_checksum(b"abc", "").is_err());
+    }
     #[test]
     fn version_triples_parse_all_release_shapes() {
         assert_eq!(version_triple("v0.2.0"), Some((0, 2, 0)));

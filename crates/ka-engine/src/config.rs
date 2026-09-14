@@ -225,6 +225,12 @@ pub struct Tui {
     /// `{"event":"turn_finished","stop":"done"}`. Example:
     /// `notify-send ka "turn done"`.
     pub notify: Option<String>,
+    /// Mouse mode: `"capture"` (default) — the wheel scrolls the chat,
+    /// ▲▼/skills-header clicks work, and ⇧drag selects natively; or
+    /// `"native"` — no capture at all, so plain drag selects and
+    /// pastes with the terminal's own bindings (chat scrolls with
+    /// PgUp/PgDn). `/mouse` toggles at runtime either way.
+    pub mouse: Option<String>,
 }
 
 impl Sandbox {
@@ -443,6 +449,9 @@ impl Config {
         if other.tui.notify.is_some() {
             self.tui.notify = other.tui.notify;
         }
+        if other.tui.mouse.is_some() {
+            self.tui.mouse = other.tui.mouse;
+        }
         if other.tools.mcp.discovery.is_some() {
             self.tools.mcp.discovery = other.tools.mcp.discovery;
         }
@@ -488,6 +497,12 @@ impl Config {
     /// Whether the bell rings on turn completion and asks (default true).
     pub fn effective_bell(&self) -> bool {
         self.tui.bell.unwrap_or(true)
+    }
+
+    /// Whether the TUI starts with the mouse captured (default true).
+    /// `[tui] mouse = "native"` opts into plain terminal selection.
+    pub fn effective_mouse_capture(&self) -> bool {
+        self.tui.mouse.as_deref() != Some("native")
     }
 
     /// Whether web fetches may target private hosts (default false).

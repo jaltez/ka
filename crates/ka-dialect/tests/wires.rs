@@ -177,6 +177,7 @@ fn request(dialect: Dialect, system: &str) -> SpeakRequest {
             content: "hi".to_string(),
             calls: Vec::new(),
             results: Vec::new(),
+            thinking: None,
             images: Vec::new(),
         }],
         tools: Vec::new(),

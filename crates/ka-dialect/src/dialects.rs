@@ -295,13 +295,38 @@ mod tests {
     use super::*;
 
     #[test]
-    fn seeded_rows_are_unpriced_placeholders() {
-        // curated rows still carry placeholder pricing (priced = false);
-        // the models.dev overlay may price its own rows for real
+    fn seeded_rows_never_fabricate_pricing() {
+        // curated rows default to placeholder pricing (priced = false);
+        // a seed row may claim real pricing only with positive price fields
         let c = Catalog::parse(EMBEDDED).unwrap();
         for (id, d) in &c.dialects {
-            assert!(!d.priced, "{id} seeds placeholder pricing");
+            if d.priced {
+                assert!(
+                    d.price.input_per_mtok > 0.0,
+                    "{id} priced without input cost"
+                );
+                assert!(
+                    d.price.output_per_mtok > 0.0,
+                    "{id} priced without output cost"
+                );
+            }
         }
+    }
+
+    #[test]
+    fn deepseek_flash_row_is_verified_and_priced() {
+        let c = Catalog::embedded();
+        let d = c
+            .get("deepseek/deepseek-flash")
+            .expect("deepseek-flash row");
+        assert_eq!(d.wire, Wire::OpenaiChat);
+        assert_eq!(d.base_url.as_deref(), Some("https://api.deepseek.com"));
+        assert_eq!(d.api_key_env.as_deref(), Some("DEEPSEEK_API_KEY"));
+        assert_eq!(d.context, 1_000_000);
+        assert_eq!(d.max_output, 384_000);
+        assert!(d.priced, "peak pricing is vendor-verified");
+        assert_eq!(d.price.input_per_mtok, 0.30);
+        assert_eq!(d.price.output_per_mtok, 1.20);
     }
 
     #[test]

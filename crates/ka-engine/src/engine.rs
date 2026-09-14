@@ -191,6 +191,7 @@ fn history_from_records(
                 content,
                 calls,
                 results,
+                thinking,
                 ..
             } => {
                 let turn_role = match role {
@@ -204,6 +205,7 @@ fn history_from_records(
                 out.push(TurnMessage {
                     role: turn_role,
                     content: content.clone(),
+                    thinking: thinking.clone(),
                     calls: calls
                         .iter()
                         .map(|c| ToolCall {
@@ -262,6 +264,7 @@ fn record_from_message(msg: &ka_dialect::speaker::TurnMessage) -> ka_strand::Rec
         id: ka_strand::new_record_id(),
         role,
         content: msg.content.clone(),
+        thinking: msg.thinking.clone(),
         calls: msg
             .calls
             .iter()
@@ -281,6 +284,75 @@ fn record_from_message(msg: &ka_dialect::speaker::TurnMessage) -> ka_strand::Rec
             })
             .collect(),
     }
+}
+
+/// Build the replay payload from live history: assistant rows carry
+/// thinking and their tool calls; tool-role messages merge their
+/// excerpts into the matching call's row. Rows with no content, no
+/// thinking, and no calls vanish (pure carriers fold into the calls
+/// they answer).
+fn replay_messages(
+    history: &[ka_dialect::speaker::TurnMessage],
+) -> Vec<ka_protocol::ReplayedMessage> {
+    use ka_dialect::speaker::TurnRole;
+    use std::collections::HashMap;
+    let mut out: Vec<ka_protocol::ReplayedMessage> = Vec::new();
+    // call id -> (message index, call index) within `out`
+    let mut pending: HashMap<String, (usize, usize)> = HashMap::new();
+    for m in history {
+        match m.role {
+            TurnRole::Tool => {
+                for r in &m.results {
+                    if let Some(&(mi, ci)) = pending.get(&r.call_id) {
+                        let call = &mut out[mi].calls[ci];
+                        call.result = Some(replay_excerpt(&r.content));
+                        call.is_error = r.is_error;
+                    }
+                }
+            }
+            role => {
+                let calls: Vec<ka_protocol::ReplayedCall> = m
+                    .calls
+                    .iter()
+                    .map(|c| ka_protocol::ReplayedCall {
+                        id: c.id.clone(),
+                        tool: c.tool.clone(),
+                        detail: crate::voice::call_detail(&c.tool, &c.arguments),
+                        result: None,
+                        is_error: false,
+                    })
+                    .collect();
+                let mi = out.len();
+                for (ci, c) in m.calls.iter().enumerate() {
+                    pending.insert(c.id.clone(), (mi, ci));
+                }
+                out.push(ka_protocol::ReplayedMessage {
+                    role: match role {
+                        TurnRole::User => "user",
+                        _ => "assistant",
+                    }
+                    .to_string(),
+                    content: m.content.clone(),
+                    digest: false,
+                    thinking: m.thinking.clone().filter(|t| !t.trim().is_empty()),
+                    calls,
+                });
+            }
+        }
+    }
+    out.retain(|m| !m.content.trim().is_empty() || !m.calls.is_empty() || m.thinking.is_some());
+    out
+}
+
+/// First non-empty line of a tool output, capped at 120 chars — the
+/// compact replay note (the TUI finish-row excerpt's shape).
+fn replay_excerpt(s: &str) -> String {
+    let line = s
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .unwrap_or("");
+    line.chars().take(120).collect()
 }
 
 /// Live engine settings, derived from the initial config and mutated by
@@ -1493,22 +1565,11 @@ async fn attach_strand(
             role: "digest".to_string(),
             content: String::new(),
             digest: true,
+            thinking: None,
+            calls: Vec::new(),
         });
     }
-    messages.extend(
-        voice
-            .history
-            .iter()
-            .filter(|m| !m.content.trim().is_empty())
-            .map(|m| ka_protocol::ReplayedMessage {
-                role: match m.role {
-                    ka_dialect::speaker::TurnRole::User => "user".to_string(),
-                    _ => "assistant".to_string(),
-                },
-                content: m.content.clone(),
-                digest: false,
-            }),
-    );
+    messages.extend(replay_messages(&voice.history));
     events.send(Event::Replay { messages }).await.ok();
     Ok(strand)
 }
@@ -3617,6 +3678,7 @@ mod tests {
                 content: "hello".into(),
                 calls: Vec::new(),
                 results: Vec::new(),
+                thinking: None,
             })
             .unwrap();
 
@@ -3636,5 +3698,65 @@ mod tests {
         });
         assert_eq!(child_parent.as_deref(), Some(parent_id.as_str()));
         let _ = std::fs::remove_dir_all(&work);
+    }
+
+    #[test]
+    fn replay_messages_merge_tool_results_into_calls() {
+        use ka_dialect::speaker::{ToolCall, ToolResult, TurnMessage};
+        let history = vec![
+            TurnMessage::user("list files"),
+            TurnMessage {
+                role: ka_dialect::speaker::TurnRole::Assistant,
+                content: String::new(),
+                thinking: Some("scan".into()),
+                calls: vec![ToolCall {
+                    id: "c1".into(),
+                    tool: "read".into(),
+                    arguments: serde_json::json!({"path": "lib.rs"}),
+                }],
+                results: Vec::new(),
+                images: Vec::new(),
+            },
+            TurnMessage::tool(vec![ToolResult {
+                call_id: "c1".into(),
+                content: "line one\nline two".into(),
+                is_error: false,
+                images: Vec::new(),
+            }]),
+            TurnMessage::assistant("found it"),
+        ];
+        let msgs = super::replay_messages(&history);
+        // the calls-only assistant turn survives (it carries calls + a
+        // thought); the tool-role message emits no row of its own
+        assert_eq!(msgs.len(), 3, "{msgs:?}");
+        let call_row = &msgs[1];
+        assert!(call_row.content.is_empty());
+        assert_eq!(call_row.thinking.as_deref(), Some("scan"));
+        let call = &call_row.calls[0];
+        assert_eq!(call.id, "c1");
+        assert_eq!(call.tool, "read");
+        assert!(call.detail.contains("lib.rs"), "detail: {}", call.detail);
+        assert_eq!(
+            call.result.as_deref(),
+            Some("line one"),
+            "first-line excerpt"
+        );
+        assert!(!call.is_error);
+    }
+
+    #[test]
+    fn record_and_history_roundtrip_thinking() {
+        let msg = ka_dialect::speaker::TurnMessage {
+            role: ka_dialect::speaker::TurnRole::Assistant,
+            content: "answer".into(),
+            thinking: Some("pondering".into()),
+            calls: Vec::new(),
+            results: Vec::new(),
+            images: Vec::new(),
+        };
+        let record = super::record_from_message(&msg);
+        let (history, _, _) = super::history_from_records(&[record]);
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].thinking.as_deref(), Some("pondering"));
     }
 }

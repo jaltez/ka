@@ -785,6 +785,7 @@ impl Voice {
         TurnMessage {
             role: m.role,
             content: cap(&m.content),
+            thinking: None,
             calls: m
                 .calls
                 .iter()
@@ -1360,6 +1361,10 @@ attempt implementation — the user will review and switch to build mode.",
         self.state.loop_counts.clear();
         let mut usage_total = Usage::default();
         let mut assistant_text = String::new();
+        // the closing (text-only) round's thinking: step rounds attach
+        // theirs to the step push, but the final push used to drop it —
+        // the "thoughts vanish after resume" bug
+        let mut closing_thinking = String::new();
         let mut final_stop = Stop::Done;
         let mut steps = 0u32;
         let mut overflow_retried = false;
@@ -1388,6 +1393,7 @@ attempt implementation — the user will review and switch to build mode.",
 
             let mut step_calls: Vec<ToolCall> = Vec::new();
             let mut step_text = String::new();
+            let mut step_thought = String::new();
             let mut step_failed: Option<(ErrorClass, String, bool)> = None;
             let mut step_finished = false;
 
@@ -1440,6 +1446,7 @@ attempt implementation — the user will review and switch to build mode.",
                                 events.send(Event::Delta { kind: ka_protocol::DeltaKind::Text(t) }).await.ok();
                             }
                             StreamEvent::Thought(t) => {
+                                step_thought.push_str(&t);
                                 events.send(Event::Delta { kind: ka_protocol::DeltaKind::Thought(t) }).await.ok();
                             }
                             StreamEvent::Call(call) => {
@@ -1689,6 +1696,7 @@ attempt implementation — the user will review and switch to build mode.",
             }
 
             if step_calls.is_empty() || steps >= self.max_steps {
+                closing_thinking = std::mem::take(&mut step_thought);
                 break 'outer;
             }
 
@@ -1696,10 +1704,15 @@ attempt implementation — the user will review and switch to build mode.",
             // permission asks must remain one-at-a-time UX — then the
             // approved calls run concurrently and results are reassembled
             // in original call order.
-            self.history.push(TurnMessage::assistant_with_calls(
-                step_text.clone(),
-                step_calls.clone(),
-            ));
+            let step_thinking = (!step_thought.trim().is_empty()).then(|| step_thought.clone());
+            self.history.push(TurnMessage {
+                role: TurnRole::Assistant,
+                content: step_text.clone(),
+                thinking: step_thinking,
+                calls: step_calls.clone(),
+                results: Vec::new(),
+                images: Vec::new(),
+            });
             let mut slots: Vec<Option<ToolOutput>> = vec![None; step_calls.len()];
             let mut approved: Vec<(usize, std::sync::Arc<dyn Hand>)> = Vec::new();
             for (idx, call) in step_calls.iter().enumerate() {
@@ -1918,12 +1931,20 @@ attempt implementation — the user will review and switch to build mode.",
         };
 
         if final_stop != Stop::Aborted {
-            self.history
-                .push(TurnMessage::assistant(if assistant_text.is_empty() {
+            let thinking = (!closing_thinking.trim().is_empty())
+                .then(|| std::mem::take(&mut closing_thinking));
+            self.history.push(TurnMessage {
+                role: TurnRole::Assistant,
+                content: if assistant_text.is_empty() {
                     "(no text)".to_string()
                 } else {
                     assistant_text.clone()
-                }));
+                },
+                thinking,
+                calls: Vec::new(),
+                results: Vec::new(),
+                images: Vec::new(),
+            });
         }
         // run a staged pre-finish future (engine auto-commit) ahead of
         // the terminal event, so its notes precede TurnFinished
@@ -2703,7 +2724,7 @@ async fn wait_or_cancel(
 /// bash → the command flattened to one line (≤48 cols), file tools → the
 /// path's last segment (≤32), searches → the pattern (≤32), anything
 /// else empty (the header shows the bare tool name).
-fn call_detail(tool: &str, arguments: &serde_json::Value) -> String {
+pub(crate) fn call_detail(tool: &str, arguments: &serde_json::Value) -> String {
     let str_arg = |key: &str| arguments.get(key).and_then(serde_json::Value::as_str);
     match tool {
         "bash" => str_arg("command")
@@ -5245,6 +5266,69 @@ mod tests {
         voice.note_context_for_tests(400_000);
         assert!(!voice.context_pressure_frac(1_000_000, 80));
         assert!(!voice.start_speculative(None));
+    }
+
+    /// Regression for "thinking blocks disappear when resuming": the
+    /// CLOSING (text-only) round's reasoning used to be dropped from the
+    /// final history push — step rounds kept theirs, so thoughts vanished
+    /// from replay for every turn that ended without tool calls (most).
+    #[tokio::test]
+    async fn closing_round_thinking_persists_in_history() {
+        use ka_dialect::speaker::{SpeakFuture, SpeakRequest, Speaker, StreamEvent};
+        struct Thinker;
+        impl Speaker for Thinker {
+            fn speak<'a>(
+                &'a self,
+                _req: SpeakRequest,
+                out: tokio::sync::mpsc::Sender<StreamEvent>,
+            ) -> SpeakFuture<'a> {
+                Box::pin(async move {
+                    out.send(StreamEvent::Thought("let me think this through".into()))
+                        .await
+                        .ok();
+                    out.send(StreamEvent::Text("the answer".into())).await.ok();
+                    out.send(StreamEvent::Finished {
+                        stop: Stop::Done,
+                        usage: Usage::default(),
+                    })
+                    .await
+                    .ok();
+                })
+            }
+        }
+        let catalog = Catalog::parse(
+            "[dialects.\"test/m\"]\nwire = \"openai_chat\"\nbase_url = \"http://127.0.0.1:1\"\ncontext = 1000000\n",
+        )
+        .unwrap();
+        let mut voice = Voice::new(catalog, std::env::temp_dir(), ka_protocol::Mode::Free, 5)
+            .with_speaker(Wire::OpenaiChat, std::sync::Arc::new(Thinker));
+        let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::channel(16);
+        let (evt_tx, _evt_rx) = tokio::sync::mpsc::channel(256);
+        let mut inter = Vec::new();
+        let mut defers = std::collections::VecDeque::new();
+        let mut guards = GuardRuntime::default();
+        voice
+            .turn(
+                "test/m",
+                "ask".into(),
+                &mut cmd_rx,
+                &evt_tx,
+                &mut inter,
+                &mut defers,
+                &mut guards,
+                None,
+                Vec::new(),
+            )
+            .await;
+        drop(cmd_tx);
+        let last = voice.history.last().expect("final assistant push");
+        assert_eq!(last.role, ka_dialect::speaker::TurnRole::Assistant);
+        assert_eq!(last.content, "the answer");
+        assert_eq!(
+            last.thinking.as_deref(),
+            Some("let me think this through"),
+            "closing-round thinking must persist for replay"
+        );
     }
 
     #[tokio::test]

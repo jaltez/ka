@@ -285,6 +285,22 @@ pub enum Command {
     },
 }
 
+/// One replayed tool call: the header the live turn showed plus its
+/// merged result note (filled in from the following tool message).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct ReplayedCall {
+    /// Engine call id.
+    pub id: String,
+    /// Tool name.
+    pub tool: String,
+    /// Argument summary (the CallStarted detail).
+    pub detail: String,
+    /// First-line result excerpt once the tool message landed.
+    pub result: Option<String>,
+    /// Whether the tool reported an error.
+    pub is_error: bool,
+}
+
 /// A replayed historical message (emitted on resume so surfaces can
 /// reconstruct the transcript).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
@@ -296,6 +312,13 @@ pub struct ReplayedMessage {
     /// Whether this row is a digest divider (additive).
     #[serde(default)]
     pub digest: bool,
+    /// Assistant reasoning captured with the message.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking: Option<String>,
+    /// Tool calls issued with this assistant message; their results
+    /// merge in from the following tool-role messages.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub calls: Vec<ReplayedCall>,
 }
 
 /// Per-MCP-server line of the bootstrap [`Event::Inventory`] card.
@@ -623,6 +646,23 @@ mod tests {
                 role: "user".into(),
                 content: "before the crash".into(),
                 digest: false,
+                thinking: None,
+                calls: Vec::new(),
+            }],
+        });
+        roundtrip_event(Event::Replay {
+            messages: vec![ReplayedMessage {
+                role: "assistant".into(),
+                content: String::new(),
+                digest: false,
+                thinking: Some("weighing options".into()),
+                calls: vec![ReplayedCall {
+                    id: "c1".into(),
+                    tool: "read".into(),
+                    detail: "lib.rs".into(),
+                    result: Some("fn main() {}".into()),
+                    is_error: false,
+                }],
             }],
         });
         roundtrip_event(Event::TurnStarted {

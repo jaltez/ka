@@ -20,6 +20,9 @@ pub struct TurnMessage {
     pub role: TurnRole,
     /// What they said (plain text; tool blocks are carried separately).
     pub content: String,
+    /// Reasoning captured alongside assistant text. Display-only:
+    /// persisted for session replay, never resent to the LLM.
+    pub thinking: Option<String>,
     /// Tool calls issued with this assistant message.
     pub calls: Vec<ToolCall>,
     /// Tool results carried by a `Tool`-role message.
@@ -37,6 +40,7 @@ impl TurnMessage {
         Self {
             role: TurnRole::User,
             content: content.into(),
+            thinking: None,
             calls: Vec::new(),
             results: Vec::new(),
             images: Vec::new(),
@@ -48,6 +52,7 @@ impl TurnMessage {
         Self {
             role: TurnRole::User,
             content: content.into(),
+            thinking: None,
             calls: Vec::new(),
             results: Vec::new(),
             images,
@@ -59,6 +64,7 @@ impl TurnMessage {
         Self {
             role: TurnRole::Assistant,
             content: content.into(),
+            thinking: None,
             calls: Vec::new(),
             results: Vec::new(),
             images: Vec::new(),
@@ -70,6 +76,7 @@ impl TurnMessage {
         Self {
             role: TurnRole::Assistant,
             content: content.into(),
+            thinking: None,
             calls,
             results: Vec::new(),
             images: Vec::new(),
@@ -81,6 +88,7 @@ impl TurnMessage {
         Self {
             role: TurnRole::Tool,
             content: String::new(),
+            thinking: None,
             calls: Vec::new(),
             results,
             images: Vec::new(),

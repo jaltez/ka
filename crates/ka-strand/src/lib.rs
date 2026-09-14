@@ -92,6 +92,9 @@ pub enum Record {
         /// Tool results carried by a tool-role message.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         results: Vec<StoredResult>,
+        /// Assistant reasoning captured with this message.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        thinking: Option<String>,
     },
     /// A settings change (model / effort / mode).
     Change {
@@ -381,6 +384,7 @@ impl StrandFile {
             content: "(turn interrupted)".to_string(),
             calls: Vec::new(),
             results: Vec::new(),
+            thinking: None,
         };
         self.append(record)?;
         self.settings.dangling = false;
@@ -871,6 +875,7 @@ mod tests {
                 content: "go".into(),
                 calls: Vec::new(),
                 results: Vec::new(),
+                thinking: None,
             })
             .unwrap();
         strand
@@ -884,6 +889,7 @@ mod tests {
                     arguments: serde_json::json!({"path": "x"}),
                 }],
                 results: Vec::new(),
+                thinking: None,
             })
             .unwrap();
         strand
@@ -897,6 +903,7 @@ mod tests {
                     content: "file body".into(),
                     is_error: false,
                 }],
+                thinking: None,
             })
             .unwrap();
         strand
@@ -929,6 +936,7 @@ mod tests {
                 content: "hello?".into(),
                 calls: Vec::new(),
                 results: Vec::new(),
+                thinking: None,
             })
             .unwrap();
         assert!(
@@ -962,6 +970,7 @@ mod tests {
                     content: prompt.into(),
                     calls: Vec::new(),
                     results: Vec::new(),
+                    thinking: None,
                 })
                 .unwrap();
         }
@@ -986,6 +995,7 @@ mod tests {
                 content: "first message".into(),
                 calls: Vec::new(),
                 results: Vec::new(),
+                thinking: None,
             })
             .unwrap();
         let path = strand.path().expect("materialized").to_path_buf();
@@ -1008,6 +1018,7 @@ mod tests {
                 content: "survives corruption".into(),
                 calls: Vec::new(),
                 results: Vec::new(),
+                thinking: None,
             })
             .unwrap();
         let path = strand.path().unwrap().to_path_buf();
@@ -1020,6 +1031,7 @@ mod tests {
                 content: "fine".into(),
                 calls: Vec::new(),
                 results: Vec::new(),
+                thinking: None,
             })
             .unwrap();
         drop(writer);
@@ -1050,6 +1062,7 @@ mod tests {
                 content: "kept".into(),
                 calls: Vec::new(),
                 results: Vec::new(),
+                thinking: None,
             })
             .unwrap();
         let path = strand.path().unwrap().to_path_buf();
@@ -1097,6 +1110,7 @@ mod tests {
                 content: prompt.into(),
                 calls: Vec::new(),
                 results: Vec::new(),
+                thinking: None,
             })
             .unwrap();
             strands.push(s);
@@ -1165,6 +1179,7 @@ mod tests {
                 content: "hi\n there".into(),
                 calls: Vec::new(),
                 results: Vec::new(),
+                thinking: None,
             },
             Record::Message {
                 id: new_record_id(),
@@ -1172,6 +1187,7 @@ mod tests {
                 content: "**bold**".into(),
                 calls: Vec::new(),
                 results: Vec::new(),
+                thinking: None,
             },
             Record::Digest {
                 id: new_record_id(),
@@ -1184,6 +1200,7 @@ mod tests {
                 content: "  ".into(),
                 calls: Vec::new(),
                 results: Vec::new(),
+                thinking: None,
             },
         ];
         let md = render_markdown(&records);
@@ -1212,6 +1229,41 @@ mod tests {
     }
 
     #[test]
+    fn thinking_roundtrips_and_stays_absent_when_none() {
+        let record = Record::Message {
+            id: new_record_id(),
+            role: Role::Assistant,
+            content: "answer".into(),
+            calls: Vec::new(),
+            results: Vec::new(),
+            thinking: Some("pondering".into()),
+        };
+        let line = serde_json::to_string(&record).unwrap();
+        assert!(line.contains("pondering"), "{line}");
+        let back: Record = serde_json::from_str(&line).unwrap();
+        assert_eq!(back, record);
+
+        // None never serializes (the JSONL stays minimal)…
+        let bare = serde_json::to_string(&Record::Message {
+            id: new_record_id(),
+            role: Role::Assistant,
+            content: "plain".into(),
+            calls: Vec::new(),
+            results: Vec::new(),
+            thinking: None,
+        })
+        .unwrap();
+        assert!(!bare.contains("thinking"), "{bare}");
+        // …and old strands written before the field parse as None
+        let old = r#"{"record":"message","id":"r1","role":"assistant","content":"old"}"#;
+        let parsed: Record = serde_json::from_str(old).unwrap();
+        match parsed {
+            Record::Message { thinking, .. } => assert!(thinking.is_none()),
+            other => panic!("expected message, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn list_sums_usage_and_honors_title_override() {
         let data = temp_data("usage-sum");
         let cwd = data.join("proj");
@@ -1225,6 +1277,7 @@ mod tests {
                     content: "question".into(),
                     calls: Vec::new(),
                     results: Vec::new(),
+                    thinking: None,
                 })
                 .unwrap();
             strand
@@ -1274,6 +1327,7 @@ mod tests {
                 content: "plain".into(),
                 calls: Vec::new(),
                 results: Vec::new(),
+                thinking: None,
             })
             .unwrap();
         let s = list(&cwd).unwrap().remove(0);
