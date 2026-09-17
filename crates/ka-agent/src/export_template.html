@@ -1,0 +1,60 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>__KA_TITLE__</title>
+<style>
+:root{color-scheme:light dark}
+body{margin:0 auto;max-width:52rem;padding:2rem 1.25rem 6rem;
+ font:16px/1.6 -apple-system,"Segoe UI",Roboto,Helvetica,Arial,sans-serif}
+h1,h2,h3,h4{line-height:1.25;margin:1.6em 0 .5em}
+code,pre{font:.9em/1.5 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+pre{background:rgba(127,127,127,.12);padding:.75rem 1rem;border-radius:8px;overflow:auto}
+code{background:rgba(127,127,127,.12);padding:.1em .35em;border-radius:4px}
+pre code{background:none;padding:0}
+blockquote{margin:1em 0;padding:.1em 1em;border-left:4px solid rgba(127,127,127,.4)}
+table{border-collapse:collapse}
+th,td{border:1px solid rgba(127,127,127,.4);padding:.3em .6em}
+header{border-bottom:1px solid rgba(127,127,127,.3);margin-bottom:2rem;padding-bottom:.75rem}
+header .sub,footer{color:#888;font-size:.85em}
+footer{margin-top:4rem}
+</style>
+</head>
+<body>
+<header><strong>__KA_TITLE__</strong><div class="sub">ka session export</div></header>
+<div id="content"></div>
+<footer>exported by ka — self-contained, renders offline</footer>
+<script type="text/markdown" id="ka-md">__KA_MARKDOWN__</script>
+<script>
+/* vendored minimal markdown renderer: headings, lists, code fences,
+   quotes, rules, inline code/bold/italic/links — no dependencies */
+(function(){
+function esc(s){return s.replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;")}
+function inline(s){return esc(s)
+ .replace(/`([^`]+)`/g,"<code>$1</code>")
+ .replace(/\*\*([^*]+)\*\*/g,"<strong>$1</strong>")
+ .replace(/\*([^*]+)\*/g,"<em>$1</em>")
+ .replace(/\[([^\]]+)\]\(([^)\s]+)\)/g,'<a href="$2">$1</a>')}
+var md=document.getElementById("ka-md").textContent;
+var out=[],code=null,list=null,items=[];
+function flushList(){if(list){out.push("<"+list+">"+items.map(function(li){return "<li>"+inline(li)+"</li>"}).join("")+"</"+list+">");list=null;items=[]}}
+function flushCode(){if(code!==null){out.push("<pre><code>"+esc(code)+"</code></pre>");code=null}}
+var lines=md.split("\n");
+for(var i=0;i<lines.length;i++){var L=lines[i];
+ if(/^```/.test(L)){flushList();if(code===null){code=""}else{flushCode()}continue}
+ if(code!==null){code+=L+"\n";continue}
+ var h=L.match(/^(#{1,6})\s+(.*)/);
+ if(h){flushList();out.push("<h"+h[1].length+">"+inline(h[2])+"</h"+h[1].length+">");continue}
+ if(/^(-|\*|\+)\s+/.test(L)){if(list!=="ul"){flushList();list="ul"}items.push(L.replace(/^(-|\*|\+)\s+/,""));continue}
+ if(/^\d+\.\s+/.test(L)){if(list!=="ol"){flushList();list="ol"}items.push(L.replace(/^\d+\.\s+/,""));continue}
+ if(/^>\s?/.test(L)){flushList();out.push("<blockquote>"+inline(L.replace(/^>\s?/,""))+"</blockquote>");continue}
+ if(/^(-{3,}|\*{3,})$/.test(L.trim())){flushList();out.push("<hr>");continue}
+ if(L.trim()===""){flushList();continue}
+ flushList();out.push("<p>"+inline(L)+"</p>")}
+flushCode();flushList();
+document.getElementById("content").innerHTML=out.join("\n");
+})();
+</script>
+</body>
+</html>

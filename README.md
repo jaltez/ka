@@ -36,7 +36,8 @@ Keys: `Enter` send / interject mid-turn · `+text` defer until turn ends · `Esc
 | `ka run [-c] [--model M] [--mode guarded\|free\|plan] [--trust] [--dialects f] "prompt"` | one headless turn, NDJSON events on stdout, exit 0/1/2 |
 | `ka models [--no-discovery]` | catalog + local Ollama/LM Studio probes |
 | `ka rewind [N]` | drop the last N exchanges of the newest strand |
-| `ka export [-o out.md]` | strand as readable markdown |
+| `ka export [-o out.md] [--html]` | strand as readable markdown, or a self-contained offline HTML page |
+| `ka skill install <git-url\|path> [--force]` / `ka skill list` / `ka skill remove <name>` | user-scope skill lifecycle (`~/.config/ka/skills`; SKILL.md directories; git URL or local path) |
 | `ka init` | starter AGENTS.md from repo shape |
 | `ka config {schema,print}` | resolved config / JSON schema |
 

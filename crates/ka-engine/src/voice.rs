@@ -751,6 +751,44 @@ impl Voice {
         savings
     }
 
+    /// The ladder's `shake`: deterministically truncate the tool-call
+    /// arguments of every call that predates the last user message —
+    /// by then the call is stale (its result is already in the
+    /// transcript) and only the giant argument payloads linger in the
+    /// resent context. Returns the number of calls truncated.
+    /// Idempotent: already-shaken calls are left alone.
+    pub fn shake(&mut self, arg_cap: usize) -> usize {
+        let Some(last_user) = self.history.iter().rposition(|m| m.role == TurnRole::User) else {
+            return 0;
+        };
+        let mut n = 0;
+        for m in self.history[..last_user].iter_mut() {
+            for call in m.calls.iter_mut() {
+                let compact = call.arguments.to_string();
+                if compact.len() > arg_cap {
+                    // the replacement is stored as a JSON string: inner
+                    // quotes/backslashes would be escaped and re-grow
+                    // past the cap, so they are normalized away first
+                    const MARKER: &str = "[shaken]";
+                    let budget = arg_cap.saturating_sub(MARKER.len() + 2);
+                    let flat: String = compact
+                        .chars()
+                        .map(|c| match c {
+                            '"' => '\'',
+                            '\\' => '\'',
+                            other => other,
+                        })
+                        .collect();
+                    let mut kept: String = flat.chars().take(budget).collect();
+                    kept.push_str(MARKER);
+                    call.arguments = serde_json::Value::String(kept);
+                    n += 1;
+                }
+            }
+        }
+        n
+    }
+
     fn history_sizes(&self, ratio: f64) -> Vec<u64> {
         self.history
             .iter()
@@ -3374,6 +3412,57 @@ mod tests {
                 .is_none()
         );
     }
+    #[test]
+    fn shake_truncates_stale_args_only() {
+        use ka_dialect::speaker::{ToolCall, ToolResult, TurnMessage};
+        let catalog = Catalog::parse(
+            "[dialects.\"test/m\"]\nwire = \"openai_chat\"\nbase_url = \"http://127.0.0.1:1\"\ncontext = 1000\n",
+        )
+        .unwrap();
+        let mut voice = Voice::new(catalog, std::env::temp_dir(), ka_protocol::Mode::Guarded, 5);
+        let big_args = serde_json::json!({ "q": "x".repeat(500) });
+        // stale: a call issued before the last user message
+        voice.history.push(TurnMessage::assistant_with_calls(
+            "checking",
+            vec![ToolCall {
+                id: "t1".into(),
+                tool: "grep".into(),
+                arguments: big_args.clone(),
+            }],
+        ));
+        voice.history.push(TurnMessage::tool(vec![ToolResult {
+            call_id: "t1".into(),
+            content: "results".into(),
+            is_error: false,
+            images: Vec::new(),
+        }]));
+        voice.history.push(TurnMessage::user("new question"));
+        // fresh: a call after the last user message keeps its arguments
+        voice.history.push(TurnMessage::assistant_with_calls(
+            "now checking",
+            vec![ToolCall {
+                id: "t2".into(),
+                tool: "grep".into(),
+                arguments: big_args.clone(),
+            }],
+        ));
+
+        let n = voice.shake(240);
+        assert_eq!(n, 1, "only the stale call is shaken");
+        assert!(
+            voice.history[0].calls[0]
+                .arguments
+                .to_string()
+                .contains("[shaken]"),
+            "the stale arguments are truncated"
+        );
+        assert_eq!(
+            voice.history[3].calls[0].arguments, big_args,
+            "the fresh call keeps its arguments"
+        );
+        assert_eq!(voice.shake(240), 0, "shaking is idempotent");
+    }
+
     #[test]
     fn apply_digest_cuts_at_user_boundary_and_keeps_tail() {
         use ka_dialect::speaker::{ToolCall, ToolResult, TurnMessage, TurnRole};

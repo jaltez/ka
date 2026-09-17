@@ -153,7 +153,7 @@ enum CliCommand {
         #[arg(default_value_t = 1)]
         turns: u32,
     },
-    /// Export a strand as readable markdown
+    /// Export a strand as readable markdown (or standalone HTML)
     Export {
         /// Output path (default: stdout)
         #[arg(short, long)]
@@ -161,6 +161,14 @@ enum CliCommand {
         /// Session to export (id prefix; default: newest for this cwd)
         #[arg(long, value_name = "ID")]
         session: Option<String>,
+        /// Render a self-contained HTML page instead of markdown
+        #[arg(long)]
+        html: bool,
+    },
+    /// Manage user skills (~/.config/ka/skills)
+    Skill {
+        #[command(subcommand)]
+        cmd: SkillCmd,
     },
     /// List sessions for this directory (ids for `ka --session`)
     Sessions {
@@ -214,10 +222,37 @@ enum ConfigCommand {
 /// presence marks a signed build and lets `ka update` verify artifacts.
 pub const PUBLIC_KEY: Option<&str> = option_env!("KA_PUBKEY");
 
+/// `ka skill ...`: user-scope skill lifecycle. The user skills dir is
+/// global, so running the command IS the trust act; discovery still
+/// gates user skills on the project's trust decision.
+#[derive(clap::Subcommand, Clone, Debug)]
+pub enum SkillCmd {
+    /// Install a skill from a git URL or a local directory (needs SKILL.md)
+    Install {
+        /// Git URL (https://, git@) or path to a directory with SKILL.md
+        source: String,
+        /// Overwrite an installed skill of the same name
+        #[arg(long)]
+        force: bool,
+    },
+    /// List installed user skills
+    List,
+    /// Remove an installed skill by directory name
+    Remove {
+        /// The skill's directory name (see `ka skill list`)
+        name: String,
+    },
+}
+
 mod acp;
 mod doctor;
 mod serve;
+mod skills;
 mod update;
+
+/// Self-contained HTML export page: the markdown rides in an inert
+/// island, rendered offline by a vendored renderer (no dependencies).
+const EXPORT_TEMPLATE: &str = include_str!("export_template.html");
 
 /// The strands storage root (`<data>/strands`). Delegates to
 /// `ka_strand::data_dir()` so the index scans the same tree the writer
@@ -504,7 +539,8 @@ async fn dispatch(cli: Cli) -> Result<ExitCode, String> {
         Some(CliCommand::Init) => run_init(),
         Some(CliCommand::Sessions { json }) => run_sessions(json),
         Some(CliCommand::Rewind { turns }) => run_rewind(turns).await,
-        Some(CliCommand::Export { out, session }) => run_export(out, session),
+        Some(CliCommand::Export { out, session, html }) => run_export(out, session, html),
+        Some(CliCommand::Skill { cmd }) => skills::run_skill(cmd),
         Some(CliCommand::Config { cmd }) => match cmd {
             ConfigCommand::Schema => {
                 println!(
@@ -1417,7 +1453,11 @@ async fn run_rewind(turns: u32) -> Result<ExitCode, String> {
 }
 
 /// Export the latest (or waypoint) strand as markdown.
-fn run_export(out: Option<PathBuf>, session: Option<String>) -> Result<ExitCode, String> {
+fn run_export(
+    out: Option<PathBuf>,
+    session: Option<String>,
+    html: bool,
+) -> Result<ExitCode, String> {
     let cwd = std::env::current_dir().map_err(|e| format!("cwd: {e}"))?;
     let target = match session {
         Some(id) => match resolve_session(&cwd, &id)? {
@@ -1436,9 +1476,28 @@ fn run_export(out: Option<PathBuf>, session: Option<String>) -> Result<ExitCode,
     };
     let records = ka_strand::read(&target).map_err(|e| format!("{}: {e}", target.display()))?;
     let md = ka_strand::render_markdown(&records);
+    // the html path derives its output name from the strand when -o is
+    // omitted, so `ka export --html` just works
+    let out = match (out, html) {
+        (Some(path), _) => Some(path),
+        (None, true) => Some(cwd.join(format!(
+            "{}.html",
+            target
+                .file_stem()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "ka-export".to_string())
+        ))),
+        (None, false) => None,
+    };
     match out {
         Some(path) => {
-            std::fs::write(&path, &md).map_err(|e| format!("{}: {e}", path.display()))?;
+            if html {
+                let title = ka_strand::title_of(&records);
+                let page = skills::render_html(&title, &md);
+                std::fs::write(&path, page).map_err(|e| format!("{}: {e}", path.display()))?;
+            } else {
+                std::fs::write(&path, &md).map_err(|e| format!("{}: {e}", path.display()))?;
+            }
             println!("wrote {}", path.display());
         }
         None => print!("{md}"),

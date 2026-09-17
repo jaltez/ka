@@ -110,7 +110,7 @@ Grounded in `daily-driver-study.md` (fact-checked vs omp/pi/Claude Code/OpenCode
 
 Order: 8.1 → 8.2 → 8.3 → 8.4. 8.4 items are filler and never block.
 
-### 8.1 LSP write-through — act through the server
+### 8.1 LSP write-through — act through the server (shipped 2026-09)
 - **[M]** Handle `workspace/applyEdit` reverse request in `lsp.rs` (preview + apply through the write path)
 - **[M]** Write-tier hand `lsp_rename`: `textDocument/rename` → `WorkspaceEdit` → ledger-stamped apply with unified_diff preview + size caps
 - **[M]** Write-tier hand `lsp_actions`: `textDocument/codeAction` (+`codeAction/resolve`) → `applyEdit` / `workspace/executeCommand`
@@ -119,7 +119,7 @@ Order: 8.1 → 8.2 → 8.3 → 8.4. 8.4 items are filler and never block.
 - **[O]** `textDocument/formatting` hand; `prepareRename` validity precheck
 - Tests: fixture LSP server (rename/action/willRename/applyEdit paths) + feature contracts + README together
 
-### 8.2 DAP — the probe
+### 8.2 DAP — the probe (shipped 2026-09)
 - **[M]** Extract the shared Content-Length framing codec from `lsp.rs`/`mcp.rs`; `dap.rs` becomes its third consumer
 - **[M]** `dap.rs` client: initialize→launch/attach→`initialized`→setBreakpoints→configurationDone; threads/stackTrace/scopes/variables/evaluate; continue/next/stepIn/stepOut; output ring (bounded); capability-gated actions; disconnect; idle-session cleanup; `runInTerminal` rejected with an instructive error (console external)
 - **[M]** Single `debug` hand, curated ~14-action MVP set (omp ships 28 — instruction/data breakpoints, memory R/W, disassembly wait for pull)
@@ -129,7 +129,7 @@ Order: 8.1 → 8.2 → 8.3 → 8.4. 8.4 items are filler and never block.
 - **[O]** cargo feature `dap` if `xtask size` says >100 KB
 - Tests: fake DAP adapter fixture binary (handshake, breakpoint, stop-read loop); catalog schema contract; dogfood = debugging ka with lldb-dap
 
-### 8.3 Delegation 2.0 — contracts, steering, merge-back
+### 8.3 Delegation 2.0 — contracts, steering, merge-back (shipped 2026-09)
 - **[M]** Agent frontmatter `output:` (JSON schema); child final message validated through the existing structured-output path; one instructive retry
 - **[M]** `tasks send <id> <text>` — steer running background agents via their (currently empty) interjection queues
 - **[M]** Sibling messaging: engine-mediated roster injected into spawned context; `tasks inbox`; messages to finished agents surface as notes (no revival in v1)
@@ -138,9 +138,9 @@ Order: 8.1 → 8.2 → 8.3 → 8.4. 8.4 items are filler and never block.
 - Declined: CoW isolation backends (fuse/overlayfs daemons violate one-process children-only; git worktrees are the Claude Code-shipped subset)
 
 ### 8.4 Convenience set (filler)
-- **[M]** `ka skill install|list|remove` — git URL/path → user skills dir, trust-gated, no npm registry; agentskills.io spec-field alignment (`license`, `compatibility`, `metadata`, `allowed-tools`)
-- **[M]** HTML export: `/export --html` + `ka export --html` — self-contained `include_str!` template, zero deps, tool-call cards + agent sections
-- **[M]** Compaction ladder formalized: prune (spill) → shake (deterministic; now also truncates stale tool *args*) → digest; post-digest re-read of ≤5 ledger-hot files
+- **[M]** `ka skill install|list|remove` — git URL/path → user skills dir, trust-gated, no npm registry; agentskills.io spec-field alignment (`license`, `compatibility`, `metadata`, `allowed-tools`) — **shipped 2026-09** (install/list/remove + tolerant frontmatter)
+- **[M]** HTML export: `/export --html` + `ka export --html` — self-contained `include_str!` template, zero deps, tool-call cards + agent sections — **shipped 2026-09** (`ka export --html`; TUI flag pending)
+- **[M]** Compaction ladder formalized: prune (spill) → shake (deterministic; now also truncates stale tool args) → digest — **shake shipped 2026-09**; post-digest re-read of ≤5 ledger-hot files **still open** (needs a record_ids/persistence invariant pass before it can land safely)
 - **[O]** SDK-story doc: crates.io workspace, `--print stream-json`, `ka serve` SSE, ACP — one page tying the surfaces together
 - Declined: snapcompact (study §4.7), live collab/share relay, npm tarball installs
 

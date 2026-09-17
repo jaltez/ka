@@ -1680,7 +1680,21 @@ async fn settle_context(
 ) {
     let window = voice.window_tokens();
     let ratio = voice_ratio(voice);
+    // the ladder: shake (deterministic stale-arg truncation) → prune
+    // (spill oversized outputs) → digest (summarize + cut) later in the
+    // caller if pressure still holds
+    let shaken = voice.shake(240);
     let saved = voice.prune_tool_outputs(ratio);
+    if shaken > 0 {
+        events
+            .send(Event::Note {
+                message: format!(
+                    "shaken: {shaken} stale tool call(s) had their arguments truncated"
+                ),
+            })
+            .await
+            .ok();
+    }
     if std::env::var("KA_DEBUG_SETTLE").is_ok() {
         eprintln!(
             "[settle] window={window} ratio={ratio} last_context={} pressure={}",
