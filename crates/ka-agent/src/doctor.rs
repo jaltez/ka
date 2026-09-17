@@ -218,15 +218,7 @@ fn trust_check() -> Check {
 
 /// Strand count + spills disk usage.
 fn local_data_check() -> Check {
-    let data = std::env::var("KA_DATA_DIR")
-        .map(PathBuf::from)
-        .or_else(|_| {
-            std::env::var("XDG_DATA_HOME")
-                .map(PathBuf::from)
-                .or_else(|_| std::env::var("HOME").map(|h| PathBuf::from(h).join(".local/share")))
-        })
-        .unwrap_or_else(|_| std::env::temp_dir())
-        .join("ka");
+    let data = ka_strand::data_dir();
 
     // strands live at <data>/strands/<encoded-cwd>/<id>.jsonl: count
     // the FILES one level down (the old read_dir counted project

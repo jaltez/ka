@@ -8,7 +8,7 @@ use ka_dialect::Catalog;
 use ka_engine::config::Config;
 use ka_engine::spawn_full;
 use ka_protocol::{Command, Event, Stop, to_line};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 #[derive(Parser)]
@@ -306,6 +306,22 @@ fn parse_mode(s: &str) -> Result<ka_protocol::Mode, String> {
             "unknown mode {other:?} (expected \
 guarded|needs-approval|accept-edits|free|full-access|plan)"
         )),
+    }
+}
+
+/// Waypoint cwd match: exact first, then canonicalized — the same
+/// directory reached by different mount spellings (`/mnt/c/Proj` vs
+/// `/mnt/c/proj` under WSL's case-insensitive DrvFs, `C:\X` vs `c:\x`,
+/// symlinked homes) must count, or `ka -c` misses the session the
+/// terminal is actually in. Canonicalize fails on a missing dir → plain
+/// inequality, matching the old exact-compare behavior.
+fn same_dir(a: &Path, b: &Path) -> bool {
+    if a == b {
+        return true;
+    }
+    match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+        (Ok(ca), Ok(cb)) => ca == cb,
+        _ => false,
     }
 }
 
@@ -637,7 +653,7 @@ async fn run_headless(
     } else if continue_latest {
         let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
         match ka_engine::read_waypoint() {
-            Some((way_cwd, path)) if way_cwd == cwd && path.exists() => {
+            Some((way_cwd, path)) if same_dir(&way_cwd, &cwd) && path.exists() => {
                 ka_engine::StrandChoice::Path(path)
             }
             _ => ka_engine::StrandChoice::Latest,
@@ -911,7 +927,7 @@ async fn run_tui(cli: Cli) -> Result<ExitCode, String> {
     } else if cli.continue_latest {
         // waypoint first, else newest
         match ka_engine::read_waypoint() {
-            Some((way_cwd, path)) if way_cwd == cwd && path.exists() => {
+            Some((way_cwd, path)) if same_dir(&way_cwd, &cwd) && path.exists() => {
                 ka_engine::StrandChoice::Path(path)
             }
             _ => ka_engine::StrandChoice::Latest,
@@ -1371,7 +1387,7 @@ async fn run_rewind(turns: u32) -> Result<ExitCode, String> {
     println!("rewinding {} turn(s) in {}", turns, latest.path.display());
 
     let choice = match ka_engine::read_waypoint() {
-        Some((way_cwd, path)) if way_cwd == cwd && path.exists() => {
+        Some((way_cwd, path)) if same_dir(&way_cwd, &cwd) && path.exists() => {
             ka_engine::StrandChoice::Path(path)
         }
         _ => ka_engine::StrandChoice::Path(latest.path.clone()),
@@ -1409,7 +1425,7 @@ fn run_export(out: Option<PathBuf>, session: Option<String>) -> Result<ExitCode,
             _ => unreachable!("resolve_session returns a path"),
         },
         None => match ka_engine::read_waypoint() {
-            Some((way_cwd, path)) if way_cwd == cwd && path.exists() => path,
+            Some((way_cwd, path)) if same_dir(&way_cwd, &cwd) && path.exists() => path,
             _ => {
                 ka_strand::latest(&cwd)
                     .map_err(|e| format!("listing strands: {e}"))?

@@ -33,15 +33,10 @@ pub struct RebuildStats {
 
 /// Default index database location: `<data>/ka/index.db`.
 pub fn default_db_path() -> PathBuf {
-    std::env::var("KA_DATA_DIR")
-        .map(PathBuf::from)
-        .or_else(|_| {
-            std::env::var("XDG_DATA_HOME")
-                .map(PathBuf::from)
-                .or_else(|_| std::env::var("HOME").map(|h| PathBuf::from(h).join(".local/share")))
-        })
-        .unwrap_or_else(|_| std::env::temp_dir())
-        .join("ka/index.db")
+    if let Ok(dir) = std::env::var("KA_DATA_DIR") {
+        return PathBuf::from(dir).join("index.db");
+    }
+    ka_strand::data_dir().join("index.db")
 }
 
 /// Open (creating) the index database and ensure the schema.

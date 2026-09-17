@@ -222,7 +222,8 @@ pub fn set_data_dir_for_tests(dir: PathBuf) {
     DATA_DIR_OVERRIDE.with(|d| *d.borrow_mut() = Some(dir));
 }
 
-/// Data root: `KA_DATA_DIR` (tests) > `XDG_DATA_HOME/ka` > `~/.local/share/ka`.
+/// Data root: `KA_DATA_DIR` (tests) > platform data base (see
+/// [`data_base`]) + `ka`.
 pub fn data_dir() -> PathBuf {
     if let Some(dir) = DATA_DIR_OVERRIDE.with(|d| d.borrow().clone()) {
         return dir;
@@ -230,21 +231,111 @@ pub fn data_dir() -> PathBuf {
     if let Ok(dir) = std::env::var("KA_DATA_DIR") {
         return PathBuf::from(dir);
     }
-    let base = std::env::var("XDG_DATA_HOME")
-        .map(PathBuf::from)
-        .or_else(|_| std::env::var("HOME").map(|h| PathBuf::from(h).join(".local/share")))
-        .unwrap_or_else(|_| std::env::temp_dir());
-    base.join("ka")
+    data_base(
+        std::env::var("XDG_DATA_HOME").ok().as_deref(),
+        std::env::var("HOME").ok().as_deref(),
+        std::env::var("LOCALAPPDATA").ok().as_deref(),
+        cfg!(windows),
+    )
+    .join("ka")
+}
+
+/// Platform data base, factored pure for tests. Unix: `XDG_DATA_HOME` >
+/// `~/.local/share` > temp. Windows: `%LOCALAPPDATA%` first — the store
+/// must not depend on the shell (Git Bash sets `HOME`, PowerShell does
+/// not, so a HOME-first chain flip-flops the store between terminals) —
+/// then the same HOME fallback, then temp.
+pub fn data_base(
+    xdg: Option<&str>,
+    home: Option<&str>,
+    localappdata: Option<&str>,
+    windows: bool,
+) -> PathBuf {
+    let home_dir = home.map(|h| PathBuf::from(h).join(".local/share"));
+    if windows {
+        return localappdata
+            .map(PathBuf::from)
+            .or(home_dir)
+            .unwrap_or_else(std::env::temp_dir);
+    }
+    xdg.map(PathBuf::from)
+        .or(home_dir)
+        .unwrap_or_else(std::env::temp_dir)
 }
 
 fn encode_cwd(cwd: &Path) -> String {
     let s = cwd.to_string_lossy().replace('/', "-");
+    let s = if cfg!(windows) {
+        sanitize_windows_key(s)
+    } else {
+        s
+    };
     format!("-{s}")
+}
+
+/// Windows store-key sanitizing: `\` would nest components under the
+/// strand dir and `:` is an illegal NTFS name character (`C:\x\y` would
+/// otherwise encode to the unusable `-C:\x\y`). Both become `-`. Unix
+/// cwd strings never contain `\`, and `:` is legal-but-rare there, so
+/// Unix encodings stay byte-identical.
+fn sanitize_windows_key(s: String) -> String {
+    s.replace(['\\', ':'], "-")
 }
 
 /// The strand directory for a working directory.
 pub fn strand_dir(cwd: &Path) -> PathBuf {
     data_dir().join("strands").join(encode_cwd(cwd))
+}
+
+/// Windows long paths: past ~240 chars, std::fs calls fail at MAX_PATH
+/// unless the path carries the `\\?\` verbatim prefix (which skips Win32
+/// normalization). Apply it only when needed — short paths keep the
+/// normal spelling, so the conversion's blast radius is exactly the
+/// deep-cwd case it exists for. Non-Windows: identity.
+fn store_path(path: &Path) -> PathBuf {
+    #[cfg(windows)]
+    {
+        const THRESHOLD: usize = 240;
+        if path.as_os_str().len() >= THRESHOLD {
+            if let Some(v) = verbatim(path) {
+                return v;
+            }
+        }
+        path.to_path_buf()
+    }
+    #[cfg(not(windows))]
+    {
+        path.to_path_buf()
+    }
+}
+
+/// Lexical `\\?\` conversion for absolute Windows paths. `None` for
+/// anything unusual (relative paths, device prefixes) — the caller then
+/// keeps the plain spelling rather than guessing.
+#[cfg(windows)]
+fn verbatim(path: &Path) -> Option<PathBuf> {
+    use std::path::{Component, Prefix};
+    let mut out = PathBuf::from(r"\\?\");
+    for comp in path.components() {
+        match comp {
+            Component::Prefix(p) => match p.kind() {
+                Prefix::Disk(letter) | Prefix::VerbatimDisk(letter) => {
+                    out.push(format!("{}:", letter));
+                }
+                Prefix::UNC(server, share) | Prefix::VerbatimUNC(server, share) => {
+                    out =
+                        PathBuf::from(format!(r"\\?\UNC\{}\{}", server.display(), share.display()));
+                }
+                _ => return None,
+            },
+            Component::RootDir | Component::CurDir => {}
+            Component::ParentDir => {
+                out.pop();
+            }
+            Component::Normal(s) => out.push(s),
+        }
+    }
+    Some(out)
 }
 
 /// A strand under management: path (None until first append for fresh
@@ -306,7 +397,7 @@ impl StrandFile {
         if let Some(path) = &self.path {
             return Ok(path.clone());
         }
-        let dir = strand_dir(&self.cwd);
+        let dir = store_path(&strand_dir(&self.cwd));
         std::fs::create_dir_all(&dir)?;
         let header = self
             .records
@@ -533,7 +624,7 @@ struct UsageProbe {
 pub fn list(cwd: &Path) -> std::io::Result<Vec<StrandSummary>> {
     let dir = strand_dir(cwd);
     let mut summaries = Vec::new();
-    let entries = match std::fs::read_dir(&dir) {
+    let entries = match std::fs::read_dir(store_path(&dir)) {
         Ok(e) => e,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(summaries),
         Err(e) => return Err(e),
@@ -625,7 +716,7 @@ fn summarize(path: &Path) -> Option<StrandSummary> {
 fn headers(cwd: &Path) -> std::io::Result<Vec<(PathBuf, String)>> {
     let dir = strand_dir(cwd);
     let mut out = Vec::new();
-    let entries = match std::fs::read_dir(&dir) {
+    let entries = match std::fs::read_dir(store_path(&dir)) {
         Ok(e) => e,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(out),
         Err(e) => return Err(e),
@@ -779,7 +870,7 @@ pub fn now_rfc3339() -> String {
 /// Read every record from a strand file. Malformed lines fail with the
 /// offending line number; a missing file is an empty vec (fresh strand).
 pub fn read(path: &Path) -> std::io::Result<Vec<Record>> {
-    let file = match File::open(path) {
+    let file = match File::open(store_path(path)) {
         Ok(f) => f,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(e) => return Err(e),
@@ -847,6 +938,53 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use super::*;
+
+    #[test]
+    fn windows_cwd_keys_are_flat_and_legal() {
+        // `C:\Users\x\proj` must not survive as `-C:\Users\x\proj`: the
+        // backslashes would nest components under strands/ and `-C:` is
+        // an illegal NTFS name (colon), so persistence would fail with
+        // os error 123 on every append.
+        assert_eq!(
+            sanitize_windows_key("C:\\Users\\x\\proj".to_string()),
+            "C--Users-x-proj"
+        );
+        // Unix encodings are untouched by the Windows branch.
+        assert_eq!(
+            sanitize_windows_key("/home/u/proj".to_string()),
+            "/home/u/proj"
+        );
+    }
+
+    #[test]
+    fn data_base_orders_by_platform() {
+        let (xdg, home, local) = (
+            Some("/xdg".to_string()),
+            Some("/home/u".to_string()),
+            Some("C:\\Users\\u\\AppData\\Local".to_string()),
+        );
+        // Unix: XDG > HOME > temp (historical behavior, unchanged).
+        assert_eq!(
+            data_base(xdg.as_deref(), home.as_deref(), local.as_deref(), false),
+            PathBuf::from("/xdg")
+        );
+        assert_eq!(
+            data_base(None, home.as_deref(), local.as_deref(), false),
+            PathBuf::from("/home/u/.local/share")
+        );
+        // Windows: LOCALAPPDATA first — shell-independent (Git Bash sets
+        // HOME, PowerShell does not; the store must not move between
+        // them) — then HOME, then temp.
+        assert_eq!(
+            data_base(xdg.as_deref(), home.as_deref(), local.as_deref(), true),
+            PathBuf::from("C:\\Users\\u\\AppData\\Local")
+        );
+        assert_eq!(
+            data_base(None, home.as_deref(), None, true),
+            PathBuf::from("/home/u/.local/share")
+        );
+        assert_eq!(data_base(None, None, None, true), std::env::temp_dir());
+    }
 
     fn temp_data(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("ka-strand3-{}-{name}", std::process::id()));
