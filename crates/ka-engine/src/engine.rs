@@ -485,20 +485,26 @@ async fn run(
     voice.set_sandbox(sandbox_policy);
     // safe mode: [lsp] spawns user-configured executables — same risk
     // class as hooks/MCP, so the diagnostics tier is inert there too
-    let lsp_cfg = if crate::conventions::bare_mode() {
-        crate::config::Lsp::default()
-    } else {
-        config.lsp.clone()
-    };
+    let lsp_cfg = effective_lsp_cfg(&config);
     let lsp = std::sync::Arc::new(crate::lsp::LspManager::new(&cwd, &lsp_cfg));
     voice.set_lsp(lsp.clone());
     // navigation hands (symbols/definition/references/diagnostics) plus
-    // an eager server start, only when the diagnostics tier is live
+    // an eager server start, only when the diagnostics tier is live;
+    // write-through rides the same gate ([lsp] write_through)
     if lsp_cfg.enable == Some(true) && lsp_cfg.commands.as_ref().is_some_and(|c| !c.is_empty()) {
         lsp.start_all();
-        for hand in crate::hands::lsp_tools::hands(lsp.clone()) {
+        for hand in lsp_hands(lsp.clone(), &lsp_cfg) {
             voice.push_hand(hand);
         }
+    }
+    // the debug probe (Phase 8.2): a single `debug` hand over DAP,
+    // Exec-tier control flow, Read-tier inspection — only under
+    // [debug] enable = true
+    let debug_cfg = effective_debug_cfg(&config);
+    if debug_cfg.enable == Some(true) {
+        voice.push_hand(std::sync::Arc::new(crate::hands::debug::DebugHand::new(
+            std::sync::Arc::new(crate::dap::DebugManager::new(debug_cfg.adapters.clone())),
+        )));
     }
     voice.set_web_allow_private(config.effective_web_allow_private());
     {
@@ -2155,6 +2161,44 @@ fn strand_id(strand: &ka_strand::StrandFile) -> String {
         .unwrap_or_default()
 }
 
+/// The `[lsp]` tier as the engine sees it: the whole tier — spawned
+/// servers, navigation hands, write-through — is inert in bare mode,
+/// because starting user-configured executables is the same risk class
+/// as hooks/MCP (which bare mode also darkens).
+pub fn effective_lsp_cfg(config: &crate::config::Config) -> crate::config::Lsp {
+    if crate::conventions::bare_mode() {
+        crate::config::Lsp::default()
+    } else {
+        config.lsp.clone()
+    }
+}
+
+/// The hands the LSP tier contributes once the tier is enabled:
+/// navigation always, write-through (`lsp_rename` / `lsp_actions`) only
+/// under `[lsp] write_through = true` — ka acts through the server, but
+/// still on the ledger/write path.
+pub fn lsp_hands(
+    lsp: std::sync::Arc<crate::lsp::LspManager>,
+    cfg: &crate::config::Lsp,
+) -> Vec<std::sync::Arc<dyn crate::hands::Hand>> {
+    let mut hands = crate::hands::lsp_tools::hands(lsp.clone());
+    if cfg.write_through == Some(true) {
+        hands.extend(crate::hands::lsp_write::hands(lsp));
+    }
+    hands
+}
+
+/// The `[debug]` tier as the engine sees it: spawning debug adapters is
+/// a customization tier (user-configured executables) — inert in bare
+/// mode like `[lsp]`.
+pub fn effective_debug_cfg(config: &crate::config::Config) -> crate::config::Debug {
+    if crate::conventions::bare_mode() {
+        crate::config::Debug::default()
+    } else {
+        config.debug.clone()
+    }
+}
+
 /// Waypoint: tiny per-terminal pointer so `ka -c` continues the right
 /// strand per pane. Best-effort.
 fn write_waypoint(cwd: &std::path::Path, strand_path: &std::path::Path) {
@@ -2185,6 +2229,16 @@ pub fn read_waypoint() -> Option<(std::path::PathBuf, std::path::PathBuf)> {
 fn tty_key() -> Option<String> {
     if let Ok(explicit) = std::env::var("KA_TTY") {
         return Some(format!("{}-{}", explicit.len(), explicit.replace('/', "_")));
+    }
+    // Windows has no /proc: key by Windows Terminal's per-window GUID
+    // when present, else one coarse per-console key. `ka -c` still
+    // verifies the waypoint's cwd before resuming, so a shared key can
+    // only ever resume this directory's most recently attached strand.
+    if cfg!(windows) {
+        return Some(match std::env::var("WT_SESSION") {
+            Ok(guid) => format!("wt-{}", guid.replace(['\\', '/'], "_")),
+            Err(_) => "console".to_string(),
+        });
     }
     let link = std::fs::read_link("/proc/self/fd/0").ok()?;
     let name = link.to_string_lossy();

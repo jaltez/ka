@@ -115,6 +115,30 @@ impl Snapshots {
         Ok(Some(entry))
     }
 
+    /// Journal the first appearance of a file — no prior bytes to park;
+    /// undo removes it. Used by the file-move path: after a rename, the
+    /// new path must vanish again on /undo, or the file ends up
+    /// duplicated (old path restored, moved copy stranded).
+    pub fn record_creation(&mut self, path: &Path) -> io::Result<Option<SnapEntry>> {
+        let Some(root) = self.root.clone() else {
+            return Ok(None);
+        };
+        if self.strand.is_empty() {
+            return Err(io::Error::other("snapshot journal has no active strand"));
+        }
+        self.seq += 1;
+        let entry = SnapEntry {
+            seq: self.seq,
+            strand: self.strand.clone(),
+            path: path.to_path_buf(),
+            existed: false,
+            ts: now_stamp(),
+        };
+        self.manifest.push(entry.clone());
+        self.append_journal(root.as_path(), &entry)?;
+        Ok(Some(entry))
+    }
+
     /// Restore the latest snapshot of the active strand (pops it).
     pub fn undo(&mut self) -> io::Result<Option<SnapEntry>> {
         let Some(root) = self.root.clone() else {

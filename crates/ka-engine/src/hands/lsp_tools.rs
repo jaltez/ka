@@ -499,6 +499,7 @@ mod tests {
             &crate::config::Lsp {
                 enable: Some(true),
                 commands: None,
+                write_through: None,
             },
         );
         let out = DiagnosticsHand(Arc::new(mgr))
@@ -573,6 +574,7 @@ while True:
                         .into_iter()
                         .collect(),
                 ),
+                write_through: None,
             },
         ));
         mgr.start_all();

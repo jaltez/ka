@@ -104,6 +104,48 @@ Legend: **[M]** mandatory · **[O]** optional/deferrable. Names refer to the arc
 11. Web search + URL reader tools
 12. Structured-output mode (schema-constrained replies)
 
+## Phase 8 — Daily-Driver Gap Closing (ratified 2026-09-14)
+
+Grounded in `daily-driver-study.md` (fact-checked vs omp/pi/Claude Code/OpenCode/Codex/Gemini/Crush/goose/aider). Locked decisions: **DAP client in ka-engine as the third Content-Length JSON-RPC instance (after lsp.rs, mcp.rs) · adapter catalog is data (embedded TOML + `[debug.adapters]` overlay, mirroring `[lsp.commands]`) · runtime gates `[debug] enable` / `[lsp] write_through`, inert in `--safe-mode` · debug adapters join the allowed-children list · every addition re-measured via `xtask size`; anything >100 KB becomes a cargo feature · WorkspaceEdits apply only through the existing exact-match/ledger write path · keys-only auth reaffirmed (`ka-passport` stays future, Copilot device-flow only).**
+
+Order: 8.1 → 8.2 → 8.3 → 8.4. 8.4 items are filler and never block.
+
+### 8.1 LSP write-through — act through the server
+- **[M]** Handle `workspace/applyEdit` reverse request in `lsp.rs` (preview + apply through the write path)
+- **[M]** Write-tier hand `lsp_rename`: `textDocument/rename` → `WorkspaceEdit` → ledger-stamped apply with unified_diff preview + size caps
+- **[M]** Write-tier hand `lsp_actions`: `textDocument/codeAction` (+`codeAction/resolve`) → `applyEdit` / `workspace/executeCommand`
+- **[M]** File moves consult `workspace/willRenameFiles` (ripple edits applied first) + `didRenameFiles`; moved open files `didClose`d
+- **[M]** Config `[lsp] write_through = true` (strict-TOML schema test); refuse edits on drifted open files
+- **[O]** `textDocument/formatting` hand; `prepareRename` validity precheck
+- Tests: fixture LSP server (rename/action/willRename/applyEdit paths) + feature contracts + README together
+
+### 8.2 DAP — the probe
+- **[M]** Extract the shared Content-Length framing codec from `lsp.rs`/`mcp.rs`; `dap.rs` becomes its third consumer
+- **[M]** `dap.rs` client: initialize→launch/attach→`initialized`→setBreakpoints→configurationDone; threads/stackTrace/scopes/variables/evaluate; continue/next/stepIn/stepOut; output ring (bounded); capability-gated actions; disconnect; idle-session cleanup; `runInTerminal` rejected with an instructive error (console external)
+- **[M]** Single `debug` hand, curated ~14-action MVP set (omp ships 28 — instruction/data breakpoints, memory R/W, disassembly wait for pull)
+- **[M]** Adapter catalog as data: embedded seed (`gdb -i dap`, `lldb-dap`, `codelldb`, debugpy, `dlv` dap, `netcoredbg`, js-debug) + `[debug.adapters]` overlay
+- **[M]** Clearance: control-flow actions (launch/attach/step/continue/terminate) = Exec; inspection (stack/scopes/variables/evaluate/threads) = Read
+- **[O]** TUI roster (tasks-style session list); breakpoint-stop Notes
+- **[O]** cargo feature `dap` if `xtask size` says >100 KB
+- Tests: fake DAP adapter fixture binary (handshake, breakpoint, stop-read loop); catalog schema contract; dogfood = debugging ka with lldb-dap
+
+### 8.3 Delegation 2.0 — contracts, steering, merge-back
+- **[M]** Agent frontmatter `output:` (JSON schema); child final message validated through the existing structured-output path; one instructive retry
+- **[M]** `tasks send <id> <text>` — steer running background agents via their (currently empty) interjection queues
+- **[M]** Sibling messaging: engine-mediated roster injected into spawned context; `tasks inbox`; messages to finished agents surface as notes (no revival in v1)
+- **[M]** `tasks merge <id>` — clean-only patch apply from the surviving `ka-<name>-<uuid>` worktree branch; on conflict surface the `.patch` path and stop; parent-mode gated (accept-edits/free, else Ask)
+- **[O]** TUI `/tasks` roster w/ status/cost + transcript pager
+- Declined: CoW isolation backends (fuse/overlayfs daemons violate one-process children-only; git worktrees are the Claude Code-shipped subset)
+
+### 8.4 Convenience set (filler)
+- **[M]** `ka skill install|list|remove` — git URL/path → user skills dir, trust-gated, no npm registry; agentskills.io spec-field alignment (`license`, `compatibility`, `metadata`, `allowed-tools`)
+- **[M]** HTML export: `/export --html` + `ka export --html` — self-contained `include_str!` template, zero deps, tool-call cards + agent sections
+- **[M]** Compaction ladder formalized: prune (spill) → shake (deterministic; now also truncates stale tool *args*) → digest; post-digest re-read of ≤5 ledger-hot files
+- **[O]** SDK-story doc: crates.io workspace, `--print stream-json`, `ka serve` SSE, ACP — one page tying the surfaces together
+- Declined: snapcompact (study §4.7), live collab/share relay, npm tarball installs
+
+**Exit:** heavy interactive coding on ka — refactor-through-server, attach-a-debugger, fan-out with contracts and merge-back — without reaching for another harness, at ≤10 MB musl.
+
 ## Non-goals (explicit, permanent)
 No in-process plugin runtime · no vector DB / semantic indexing · no browser or computer control · no image gen / TTS / voice · no enterprise/MDM/team/cloud tier · no telemetry beyond optional local logs · no eval kernels · **no subscription OAuth in core** (`ka-passport` crate may add it later).
 
@@ -111,3 +153,5 @@ Re-ratified 2026-09-13: **git mutation is no longer a non-goal** — `[git] auto
 
 ## Footprint budget (enforced from Phase 0)
 Single static binary ≤ 10MB (musl, stripped) · cold start ≤ 50ms · idle RSS ≤ 15MB · zero network at steady state · children only: user shell, stdio MCP (optional), git (optional).
+
+Ratified 2026-09-14 with Phase 8: **debug adapters join the allowed-children list** (runtime-gated `[debug] enable`, inert in `--safe-mode`) — same trust class as stdio MCP servers.

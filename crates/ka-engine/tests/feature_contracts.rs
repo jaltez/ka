@@ -269,6 +269,7 @@ fn conditional_hands_contract() {
         &ka_engine::config::Lsp {
             enable: Some(true),
             commands: None,
+            write_through: None,
         },
     )));
     let mut lsp_names: Vec<String> = lsp.iter().map(|h| h.def().name).collect();
@@ -286,6 +287,120 @@ fn conditional_hands_contract() {
         );
         assert!(d.read_only);
     }
+
+    // LSP write-through pair ([lsp] write_through = true only)
+    let lsp_w = hands::lsp_write::hands(Arc::new(ka_engine::lsp::LspManager::new(
+        Path::new("/tmp"),
+        &ka_engine::config::Lsp {
+            enable: Some(true),
+            commands: None,
+            write_through: Some(true),
+        },
+    )));
+    let mut lsp_w_names: Vec<String> = lsp_w.iter().map(|h| h.def().name).collect();
+    lsp_w_names.sort();
+    assert_eq!(lsp_w_names, vec!["lsp_actions", "lsp_format", "lsp_rename"]);
+    let rename = lsp_w.iter().find(|h| h.def().name == "lsp_rename").unwrap();
+    assert_eq!(rename.def().clearance, hands::Clearance::Write);
+    assert!(!rename.def().read_only);
+    let format = lsp_w.iter().find(|h| h.def().name == "lsp_format").unwrap();
+    assert_eq!(
+        format.def().clearance,
+        hands::Clearance::Write,
+        "formatting rewrites the file"
+    );
+    assert!(!format.def().read_only);
+    let actions = lsp_w
+        .iter()
+        .find(|h| h.def().name == "lsp_actions")
+        .unwrap();
+    let d = actions.def();
+    assert_eq!(d.clearance, hands::Clearance::Read, "static tier = listing");
+    assert!(!d.read_only);
+    assert_eq!(
+        actions.clearance_for(&serde_json::json!({"file": "a.rs", "line": 1})),
+        hands::Clearance::Read,
+        "listing reads"
+    );
+    assert_eq!(
+        actions.clearance_for(&serde_json::json!({
+            "file": "a.rs", "line": 1, "mode": "run", "pick": 1
+        })),
+        hands::Clearance::Write,
+        "running a code action mutates"
+    );
+
+    // the engine's registration decision: write-through joins only under
+    // write_through = true; the navigation set is identical either way
+    let off = ka_engine::config::Lsp {
+        enable: Some(true),
+        commands: None,
+        write_through: None,
+    };
+    let on = ka_engine::config::Lsp {
+        enable: Some(true),
+        commands: None,
+        write_through: Some(true),
+    };
+    let nav = ka_engine::lsp_hands(
+        Arc::new(ka_engine::lsp::LspManager::new(Path::new("/tmp"), &off)),
+        &off,
+    );
+    let both = ka_engine::lsp_hands(
+        Arc::new(ka_engine::lsp::LspManager::new(Path::new("/tmp"), &on)),
+        &on,
+    );
+    assert_eq!(
+        nav.len() + 3,
+        both.len(),
+        "write-through adds exactly three hands"
+    );
+    assert!(
+        nav.iter()
+            .all(|h| h.def().name != "lsp_rename" && h.def().name != "lsp_actions")
+    );
+    assert!(both.iter().any(|h| h.def().name == "lsp_rename"));
+    assert!(both.iter().any(|h| h.def().name == "lsp_actions"));
+    assert!(both.iter().any(|h| h.def().name == "lsp_format"));
+
+    // the debug probe ([debug] enable = true only): control flow runs at
+    // Exec, inspection reads, unknown actions fail closed at Exec
+    let dbg = hands::debug::DebugHand::new(Arc::new(ka_engine::dap::DebugManager::new(None)));
+    let d = dbg.def();
+    assert_eq!(d.name, "debug");
+    assert_eq!(d.clearance, hands::Clearance::Exec);
+    assert!(!d.read_only);
+    for action in [
+        "start",
+        "break",
+        "clear",
+        "continue",
+        "next",
+        "step_in",
+        "step_out",
+        "pause",
+        "disconnect",
+    ] {
+        assert_eq!(
+            dbg.clearance_for(&serde_json::json!({"action": action})),
+            hands::Clearance::Exec,
+            "{action} drives the debuggee"
+        );
+    }
+    for action in [
+        "sessions", "breaks", "threads", "stack", "vars", "eval", "output",
+    ] {
+        assert_eq!(
+            dbg.clearance_for(&serde_json::json!({"action": action})),
+            hands::Clearance::Read,
+            "{action} only inspects"
+        );
+    }
+    assert_eq!(
+        dbg.clearance_for(&serde_json::json!({"action": "wat"})),
+        hands::Clearance::Exec,
+        "unknown actions fail closed"
+    );
 
     // MCP lazy front-hand
     let mcp = ka_engine::mcp::McpCallHand::new(Vec::new());
@@ -365,6 +480,10 @@ fn config_schema_carries_every_documented_key() {
         "lsp",
         "enable",
         "commands",
+        "write_through",
+        "debug",
+        "enable",
+        "adapters",
         "tui",
         "header_glyph",
         "bell",

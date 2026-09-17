@@ -1,0 +1,25 @@
+# DAP adapter seed catalog: name → stdio launch command (argv,
+# whitespace-split, spawned with cwd = the session's working directory).
+# Socket-only adapters do not fit ka's one-process-children model — use
+# the adapter's stdio mode or skip it. Override or add entries via the
+# [debug.adapters] config overlay (strict TOML: unknown keys are errors).
+
+[gdb]
+command = "gdb -i dap"
+
+[lldb]
+command = "lldb-dap"
+
+[codelldb]
+# codelldb usually needs its extension directory; point [debug.adapters]
+# at your install: codelldb = "/path/to/codelldb/adapter"
+command = "codelldb"
+
+[debugpy]
+command = "python3 -m debugpy.adapter"
+
+[dlv]
+command = "dlv dap"
+
+[netcoredbg]
+command = "netcoredbg"

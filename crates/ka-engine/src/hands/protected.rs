@@ -12,7 +12,7 @@ use std::path::{Component, Path, PathBuf};
 
 /// Lexically normalize `..`/`.` without touching the filesystem (the
 /// target may not exist yet; `canonicalize` would miss new files).
-fn normalize(path: &Path) -> PathBuf {
+pub(crate) fn normalize(path: &Path) -> PathBuf {
     let mut out = PathBuf::new();
     for comp in path.components() {
         match comp {

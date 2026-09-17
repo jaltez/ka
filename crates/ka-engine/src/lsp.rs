@@ -1,7 +1,10 @@
-//! Opt-in language-server diagnostics: a hand-rolled LSP client over
+//! Opt-in language-server integration: a hand-rolled LSP client over
 //! stdio (JSON-RPC with `Content-Length` framing — no new dependency,
-//! same precedent as the MCP client). Only diagnostics; no completions,
-//! no hover, no workspace features.
+//! same precedent as the MCP client). Diagnostics and navigation by
+//! default; with `[lsp] write_through = true`, also rename and code
+//! actions that act through the server (`hands/lsp_write.rs`) and
+//! `workspace/applyEdit` reverse requests claimed by those hands.
+//! No completions, no hover.
 //!
 //! Contract (the opencode #9102 lesson): diagnostics are informational
 //! context appended to a *successful* edit/write tool result. They never
@@ -21,9 +24,11 @@
 //! eventual consistency, the LSP ceiling).
 
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 
-use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::io::BufReader;
 use tokio::process::{Child, ChildStdin};
 use tokio::sync::oneshot;
 
@@ -43,6 +48,9 @@ const READY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 /// How long `request` waits for a response (cold rust-analyzer indexes
 /// can make the first workspace query slow).
 const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+/// Bound on queued `workspace/applyEdit` reverse requests — beyond it a
+/// request is answered `applied: false` rather than parked.
+const MAX_REVERSE: usize = 16;
 
 /// One cached diagnostic (normalized off the wire).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -325,6 +333,192 @@ pub fn utf16_column(line: &str, byte_offset: usize) -> u64 {
     prefix.encode_utf16().count() as u64
 }
 
+/// Byte offset for an LSP `{line, character}` position in `text`, both
+/// 0-based UTF-16-unit counts. Spec-clamped rather than erroring: a
+/// line past the document end resolves to the end of text, a character
+/// past the line end to the line end (LSP 3.17 "if the character value
+/// is greater than the line length it defaults back to the line
+/// length"). Line terminators are `\n`; a `\r` before one is ordinary
+/// line content.
+pub fn utf16_to_byte(text: &str, line: u64, character: u64) -> usize {
+    let mut offset = 0usize;
+    for (current_line, piece) in text.split('\n').enumerate() {
+        if current_line as u64 == line {
+            let mut units = 0u64;
+            for (byte_idx, ch) in piece.char_indices() {
+                if units >= character {
+                    return offset + byte_idx;
+                }
+                units += ch.len_utf16() as u64;
+            }
+            return offset + piece.len();
+        }
+        offset += piece.len() + 1;
+    }
+    // line past the document: end of text
+    text.len()
+}
+
+/// One normalized `TextEdit` off the wire (UTF-16 range → replacement).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RawEdit {
+    /// 0-based start line / character (UTF-16 units).
+    pub start_line: u64,
+    pub start_char: u64,
+    pub end_line: u64,
+    pub end_char: u64,
+    pub new_text: String,
+}
+
+/// Parse a `WorkspaceEdit` (`changes` map and/or `documentChanges`
+/// array of edit entries) into per-file edit lists, path-resolved and
+/// capped. File create/rename/delete `documentChanges` are refused —
+/// ka's write path only applies text edits.
+pub fn parse_workspace_edit(
+    edit: &serde_json::Value,
+) -> Result<Vec<(PathBuf, Vec<RawEdit>)>, String> {
+    /// Cap sanity: a server response must not drive a mega-edit.
+    const MAX_FILES: usize = 50;
+    const MAX_NEWTEXT_BYTES: usize = 256 * 1024;
+
+    let parse_edit = |e: &serde_json::Value| -> Option<RawEdit> {
+        Some(RawEdit {
+            start_line: e["range"]["start"]["line"].as_u64()?,
+            start_char: e["range"]["start"]["character"].as_u64()?,
+            end_line: e["range"]["end"]["line"].as_u64()?,
+            end_char: e["range"]["end"]["character"].as_u64()?,
+            new_text: e
+                .get("newText")
+                .and_then(serde_json::Value::as_str)?
+                .to_string(),
+        })
+    };
+
+    // documentChanges wins when a server sends both shapes. Parsing is
+    // fail-closed: a malformed entry (bad range, missing newText, no
+    // edits/kind) refuses the whole edit — a partially applied rename
+    // is worse than none.
+    let mut files: Vec<(PathBuf, Vec<RawEdit>)> = Vec::new();
+    if let Some(changes) = edit.get("documentChanges").and_then(|c| c.as_array()) {
+        for change in changes {
+            if let Some(items) = change.get("edits").and_then(|e| e.as_array()) {
+                let uri = change["textDocument"]["uri"].as_str().unwrap_or_default();
+                let edits: Vec<RawEdit> = items
+                    .iter()
+                    .map(parse_edit)
+                    .collect::<Option<Vec<_>>>()
+                    .ok_or_else(|| {
+                        format!("workspace edit has a malformed entry for {uri:?}; refusing")
+                    })?;
+                push_file(&mut files, uri, edits)?;
+            } else if let Some(kind) = change.get("kind").and_then(|k| k.as_str()) {
+                return Err(format!(
+                    "workspace edit contains a file {kind} operation — only text edits \
+                     are supported; nothing was applied"
+                ));
+            } else {
+                return Err("workspace edit entry has neither edits nor kind; refusing".to_string());
+            }
+        }
+    } else if let Some(changes) = edit.get("changes").and_then(|c| c.as_object()) {
+        for (uri, items) in changes {
+            let items = items.as_array().ok_or_else(|| {
+                format!("workspace edit entry for {uri:?} is not an array; refusing")
+            })?;
+            let edits: Vec<RawEdit> = items
+                .iter()
+                .map(parse_edit)
+                .collect::<Option<Vec<_>>>()
+                .ok_or_else(|| {
+                    format!("workspace edit has a malformed entry for {uri:?}; refusing")
+                })?;
+            push_file(&mut files, uri, edits)?;
+        }
+    }
+    if files.len() > MAX_FILES {
+        return Err(format!(
+            "workspace edit touches {} files (cap {MAX_FILES}); refusing",
+            files.len()
+        ));
+    }
+    let total_bytes: usize = files
+        .iter()
+        .flat_map(|(_, edits)| edits.iter().map(|e| e.new_text.len()))
+        .sum();
+    if total_bytes > MAX_NEWTEXT_BYTES {
+        return Err(format!(
+            "workspace edit inserts {total_bytes} bytes (cap {MAX_NEWTEXT_BYTES}); refusing"
+        ));
+    }
+    Ok(files)
+}
+
+/// Resolve one URI → path and append its edit list, merging when the
+/// same file appears twice.
+fn push_file(
+    files: &mut Vec<(PathBuf, Vec<RawEdit>)>,
+    uri: &str,
+    edits: Vec<RawEdit>,
+) -> Result<(), String> {
+    const MAX_EDITS_PER_FILE: usize = 64;
+    let Some(path) = path_of_uri(uri) else {
+        return Err(format!(
+            "workspace edit targets non-file URI {uri:?}; refusing"
+        ));
+    };
+    let path = PathBuf::from(path);
+    if let Some(existing) = files.iter_mut().find(|(p, _)| *p == path) {
+        existing.1.extend(edits);
+        if existing.1.len() > MAX_EDITS_PER_FILE {
+            return Err(format!(
+                "workspace edit has {} edits for {} (cap {MAX_EDITS_PER_FILE}); refusing",
+                existing.1.len(),
+                path.display()
+            ));
+        }
+    } else {
+        if edits.len() > MAX_EDITS_PER_FILE {
+            return Err(format!(
+                "workspace edit has {} edits for {} (cap {MAX_EDITS_PER_FILE}); refusing",
+                edits.len(),
+                path.display()
+            ));
+        }
+        files.push((path, edits));
+    }
+    Ok(())
+}
+
+/// Apply one file's edits to its text: UTF-16 ranges → byte ranges
+/// (spec-clamped), non-overlap enforced, applied last-to-first so
+/// earlier positions stay valid. Overlapping edits are a server bug —
+/// refused whole rather than merged.
+pub fn apply_text_edits(text: &str, edits: &[RawEdit]) -> Result<String, String> {
+    let mut spans: Vec<(usize, usize, &str)> = edits
+        .iter()
+        .map(|e| {
+            let start = utf16_to_byte(text, e.start_line, e.start_char);
+            let end = utf16_to_byte(text, e.end_line, e.end_char).max(start);
+            (start, end, e.new_text.as_str())
+        })
+        .collect();
+    spans.sort_by_key(|(s, e, _)| (*s, *e));
+    for pair in spans.windows(2) {
+        let (prev_end, _) = (pair[0].1, pair[0].2);
+        let (next_start, _) = (pair[1].0, pair[1].1);
+        if next_start < prev_end {
+            return Err(
+                "overlapping edits from the language server; refusing to merge".to_string(),
+            );
+        }
+    }
+    let mut out = text.to_string();
+    for (start, end, new_text) in spans.iter().rev() {
+        out.replace_range(start..end, new_text);
+    }
+    Ok(out)
+}
+
 /// Diagnostics cache (URI → latest publish for the current content).
 /// `None` marks "no publish for this content yet".
 type Cache = parking_lot::Mutex<HashMap<String, Option<Vec<Diag>>>>;
@@ -334,6 +528,18 @@ type Versions = parking_lot::Mutex<HashMap<String, i64>>;
 /// Request responses owed to callers (id → waiter). The reader task
 /// completes the matching sender; everyone else times out.
 type Pending = parking_lot::Mutex<HashMap<i64, oneshot::Sender<serde_json::Value>>>;
+/// Server→client `workspace/applyEdit` requests waiting for a write-
+/// through hand to claim them (per language). Bounded: a request that
+/// arrives when the queue is full is answered `applied: false` instead
+/// of parked — servers must never hang on an unclaimed edit.
+type Reverse = parking_lot::Mutex<Vec<ReverseReq>>;
+
+/// One queued reverse request.
+struct ReverseReq {
+    lang: String,
+    id: i64,
+    edit: serde_json::Value,
+}
 
 /// A ready server child for one language.
 struct ServerProc {
@@ -366,6 +572,8 @@ struct Shared {
     /// Request ids handed out so far (initialize owns 1).
     next_id: std::sync::atomic::AtomicI64,
     pending: std::sync::Arc<Pending>,
+    /// Unclaimed `workspace/applyEdit` reverse requests.
+    reverse: std::sync::Arc<Reverse>,
     /// Serializes every pipe writer (touch/didChange, didOpen, and
     /// requests share one server stdin). Without it, two concurrent
     /// hands both find the writer taken and one fails spuriously with
@@ -397,6 +605,7 @@ impl LspManager {
                 versions: std::sync::Arc::new(parking_lot::Mutex::new(HashMap::new())),
                 next_id: std::sync::atomic::AtomicI64::new(2),
                 pending: std::sync::Arc::new(parking_lot::Mutex::new(HashMap::new())),
+                reverse: std::sync::Arc::new(parking_lot::Mutex::new(Vec::new())),
                 write_lock: tokio::sync::Mutex::new(()),
                 cwd: cwd.to_path_buf(),
             }),
@@ -594,6 +803,211 @@ impl LspManager {
         }
     }
 
+    /// Take every queued `workspace/applyEdit` reverse request for
+    /// `lang` (leaving other languages' entries in place).
+    pub fn claim_reverse_edits(&self, lang: &str) -> Vec<(i64, serde_json::Value)> {
+        let mut q = self.shared.reverse.lock();
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i < q.len() {
+            if q[i].lang == lang {
+                let r = q.remove(i);
+                out.push((r.id, r.edit));
+            } else {
+                i += 1;
+            }
+        }
+        out
+    }
+
+    /// Answer a server→client request we claimed via
+    /// [`Self::claim_reverse_edits`].
+    pub async fn respond_request(
+        &self,
+        lang: &str,
+        id: i64,
+        result: serde_json::Value,
+    ) -> Result<(), String> {
+        let msg = serde_json::json!({ "jsonrpc": "2.0", "id": id, "result": result });
+        send_message(&self.shared, lang, &msg)
+            .await
+            .map_err(|_| format!("{lang} language server is not writable"))
+    }
+
+    /// One notification (no response expected) to `lang`'s ready server.
+    pub async fn notify(
+        &self,
+        lang: &str,
+        method: &str,
+        params: serde_json::Value,
+    ) -> Result<(), String> {
+        // fire-and-forget: a still-starting server never opened the
+        // document anyway, and the didRenameFiles fan-out hits every
+        // configured server serially — waiting ≤READY_TIMEOUT per
+        // language would only stall the hand. Skip instead.
+        if !self.is_ready(lang) {
+            return Err(format!(
+                "{lang} language server not ready; notification skipped"
+            ));
+        }
+        let msg = serde_json::json!({ "jsonrpc": "2.0", "method": method, "params": params });
+        send_message(&self.shared, lang, &msg)
+            .await
+            .map_err(|_| format!("{lang} language server is not writable"))
+    }
+
+    /// Whether `lang`'s server finished its handshake — no waiting.
+    pub fn is_ready(&self, lang: &str) -> bool {
+        matches!(
+            self.shared.inner.lock().servers.get(lang),
+            Some(Server::Ready(_))
+        )
+    }
+
+    /// Close a document the servers track (didClose + cache/version
+    /// cleanup) — called after a file moves so servers drop the old URI.
+    /// Best-effort: a not-yet-ready server simply never opened it.
+    pub async fn close_document(&self, path: &Path) {
+        let uri = uri_for(path);
+        self.shared.versions.lock().remove(&uri);
+        self.shared.cache.lock().remove(&uri);
+        if let Some(lang) = language_for(path) {
+            let msg = serde_json::json!({
+                "jsonrpc": "2.0",
+                "method": "textDocument/didClose",
+                "params": { "textDocument": { "uri": uri } }
+            });
+            let _ = send_message(&self.shared, lang, &msg).await;
+        }
+    }
+
+    /// One request that simultaneously claims `workspace/applyEdit`
+    /// reverse requests from the same server while its response is
+    /// pending. Servers commonly answer `executeCommand` by *sending*
+    /// `applyEdit` first and finishing only once it is applied — a
+    /// plain request would deadlock until the timeout. Each claimed
+    /// edit goes through `on_edit`; the reply reports whether it
+    /// applied.
+    pub async fn request_with_reverse<'a>(
+        &self,
+        lang: &str,
+        method: &str,
+        params: serde_json::Value,
+        mut on_edit: impl FnMut(
+            serde_json::Value,
+        ) -> Pin<std::boxed::Box<dyn Future<Output = bool> + Send + 'a>>,
+    ) -> Result<serde_json::Value, String> {
+        self.ensure_ready(lang).await?;
+        let id = self
+            .shared
+            .next_id
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let (tx, mut rx) = oneshot::channel::<serde_json::Value>();
+        self.shared.pending.lock().insert(id, tx);
+        let msg = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": method,
+            "params": params,
+        });
+        if send_message(&self.shared, lang, &msg).await.is_err() {
+            self.shared.pending.lock().remove(&id);
+            return Err(format!("{lang} language server is not writable"));
+        }
+        let deadline = tokio::time::Instant::now() + REQUEST_TIMEOUT;
+        let outcome: Result<serde_json::Value, String> = loop {
+            let response = tokio::select! {
+                r = &mut rx => {
+                    match r {
+                        Ok(resp) => resp,
+                        Err(_) => {
+                            self.shared.pending.lock().remove(&id);
+                            break Err(format!(
+                                "{lang} language server dropped the request"
+                            ));
+                        }
+                    }
+                }
+                _ = tokio::time::sleep(std::time::Duration::from_millis(50)) => {
+                    if tokio::time::Instant::now() >= deadline {
+                        self.shared.pending.lock().remove(&id);
+                        break Err(format!("{lang} language server timed out"));
+                    }
+                    serde_json::Value::Null
+                }
+            };
+            // the sleep branch yields Null; a real response is always
+            // a JSON-RPC envelope object
+            if !response.is_null() {
+                if let Some(err) = response.get("error") {
+                    let code = err
+                        .get("code")
+                        .and_then(serde_json::Value::as_i64)
+                        .unwrap_or(0);
+                    let text = err
+                        .get("message")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("?");
+                    break Err(format!("server error {code}: {text}"));
+                }
+                break Ok(response
+                    .get("result")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null));
+            }
+            // drain any reverse applyEdit that arrived while waiting
+            for (rid, edit) in self.claim_reverse_edits(lang) {
+                let applied = on_edit(edit).await;
+                let result = if applied {
+                    serde_json::json!({ "applied": true })
+                } else {
+                    serde_json::json!({
+                        "applied": false,
+                        "failureReason": "ka: edit refused (ledger drift, protected path, or caps)",
+                    })
+                };
+                let _ = self.respond_request(lang, rid, result).await;
+            }
+        };
+        if outcome.is_err() {
+            // the outer request failed: answer any stranded applyEdit
+            // truthfully instead of parking it (a later, unrelated op
+            // would otherwise claim and apply it out of context)
+            for (rid, _edit) in self.claim_reverse_edits(lang) {
+                let _ = self
+                    .respond_request(
+                        lang,
+                        rid,
+                        serde_json::json!({
+                            "applied": false,
+                            "failureReason":
+                                "ka: outer request failed; edit not applied",
+                        }),
+                    )
+                    .await;
+            }
+        }
+        outcome
+    }
+
+    /// Feed `path`'s on-disk content to its server and wait (≤2.5 s) for
+    /// fresh diagnostics — the write-through hands' feedback loop.
+    /// `None` = nothing to report (disabled/unknown/unconfigured, no
+    /// publish in the window, or a clean file).
+    pub async fn refresh(&self, path: &Path) -> Option<Vec<String>> {
+        let text = std::fs::read_to_string(path).ok()?;
+        if !self.touch(path, &text).await {
+            return None;
+        }
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(2500);
+        let mut rendered = self.diagnostics(path);
+        while rendered.is_none() && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            rendered = self.diagnostics(path);
+        }
+        rendered.filter(|lines| !lines.is_empty())
+    }
+
     /// Ensure the language server has `path` open with its on-disk
     /// content, so position queries (definition/references) see current
     /// truth. Returns the document URI.
@@ -637,28 +1051,7 @@ impl LspManager {
     /// dance keeps the table lock off the pipe await). A dead pipe
     /// fails the language for the session — same policy as `touch`.
     async fn write_to_server(&self, lang: &str, msg: &serde_json::Value) -> Result<(), ()> {
-        let _guard = self.shared.write_lock.lock().await;
-        let mut writer = {
-            let mut inner = self.shared.inner.lock();
-            inner.servers.get_mut(lang).and_then(|s| match s {
-                Server::Ready(p) => p.writer.take(),
-                _ => None,
-            })
-        };
-        let Some(w) = writer.as_mut() else {
-            return Err(());
-        };
-        if write_msg(w, msg).await.is_err() {
-            let mut inner = self.shared.inner.lock();
-            inner.servers.remove(lang);
-            inner.failed.insert(lang.to_string());
-            return Err(());
-        }
-        let mut inner = self.shared.inner.lock();
-        if let Some(Server::Ready(p)) = inner.servers.get_mut(lang) {
-            p.writer = writer.take();
-        }
-        Ok(())
+        send_message(&self.shared, lang, msg).await
     }
 
     /// Snapshot of every file's cached diagnostics (display path,
@@ -693,7 +1086,12 @@ fn cached(cache: &Cache, uri: &str) -> Option<Vec<String>> {
 /// → optionally didOpen the content that kicked us off, then publish it
 /// ready. Any failure marks the language failed for the session (no
 /// retries).
-async fn start_server(shared: &Shared, lang: &str, command: &str, first_doc: Option<(&str, &str)>) {
+async fn start_server(
+    shared: &std::sync::Arc<Shared>,
+    lang: &str,
+    command: &str,
+    first_doc: Option<(&str, &str)>,
+) {
     let fail = |shared: &Shared, lang: &str| {
         let mut inner = shared.inner.lock();
         inner.servers.remove(lang);
@@ -735,9 +1133,8 @@ async fn start_server(shared: &Shared, lang: &str, command: &str, first_doc: Opt
     };
     tokio::spawn(read_loop(
         BufReader::new(reader),
-        shared.cache.clone(),
-        shared.versions.clone(),
-        shared.pending.clone(),
+        shared.clone(),
+        lang.to_string(),
         init_tx,
     ));
     let init = serde_json::json!({
@@ -800,80 +1197,101 @@ async fn start_server(shared: &Shared, lang: &str, command: &str, first_doc: Opt
     );
 }
 
-/// Write one framed JSON-RPC message.
+/// Write one framed JSON-RPC message (the shared wire codec does the
+/// framing; this wrapper is the serde boundary).
 async fn write_msg(w: &mut ChildStdin, msg: &serde_json::Value) -> std::io::Result<()> {
-    let body = serde_json::to_string(msg)?;
-    w.write_all(format!("Content-Length: {}\r\n\r\n", body.len()).as_bytes())
-        .await?;
-    w.write_all(body.as_bytes()).await?;
-    w.flush().await
+    let body = serde_json::to_vec(msg)?;
+    crate::wire::write_frame(w, &body).await
+}
+
+/// Write one message to `lang`'s ready server (writer take/put-back
+/// dance keeps the table lock off the pipe await). A dead pipe fails
+/// the language for the session — same policy as `touch`. Shared by the
+/// manager methods and the read loop (which answers server→client
+/// requests on the same pipe).
+async fn send_message(shared: &Shared, lang: &str, msg: &serde_json::Value) -> Result<(), ()> {
+    let _guard = shared.write_lock.lock().await;
+    let mut writer = {
+        let mut inner = shared.inner.lock();
+        inner.servers.get_mut(lang).and_then(|s| match s {
+            Server::Ready(p) => p.writer.take(),
+            _ => None,
+        })
+    };
+    let Some(w) = writer.as_mut() else {
+        return Err(());
+    };
+    if write_msg(w, msg).await.is_err() {
+        let mut inner = shared.inner.lock();
+        inner.servers.remove(lang);
+        inner.failed.insert(lang.to_string());
+        return Err(());
+    }
+    let mut inner = shared.inner.lock();
+    if let Some(Server::Ready(p)) = inner.servers.get_mut(lang) {
+        p.writer = writer.take();
+    }
+    Ok(())
+}
+
+/// Reply to a server→client request WITHOUT stalling this loop: the
+/// write path can block on `write_lock` (a slow consumer of the
+/// server's stdin), and this loop is the only stdout drainer — parking
+/// it inline on the lock can wedge the pipe. Spawned, best-effort, like
+/// every reply here.
+async fn reply_off_loop(shared: &std::sync::Arc<Shared>, lang: &str, reply: serde_json::Value) {
+    let shared = shared.clone();
+    let lang = lang.to_string();
+    tokio::spawn(async move {
+        let _ = send_message(&shared, &lang, &reply).await;
+    });
 }
 
 /// Read framed messages off a server's stdout, caching
 /// publishDiagnostics (version-filtered against what we sent),
-/// signaling the initialize response, and completing pending requests.
+/// signaling the initialize response, completing pending requests, and
+/// dispatching server→client requests: `workspace/applyEdit` is queued
+/// for a write-through hand to claim (bounded; overflow is answered
+/// `applied: false`), everything else gets a polite `null` result — the
+/// pre-write-through behavior was silence, which left servers waiting.
 /// Runs until the pipe closes.
 async fn read_loop<R: tokio::io::AsyncRead + Unpin + Send + 'static>(
     mut reader: R,
-    cache: std::sync::Arc<Cache>,
-    versions: std::sync::Arc<Versions>,
-    pending: std::sync::Arc<Pending>,
+    shared: std::sync::Arc<Shared>,
+    lang: String,
     init_tx: oneshot::Sender<bool>,
 ) {
     let mut init_tx = Some(init_tx);
     loop {
-        // read headers
-        let headers = match read_headers(&mut reader).await {
-            Ok(Some(h)) => h,
-            _ => return,
+        let body = match crate::wire::read_frame(&mut reader).await {
+            Some(b) => b,
+            None => return,
         };
-        // header names are case-insensitive per the LSP base protocol;
-        // a hostile/buggy Content-Length must not drive an allocation
-        const MAX_FRAME: usize = 16 * 1024 * 1024;
-        let len: usize = match headers
-            .iter()
-            .find_map(|h| {
-                let (k, v) = h.split_once(':')?;
-                k.eq_ignore_ascii_case("content-length")
-                    .then(|| v.trim().parse::<usize>().ok())
-                    .flatten()
-            })
-            .unwrap_or(0)
-        {
-            0 => continue,
-            l if l > MAX_FRAME => return, // lie: close the connection
-            l => l,
-        };
-        // read body
-        let mut body = vec![0u8; len];
-        if reader.read_exact(&mut body).await.is_err() {
-            return;
-        }
         let Ok(msg) = serde_json::from_slice::<serde_json::Value>(&body) else {
             continue;
         };
-        // responses carry an id and no method; server→client requests
-        // (id + method, e.g. workspace/configuration) stay ignored
-        if msg.get("method").is_none() {
+        let method = msg.get("method").and_then(|m| m.as_str());
+        // responses carry an id and no method
+        if method.is_none() {
             if let Some(id) = msg.get("id").and_then(serde_json::Value::as_i64) {
                 if id == 1 {
                     if let Some(tx) = init_tx.take() {
                         let _ = tx.send(msg.get("result").is_some());
                     }
-                } else if let Some(tx) = pending.lock().remove(&id) {
+                } else if let Some(tx) = shared.pending.lock().remove(&id) {
                     let _ = tx.send(msg);
                 }
                 continue;
             }
         }
-        if msg.get("method").and_then(|m| m.as_str()) == Some("textDocument/publishDiagnostics") {
+        if method == Some("textDocument/publishDiagnostics") {
             let Some(uri) = msg["params"]["uri"].as_str() else {
                 continue;
             };
             // stale-publish filter: a publish tagged with a version
             // older than what we last sent describes previous content
             if let Some(v) = msg["params"]["version"].as_i64() {
-                let current = versions.lock().get(uri).copied().unwrap_or(i64::MAX);
+                let current = shared.versions.lock().get(uri).copied().unwrap_or(i64::MAX);
                 if v < current {
                     continue;
                 }
@@ -901,38 +1319,64 @@ async fn read_loop<R: tokio::io::AsyncRead + Unpin + Send + 'static>(
                         .collect()
                 })
                 .unwrap_or_default();
-            cache.lock().insert(uri.to_string(), Some(diags));
+            shared.cache.lock().insert(uri.to_string(), Some(diags));
+            continue;
+        }
+        // server→client requests (id + method): queue applyEdit for a
+        // write-through hand, answer everything else with a null result
+        if let (Some(method), Some(id)) =
+            (method, msg.get("id").and_then(serde_json::Value::as_i64))
+        {
+            if method == "workspace/applyEdit" {
+                let edit = msg["params"]["edit"].clone();
+                let queued = {
+                    let mut q = shared.reverse.lock();
+                    if q.len() < MAX_REVERSE {
+                        q.push(ReverseReq {
+                            lang: lang.clone(),
+                            id,
+                            edit,
+                        });
+                        true
+                    } else {
+                        false
+                    }
+                };
+                if !queued {
+                    let reply = serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "result": {
+                            "applied": false,
+                            "failureReason": "ka: reverse-request queue full",
+                        }
+                    });
+                    reply_off_loop(&shared, &lang, reply).await;
+                }
+            } else if method == "workspace/configuration" {
+                // spec: one result item per requested section; a bare
+                // null is wrong-typed and strict servers reject it
+                let n = msg["params"]["items"].as_array().map_or(1, Vec::len);
+                reply_off_loop(
+                    &shared,
+                    &lang,
+                    serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "result": vec![serde_json::Value::Null; n]
+                    }),
+                )
+                .await;
+            } else {
+                reply_off_loop(
+                    &shared,
+                    &lang,
+                    serde_json::json!({ "jsonrpc": "2.0", "id": id, "result": null }),
+                )
+                .await;
+            }
         }
         // everything else (logMessage, progress, ...) is ignored
-    }
-}
-
-/// Read one header block (to the blank line); `None` = EOF.
-async fn read_headers<R: tokio::io::AsyncRead + Unpin>(
-    reader: &mut R,
-) -> std::io::Result<Option<Vec<String>>> {
-    let mut headers: Vec<String> = Vec::new();
-    let mut byte = [0u8; 1];
-    loop {
-        // read one line terminated by \n (header lines end \r\n)
-        let mut line = Vec::new();
-        loop {
-            match reader.read(&mut byte).await {
-                Ok(0) | Err(_) => return Ok(None),
-                Ok(_) if byte[0] == b'\n' => break,
-                Ok(_) => line.push(byte[0]),
-            }
-        }
-        let line = String::from_utf8_lossy(&line)
-            .trim_end_matches('\r')
-            .to_string();
-        if line.is_empty() {
-            if headers.is_empty() {
-                continue; // stray blank lines between messages
-            }
-            return Ok(Some(std::mem::take(&mut headers)));
-        }
-        headers.push(line);
     }
 }
 
@@ -957,6 +1401,7 @@ mod tests {
             &LspConfig {
                 enable: Some(true),
                 commands: Some(BTreeMap::from([("rust".to_string(), command)])),
+                write_through: None,
             },
         )
     }
@@ -1016,6 +1461,148 @@ mod tests {
         );
     }
 
+    #[test]
+    fn utf16_to_byte_maps_and_clamps() {
+        let text = "fn a() {}\nlet é = \"日\";\nlast\n";
+        assert_eq!(utf16_to_byte(text, 0, 0), 0);
+        assert_eq!(utf16_to_byte(text, 1, 0), 10, "line 1 starts after \\n");
+        // "let " = 4 units and 4 bytes
+        assert_eq!(utf16_to_byte(text, 1, 4), 14);
+        // "let é = \"" = 9 UTF-16 units (é is one) but 10 bytes
+        assert_eq!(utf16_to_byte(text, 1, 9), 20);
+        // character past the line clamps to the line end
+        assert_eq!(utf16_to_byte(text, 1, 999), 10 + "let é = \"日\";".len());
+        // line past the document clamps to the end of text
+        assert_eq!(utf16_to_byte(text, 99, 0), text.len());
+    }
+
+    fn raw(sl: u64, sc: u64, el: u64, ec: u64, nt: &str) -> RawEdit {
+        RawEdit {
+            start_line: sl,
+            start_char: sc,
+            end_line: el,
+            end_char: ec,
+            new_text: nt.to_string(),
+        }
+    }
+
+    #[test]
+    fn text_edits_apply_and_refuse_overlap() {
+        let text = "aaa\nbbb\nccc\n";
+        let out = apply_text_edits(text, &[raw(1, 0, 1, 3, "B"), raw(0, 0, 0, 3, "A")]).unwrap();
+        assert_eq!(out, "A\nB\nccc\n");
+        // zero-width insert
+        let out = apply_text_edits(text, &[raw(2, 0, 2, 0, "// ")]).unwrap();
+        assert_eq!(out, "aaa\nbbb\n// ccc\n");
+        // multi-unit characters inside the replaced span
+        let uni = "let é = 1;\n";
+        let out = apply_text_edits(uni, &[raw(0, 4, 0, 5, "èè")]).unwrap();
+        assert_eq!(out, "let èè = 1;\n");
+        // overlapping edits are refused whole
+        assert!(
+            apply_text_edits(text, &[raw(0, 0, 1, 0, "x"), raw(0, 1, 0, 2, "y")]).is_err(),
+            "overlap must refuse"
+        );
+    }
+
+    #[test]
+    fn workspace_edits_parse_both_shapes_and_refuse_file_ops() {
+        let a = uri_for(Path::new("/w/a.rs"));
+        let b = uri_for(Path::new("/w/b.rs"));
+        let edit = |nt: &str| {
+            serde_json::json!({
+                "range": {
+                    "start": { "line": 0, "character": 0 },
+                    "end": { "line": 0, "character": 3 }
+                },
+                "newText": nt
+            })
+        };
+        let changes = serde_json::json!({
+            "changes": { a.clone(): [edit("x")], b.clone(): [edit("y")] }
+        });
+        let files = parse_workspace_edit(&changes).unwrap();
+        assert_eq!(files.len(), 2);
+        assert_eq!(files[0].0, PathBuf::from("/w/a.rs"));
+        assert_eq!(files[0].1[0].new_text, "x");
+
+        let doc_changes = serde_json::json!({
+            "documentChanges": [
+                { "textDocument": { "uri": a, "version": 1 }, "edits": [edit("z")] }
+            ]
+        });
+        let files = parse_workspace_edit(&doc_changes).unwrap();
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].1[0].new_text, "z");
+
+        let file_op = serde_json::json!({
+            "documentChanges": [
+                { "kind": "rename", "oldUri": a, "newUri": b }
+            ]
+        });
+        let err = parse_workspace_edit(&file_op).unwrap_err();
+        assert!(err.contains("file rename"), "{err}");
+        // non-file URIs refuse
+        let bad = serde_json::json!({ "changes": { "untitled:Untitled-1": [edit("x")] } });
+        assert!(parse_workspace_edit(&bad).is_err());
+    }
+
+    #[test]
+    fn workspace_edit_caps_refuse() {
+        let edit = |nt: &str| {
+            serde_json::json!({
+                "range": {
+                    "start": { "line": 0, "character": 0 },
+                    "end": { "line": 0, "character": 1 }
+                },
+                "newText": nt
+            })
+        };
+        // 51 files > cap 50 — README: "capped (50 files, ...)"
+        let mut changes = serde_json::Map::new();
+        for i in 0..51 {
+            changes.insert(
+                uri_for(Path::new(&format!("/w/f{i}.rs"))),
+                serde_json::json!([edit("x")]),
+            );
+        }
+        let err = parse_workspace_edit(&serde_json::json!({ "changes": changes })).unwrap_err();
+        assert!(err.contains("cap 50"), "{err}");
+        // 65 edits for one file > cap 64 (README: "64 edits per file")
+        let a = uri_for(Path::new("/w/a.rs"));
+        let many: Vec<_> = (0..65).map(|_| edit("x")).collect();
+        let err = parse_workspace_edit(&serde_json::json!({ "changes": { a.clone(): many } }))
+            .unwrap_err();
+        assert!(err.contains("cap 64"), "{err}");
+        // > 256 KB of inserted text (README: "256 KB of inserted text")
+        let big = "x".repeat(256 * 1024 + 1);
+        let err = parse_workspace_edit(&serde_json::json!({ "changes": { a: [edit(&big)] } }))
+            .unwrap_err();
+        assert!(err.contains("cap 262144"), "{err}");
+    }
+
+    #[test]
+    fn malformed_edits_refuse_whole() {
+        let a = uri_for(Path::new("/w/a.rs"));
+        // missing range: not silently skipped — a partially applied
+        // rename is worse than none
+        let bad_range = serde_json::json!({ "changes": { a.clone(): [ { "newText": "x" } ] } });
+        assert!(parse_workspace_edit(&bad_range).is_err());
+        // missing newText: absence is not an implied deletion
+        let bad_text = serde_json::json!({ "changes": { a.clone(): [ {
+            "range": { "start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 1} }
+        } ] } });
+        assert!(parse_workspace_edit(&bad_text).is_err());
+        // documentChanges entry with neither edits nor kind
+        let neither =
+            serde_json::json!({ "documentChanges": [ { "textDocument": { "uri": a } } ] });
+        let err = parse_workspace_edit(&neither).unwrap_err();
+        assert!(err.contains("neither edits nor kind"), "{err}");
+        // changes value that is not an array
+        let not_array = serde_json::json!({ "changes": { a: "nope" } });
+        assert!(parse_workspace_edit(&not_array).is_err());
+    }
+
     #[tokio::test]
     async fn manager_is_inert_without_enable() {
         let m = LspManager::new(
@@ -1026,6 +1613,7 @@ mod tests {
                     "rust".to_string(),
                     "rust-analyzer".to_string(),
                 )])),
+                write_through: None,
             },
         );
         assert!(

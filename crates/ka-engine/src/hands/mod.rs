@@ -14,12 +14,14 @@ pub mod bash;
 pub mod delegate;
 pub use bash::BashHand;
 pub mod bashp;
+pub mod debug;
 pub mod edit;
 pub mod git;
 pub mod glob;
 pub mod grep;
 pub mod jobs;
 pub mod lsp_tools;
+pub mod lsp_write;
 pub mod memory;
 pub mod pathfinder;
 pub mod protected;
@@ -302,7 +304,7 @@ impl Ledger {
     /// `Ok(())` when `path` was read and is unchanged since.
     pub fn verify(&self, path: &Path) -> Result<(), String> {
         let display = path.display();
-        let Some(stamp) = self.stamps.get(path) else {
+        let Some(stamp) = self.lookup(path) else {
             return Err(format!(
                 "{display} has not been read yet; read it before editing"
             ));
@@ -320,6 +322,24 @@ impl Ledger {
             }
             Err(e) => Err(format!("{display}: {e}")),
         }
+    }
+
+    /// Whether `path` is currently tracked (read this session).
+    pub fn is_tracked(&self, path: &Path) -> bool {
+        self.lookup(path).is_some()
+    }
+
+    /// Stamp lookup: direct hit first, then the canonical form. The
+    /// read hands key stamps by the model's path (`~/x`, cwd-joined,
+    /// symlinks intact), while server-decoded URI paths may take the
+    /// symlink-resolved form — the drift check must not silently miss
+    /// because the two spellings differ.
+    fn lookup(&self, path: &Path) -> Option<FileStamp> {
+        if let Some(stamp) = self.stamps.get(path) {
+            return Some(*stamp);
+        }
+        let canon = std::fs::canonicalize(path).ok()?;
+        self.stamps.get(&canon).copied()
     }
 
     /// Drop all stamps (after arbitrary shell execution, any file may have

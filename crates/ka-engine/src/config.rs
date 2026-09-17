@@ -253,6 +253,21 @@ pub struct Lsp {
     /// "pyright-langserver --stdio", typescript =
     /// "typescript-language-server --stdio" }.
     pub commands: Option<std::collections::BTreeMap<String, String>>,
+    /// Act through the server, not just read: adds the `lsp_rename` and
+    /// `lsp_actions` hands (Write tier). Default false.
+    pub write_through: Option<bool>,
+}
+
+/// DAP debugging probe ([debug]): off by default — spawning debug
+/// adapters is the same trust class as stdio MCP. Inert in --safe-mode.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields, default)]
+pub struct Debug {
+    /// Enable the `debug` hand (default false).
+    pub enable: Option<bool>,
+    /// Adapter overrides: name → stdio launch command, merged over the
+    /// embedded catalog. Example: { codelldb = "/opt/codelldb/adapter" }.
+    pub adapters: Option<std::collections::BTreeMap<String, String>>,
 }
 
 /// Post-edit verification ([verify]): the aider auto-lint/auto-test
@@ -355,6 +370,9 @@ pub struct Config {
     /// Language-server diagnostics ([lsp]).
     #[serde(default)]
     pub lsp: Lsp,
+    /// DAP debugging probe ([debug]).
+    #[serde(default)]
+    pub debug: Debug,
     /// TUI appearance ([tui]).
     #[serde(default)]
     pub tui: Tui,

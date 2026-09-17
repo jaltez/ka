@@ -81,5 +81,39 @@ fn safe_mode_disables_every_customization_tier() {
         assert!(!conventions::discover_agents(&dir).is_empty());
     });
 
+    // the [lsp] tier — spawned servers, navigation hands, write-through —
+    // is a customization tier like any other: bare mode forces
+    // Lsp::default(), so neither gate (enable / write_through) can fire
+    let loaded = ka_engine::config::Config {
+        lsp: ka_engine::config::Lsp {
+            enable: Some(true),
+            commands: Some(
+                [("rust".to_string(), "rust-analyzer".to_string())]
+                    .into_iter()
+                    .collect(),
+            ),
+            write_through: Some(true),
+        },
+        ..ka_engine::config::Config::default()
+    };
+    conventions::set_bare_mode(true);
+    let lsp = ka_engine::effective_lsp_cfg(&loaded);
+    conventions::set_bare_mode(false);
+    assert_ne!(
+        lsp.enable,
+        Some(true),
+        "bare mode never spawns language servers"
+    );
+    assert_ne!(
+        lsp.write_through,
+        Some(true),
+        "bare mode never registers write-through hands"
+    );
+    assert_ne!(
+        ka_engine::effective_debug_cfg(&loaded).enable,
+        Some(true),
+        "bare mode never spawns debug adapters"
+    );
+
     let _ = std::fs::remove_dir_all(&dir);
 }

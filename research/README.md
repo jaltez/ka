@@ -38,4 +38,5 @@ scanned per-agent, then cross-aggregated.
 - `ka/implications.md` — mapping to Ka: workspace blueprint, build order, differentiators, risks
 - `ka/roadmap.md` — final phased roadmap (post-grilling decisions baked in)
 - `ka/architecture.md` — **original Ka architecture**: vocabulary, crates, protocol, dialects, safety, strand format, inspiration→reinvention map
+- `ka/daily-driver-study.md` — 2026-09 fact-check + field comparison driving Phase 8: LSP write-through, DAP, delegation contracts/steering/merge, convenience set
 - `repos/` — shallow clones used for scanning (1.4GB — disposable)

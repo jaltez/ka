@@ -92,12 +92,27 @@ mode = "fs"                # bash children: read everything, write only
 
 [lsp]                      # opt-in diagnostics feedback
 enable = true
+write_through = true       # act through the server (below), not just read
 [lsp.commands]             # language → stdio server; only configured
 rust = "rust-analyzer"     # languages spawn (hand-rolled client, no
 python = "pyright-langserver --stdio"  # new deps)
 ```
 
 `[lsp]` appends the server's latest diagnostics to successful `edit`/`write` results as informational context (never tool errors), capped at 20 lines. With LSP enabled, four navigation hands join the registry: `symbols` (workspace symbol search — the budget-safe repo map), `definition` / `references` (IDE-style navigation), and `diagnostics` (pull project-wide or per-file findings). Servers start eagerly so navigation works before the first edit. `ka doctor` reports whether configured server commands exist on PATH.
+
+With `write_through = true`, three Write-tier hands join: `lsp_rename`, `lsp_actions`, and `lsp_format`. `lsp_rename` renames a symbol through `textDocument/rename` — every reference updates in one call; with `kind = "file"` it moves a file, applying each server's ripple edits first (`workspace/willRenameFiles`: imports, re-exports, barrels) and notifying `didRenameFiles` after. `lsp_actions` lists the server's code actions at a position (Read tier) and runs one — `mode = "run"`, pick by number or title — applying its `WorkspaceEdit`, executing its command, and honoring `workspace/applyEdit` requests the server sends mid-command. `lsp_format` formats a whole file through `textDocument/formatting`; its edits ride the same ledger path as every server-proposed change. Server-proposed edits ride the ka write path, never around it: files you have read refuse to change since the read (same ledger as `edit`), untouched ripple files are snapshotted (`/undo` covers them) and ledger-minted on apply, everything is capped (50 files, 64 edits per file, 256 KB of inserted text), stays inside the working directory, and never touches protected paths. Write-through is inert in `--safe-mode` like every customization tier.
+
+## Debugging (DAP, opt-in)
+
+```toml
+[debug]                    # the probe: spawn a debug adapter, drive it
+enable = true              # via one `debug` hand
+[debug.adapters]           # name → stdio launch command; merged over
+codelldb = "/opt/codelldb/adapter"  # the embedded seed (gdb, lldb-dap,
+                           # debugpy, dlv, netcoredbg)
+```
+
+The `debug` hand launches or attaches a program, sets breakpoints, steps, and inspects the stack, variables, and expressions. Control-flow actions (start/break/clear/continue/next/step_in/step_out/pause/disconnect) run at Exec clearance; inspection (sessions/breaks/threads/stack/vars/eval/output) reads. Blocking actions wait — bounded — for the next stop and report where it landed; adapter console output lands in a bounded ring; `runInTerminal` is refused (the debug console is external). Sessions are capped and reaped when idle or dead. Inert in `--safe-mode`.
 
 ## Verify loop, notifications, memory inbox
 
