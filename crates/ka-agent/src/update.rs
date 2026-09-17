@@ -126,17 +126,10 @@ pub async fn check_and_install(
     check_only: bool,
 ) -> Result<UpdateOutcome, String> {
     let old_version = current_version();
-    let verifying = match pubkey {
-        Some(pk) => Some(verifying_key(pk)?),
-        None => {
-            eprintln!(
-                "ka: unsigned build (cargo install builds carry no release key): \
-                 verifying sha256 only. For signature-verified self-updates \
-                 install a release binary: https://github.com/jaltez/ka/releases"
-            );
-            None
-        }
-    };
+    // unsigned builds (e.g. cargo install) verify the CI-published
+    // sha256 instead of the ed25519 signature; `ka doctor` reports
+    // which build identity is running
+    let verifying = pubkey.map(verifying_key).transpose()?;
 
     let client = reqwest::Client::new();
     let url = format!("{api_base}/repos/{repo}/releases");
