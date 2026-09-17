@@ -402,6 +402,25 @@ fn conditional_hands_contract() {
         "unknown actions fail closed"
     );
 
+    // the tasks hand: listing/reading are Read; steering a running
+    // agent and merging its branch mutate (Write); cancel stays Read
+    let tasks_hand = hands::tasks::TasksHand::new(ka_engine::hands::tasks::AgentTaskTable::new());
+    assert_eq!(tasks_hand.def().name, "tasks");
+    assert_eq!(tasks_hand.def().clearance, hands::Clearance::Read);
+    assert!(!tasks_hand.def().read_only, "send/merge mutate");
+    assert_eq!(
+        tasks_hand.clearance_for(&serde_json::json!({"action": "send"})),
+        hands::Clearance::Write
+    );
+    assert_eq!(
+        tasks_hand.clearance_for(&serde_json::json!({"action": "merge"})),
+        hands::Clearance::Write
+    );
+    assert_eq!(
+        tasks_hand.clearance_for(&serde_json::json!({"action": "list"})),
+        hands::Clearance::Read
+    );
+
     // MCP lazy front-hand
     let mcp = ka_engine::mcp::McpCallHand::new(Vec::new());
     let d = mcp.def();
@@ -428,6 +447,7 @@ fn conditional_hands_contract() {
             model: None,
             effort: None,
             tools: None,
+            output: None,
         }],
         Arc::new(parking_lot::RwLock::new(
             hands::pathfinder::PathfinderSource::default(),
@@ -1069,6 +1089,7 @@ async fn background_delegate_registers_and_reports() {
             model: None,
             effort: None,
             tools: None,
+            output: None,
         }],
         voice.pathfinder_slot(),
         ka_protocol::Mode::Free,

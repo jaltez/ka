@@ -29,6 +29,10 @@ pub struct AgentDef {
     /// frontmatter, e.g. `tools: read, grep, glob`). Default: all
     /// (read-only) hands.
     pub tools: Option<Vec<String>>,
+    /// JSON schema (compact, one frontmatter line) the final reply must
+    /// satisfy — validated speaker-side through ka's structured-output
+    /// path. Invalid JSON here is ignored (the agent stays usable).
+    pub output: Option<serde_json::Value>,
 }
 
 impl AgentDef {
@@ -42,6 +46,7 @@ impl AgentDef {
         let mut model: Option<String> = None;
         let mut effort: Option<ka_protocol::Effort> = None;
         let mut tools: Option<Vec<String>> = None;
+        let mut output: Option<serde_json::Value> = None;
         let mut body = text.to_string();
 
         if let Some(rest) = text.strip_prefix("---") {
@@ -75,6 +80,9 @@ impl AgentDef {
                                     .collect(),
                             );
                         }
+                        "output" if !value.is_empty() => {
+                            output = serde_json::from_str(value).ok();
+                        }
                         _ => {}
                     }
                 }
@@ -93,6 +101,7 @@ impl AgentDef {
             model,
             effort,
             tools,
+            output,
         }
     }
 
@@ -163,6 +172,21 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use super::*;
+
+    #[test]
+    fn output_frontmatter_parses_and_ignores_invalid_json() {
+        let def = AgentDef::parse(
+            "---\nname: checker\noutput: {\"type\":\"object\",\"properties\":{\"ok\":{\"type\":\"boolean\"}}}\n---\nbody",
+            "fallback",
+        );
+        assert_eq!(def.name, "checker");
+        assert_eq!(def.output.as_ref().unwrap()["type"], "object");
+
+        // invalid JSON is ignored — the agent stays usable, unstructured
+        let bad = AgentDef::parse("---\nname: bad\noutput: {not json\n---\nbody", "fallback");
+        assert_eq!(bad.name, "bad");
+        assert!(bad.output.is_none());
+    }
 
     #[test]
     fn parses_frontmatter_and_body() {

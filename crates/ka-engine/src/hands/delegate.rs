@@ -157,6 +157,7 @@ track it with the tasks tool.",
             // model tracks it via the tasks hand (single tasks only)
             if args.get("background").and_then(Value::as_bool) == Some(true) {
                 let id = self.tasks.register(agent_name, task);
+                let roster = Some(self.tasks.rows_except(Some(id)));
                 let def = def.clone();
                 let task = task.to_string();
                 let cwd = ctx.cwd.clone();
@@ -166,7 +167,14 @@ track it with the tasks tool.",
                 let events = self.events.clone();
                 let tasks_in = tasks.clone();
                 let handle = tokio::spawn(async move {
-                    let outcome = run_agent(def, task.clone(), cwd, source, parent_mode).await;
+                    let (outcome, branch) =
+                        run_agent(def, task.clone(), cwd, source, parent_mode, roster, |tx| {
+                            tasks_in.attach_cmds(id, tx)
+                        })
+                        .await;
+                    if let Some(branch) = &branch {
+                        tasks_in.set_branch(id, branch.clone());
+                    }
                     tasks_in.finish(id, outcome.clone());
                     let (label, note) = match &outcome {
                         Ok(summary) => ("finished", truncate_for_note(summary, 200)),
@@ -187,16 +195,19 @@ track it with the tasks tool.",
                      and check the tasks tool for the result"
                 ));
             }
+            let roster = Some(self.tasks.rows_except(None));
             let source = self.source.read().clone();
-            match run_agent(
+            let (outcome, _branch) = run_agent(
                 def.clone(),
                 task.to_string(),
                 ctx.cwd.clone(),
                 source,
                 self.parent_mode,
+                roster,
+                |_| {},
             )
-            .await
-            {
+            .await;
+            match outcome {
                 Ok(summary) => ToolOutput::ok(summary),
                 Err(e) => ToolOutput::err(e),
             }
@@ -262,9 +273,17 @@ impl DelegateHand {
                 match entry {
                     Ok(job) => {
                         let name = job.def.name.clone();
-                        let out =
-                            run_agent(job.def, job.task, job.cwd, job.source, job.parent_mode)
-                                .await;
+                        let out = run_agent(
+                            job.def,
+                            job.task,
+                            job.cwd,
+                            job.source,
+                            job.parent_mode,
+                            None,
+                            |_| (),
+                        )
+                        .await
+                        .0;
                         (Some(name), out)
                     }
                     Err(reason) => (None, Err(reason)),
@@ -329,18 +348,71 @@ struct FanoutJob {
 }
 
 /// Run one agent on one task: a nested voice turn (read-only, or
-/// worktree-isolated when the agent opts in), 10-minute cap. `Err`
-/// carries the full user-facing reason.
+/// worktree-isolated when the agent opts in), 10-minute cap per
+/// attempt. `roster` (sibling task rows) is injected into the prompt as
+/// context; `on_channels` receives the steering channel per attempt so
+/// `tasks send` can reach the live turn. An agent with an `output:`
+/// schema gets one instructive retry when an attempt fails. Returns the
+/// outcome plus the surviving worktree branch (isolated agents).
 async fn run_agent(
     def: AgentDef,
     task: String,
     cwd: std::path::PathBuf,
     source: super::pathfinder::PathfinderSource,
     parent_mode: ka_protocol::Mode,
-) -> Result<String, String> {
+    roster: Option<Vec<String>>,
+    mut on_channels: impl FnMut(mpsc::Sender<ka_protocol::Command>),
+) -> (Result<String, String>, Option<String>) {
+    let attempts = if def.output.is_some() { 2 } else { 1 };
+    let mut outcome: (Result<String, String>, Option<String>) =
+        (Err("agent never ran".to_string()), None);
+    for attempt in 0..attempts {
+        let task_text = if attempt > 0 {
+            let reason = match &outcome.0 {
+                Err(reason) => reason.clone(),
+                Ok(_) => String::new(),
+            };
+            format!(
+                "{task}\n\nYour previous reply could not be used ({reason}). Reply again \
+                 with a single JSON value that matches the required output schema — \
+                 no prose around it."
+            )
+        } else {
+            task.clone()
+        };
+        outcome = run_agent_once(
+            &def,
+            &task_text,
+            &cwd,
+            &source,
+            parent_mode,
+            roster.clone(),
+            &mut on_channels,
+        )
+        .await;
+        if outcome.0.is_ok() {
+            break;
+        }
+    }
+    outcome
+}
+
+/// One attempt of [`run_agent`].
+async fn run_agent_once(
+    def: &AgentDef,
+    task: &str,
+    cwd: &std::path::Path,
+    source: &super::pathfinder::PathfinderSource,
+    parent_mode: ka_protocol::Mode,
+    roster: Option<Vec<String>>,
+    on_channels: &mut impl FnMut(mpsc::Sender<ka_protocol::Command>),
+) -> (Result<String, String>, Option<String>) {
     let agent_name = def.name.as_str();
-    let Some(parent_model) = source.model else {
-        return Err("delegate: no model configured for the parent session".to_string());
+    let Some(parent_model) = source.model.clone() else {
+        return (
+            Err("delegate: no model configured for the parent session".to_string()),
+            None,
+        );
     };
     // per-agent model/effort (factory-droids style): the frontmatter
     // selector wins outright; an effort alone re-arms the parent's
@@ -363,23 +435,35 @@ async fn run_agent(
             parent_mode,
             ka_protocol::Mode::AcceptEdits | ka_protocol::Mode::Free
         ) {
-            return Err(
-                "delegate: isolated agents need write access — switch to accept_edits or free mode first (/mode)"
-                    .to_string(),
+            return (
+                Err(
+                    "delegate: isolated agents need write access — switch to accept_edits or free mode first (/mode)"
+                        .to_string(),
+                ),
+                None,
             );
         }
-        match create_worktree(&cwd, &format!("ka-{agent_name}")) {
+        match create_worktree(cwd, &format!("ka-{agent_name}")) {
             Ok(path) => worktree = Some(path),
-            Err(e) => return Err(e),
+            Err(e) => return (Err(e), None),
         }
     }
-    let agent_cwd = worktree.clone().unwrap_or_else(|| cwd.clone());
+    let agent_cwd = worktree.clone().unwrap_or_else(|| cwd.to_path_buf());
 
-    let prompt = format!("{}\n\nTask: {}", def.system, task);
+    let mut prompt = format!("{}\n\nTask: {}", def.system, task);
+    if let Some(rows) = roster.filter(|r| !r.is_empty()) {
+        prompt.push_str(&format!(
+            "\n\nSibling tasks also in flight (context only — do not wait on them):\n{}",
+            rows.join("\n")
+        ));
+    }
     let (cmd_tx, mut cmd_rx) = mpsc::channel(16);
+    on_channels(cmd_tx.clone());
     let (evt_tx, mut evt_rx) = mpsc::channel(256);
     let isolated = worktree.is_some();
     let max_steps = def.max_steps;
+    let schema = def.output.clone();
+    let source = source.clone();
     let handle = tokio::spawn(async move {
         let mut interjections = Vec::new();
         let mut deferrals = std::collections::VecDeque::new();
@@ -412,7 +496,7 @@ async fn run_agent(
                 &mut interjections,
                 &mut deferrals,
                 &mut GuardRuntime::default(),
-                None,
+                schema,
                 Vec::new(),
             )
             .await;
@@ -442,26 +526,35 @@ async fn run_agent(
     let _ = handle.await;
 
     if !matches!(deadline, Ok(())) {
-        return Err("delegate: agent timed out (10m)".to_string());
+        return (
+            Err("delegate: agent timed out (10m)".to_string()),
+            worktree.map(|_| String::new()),
+        );
     }
     if summary.trim().is_empty() && !thought.trim().is_empty() {
         summary = thought; // thinking models: reason-only replies
     }
     if summary.trim().is_empty() {
-        return Err(format!(
-            "agent {agent_name} failed: {}",
-            failed.unwrap_or_else(|| "no summary produced".to_string())
-        ));
+        return (
+            Err(format!(
+                "agent {agent_name} failed: {}",
+                failed.unwrap_or_else(|| "no summary produced".to_string())
+            )),
+            None,
+        );
     }
     if let Some(wt) = &worktree {
-        match finish_worktree(&cwd, wt, agent_name) {
-            Ok(branch) => summary.push_str(&format!(
-                "\n\n(isolated worktree: changes live on branch `{branch}`)"
-            )),
-            Err(e) => return Err(e),
+        match finish_worktree(cwd, wt) {
+            Ok(branch) => {
+                summary.push_str(&format!(
+                    "\n\n(isolated worktree: changes live on branch `{branch}`)"
+                ));
+                return (Ok(summary), Some(branch));
+            }
+            Err(e) => return (Err(e), None),
         }
     }
-    Ok(summary)
+    (Ok(summary), None)
 }
 /// Reasoning-effort label for selector assembly.
 fn effort_label(e: &ka_protocol::Effort) -> &'static str {
@@ -533,11 +626,7 @@ fn create_worktree(cwd: &std::path::Path, name: &str) -> Result<std::path::PathB
 
 /// Remove the worktree (force) and its directory; the branch keeps any
 /// commits the agent made. Returns the branch name for the report.
-fn finish_worktree(
-    cwd: &std::path::Path,
-    path: &std::path::Path,
-    name: &str,
-) -> Result<String, String> {
+fn finish_worktree(cwd: &std::path::Path, path: &std::path::Path) -> Result<String, String> {
     let branch_out = std::process::Command::new("git")
         .args(["branch", "--show-current"])
         .current_dir(path)
@@ -546,7 +635,6 @@ fn finish_worktree(
     let branch = String::from_utf8_lossy(&branch_out.stdout)
         .trim()
         .to_string();
-    let _branch = branch;
     let status = std::process::Command::new("git")
         .args(["worktree", "remove", "--force"])
         .arg(path)
@@ -556,7 +644,7 @@ fn finish_worktree(
     if !status.success() {
         let _ = std::fs::remove_dir_all(path);
     }
-    Ok(format!("{name}-worktree"))
+    Ok(branch)
 }
 
 #[cfg(test)]
@@ -577,6 +665,7 @@ mod tests {
                 model: None,
                 effort: None,
                 tools: None,
+                output: None,
             },
             AgentDef {
                 name: "scout".to_string(),
@@ -587,6 +676,7 @@ mod tests {
                 model: None,
                 effort: None,
                 tools: None,
+                output: None,
             },
         ];
         let (events, _rx) = mpsc::channel(16);
@@ -801,7 +891,7 @@ mod tests {
             .unwrap();
         assert!(String::from_utf8_lossy(&branch.stdout).contains("reviewer"));
 
-        let name = finish_worktree(&dir, &wt, "reviewer").unwrap();
+        let name = finish_worktree(&dir, &wt).unwrap();
         assert!(name.contains("reviewer"));
         assert!(!wt.exists(), "worktree dir removed");
         let _ = std::fs::remove_dir_all(&dir);
