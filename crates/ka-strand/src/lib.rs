@@ -933,6 +933,22 @@ pub fn render_markdown(records: &[Record]) -> String {
     md
 }
 
+/// Render a strand export as a self-contained HTML page: the markdown
+/// rides in an inert escaped island and a vendored renderer turns it
+/// into DOM offline — no dependencies. Shared by the CLI's
+/// `ka export --html` and the TUI's `/export --html`.
+pub fn render_html(title: &str, markdown: &str) -> String {
+    const TEMPLATE: &str = include_str!("export_template.html");
+    let esc = |s: &str| {
+        s.replace('&', "&amp;")
+            .replace('<', "&lt;")
+            .replace('>', "&gt;")
+    };
+    TEMPLATE
+        .replace("__KA_TITLE__", &esc(title))
+        .replace("__KA_MARKDOWN__", &esc(markdown))
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]

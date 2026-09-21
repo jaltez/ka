@@ -135,6 +135,12 @@ impl Session {
         self.dead.load(Ordering::Relaxed) || self.last_used.lock().elapsed() > SESSION_TTL
     }
 
+    /// Roster status: `live` while the adapter is connected and not
+    /// expired, `ended` once it terminated or was disconnected.
+    pub fn status(&self) -> &'static str {
+        if self.expired() { "ended" } else { "live" }
+    }
+
     /// Send one request and wait for its (successful) body. DAP has no
     /// separate id field: responses echo the request's `seq` as
     /// `request_seq`, so the pending map is keyed by seq.
@@ -174,10 +180,14 @@ impl Session {
         Ok(resp.get("body").cloned().unwrap_or(Value::Null))
     }
 
-    /// One event (no response expected).
-    async fn emit(&self, event: &str, body: Value) -> Result<(), String> {
+    /// Frame and send a request whose response we deliberately do not
+    /// wait for — some adapters (debugpy) answer `launch` only after
+    /// `configurationDone`, so a synchronous wait would deadlock the
+    /// handshake. `configurationDone` (also sent sync) is the ordering
+    /// point instead.
+    async fn send_request(&self, command: &str, args: Value) -> Result<(), String> {
         let seq = self.seq.fetch_add(1, Ordering::Relaxed);
-        let msg = json!({ "seq": seq, "type": "event", "event": event, "body": body });
+        let msg = json!({ "seq": seq, "type": "request", "command": command, "arguments": args });
         let mut w = self.writer.lock().await;
         let Some(w) = w.as_mut() else {
             return Err("adapter pipe is closed".to_string());
@@ -533,17 +543,24 @@ impl DebugManager {
             )
             .await?;
         *session.capabilities.lock() = caps;
-        // the adapter gates breakpoint setup behind the `initialized`
-        // event — wait for it instead of racing
+        // launch/attach goes out immediately after the initialize
+        // response — VS Code's order, and required by adapters (debugpy)
+        // that only emit `initialized` once the debuggee is started. Its
+        // RESPONSE is deferred until configurationDone by such adapters,
+        // so the request is fire-and-forget and configurationDone below
+        // is the synchronization point.
+        let method = if launch { "launch" } else { "attach" };
+        session.send_request(method, launch_args).await?;
         if tokio::time::timeout(READY_TIMEOUT, session.initialized.notified())
             .await
             .is_err()
         {
             return Err(format!("{adapter}: no `initialized` event in time"));
         }
-        let _ = session.emit("initialized", Value::Null).await;
-        let method = if launch { "launch" } else { "attach" };
-        session.request(method, launch_args).await?;
+        // The client does NOT echo an `initialized` event: debugpy treats
+        // a client-sent one as "start the debuggee now", which would run
+        // the program before breakpoints are registered. setBreakpoints
+        // is legal as soon as the event above arrives.
         for (file, lines) in breakpoints {
             session.set_breakpoints(file, lines).await?;
         }
@@ -715,6 +732,11 @@ def event(name, body=None):
 
 while True:
     msg = read_msg()
+    if msg.get("type") == "response" and msg.get("command") == "runInTerminal":
+        # the client refused our reverse request (probe verified)
+        refused = msg.get("success") is False and "ka" in (msg.get("message") or "")
+        event("output", {{"output": "ka_rejected=%s\\n" % str(refused).lower()}})
+        continue
     if msg.get("type") != "request":
         continue
     cmd = msg.get("command")
@@ -723,12 +745,12 @@ while True:
         event("initialized")
     elif cmd == "launch":
         # pull a runInTerminal reverse request: the client must refuse
-        # it (failure response, console external) and keep going
+        # it (failure response, console external) and keep going. The
+        # probe response is handled in the main loop — launch itself is
+        # answered immediately (a real adapter defers it, but the client
+        # sends launch fire-and-forget either way).
         send({{"seq": 0, "type": "request", "command": "runInTerminal",
               "arguments": {{"kind": "external"}}}})
-        resp = read_msg()
-        refused = resp.get("success") is False and "ka" in (resp.get("message") or "")
-        event("output", {{"output": "ka_rejected=%s\\n" % str(refused).lower()}})
         reply(msg)
     elif cmd == "setBreakpoints":
         lines = [b["line"] for b in msg["arguments"]["breakpoints"]]
@@ -885,5 +907,77 @@ while True:
             err.contains("is the adapter installed"),
             "spawn failure names the binary and the hint: {err}"
         );
+    }
+
+    /// REAL third-party adapter dogfood (roadmap 8.2): drive Microsoft's
+    /// debugpy over stdio — launch a python script, break, read the
+    /// stack/variables, evaluate, resume to exit. Skips when debugpy is
+    /// not installed.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn dap_debugpy_real_adapter_round_trip() {
+        if !which_python3() {
+            return;
+        }
+        // debugpy present?
+        if std::process::Command::new("python3")
+            .args(["-m", "debugpy", "--version"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| !s.success())
+            .unwrap_or(true)
+        {
+            return;
+        }
+        let dir = dap_dir("debugpy");
+        let script = dir.join("sample.py");
+        std::fs::write(
+            &script,
+            "import sys\n\n\ndef work(n):\n    total = n + 1\n    return total\n\n\nwork(41)\n",
+        )
+        .unwrap();
+        let mut ov = BTreeMap::new();
+        ov.insert(
+            "debugpy".to_string(),
+            "python3 -m debugpy.adapter".to_string(),
+        );
+        let mgr = DebugManager::new(Some(ov));
+        let breaks = vec![(script.display().to_string(), vec![5u64])];
+        let s = mgr
+            .start(
+                "debugpy",
+                true,
+                json!({
+                    "program": script.display().to_string(),
+                    "console": "internalConsole",
+                    // stop at entry: the debuggee cannot race past the
+                    // breakpoint on a script this small, and the entry
+                    // stop is a deterministic first inspection point
+                    "stopOnEntry": true
+                }),
+                &breaks,
+                &dir,
+            )
+            .await
+            .unwrap();
+        // entry stop fires when configurationDone releases the debuggee
+        assert_eq!(s.wait_stop().await, Wait::Stopped);
+        // resume → runs to the line-5 breakpoint inside work()
+        assert_eq!(s.resume("continue").await.unwrap(), Wait::Stopped);
+        let frames = s.stack(10).await.unwrap();
+        assert!(
+            frames.iter().any(|f| f.contains("work")),
+            "the work frame is on the stack: {frames:?}"
+        );
+        let vars = s.variables(20).await.unwrap();
+        assert!(
+            vars.iter().any(|v| v.contains("n = 41")),
+            "frame locals carry the argument: {vars:?}"
+        );
+        assert_eq!(s.evaluate("n * 2").await.unwrap(), "82");
+        assert_eq!(s.resume("continue").await.unwrap(), Wait::Ended);
+        s.disconnect().await.unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

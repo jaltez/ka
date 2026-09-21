@@ -1075,6 +1075,63 @@ impl Voice {
         kept_from
     }
 
+    /// The ladder's last step: after a digest, re-inject the most
+    /// recently read/edited files (ledger-hot) as a bounded appendix on
+    /// the trailing user message, so the concrete contents the digest
+    /// summarised away stay at hand. Merged into that message (never a
+    /// separate one): the anthropic wire requires alternating roles, and
+    /// merging keeps the change purely in-memory — the strand copy of
+    /// the message stays as persisted, and record_ids alignment is
+    /// untouched. Returns the files injected, newest first.
+    pub fn reinject_hot_files(&mut self, max: usize, per_file_cap: usize) -> Vec<String> {
+        let hot = self.hand_ctx.ledger.lock().hot_paths(max);
+        if hot.is_empty() {
+            return Vec::new();
+        }
+        let mut blocks = Vec::new();
+        let mut injected = Vec::new();
+        for path in &hot {
+            let Ok(text) = std::fs::read_to_string(path) else {
+                continue;
+            };
+            if text.trim().is_empty() {
+                continue;
+            }
+            let mut body: String = text.lines().take(400).collect::<Vec<_>>().join("\n");
+            if text.lines().count() > 400 {
+                body.push_str("\n… (truncated at 400 lines)");
+            }
+            if body.len() > per_file_cap {
+                let mut cut: String = body.chars().take(per_file_cap).collect();
+                cut.push_str("\n… (truncated)");
+                body = cut;
+            }
+            blocks.push(format!("[re-read {}]\n{body}", path.display()));
+            injected.push(path.display().to_string());
+        }
+        if blocks.is_empty() {
+            return Vec::new();
+        }
+        let appendix = format!(
+            "[context re-read after digest — these files were recently read or edited; \
+             current contents follow]\n\n{}",
+            blocks.join("\n\n")
+        );
+        match self
+            .history
+            .iter_mut()
+            .rev()
+            .find(|m| m.role == TurnRole::User)
+        {
+            Some(m) => {
+                m.content.push_str("\n\n");
+                m.content.push_str(&appendix);
+            }
+            None => self.history.push(TurnMessage::user(appendix)),
+        }
+        hot.iter().map(|p| p.display().to_string()).collect()
+    }
+
     /// First matching configured rule's verdict for this call.
     fn match_rule(&self, call: &ToolCall) -> Option<crate::config::Verdict> {
         self.rules_cfg
@@ -3282,7 +3339,12 @@ mod tests {
             "[dialects.\"test/m\"]\nwire = \"openai_chat\"\nbase_url = \"http://127.0.0.1:1\"\ncontext = 1000\n",
         )
         .unwrap();
-        let mut voice = Voice::new(catalog, std::env::temp_dir(), ka_protocol::Mode::Guarded, 5);
+        let mut voice = Voice::new(
+            catalog.clone(),
+            std::env::temp_dir(),
+            ka_protocol::Mode::Guarded,
+            5,
+        );
         voice.set_model_selector("test/m", 1.0);
         use ka_dialect::speaker::{ToolCall, ToolResult, TurnMessage};
         voice.history.push(TurnMessage::user("q"));
@@ -3469,6 +3531,66 @@ mod tests {
             "the fresh call keeps its arguments"
         );
         assert_eq!(voice.shake(240), 0, "shaking is idempotent");
+    }
+
+    #[test]
+    fn reinject_hot_files_merges_into_the_last_user_message() {
+        use ka_dialect::speaker::TurnRole;
+        let catalog = Catalog::parse(
+            "[dialects.\"test/m\"]\nwire = \"openai_chat\"\nbase_url = \"http://127.0.0.1:1\"\ncontext = 1000\n",
+        )
+        .unwrap();
+        let mut voice = Voice::new(
+            catalog.clone(),
+            std::env::temp_dir(),
+            ka_protocol::Mode::Guarded,
+            5,
+        );
+        let a = std::env::temp_dir().join(format!("ka-hot-a-{}", std::process::id()));
+        let b = std::env::temp_dir().join(format!("ka-hot-b-{}", std::process::id()));
+        std::fs::write(&a, "alpha contents\n").unwrap();
+        let meta_a = std::fs::metadata(&a).unwrap();
+        voice.hand_ctx.ledger.lock().mint(&a, &meta_a);
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        std::fs::write(&b, "beta contents\n").unwrap();
+        let meta_b = std::fs::metadata(&b).unwrap();
+        voice.hand_ctx.ledger.lock().mint(&b, &meta_b);
+        // the post-digest shape: history is a kept tail ending on the
+        // user's current prompt
+        voice.history.push(TurnMessage::user("current prompt"));
+
+        let injected = voice.reinject_hot_files(5, 6144);
+        assert_eq!(
+            injected,
+            vec![b.display().to_string(), a.display().to_string()],
+            "newest first"
+        );
+        assert_eq!(voice.history.len(), 1, "merged, not appended");
+        let last = voice.history.last().unwrap();
+        assert_eq!(last.role, TurnRole::User);
+        assert!(last.content.contains("beta contents"), "{:?}", last.content);
+        assert!(
+            last.content.contains("alpha contents"),
+            "{:?}",
+            last.content
+        );
+        assert!(last.content.contains("re-read"), "{:?}", last.content);
+
+        // a nonexistent hot path is skipped, not fatal (fresh voice: the
+        // previous phase already merged its files)
+        let mut voice = Voice::new(catalog, std::env::temp_dir(), ka_protocol::Mode::Guarded, 5);
+        let ghost = std::env::temp_dir().join(format!("ka-hot-ghost-{}", std::process::id()));
+        std::fs::write(&ghost, "gone\n").unwrap();
+        let meta = std::fs::metadata(&ghost).unwrap();
+        voice.hand_ctx.ledger.lock().mint(&ghost, &meta);
+        std::fs::remove_file(&ghost).unwrap();
+        let injected = voice.reinject_hot_files(5, 6144);
+        assert!(
+            injected.is_empty(),
+            "unreadable hot paths are skipped: {injected:?}"
+        );
+        let _ = std::fs::remove_file(&a);
+        let _ = std::fs::remove_file(&b);
     }
 
     #[test]

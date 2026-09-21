@@ -46,6 +46,8 @@ struct AgentTask {
     /// injects an interjection through it. `None` for finished tasks
     /// and when the runner has not started yet.
     cmds: Option<mpsc::Sender<ka_protocol::Command>>,
+    /// Turn cost (USD) accumulated by the runner, once known.
+    cost: f64,
     /// The surviving worktree branch of an isolated task (merge source).
     branch: Option<String>,
     /// Messages that arrived for a task that was no longer running —
@@ -89,6 +91,7 @@ impl AgentTaskTable {
             state: AgentTaskState::Running,
             handle: None,
             cmds: None,
+            cost: 0.0,
             branch: None,
             inbox: Vec::new(),
         });
@@ -106,6 +109,13 @@ impl AgentTaskTable {
     pub fn attach_cmds(&self, id: u64, cmds: mpsc::Sender<ka_protocol::Command>) {
         if let Some(e) = self.inner.lock().iter_mut().find(|e| e.id == id) {
             e.cmds = Some(cmds);
+        }
+    }
+
+    /// Record the runner's accumulated turn cost (USD).
+    pub fn set_cost(&self, id: u64, cost: f64) {
+        if let Some(e) = self.inner.lock().iter_mut().find(|e| e.id == id) {
+            e.cost = cost;
         }
     }
 
@@ -198,8 +208,13 @@ impl AgentTaskTable {
             .filter(|e| Some(e.id) != exclude)
             .map(|e| {
                 let head: String = e.task.chars().take(60).collect();
+                let cost = if e.cost > 0.0 {
+                    format!("  ${:.4}", e.cost)
+                } else {
+                    String::new()
+                };
                 format!(
-                    "t-{}  {:7}  {:5}  {} — {}",
+                    "t-{}  {:7}  {:5}  {} — {}{cost}",
                     e.id,
                     e.state.label(),
                     elapsed(e.started),

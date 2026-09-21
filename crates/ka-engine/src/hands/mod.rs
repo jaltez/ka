@@ -363,6 +363,18 @@ impl Ledger {
     pub fn tracked_paths(&self) -> Vec<PathBuf> {
         self.stamps.keys().cloned().collect()
     }
+
+    /// The `n` most recently read/edited paths (ledger-hot), newest
+    /// first — the post-digest re-read set.
+    pub fn hot_paths(&self, n: usize) -> Vec<PathBuf> {
+        let mut stamps: Vec<(PathBuf, SystemTime)> = self
+            .stamps
+            .iter()
+            .map(|(p, s)| (p.clone(), s.mtime))
+            .collect();
+        stamps.sort_by_key(|(_, mtime)| std::cmp::Reverse(*mtime));
+        stamps.into_iter().take(n).map(|(p, _)| p).collect()
+    }
 }
 
 /// Spill store: oversized tool outputs parked on disk, referenced as

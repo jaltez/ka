@@ -264,6 +264,9 @@ pub enum Command {
     ExportMarkdown {
         /// Output file path (None = default name in cwd).
         out: Option<std::path::PathBuf>,
+        /// Render a self-contained HTML page instead of markdown.
+        #[serde(default)]
+        html: bool,
     },
     /// Persist settings to the user config layer (~/.config/ka/ka.toml).
     SaveSettings {
@@ -612,8 +615,16 @@ mod tests {
         });
         roundtrip_command(Command::ExportMarkdown {
             out: Some(std::path::PathBuf::from("x.md")),
+            html: false,
         });
-        roundtrip_command(Command::ExportMarkdown { out: None });
+        roundtrip_command(Command::ExportMarkdown {
+            out: None,
+            html: false,
+        });
+        roundtrip_command(Command::ExportMarkdown {
+            out: None,
+            html: true,
+        });
     }
 
     #[test]

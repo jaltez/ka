@@ -428,6 +428,8 @@ struct Ctx {
     mcp_lazy: bool,
     /// Background delegate-task registry (/tasks rows).
     agent_tasks: std::sync::Arc<crate::hands::tasks::AgentTaskTable>,
+    /// Live DAP sessions (/tasks rows), when the [debug] tier is on.
+    debug: Option<std::sync::Arc<crate::dap::DebugManager>>,
 }
 
 async fn run(
@@ -501,9 +503,11 @@ async fn run(
     // Exec-tier control flow, Read-tier inspection — only under
     // [debug] enable = true
     let debug_cfg = effective_debug_cfg(&config);
-    if debug_cfg.enable == Some(true) {
+    let debug = (debug_cfg.enable == Some(true))
+        .then(|| std::sync::Arc::new(crate::dap::DebugManager::new(debug_cfg.adapters.clone())));
+    if let Some(debug) = &debug {
         voice.push_hand(std::sync::Arc::new(crate::hands::debug::DebugHand::new(
-            std::sync::Arc::new(crate::dap::DebugManager::new(debug_cfg.adapters.clone())),
+            debug.clone(),
         )));
     }
     voice.set_web_allow_private(config.effective_web_allow_private());
@@ -527,6 +531,7 @@ async fn run(
         maintenance: maintenance_rx,
         mcp_lazy,
         agent_tasks: agent_tasks.clone(),
+        debug,
     };
     // markdown agents: .ka/agents/*.md etc. become one `delegate` hand
     // (empty in safe mode)
@@ -960,6 +965,16 @@ async fn handle_command(
                 };
                 let cmd: String = j.cmd.chars().take(60).collect();
                 rows.push(format!("job-{}`  {state}  {cmd}", j.id));
+            }
+            if let Some(debug) = &ctx.debug {
+                for s in debug.sessions() {
+                    rows.push(format!(
+                        "dap {}  {:7}  breakpoints in {} file(s)",
+                        s.id(),
+                        s.status(),
+                        s.breakpoints().len()
+                    ));
+                }
             }
             if rows.is_empty() {
                 rows.push("no background tasks or jobs".to_string());
@@ -1398,7 +1413,7 @@ async fn handle_command(
                 })
                 .await?;
         }
-        Command::ExportMarkdown { out } => {
+        Command::ExportMarkdown { out, html } => {
             let msg_count = ctx
                 .strand
                 .records()
@@ -1415,6 +1430,7 @@ async fn handle_command(
                     .await
                     .ok();
             } else {
+                let ext = if html { "html" } else { "md" };
                 let path = match out {
                     Some(p) => p,
                     None => {
@@ -1427,11 +1443,16 @@ async fn handle_command(
                             .chars()
                             .rev()
                             .collect();
-                        ctx.cwd.join(format!("ka-session-{tail}.md"))
+                        ctx.cwd.join(format!("ka-session-{tail}.{ext}"))
                     }
                 };
                 let md = ka_strand::render_markdown(ctx.strand.records());
-                match std::fs::write(&path, md) {
+                let payload = if html {
+                    ka_strand::render_html(&ka_strand::title_of(ctx.strand.records()), &md)
+                } else {
+                    md
+                };
+                match std::fs::write(&path, payload) {
                     Ok(()) => {
                         ctx.events
                             .send(Event::Note {
@@ -1751,6 +1772,7 @@ async fn run_digest(
         if let Some(summary) = voice.take_speculative().await {
             let _ = voice.apply_digest(summary, ratio);
             persist_delta(voice, state, strand);
+            reinject_after_digest(voice, events).await;
             events
                 .send(Event::Note {
                     message: "context digested (speculative)".to_string(),
@@ -1769,6 +1791,7 @@ async fn run_digest(
             let kept = voice.apply_digest(summary, ratio);
             let _ = kept;
             persist_delta(voice, state, strand);
+            reinject_after_digest(voice, events).await;
             events
                 .send(Event::Note {
                     message: "context digested".to_string(),
@@ -1791,6 +1814,7 @@ unavailable). The most recent exchange follows; re-read files you need."
                 .to_string();
             voice.apply_digest(summary, ratio);
             persist_delta(voice, state, strand);
+            reinject_after_digest(voice, events).await;
             DigestResult::Digested
         }
     }
@@ -2134,6 +2158,25 @@ async fn engine_ask(
                 }
             }
         }
+    }
+}
+
+/// The ladder's last step: re-read the ≤5 ledger-hot files into context
+/// (bounded per file), so a digest doesn't summarise away the concrete
+/// contents the model was just working with. In-memory only — merged
+/// into the trailing user message, never persisted as new records.
+async fn reinject_after_digest(voice: &mut Voice, events: &mpsc::Sender<Event>) {
+    let files = voice.reinject_hot_files(5, 6144);
+    if !files.is_empty() {
+        events
+            .send(Event::Note {
+                message: format!(
+                    "re-read {} ledger-hot file(s) into context after the digest",
+                    files.len()
+                ),
+            })
+            .await
+            .ok();
     }
 }
 
@@ -2837,6 +2880,7 @@ mod tests {
         let out = work.join("out.md");
         h.commands
             .send(Command::ExportMarkdown {
+                html: false,
                 out: Some(out.clone()),
             })
             .await
@@ -2862,7 +2906,10 @@ mod tests {
         // empty session: error, and no default-named file appears in cwd
         let mut h2 = spawn_full(cfg, ka_dialect::Catalog::embedded(), StrandChoice::New);
         h2.commands
-            .send(Command::ExportMarkdown { out: None })
+            .send(Command::ExportMarkdown {
+                out: None,
+                html: false,
+            })
             .await
             .unwrap();
         let mut saw_err = false;

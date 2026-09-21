@@ -6085,15 +6085,23 @@ blocker > major > minor > nit, each as `file:line — issue — concrete fix`, \
             followup: None,
             modal: None,
         }),
-        "/export" => Some(Slash {
-            note: None,
-            event: Some(Command::ExportMarkdown {
-                out: rest.map(std::path::PathBuf::from),
-            }),
-            quit: false,
-            followup: None,
-            modal: None,
-        }),
+        "/export" => {
+            // `/export [--html] [path]` — html renders a self-contained
+            // offline page via the shared ka-strand renderer
+            let rest = rest.unwrap_or_default().trim();
+            let html = rest.starts_with("--html");
+            let path = rest.trim_start_matches("--html").trim();
+            Some(Slash {
+                note: None,
+                event: Some(Command::ExportMarkdown {
+                    out: (!path.is_empty()).then(|| std::path::PathBuf::from(path)),
+                    html,
+                }),
+                quit: false,
+                followup: None,
+                modal: None,
+            })
+        }
         "/spills" => Some(Slash {
             note: None,
             event: None,
@@ -9575,12 +9583,26 @@ mod tests {
         );
         let with_path = slash_command("/export o.md").unwrap();
         assert!(matches!(
-            with_path.event,
-            Some(Command::ExportMarkdown { out: Some(ref p) }) if p == &std::path::PathBuf::from("o.md")
+            &with_path.event,
+            Some(Command::ExportMarkdown {
+                out: Some(p),
+                html: false
+            }) if p == &std::path::PathBuf::from("o.md")
         ));
         assert!(matches!(
-            slash_command("/export").unwrap().event,
-            Some(Command::ExportMarkdown { out: None })
+            &slash_command("/export").unwrap().event,
+            Some(Command::ExportMarkdown {
+                out: None,
+                html: false
+            })
+        ));
+        // --html flips the renderer and still accepts a path
+        assert!(matches!(
+            &slash_command("/export --html page.html").unwrap().event,
+            Some(Command::ExportMarkdown {
+                out: Some(p),
+                html: true
+            }) if p == &std::path::PathBuf::from("page.html")
         ));
     }
 

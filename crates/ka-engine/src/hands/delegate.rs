@@ -167,11 +167,12 @@ track it with the tasks tool.",
                 let events = self.events.clone();
                 let tasks_in = tasks.clone();
                 let handle = tokio::spawn(async move {
-                    let (outcome, branch) =
+                    let (outcome, branch, cost) =
                         run_agent(def, task.clone(), cwd, source, parent_mode, roster, |tx| {
                             tasks_in.attach_cmds(id, tx)
                         })
                         .await;
+                    tasks_in.set_cost(id, cost);
                     if let Some(branch) = &branch {
                         tasks_in.set_branch(id, branch.clone());
                     }
@@ -197,7 +198,7 @@ track it with the tasks tool.",
             }
             let roster = Some(self.tasks.rows_except(None));
             let source = self.source.read().clone();
-            let (outcome, _branch) = run_agent(
+            let (outcome, _branch, _cost) = run_agent(
                 def.clone(),
                 task.to_string(),
                 ctx.cwd.clone(),
@@ -362,10 +363,11 @@ async fn run_agent(
     parent_mode: ka_protocol::Mode,
     roster: Option<Vec<String>>,
     mut on_channels: impl FnMut(mpsc::Sender<ka_protocol::Command>),
-) -> (Result<String, String>, Option<String>) {
+) -> (Result<String, String>, Option<String>, f64) {
     let attempts = if def.output.is_some() { 2 } else { 1 };
     let mut outcome: (Result<String, String>, Option<String>) =
         (Err("agent never ran".to_string()), None);
+    let mut cost = 0.0f64;
     for attempt in 0..attempts {
         let task_text = if attempt > 0 {
             let reason = match &outcome.0 {
@@ -380,7 +382,7 @@ async fn run_agent(
         } else {
             task.clone()
         };
-        outcome = run_agent_once(
+        let (res, branch, usage) = run_agent_once(
             &def,
             &task_text,
             &cwd,
@@ -390,11 +392,13 @@ async fn run_agent(
             &mut on_channels,
         )
         .await;
+        cost += usage.cost;
+        outcome = (res, branch);
         if outcome.0.is_ok() {
             break;
         }
     }
-    outcome
+    (outcome.0, outcome.1, cost)
 }
 
 /// One attempt of [`run_agent`].
@@ -406,12 +410,13 @@ async fn run_agent_once(
     parent_mode: ka_protocol::Mode,
     roster: Option<Vec<String>>,
     on_channels: &mut impl FnMut(mpsc::Sender<ka_protocol::Command>),
-) -> (Result<String, String>, Option<String>) {
+) -> (Result<String, String>, Option<String>, ka_protocol::Usage) {
     let agent_name = def.name.as_str();
     let Some(parent_model) = source.model.clone() else {
         return (
             Err("delegate: no model configured for the parent session".to_string()),
             None,
+            ka_protocol::Usage::default(),
         );
     };
     // per-agent model/effort (factory-droids style): the frontmatter
@@ -441,11 +446,12 @@ async fn run_agent_once(
                         .to_string(),
                 ),
                 None,
+                ka_protocol::Usage::default(),
             );
         }
         match create_worktree(cwd, &format!("ka-{agent_name}")) {
             Ok(path) => worktree = Some(path),
-            Err(e) => return (Err(e), None),
+            Err(e) => return (Err(e), None, ka_protocol::Usage::default()),
         }
     }
     let agent_cwd = worktree.clone().unwrap_or_else(|| cwd.to_path_buf());
@@ -464,6 +470,7 @@ async fn run_agent_once(
     let max_steps = def.max_steps;
     let schema = def.output.clone();
     let source = source.clone();
+    let (usage_tx, usage_rx) = tokio::sync::oneshot::channel();
     let handle = tokio::spawn(async move {
         let mut interjections = Vec::new();
         let mut deferrals = std::collections::VecDeque::new();
@@ -487,7 +494,7 @@ async fn run_agent_once(
         if let Some(tools) = &agent_tools {
             voice.restrict_tools(tools);
         }
-        voice
+        let usage = voice
             .turn(
                 &model,
                 prompt,
@@ -500,6 +507,7 @@ async fn run_agent_once(
                 Vec::new(),
             )
             .await;
+        let _ = usage_tx.send(usage);
     });
 
     let mut summary = String::new();
@@ -529,6 +537,7 @@ async fn run_agent_once(
         return (
             Err("delegate: agent timed out (10m)".to_string()),
             worktree.map(|_| String::new()),
+            usage_rx.await.unwrap_or_default(),
         );
     }
     if summary.trim().is_empty() && !thought.trim().is_empty() {
@@ -541,6 +550,7 @@ async fn run_agent_once(
                 failed.unwrap_or_else(|| "no summary produced".to_string())
             )),
             None,
+            usage_rx.await.unwrap_or_default(),
         );
     }
     if let Some(wt) = &worktree {
@@ -549,12 +559,17 @@ async fn run_agent_once(
                 summary.push_str(&format!(
                     "\n\n(isolated worktree: changes live on branch `{branch}`)"
                 ));
-                return (Ok(summary), Some(branch));
+                let usage = usage_rx.await.unwrap_or_default();
+                return (Ok(summary), Some(branch), usage);
             }
-            Err(e) => return (Err(e), None),
+            Err(e) => {
+                let usage = usage_rx.await.unwrap_or_default();
+                return (Err(e), None, usage);
+            }
         }
     }
-    (Ok(summary), None)
+    let usage = usage_rx.await.unwrap_or_default();
+    (Ok(summary), None, usage)
 }
 /// Reasoning-effort label for selector assembly.
 fn effort_label(e: &ka_protocol::Effort) -> &'static str {

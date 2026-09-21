@@ -252,10 +252,6 @@ mod serve;
 mod skills;
 mod update;
 
-/// Self-contained HTML export page: the markdown rides in an inert
-/// island, rendered offline by a vendored renderer (no dependencies).
-const EXPORT_TEMPLATE: &str = include_str!("export_template.html");
-
 /// The strands storage root (`<data>/strands`). Delegates to
 /// `ka_strand::data_dir()` so the index scans the same tree the writer
 /// uses (the old local copy was missing the `ka` segment and indexed an
@@ -1519,7 +1515,7 @@ fn run_export(
         Some(path) => {
             if html {
                 let title = ka_strand::title_of(&records);
-                let page = skills::render_html(&title, &md);
+                let page = ka_strand::render_html(&title, &md);
                 std::fs::write(&path, page).map_err(|e| format!("{}: {e}", path.display()))?;
             } else {
                 std::fs::write(&path, &md).map_err(|e| format!("{}: {e}", path.display()))?;

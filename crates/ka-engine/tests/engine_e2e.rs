@@ -415,9 +415,14 @@ async fn export_markdown_contract() {
     };
     let mut handle = ka_engine::spawn_with(cfg, test_catalog());
 
-    let events = settle(&mut handle, Command::ExportMarkdown { out: None }, |e| {
-        matches!(e, Event::Note { .. } | Event::Error { .. })
-    })
+    let events = settle(
+        &mut handle,
+        Command::ExportMarkdown {
+            out: None,
+            html: false,
+        },
+        |e| matches!(e, Event::Note { .. } | Event::Error { .. }),
+    )
     .await;
     assert!(
         events.iter().any(
@@ -442,6 +447,7 @@ async fn export_markdown_contract() {
         &mut handle,
         Command::ExportMarkdown {
             out: Some(out.clone()),
+            html: false,
         },
         |e| matches!(e, Event::Note { .. } | Event::Error { .. }),
     )

@@ -182,20 +182,6 @@ fn read_description(skill_md: &Path) -> Option<String> {
     None
 }
 
-/// Render a strand export as a self-contained HTML page: the markdown
-/// rides in an inert island and a vendored renderer turns it into DOM —
-/// no dependencies, works offline.
-pub fn render_html(title: &str, markdown: &str) -> String {
-    let esc = |s: &str| {
-        s.replace('&', "&amp;")
-            .replace('<', "&lt;")
-            .replace('>', "&gt;")
-    };
-    crate::EXPORT_TEMPLATE
-        .replace("__KA_TITLE__", &esc(title))
-        .replace("__KA_MARKDOWN__", &esc(markdown))
-}
-
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
@@ -250,7 +236,7 @@ mod tests {
 
     #[test]
     fn html_export_escapes_and_marks_the_island() {
-        let page = render_html(
+        let page = ka_strand::render_html(
             "t<title>",
             "# Head\n\n<script>alert(1)</script>\n\n- item `code`",
         );

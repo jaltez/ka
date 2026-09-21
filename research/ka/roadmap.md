@@ -120,14 +120,12 @@ Order: 8.1 → 8.2 → 8.3 → 8.4. 8.4 items are filler and never block.
 - Tests: fixture LSP server (rename/action/willRename/applyEdit paths) + feature contracts + README together
 
 ### 8.2 DAP — the probe (shipped 2026-09)
-- **[M]** Extract the shared Content-Length framing codec from `lsp.rs`/`mcp.rs`; `dap.rs` becomes its third consumer
-- **[M]** `dap.rs` client: initialize→launch/attach→`initialized`→setBreakpoints→configurationDone; threads/stackTrace/scopes/variables/evaluate; continue/next/stepIn/stepOut; output ring (bounded); capability-gated actions; disconnect; idle-session cleanup; `runInTerminal` rejected with an instructive error (console external)
-- **[M]** Single `debug` hand, curated ~14-action MVP set (omp ships 28 — instruction/data breakpoints, memory R/W, disassembly wait for pull)
-- **[M]** Adapter catalog as data: embedded seed (`gdb -i dap`, `lldb-dap`, `codelldb`, debugpy, `dlv` dap, `netcoredbg`, js-debug) + `[debug.adapters]` overlay
+- **[M]** DAP client + debug hand + adapter catalog + `[debug]` gate — **shipped** (16 actions; embedded catalog + `[debug.adapters]` overlay; shared Content-Length codec extracted to `wire.rs`, consumed by `lsp.rs` + `dap.rs`; real-adapter dogfood vs debugpy 1.8.22 passes: launch → entry stop → breakpoints → stack/vars/eval → exit)
 - **[M]** Clearance: control-flow actions (launch/attach/step/continue/terminate) = Exec; inspection (stack/scopes/variables/evaluate/threads) = Read
-- **[O]** TUI roster (tasks-style session list); breakpoint-stop Notes
-- **[O]** cargo feature `dap` if `xtask size` says >100 KB
-- Tests: fake DAP adapter fixture binary (handshake, breakpoint, stop-read loop); catalog schema contract; dogfood = debugging ka with lldb-dap
+- **[O]** TUI roster (tasks-style session list) — **partially**: DAP sessions surface in the `/tasks` dashboard; dedicated overlay still open. Breakpoint-stop Notes: not shipped
+- **[O]** cargo feature `dap` if `xtask size` says >100 KB — moot at 6.42 MB total
+- Tests: fake DAP adapter fixture (handshake, breakpoint, stop-read loop) + **real debugpy dogfood** (launch → entry stop → bp → stack/vars/eval → exit); catalog schema contract
+- Notes: launch is fire-and-forget (debugpy defers its response to `configurationDone`); the client never echoes the adapter's `initialized` event (debugpy starts the debuggee on it, which would race breakpoint setup)
 
 ### 8.3 Delegation 2.0 — contracts, steering, merge-back (shipped 2026-09)
 - **[M]** Agent frontmatter `output:` (JSON schema); child final message validated through the existing structured-output path; one instructive retry
