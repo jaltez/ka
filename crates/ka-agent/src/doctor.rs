@@ -105,7 +105,10 @@ fn load_layers() -> Result<(Config, String, bool), String> {
             .unwrap_or_else(|| PathBuf::from("~/.config/ka/ka.toml")),
     )];
     if let Ok(cwd) = std::env::current_dir() {
-        layers.push(("project".to_string(), cwd.join(".ka/ka.toml")));
+        layers.push((
+            "project".to_string(),
+            ka_engine::project_root(&cwd).join(".ka/ka.toml"),
+        ));
     }
     let mut cfg = Config::default();
     let mut detail = String::new();

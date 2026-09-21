@@ -317,7 +317,11 @@ fn merge_branch(cwd: &std::path::Path, id: u64, branch: &str) -> Result<String, 
     };
     let check = feed(true)?;
     if !check.status.success() {
-        let patch_path = cwd.join(".ka").join(format!("t-{id}.patch"));
+        // the root project's .ka/, so a session launched from a
+        // subdirectory still drops the patch in one findable place
+        let patch_path = crate::project_root(cwd)
+            .join(".ka")
+            .join(format!("t-{id}.patch"));
         if let Some(parent) = patch_path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }

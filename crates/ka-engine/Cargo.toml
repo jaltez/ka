@@ -37,5 +37,9 @@ test-util = []
 name = "bare_mode_contract"
 required-features = ["test-util"]
 
+[[test]]
+name = "project_root_contract"
+required-features = ["test-util"]
+
 [lints]
 workspace = true

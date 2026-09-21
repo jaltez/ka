@@ -1911,12 +1911,26 @@ fn context_rows(parts: &[ka_protocol::ContextPart], window: u64) -> Vec<String> 
     rows
 }
 
+/// The plan file path for this session: root-anchored (nearest `.git`
+/// ancestor of the launch dir, else the launch dir), matching the
+/// plan-mode system prompt and the engine's writable-path gate.
+fn plan_file_path() -> std::path::PathBuf {
+    std::env::current_dir()
+        .ok()
+        .map(|cwd| ka_engine::project_root(&cwd).join(".ka/plans/plan.md"))
+        .unwrap_or_else(|| std::path::PathBuf::from(".ka/plans/plan.md"))
+}
+
 /// The shared follow-up prompt that starts a build turn from the plan
-/// file (both `/build` and `/approve`).
+/// file (both `/build` and `/approve`). The plan file anchors at the
+/// root project (nearest `.git` ancestor, else cwd), matching the
+/// plan-mode system prompt.
 fn build_followup() -> String {
-    "Switching to build mode. Read .ka/plans/plan.md and implement it step by \
-step now; verify each step."
-        .to_string()
+    format!(
+        "Switching to build mode. Read {} and implement it step by \
+step now; verify each step.",
+        plan_file_path().display()
+    )
 }
 
 /// True when the plan file exists and was written after `/plan` started
@@ -4416,14 +4430,11 @@ async fn app(
                         }
                         if matches!(evt, Event::TurnFinished { .. })
                             && meters.mode == mode_label(ka_protocol::Mode::Plan)
-                            && plan_drafted(
-                                plan_started,
-                                std::path::Path::new(".ka/plans/plan.md"),
-                            )
+                            && plan_drafted(plan_started, &plan_file_path())
                         {
                             plan_started = None;
                             transcript.push_separated(Line::Note(
-                                "Plan drafted — review .ka/plans/plan.md, then /approve to build"
+                                "Plan drafted — review the plan file, then /approve to build"
                                     .into(),
                             ));
                         }
@@ -5365,10 +5376,12 @@ fn builtin_slash_commands() -> Vec<(String, String)> {
     ];
     if let Ok(cwd) = std::env::current_dir() {
         let home = std::env::var("HOME").ok();
+        // project scope anchors at the root project, not the launch dir
+        let root = ka_engine::project_root(&cwd);
         let mut roots = vec![
-            cwd.join(".ka/commands"),
-            cwd.join(".agents/commands"),
-            cwd.join(".claude/commands"),
+            root.join(".ka/commands"),
+            root.join(".agents/commands"),
+            root.join(".claude/commands"),
         ];
         if let Some(h) = home {
             roots.push(std::path::PathBuf::from(h).join(".config/ka/commands"));
@@ -5709,8 +5722,11 @@ pub fn scan_custom_commands_in(
 ) -> Vec<CustomCommand> {
     let mut out: Vec<CustomCommand> = Vec::new();
     let mut dirs: Vec<std::path::PathBuf> = Vec::new();
-    if project_trusted_in(state_home, cwd) {
-        dirs.extend(PROJECT_COMMAND_DIRS.iter().map(|d| cwd.join(d)));
+    // project scope anchors at the root project, matching the engine's
+    // trust store entries (one approval covers every launch dir)
+    let root = ka_engine::project_root(cwd);
+    if project_trusted_in(state_home, &root) {
+        dirs.extend(PROJECT_COMMAND_DIRS.iter().map(|d| root.join(d)));
     }
     if let Ok(home) = std::env::var("HOME") {
         dirs.push(std::path::PathBuf::from(home).join(".config/ka/commands"));
@@ -5804,10 +5820,12 @@ fn custom_command_in(
     rest: Option<&str>,
 ) -> Option<String> {
     let name = head.strip_prefix('/')?;
+    // project scope anchors at the root project, not the launch dir
+    let root = ka_engine::project_root(cwd);
     let mut candidates = vec![
-        cwd.join(format!(".ka/commands/{name}.md")),
-        cwd.join(format!(".agents/commands/{name}.md")),
-        cwd.join(format!(".claude/commands/{name}.md")),
+        root.join(format!(".ka/commands/{name}.md")),
+        root.join(format!(".agents/commands/{name}.md")),
+        root.join(format!(".claude/commands/{name}.md")),
     ];
     if let Ok(home) = std::env::var("HOME") {
         candidates
@@ -5818,7 +5836,7 @@ fn custom_command_in(
         // user-dir commands are ungated; project commands pay the trust
         // gate (like skills)
         let is_user_file = !home.is_empty() && path.starts_with(&home);
-        if !is_user_file && !project_trusted_in(state_home, cwd) {
+        if !is_user_file && !project_trusted_in(state_home, &root) {
             continue;
         }
         if let Ok(body) = std::fs::read_to_string(&path) {
@@ -5919,8 +5937,9 @@ pub fn slash_command(text: &str) -> Option<Slash> {
             })
             .map(|mut sl| {
                 sl.followup = Some(format!(
-                    "Plan this task. Research the codebase with read/glob/grep/pathfinder, \\
-then write a concrete numbered implementation plan to .ka/plans/plan.md. Task: {task}"
+                    "Plan this task. Research the codebase with read/glob/grep/pathfinder, \
+then write a concrete numbered implementation plan to {}. Task: {task}",
+                    plan_file_path().display()
                 ));
                 sl
             })
@@ -6336,7 +6355,7 @@ pub fn memory_modal_rows(cwd: &std::path::Path) -> Vec<String> {
     let mut rows = Vec::new();
     if files.is_empty() {
         rows.push("(no memory files)".to_string());
-        rows.push("create ./MEMORY.md or ~/.config/ka/MEMORY.md".to_string());
+        rows.push("create MEMORY.md at the project root or ~/.config/ka/MEMORY.md".to_string());
     }
     for (path, content) in files {
         rows.push(format!("▸ {}", path.display()));
@@ -6347,9 +6366,17 @@ pub fn memory_modal_rows(cwd: &std::path::Path) -> Vec<String> {
     rows
 }
 
-/// The staged-memory inbox file path.
+/// The staged-memory inbox file path. Anchors at the root project
+/// (nearest `.git` ancestor, else cwd) — the same file the engine's
+/// `remember` hand stages into, whatever directory the session runs in.
 fn memory_inbox_path(cwd: &std::path::Path) -> std::path::PathBuf {
-    cwd.join(".ka/memory/inbox.md")
+    ka_engine::project_root(cwd).join(".ka/memory/inbox.md")
+}
+
+/// The project MEMORY.md tier: root-anchored, mirroring the engine's
+/// [`ka_engine::conventions`] discovery.
+fn project_memory_path(cwd: &std::path::Path) -> std::path::PathBuf {
+    ka_engine::project_root(cwd).join("MEMORY.md")
 }
 
 /// Staged memory proposals, oldest first.
@@ -6399,9 +6426,9 @@ pub fn accept_memory_note(cwd: &std::path::Path, staged: &str, user: bool) -> st
     let target = if user {
         std::env::var("HOME")
             .map(|h| std::path::PathBuf::from(h).join(".config/ka/MEMORY.md"))
-            .unwrap_or_else(|_| cwd.join("MEMORY.md"))
+            .unwrap_or_else(|_| project_memory_path(cwd))
     } else {
-        cwd.join("MEMORY.md")
+        project_memory_path(cwd)
     };
     if let Some(parent) = target.parent() {
         std::fs::create_dir_all(parent)?;
@@ -6417,7 +6444,7 @@ pub fn accept_memory_note(cwd: &std::path::Path, staged: &str, user: bool) -> st
 
 fn discover_memory_files(cwd: &std::path::Path) -> Vec<(std::path::PathBuf, String)> {
     let mut out = Vec::new();
-    let project = cwd.join("MEMORY.md");
+    let project = project_memory_path(cwd);
     if let Ok(content) = std::fs::read_to_string(&project) {
         if !content.trim().is_empty() {
             out.push((project, content));

@@ -43,15 +43,18 @@ pub struct MemoryFile {
     pub content: String,
 }
 
-/// Memory tiers: project `MEMORY.md` first (cwd, ungated like
-/// AGENTS.md), then the user-level `~/.config/ka/MEMORY.md`. Missing
+/// Memory tiers: project `MEMORY.md` first (root-anchored — the root
+/// project, ungated like AGENTS.md — and where `/memory` acceptance
+/// writes), then the user-level `~/.config/ka/MEMORY.md`. Missing
 /// files are skipped.
 pub fn discover_memory(cwd: &Path) -> Vec<MemoryFile> {
     if bare_mode() {
         return Vec::new();
     }
     let mut out = Vec::new();
-    let project = cwd.join("MEMORY.md");
+    // project tier anchors at the root project, not the launch dir —
+    // symmetric with where /memory acceptance writes it
+    let project = crate::project_root(cwd).join("MEMORY.md");
     if let Ok(content) = std::fs::read_to_string(&project) {
         if !content.trim().is_empty() {
             out.push(MemoryFile {
@@ -138,10 +141,12 @@ pub fn discover_rules(cwd: &Path) -> Vec<RuleFile> {
     let trusted = crate::trust::project_trusted(cwd);
     let mut roots: Vec<PathBuf> = Vec::new();
     if trusted {
+        // project scope anchors at the root project, not the launch dir
+        let root = crate::project_root(cwd);
         roots.extend([
-            cwd.join(".ka/rules"),
-            cwd.join(".agents/rules"),
-            cwd.join(".claude/rules"),
+            root.join(".ka/rules"),
+            root.join(".agents/rules"),
+            root.join(".claude/rules"),
         ]);
     }
     if let Ok(home) = std::env::var("HOME") {
@@ -228,10 +233,12 @@ pub fn discover_skills(cwd: &Path) -> Vec<Skill> {
     }
     let project_trusted = crate::trust::project_trusted(cwd);
     let home = std::env::var("HOME").map(PathBuf::from).ok();
+    // project scope anchors at the root project, not the launch dir
+    let root = crate::project_root(cwd);
     let project = vec![
-        cwd.join(".ka/skills"),
-        cwd.join(".agents/skills"),
-        cwd.join(".claude/skills"),
+        root.join(".ka/skills"),
+        root.join(".agents/skills"),
+        root.join(".claude/skills"),
     ];
     let user = match &home {
         Some(h) => vec![

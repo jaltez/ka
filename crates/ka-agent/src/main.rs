@@ -294,11 +294,13 @@ fn load_config(
     let mut cfg = Config::default();
 
     let user = Some(ka_engine::config::user_config_path());
-    let project = if trust_project {
-        Some(PathBuf::from(".ka/ka.toml"))
-    } else {
-        None
-    };
+    // the project layer anchors at the root project (nearest .git
+    // ancestor, else cwd), symmetric with where "always allow" saves it
+    let project = trust_project.then(|| {
+        std::env::current_dir()
+            .map(|cwd| ka_engine::project_root(&cwd).join(".ka/ka.toml"))
+            .unwrap_or_else(|_| PathBuf::from(".ka/ka.toml"))
+    });
 
     for path in user.iter().chain(project.iter()).chain(configs.iter()) {
         match std::fs::read_to_string(path) {
@@ -1312,6 +1314,10 @@ fn has_gateable_ka(cwd: &std::path::Path) -> bool {
 /// otherwise. `--trust` forces. The store itself lives in
 /// [`ka_engine::trust`]; approval unlocks all three layers.
 fn project_config_trusted(cwd: &std::path::Path, force_trust: bool) -> bool {
+    // project scope anchors at the root project: gateable content, the
+    // store entry, and the prompt all address the same directory, so one
+    // approval covers every session inside the same project
+    let cwd = &ka_engine::project_root(cwd);
     // nothing to trust — and no prompt — without gateable .ka/ content
     if !has_gateable_ka(cwd) {
         return false;
@@ -1327,7 +1333,7 @@ fn project_config_trusted(cwd: &std::path::Path, force_trust: bool) -> bool {
     // prompt only when interactive
     if std::io::IsTerminal::is_terminal(&std::io::stdin()) {
         eprintln!(
-            "ka: this directory has a .ka/ project config, skills, or hooks.\n     {}\n   Trust it (loads its rules/model settings, skills and hooks)? [y/N]",
+            "ka: this project (root: {}) has a .ka/ project config, skills, or hooks.\n   Trust it (loads its rules/model settings, skills and hooks)? [y/N]",
             canonical.display()
         );
         let mut line = String::new();
@@ -1348,6 +1354,7 @@ fn project_config_trusted(cwd: &std::path::Path, force_trust: bool) -> bool {
 /// Startup note: when an untrusted project's `.ka/` would have contributed
 /// skills or hooks (both silently skipped by the engine), say so.
 fn warn_untrusted_conventions(cwd: &std::path::Path) {
+    let cwd = &ka_engine::project_root(cwd);
     if ka_engine::trust::project_trusted(cwd) {
         return;
     }
@@ -1368,27 +1375,30 @@ fn warn_untrusted_conventions(cwd: &std::path::Path) {
 }
 
 /// Deterministic starter AGENTS.md from repo shape (no model call).
+/// Generated at the root project — the nearest `.git` ancestor of the
+/// launch dir, else the launch dir — where ka and other agents read it.
 fn run_init() -> Result<ExitCode, String> {
     let cwd = std::env::current_dir().map_err(|e| format!("cwd: {e}"))?;
-    let target = cwd.join("AGENTS.md");
+    let root = ka_engine::project_root(&cwd);
+    let target = root.join("AGENTS.md");
     if target.exists() {
         return Err("AGENTS.md already exists; refusing to overwrite".to_string());
     }
 
     let mut langs = Vec::new();
-    if cwd.join("Cargo.toml").exists() {
+    if root.join("Cargo.toml").exists() {
         langs.push(("Rust", "cargo build", "cargo test"));
     }
-    if cwd.join("package.json").exists() {
+    if root.join("package.json").exists() {
         langs.push(("TypeScript/JavaScript", "npm install", "npm test"));
     }
-    if cwd.join("go.mod").exists() {
+    if root.join("go.mod").exists() {
         langs.push(("Go", "go build ./...", "go test ./..."));
     }
-    if cwd.join("pyproject.toml").is_file() || cwd.join("requirements.txt").is_file() {
+    if root.join("pyproject.toml").is_file() || root.join("requirements.txt").is_file() {
         langs.push(("Python", "pip install -e .", "pytest"));
     }
-    let git = cwd.join(".git").exists();
+    let git = root.join(".git").exists();
 
     let mut body =
         String::from("# AGENTS.md\n\nGuidance for AI agents working in this repository.\n\n");

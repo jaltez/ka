@@ -105,12 +105,15 @@ impl AgentDef {
         }
     }
 
-    /// Discovery roots for a working directory.
+    /// Discovery roots for a working directory. Project scope anchors
+    /// at the root project (nearest `.git` ancestor, else cwd), not the
+    /// launch dir.
     fn roots(cwd: &std::path::Path) -> Vec<PathBuf> {
+        let root = crate::project_root(cwd);
         let mut roots = vec![
-            cwd.join(".ka/agents"),
-            cwd.join(".agents"),
-            cwd.join(".claude/agents"),
+            root.join(".ka/agents"),
+            root.join(".agents"),
+            root.join(".claude/agents"),
         ];
         if let Ok(home) = std::env::var("HOME") {
             roots.push(PathBuf::from(home).join(".config/ka/agents"));

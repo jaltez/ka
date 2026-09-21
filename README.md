@@ -38,7 +38,7 @@ Keys: `Enter` send / interject mid-turn · `+text` defer until turn ends · `Esc
 | `ka rewind [N]` | drop the last N exchanges of the newest strand |
 | `ka export [-o out.md] [--html]` | strand as readable markdown, or a self-contained offline HTML page |
 | `ka skill install <git-url\|path> [--force]` / `ka skill list` / `ka skill remove <name>` | user-scope skill lifecycle (`~/.config/ka/skills`; SKILL.md directories; git URL or local path) |
-| `ka init` | starter AGENTS.md from repo shape |
+| `ka init` | starter AGENTS.md at the project root, from repo shape |
 | `ka config {schema,print}` | resolved config / JSON schema |
 
 TUI slash commands: `/model <sel>` `/mode [tier]` (picker: needs-approval | accept-edits | full-access | plan) `/plan <task>` `/build` `/review [base]` `/tasks` `/rewind [N]` `/compact [focus]` `/quit` plus custom `/name` from `.ka/commands/*.md` (`$ARGUMENTS` substituted). Double-Esc on an empty input opens the rewind menu — pick a past message to rewind to, or `e` to edit & resend it. `!cmd` runs a shell command directly (no turn, no gate); its output shows in the transcript and rides the next prompt as context.
@@ -49,7 +49,7 @@ TUI slash commands: `/model <sel>` `/mode [tier]` (picker: needs-approval | acce
 
 ## Config
 
-Strict TOML, layered: defaults → `~/.config/ka/ka.toml` → `.ka/ka.toml` (trust-gated: first use prompts or `--trust`; stored in `~/.local/state/ka/trust.json`) → env (`KA_MODEL`, `KA_MODE`) → flags. Unknown keys are hard errors with line numbers.
+Strict TOML, layered: defaults → `~/.config/ka/ka.toml` → `.ka/ka.toml` (trust-gated: first use prompts or `--trust`; stored in `~/.local/state/ka/trust.json`) → env (`KA_MODEL`, `KA_MODE`) → flags. Unknown keys are hard errors with line numbers. The **project root** — the nearest `.git` ancestor of the launch dir (else the launch dir itself) — hosts the whole project-scope `.ka/` layer (config, skills, rules, agents, commands, hooks) and everything ka generates into it (plans, staged memories, merge patches, always-allow saves), so sessions started in a subdirectory share one `.ka`.
 
 ```toml
 model = "ollama/qwen3.5:9b"
@@ -131,7 +131,7 @@ bell = true                # ring the bell on turn completion + asks
 notify = "notify-send ka \"turn done\""   # JSON {event, stop} on stdin
 ```
 
-The model can stage durable notes with the `remember` tool; they land in `.ka/memory/inbox.md` and nothing reaches `MEMORY.md` until you accept them in `/memory` (⏎ project · u user · d discard).
+The model can stage durable notes with the `remember` tool; they land in the project root's `.ka/memory/inbox.md` and nothing reaches `MEMORY.md` until you accept them in `/memory` (⏎ project · u user · d discard).
 
 ## Scoped rules & protected paths
 

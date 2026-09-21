@@ -57,7 +57,10 @@ impl Hand for RememberHand {
             } else {
                 note
             };
-            let inbox = ctx.cwd.join(".ka/memory/inbox.md");
+            // project root (nearest .git ancestor, else cwd): sessions
+            // launched from a subdirectory still stage into the one
+            // project-level inbox the /memory modal reads
+            let inbox = crate::project_root(&ctx.cwd).join(".ka/memory/inbox.md");
             if let Some(parent) = inbox.parent() {
                 if std::fs::create_dir_all(parent).is_err() {
                     return ToolOutput::err("remember: cannot create .ka/memory/".to_string());

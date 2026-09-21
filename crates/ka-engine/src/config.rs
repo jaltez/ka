@@ -561,11 +561,12 @@ impl Config {
 }
 
 /// Append `tool` to `[permissions] allow` in the PROJECT config layer
-/// (`<cwd>/.ka/ka.toml`), preserving all other keys. Already-listed
+/// (`<project root>/.ka/ka.toml` — the nearest `.git` ancestor of
+/// `cwd`, else `cwd` itself), preserving all other keys. Already-listed
 /// tools are a no-op (`None`). Best-effort: parse or write failures
 /// return `None` rather than clobbering a file we could not read.
 pub fn save_project_permission(cwd: &std::path::Path, tool: &str) -> Option<std::path::PathBuf> {
-    let path = cwd.join(".ka/ka.toml");
+    let path = crate::project_root(cwd).join(".ka/ka.toml");
     let mut layer = std::fs::read_to_string(&path)
         .ok()
         .and_then(|text| Config::parse_layer(&text, "project").ok())

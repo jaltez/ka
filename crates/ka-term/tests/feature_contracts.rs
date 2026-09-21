@@ -189,6 +189,44 @@ fn memory_inbox_roundtrip_and_accept() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Memory flows anchor at the root project: a session launched in a
+/// subdirectory of a git repo stages, reads, drains, and accepts into
+/// the repo root's `.ka/memory/inbox.md` and `MEMORY.md`.
+#[test]
+fn memory_inbox_anchors_at_git_root() {
+    let root = std::env::temp_dir().join(format!("ka-term-inbox-root-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(root.join(".git")).unwrap();
+    let deep = root.join("deep").join("nested");
+    std::fs::create_dir_all(&deep).unwrap();
+
+    // the engine stages at the root; the TUI reads the same file
+    std::fs::create_dir_all(root.join(".ka/memory")).unwrap();
+    std::fs::write(
+        root.join(".ka/memory/inbox.md"),
+        "- [1700000000] prefer parking_lot locks\n",
+    )
+    .unwrap();
+    let staged = read_memory_inbox(&deep);
+    assert_eq!(
+        staged,
+        vec!["- [1700000000] prefer parking_lot locks".to_string()],
+        "subdir launch reads the root inbox"
+    );
+
+    // acceptance writes the project MEMORY.md at the root
+    accept_memory_note(&deep, &staged[0], false).unwrap();
+    let memory = std::fs::read_to_string(root.join("MEMORY.md")).unwrap();
+    assert!(memory.contains("prefer parking_lot locks"), "{memory:?}");
+    assert!(!deep.join("MEMORY.md").exists(), "no memory in the subdir");
+
+    // draining removes the root inbox, not a subdir copy
+    write_memory_inbox(&deep, &[]);
+    assert!(!root.join(".ka/memory/inbox.md").exists());
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 /// Notification settings defaults: the bell is on unless disabled, and
 /// the notify command is optional.
 #[test]

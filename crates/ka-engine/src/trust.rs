@@ -62,15 +62,19 @@ pub fn trusted_in(cwd: &Path, dirs: &[PathBuf]) -> bool {
     dirs.contains(&canonical)
 }
 
-/// Whether the project-scope `.ka/` content of `cwd` may load.
+/// Whether the project-scope `.ka/` content of `cwd` may load. Both the
+/// question and the approval below resolve against the project root
+/// (nearest `.git` ancestor, else `cwd`): one approval covers sessions
+/// launched from any directory inside the same project, and the store
+/// entry matches regardless of where the trust prompt fired.
 pub fn project_trusted(cwd: &Path) -> bool {
-    trusted_in(cwd, &load_trust())
+    trusted_in(&crate::project_root(cwd), &load_trust())
 }
 
 /// Record `cwd` as trusted in the store (canonicalized, deduplicated).
 pub fn approve(cwd: &Path) {
     let mut dirs = load_trust();
-    approve_into(&mut dirs, cwd);
+    approve_into(&mut dirs, &crate::project_root(cwd));
     save_trust(&dirs);
 }
 

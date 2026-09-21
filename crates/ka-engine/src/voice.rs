@@ -1376,11 +1376,16 @@ current — one item per step, mark items done as you finish them (each call rep
 whole list).",
         );
         if self.mode == ka_protocol::Mode::Plan {
-            system.push_str(
+            // absolute, root-anchored: a session launched from a
+            // subdirectory must draft into the one project plans dir the
+            // /approve flow and the TUI watcher watch
+            let plan = crate::project_root(&self.hand_ctx.cwd).join(".ka/plans/plan.md");
+            system.push_str(&format!(
                 "\n\nPLAN MODE: research the task with read/glob/grep/pathfinder, then write a \
-concrete numbered plan to .ka/plans/plan.md (the only writable path). Do not \
+concrete numbered plan to {} (the only writable path). Do not \
 attempt implementation — the user will review and switch to build mode.",
-            );
+                plan.display()
+            ));
         }
         if let Some(d) = &self.digest {
             system.push_str(&format!(

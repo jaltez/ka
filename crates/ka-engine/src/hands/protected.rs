@@ -73,8 +73,10 @@ pub fn reason(cwd: &Path, raw: &str) -> Option<&'static str> {
     {
         return Some("shell startup files / global git config");
     }
-    // ka's own configuration, credentials, and trust state
-    let ka_project = cwd.join(".ka/ka.toml");
+    // ka's own configuration, credentials, and trust state — the
+    // project layer anchors at the root project, matching
+    // [`crate::config::save_project_permission`]
+    let ka_project = crate::project_root(cwd).join(".ka/ka.toml");
     let ka_user = home.join(".config/ka/ka.toml");
     let ka_env = home.join(".config/ka/.env");
     let ka_trust = home.join(".local/state/ka/trust.json");

@@ -136,9 +136,11 @@ pub async fn run_trusted(
     }
 }
 
-/// Find the hook script: `.ka/hooks/<name>.sh` first, then `.ka/hooks/<name>`.
+/// Find the hook script: `<project root>/.ka/hooks/<name>.sh` first,
+/// then `<name>` — root-anchored so a session launched from a
+/// subdirectory runs the same project hooks.
 fn locate(event: HookPoint, cwd: &Path) -> Option<PathBuf> {
-    let base = cwd.join(".ka").join("hooks");
+    let base = crate::project_root(cwd).join(".ka").join("hooks");
     [format!("{}.sh", event.name()), event.name().to_string()]
         .into_iter()
         .map(|name| base.join(name))
