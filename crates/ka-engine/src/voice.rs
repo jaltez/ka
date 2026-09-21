@@ -2293,18 +2293,21 @@ attempt implementation — the user will review and switch to build mode.",
                     question: format!("allow {} to modify files?", call.tool),
                 },
                 ka_protocol::Mode::Plan => {
-                    // research mode: only the plans directory is writable
-                    let arg = call.primary_arg();
-                    let plans_ok = arg.starts_with(".ka/plans/")
-                        || arg.starts_with("./.ka/plans/")
-                        || arg.contains("/.ka/plans/");
-                    if plans_ok {
+                    // research mode: only the project root's plans
+                    // directory is writable. Resolve the argument
+                    // (absolute or relative) before comparing, so every
+                    // spelling lands where the plan prompt and the TUI
+                    // watcher look
+                    let plans_dir = crate::project_root(&self.hand_ctx.cwd).join(".ka/plans");
+                    let path = crate::hands::read::resolve(&self.hand_ctx, &call.primary_arg());
+                    if path.starts_with(&plans_dir) {
                         Gate::Allow
                     } else {
                         Gate::Deny {
                             reason: format!(
-                                "plan mode is read-only except .ka/plans/ (got {arg:?}); \
-use /build to switch to implementation"
+                                "plan mode is read-only except .ka/plans/ (got {:?}); \
+use /build to switch to implementation",
+                                call.primary_arg()
                             ),
                         }
                     }

@@ -35,6 +35,21 @@ pub fn project_root(cwd: &Path) -> PathBuf {
     project_root_in(cwd, |p| p.join(".git").exists(), home.as_deref())
 }
 
+/// Canonical-form directory equality with a literal fallback (paths that
+/// no longer exist compare literally). `$HOME` may be spelled through a
+/// symlink while the walk carries the physical path (or vice versa); a
+/// raw comparison would let the walk slip past the bound and adopt a
+/// stray `.git` above home, re-anchoring generated writes there.
+fn same_dir(a: &Path, b: &Path) -> bool {
+    if a == b {
+        return true;
+    }
+    match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+        (Ok(ca), Ok(cb)) => ca == cb,
+        _ => false,
+    }
+}
+
 /// [`project_root`] with injectable marker probe and home (tests).
 fn project_root_in(cwd: &Path, is_repo: impl Fn(&Path) -> bool, home: Option<&Path>) -> PathBuf {
     let mut cur = cwd.to_path_buf();
@@ -46,7 +61,8 @@ fn project_root_in(cwd: &Path, is_repo: impl Fn(&Path) -> bool, home: Option<&Pa
         // every session under $HOME), the filesystem root, and the
         // relative-path degenerate `""`. Unmarked walks fall back to
         // the launch dir itself.
-        if cur == Path::new("/") || cur == Path::new("") || home == Some(cur.as_path()) {
+        if cur == Path::new("/") || cur == Path::new("") || home.is_some_and(|h| same_dir(h, &cur))
+        {
             return cwd.to_path_buf();
         }
         match cur.parent() {
@@ -109,5 +125,20 @@ mod project_root_tests {
             root_of("/home/u/notes", &["/home/u"], Some("/home/u")),
             Path::new("/home/u")
         );
+    }
+
+    /// The documented worktree/submodule shape: `.git` as a FILE. Uses
+    /// the real probe against a temp tree.
+    #[test]
+    fn git_file_marker_is_a_root() {
+        let dir = std::env::temp_dir().join(format!("ka-gitfile-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("deep")).unwrap();
+        std::fs::write(dir.join(".git"), "gitdir: /elsewhere/.git\n").unwrap();
+        assert_eq!(
+            project_root_in(&dir.join("deep"), |p| p.join(".git").exists(), None),
+            dir
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

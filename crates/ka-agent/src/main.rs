@@ -42,7 +42,8 @@ struct Cli {
     /// Skip local-endpoint discovery probes
     #[arg(long)]
     no_discovery: bool,
-    /// Trust this directory's .ka/ka.toml (stores the decision)
+    /// Trust the project root's .ka/ka.toml (nearest .git ancestor;
+    /// stores the decision)
     #[arg(long)]
     trust: bool,
     /// Disable all customizations (AGENTS.md, MEMORY.md, skills,
@@ -79,7 +80,8 @@ enum CliCommand {
         /// Resume a session by id (prefix ok) or file path
         #[arg(long, value_name = "ID")]
         session: Option<String>,
-        /// Trust this directory's .ka/ka.toml (stores the decision)
+        /// Trust the project root's .ka/ka.toml (nearest .git ancestor;
+        /// stores the decision)
         #[arg(long)]
         trust: bool,
         /// JSON-schema file the reply must satisfy (structured output)
@@ -295,12 +297,13 @@ fn load_config(
 
     let user = Some(ka_engine::config::user_config_path());
     // the project layer anchors at the root project (nearest .git
-    // ancestor, else cwd), symmetric with where "always allow" saves it
-    let project = trust_project.then(|| {
-        std::env::current_dir()
-            .map(|cwd| ka_engine::project_root(&cwd).join(".ka/ka.toml"))
-            .unwrap_or_else(|_| PathBuf::from(".ka/ka.toml"))
-    });
+    // ancestor, else cwd), symmetric with where "always allow" saves it;
+    // an unknowable cwd skips the layer entirely rather than guessing a
+    // relative path the trust gate would not have resolved to the same root
+    let project = trust_project
+        .then(|| std::env::current_dir().ok())
+        .flatten()
+        .map(|cwd| ka_engine::project_root(&cwd).join(".ka/ka.toml"));
 
     for path in user.iter().chain(project.iter()).chain(configs.iter()) {
         match std::fs::read_to_string(path) {
@@ -978,6 +981,15 @@ async fn run_tui(cli: Cli) -> Result<ExitCode, String> {
     let trust = trust_for_cwd(cli.trust);
     warn_untrusted_conventions(&cwd);
     let cfg = load_config(&cli.configs, cli.model.clone(), cli.mode.clone(), trust)?;
+    // the engine resolves its cwd as config cwd else process cwd; the
+    // TUI must see the same value or plan-file paths, memory roots, and
+    // custom-command roots drift from what the engine anchors to
+    let session_cwd = cfg
+        .cwd
+        .clone()
+        .map(PathBuf::from)
+        .or_else(|| std::env::current_dir().ok())
+        .unwrap_or_else(|| PathBuf::from("."));
     let catalog = build_catalog(&cli.dialects, !cli.no_discovery).await?;
     let model_label = cfg.model.clone().unwrap_or_else(|| "(canned)".to_string());
     let mut providers: Vec<ka_term::tui::ProviderInfo> = ka_dialect::providers::PROVIDERS
@@ -1084,6 +1096,7 @@ async fn run_tui(cli: Cli) -> Result<ExitCode, String> {
         tui_notify,
         tui_mouse_capture,
         fresh,
+        session_cwd,
     )
     .await
     .map_err(|e| format!("tui: {e}"))?;
@@ -1382,7 +1395,10 @@ fn run_init() -> Result<ExitCode, String> {
     let root = ka_engine::project_root(&cwd);
     let target = root.join("AGENTS.md");
     if target.exists() {
-        return Err("AGENTS.md already exists; refusing to overwrite".to_string());
+        return Err(format!(
+            "AGENTS.md already exists at {}; refusing to overwrite",
+            target.display()
+        ));
     }
 
     let mut langs = Vec::new();

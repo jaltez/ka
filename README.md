@@ -49,7 +49,7 @@ TUI slash commands: `/model <sel>` `/mode [tier]` (picker: needs-approval | acce
 
 ## Config
 
-Strict TOML, layered: defaults → `~/.config/ka/ka.toml` → `.ka/ka.toml` (trust-gated: first use prompts or `--trust`; stored in `~/.local/state/ka/trust.json`) → env (`KA_MODEL`, `KA_MODE`) → flags. Unknown keys are hard errors with line numbers. The **project root** — the nearest `.git` ancestor of the launch dir (else the launch dir itself) — hosts the whole project-scope `.ka/` layer (config, skills, rules, agents, commands, hooks) and everything ka generates into it (plans, staged memories, merge patches, always-allow saves), so sessions started in a subdirectory share one `.ka`.
+Strict TOML, layered: defaults → `~/.config/ka/ka.toml` → `.ka/ka.toml` (trust-gated: first use prompts or `--trust`; stored in `~/.local/state/ka/trust.json`) → env (`KA_MODEL`, `KA_MODE`) → flags. Unknown keys are hard errors with line numbers. The **project root** — the nearest `.git` ancestor of the launch dir, stopping at `$HOME` and the filesystem root (else the launch dir itself) — hosts the whole project-scope `.ka/` layer (config, skills, rules, agents, commands, hooks) and everything ka generates into it (plans, staged memories, merge patches, always-allow saves), so sessions started in a subdirectory share one `.ka`.
 
 ```toml
 model = "ollama/qwen3.5:9b"

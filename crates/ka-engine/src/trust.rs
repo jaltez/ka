@@ -12,7 +12,11 @@ use std::path::{Path, PathBuf};
 
 /// The trust store file, derived from the environment.
 pub fn trust_file() -> PathBuf {
-    #[cfg(test)]
+    // gated like [`test_support`] itself, not `cfg(test)`: integration
+    // suites link the lib WITHOUT `cfg(test)`, so a plain test gate
+    // would leave their `with_trust_file` redirection inert and point
+    // them at the real store
+    #[cfg(any(test, feature = "test-util"))]
     if let Some(file) = test_support::current_file() {
         return file;
     }
@@ -72,6 +76,9 @@ pub fn project_trusted(cwd: &Path) -> bool {
 }
 
 /// Record `cwd` as trusted in the store (canonicalized, deduplicated).
+/// Approving a project root also folds away superseded launch-dir
+/// entries from before root anchoring — except entries that are their
+/// own repos (submodules, vendored checkouts), which stay approved.
 pub fn approve(cwd: &Path) {
     let mut dirs = load_trust();
     approve_into(&mut dirs, &crate::project_root(cwd));
@@ -87,6 +94,10 @@ pub fn approve_at(file: &Path, cwd: &Path) {
 
 fn approve_into(dirs: &mut Vec<PathBuf>, cwd: &Path) {
     let canonical = std::fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
+    dirs.retain(|d| {
+        // keep the root itself, everything outside it, and nested repos
+        d == &canonical || !d.starts_with(&canonical) || d.join(".git").exists()
+    });
     if !dirs.contains(&canonical) {
         dirs.push(canonical);
     }
@@ -98,6 +109,32 @@ mod tests {
 
     use super::test_support::{uniq, with_trust_file};
     use super::*;
+
+    #[test]
+    fn approve_folds_superseded_launch_entries_but_keeps_nested_repos() {
+        let dir = uniq("fold");
+        let root = dir.join("proj");
+        let launch = root.join("crates/ka");
+        let nested = root.join("vendor/sub");
+        std::fs::create_dir_all(&launch).unwrap();
+        std::fs::create_dir_all(nested.join(".git")).unwrap();
+        let file = dir.join("state/ka/trust.json");
+        let canon = |p: &std::path::Path| std::fs::canonicalize(p).unwrap();
+        // pre-root-era entries: the old launch dir + a nested repo
+        save_trust_at(&file, &[canon(&launch), canon(&nested)]);
+        approve_at(&file, &root);
+        let dirs = load_trust_at(&file);
+        assert!(dirs.contains(&canon(&root)), "the root is approved");
+        assert!(
+            !dirs.contains(&canon(&launch)),
+            "a superseded launch-dir entry folds away"
+        );
+        assert!(
+            dirs.contains(&canon(&nested)),
+            "a nested repo (its own .git) stays approved"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn approve_then_project_trusted_roundtrip() {

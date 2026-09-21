@@ -1911,14 +1911,24 @@ fn context_rows(parts: &[ka_protocol::ContextPart], window: u64) -> Vec<String> 
     rows
 }
 
+/// The session cwd handed to [`run`]: the plan path must anchor where
+/// the ENGINE anchors (its resolved cwd, honoring the `cwd` config
+/// override), not wherever the process happens to stand.
+pub static PLAN_CWD: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+
 /// The plan file path for this session: root-anchored (nearest `.git`
-/// ancestor of the launch dir, else the launch dir), matching the
-/// plan-mode system prompt and the engine's writable-path gate.
+/// ancestor of the session cwd, else the session cwd), matching the
+/// plan-mode system prompt and the engine's writable-path gate. Falls
+/// back to the process cwd before [`run`] hands the session cwd over.
 fn plan_file_path() -> std::path::PathBuf {
-    std::env::current_dir()
-        .ok()
-        .map(|cwd| ka_engine::project_root(&cwd).join(".ka/plans/plan.md"))
-        .unwrap_or_else(|| std::path::PathBuf::from(".ka/plans/plan.md"))
+    let base = PLAN_CWD
+        .get()
+        .cloned()
+        .or_else(|| std::env::current_dir().ok());
+    match base {
+        Some(cwd) => ka_engine::project_root(&cwd).join(".ka/plans/plan.md"),
+        None => std::path::PathBuf::from(".ka/plans/plan.md"),
+    }
 }
 
 /// The shared follow-up prompt that starts a build turn from the plan
@@ -2430,9 +2440,11 @@ pub async fn run(
     notify: NotifySettings,
     mouse_capture: bool,
     fresh: bool,
+    session_cwd: std::path::PathBuf,
 ) -> std::io::Result<Exit> {
     let _ = AGENTS.set(agents.clone());
     let _ = NOTIFY.set(notify);
+    let _ = PLAN_CWD.set(session_cwd);
     // Register raw mode in THIS crate's crossterm before ratatui flips
     // it through its own (0.28) copy: crossterm's parser decides whether
     // `\n` means Enter or Ctrl+J by reading its own per-crate raw-mode
@@ -4433,10 +4445,10 @@ async fn app(
                             && plan_drafted(plan_started, &plan_file_path())
                         {
                             plan_started = None;
-                            transcript.push_separated(Line::Note(
-                                "Plan drafted — review the plan file, then /approve to build"
-                                    .into(),
-                            ));
+                            transcript.push_separated(Line::Note(format!(
+                                "Plan drafted — review {}, then /approve to build",
+                                plan_file_path().display()
+                            )));
                         }
                         if let Event::ContextBreakdown { parts, window } = &evt {
                             modal = Some(Modal::Context {
@@ -5291,7 +5303,7 @@ fn builtin_slash_commands() -> Vec<(String, String)> {
         ("/mode".to_string(), "pick a permission mode".to_string()),
         (
             "/plan".to_string(),
-            "research the task, write .ka/plans/plan.md".to_string(),
+            "research the task, draft the plan file".to_string(),
         ),
         ("/build".to_string(), "implement the plan file".to_string()),
         (
@@ -5685,10 +5697,11 @@ pub enum ModalKind {
 /// Load a custom command body from `.ka/commands/<name>.md` (project) or
 /// the user dir; `$ARGUMENTS` substituted with the rest of the line.
 fn project_trusted_in(state_home: &std::path::Path, cwd: &std::path::Path) -> bool {
-    let Ok(text) = std::fs::read_to_string(state_home.join("ka/trust.json")) else {
-        return false;
-    };
-    text.contains(&cwd.to_string_lossy().to_string())
+    // exact, canonicalized membership via the engine's helper: the old
+    // raw-substring match missed differently-spelled launch dirs and
+    // could false-positive on sibling path prefixes
+    let file = state_home.join("ka/trust.json");
+    ka_engine::trust::trusted_in(cwd, &ka_engine::trust::load_trust_at(&file))
 }
 
 /// One discovered custom slash command.
@@ -8110,7 +8123,7 @@ mod tests {
         std::fs::create_dir_all(&state_home).unwrap();
         let trust_file = state_home.join("ka/trust.json");
         std::fs::create_dir_all(trust_file.parent().unwrap()).unwrap();
-        std::fs::write(&trust_file, format!(r#"{{"paths":["{}"]}}"#, dir.display())).unwrap();
+        ka_engine::trust::save_trust_at(&trust_file, std::slice::from_ref(&dir));
         // sanity: without safe mode the command resolves (explicit
         // paths — no process-global cwd mutation in a parallel test
         // binary)
@@ -9515,11 +9528,7 @@ mod tests {
         );
         // trust the project: dispatch substitutes $ARGUMENTS
         std::fs::create_dir_all(state.join("ka")).unwrap();
-        std::fs::write(
-            state.join("ka/trust.json"),
-            format!("{{\"projects\":[{{\"path\":\"{}\"}}]}}", dir.display()),
-        )
-        .unwrap();
+        ka_engine::trust::save_trust_at(&state.join("ka/trust.json"), std::slice::from_ref(&dir));
         let body = custom_command_in(&dir, &state, "/review", Some("src/main.rs")).unwrap();
         assert_eq!(body, "Review this diff: src/main.rs");
 
