@@ -2444,7 +2444,17 @@ enum PendingModal {
 
 /// Visible rows in the TaskDetail/Debug pager modals — the render
 /// height cap (30) minus the box chrome (border 2 + padding 2 + 1).
+/// The key side shrinks this to the transcript pane the same way the
+/// renderer's `.min(modal_area.height)` does, so scrolling always
+/// matches what is on screen.
 const PAGER_VISIBLE: usize = 25;
+
+/// The pager's window height for a transcript pane `view_rows` tall —
+/// the same number the renderer derives from its clamped box height,
+/// so page keys never step past what is actually shown.
+fn pager_visible(view_rows: usize) -> usize {
+    PAGER_VISIBLE.min(view_rows.saturating_sub(5)).max(1)
+}
 
 /// Task id off a /tasks roster row: `t-<id>  …` → `Some(id)`, any
 /// other row shape (job-`, dap, placeholders) → None.
@@ -2458,20 +2468,25 @@ fn task_id_of_row(row: &str) -> Option<u64> {
 /// Key handling shared by the pager modals (TaskDetail, Debug): the
 /// page keys scroll the window, Home jumps to the top, End re-pins to
 /// the tail; any other key closes. Returns true when the modal should
-/// close.
-fn pager_keys(code: crossterm::event::KeyCode, total: usize, scroll: &mut Option<usize>) -> bool {
+/// close. `visible` mirrors the renderer's window height.
+fn pager_keys(
+    code: crossterm::event::KeyCode,
+    total: usize,
+    scroll: &mut Option<usize>,
+    visible: usize,
+) -> bool {
     use crossterm::event::KeyCode;
     match code {
         KeyCode::PageUp => {
-            page_up(scroll, total, PAGER_VISIBLE);
+            page_up(scroll, total, visible);
             false
         }
         KeyCode::PageDown => {
-            page_down(scroll, total, PAGER_VISIBLE);
+            page_down(scroll, total, visible);
             false
         }
         KeyCode::Home => {
-            if total > PAGER_VISIBLE {
+            if total > visible {
                 *scroll = Some(0);
             }
             false
@@ -3372,12 +3387,14 @@ async fn app(
                                 _ => {}
                             },
                             Modal::TaskDetail { text, scroll, .. } => {
-                                if pager_keys(key.code, text.lines().count(), scroll) {
+                                let visible = pager_visible(view_rows);
+                                if pager_keys(key.code, text.lines().count(), scroll, visible) {
                                     modal = None;
                                 }
                             }
                             Modal::Debug { rows, scroll } => {
-                                if pager_keys(key.code, rows.len(), scroll) {
+                                let visible = pager_visible(view_rows);
+                                if pager_keys(key.code, rows.len(), scroll, visible) {
                                     modal = None;
                                 }
                             }
@@ -7845,9 +7862,9 @@ fn render(
             }
             Modal::TaskDetail { id, text, scroll } => {
                 let lines: Vec<&str> = text.lines().collect();
-                let height = (lines.len() as u16 + 5)
-                    .clamp(7, 30)
-                    .min(frame.area().height);
+                // clamp to the transcript pane: a taller box would bleed
+                // over the input box / status bar
+                let height = (lines.len() as u16 + 5).clamp(7, 30).min(modal_area.height);
                 let width = 90.min(frame.area().width);
                 let rect = centered(width, height, modal_area);
                 frame.render_widget(ratatui::widgets::Clear, rect);
@@ -7870,9 +7887,9 @@ fn render(
                 frame.render_widget(widget, rect);
             }
             Modal::Debug { rows, scroll } => {
-                let height = (rows.len() as u16 + 5)
-                    .clamp(7, 30)
-                    .min(frame.area().height);
+                // clamp to the transcript pane: a taller box would bleed
+                // over the input box / status bar
+                let height = (rows.len() as u16 + 5).clamp(7, 30).min(modal_area.height);
                 let width = 90.min(frame.area().width);
                 let rect = centered(width, height, modal_area);
                 frame.render_widget(ratatui::widgets::Clear, rect);
@@ -9926,6 +9943,19 @@ mod tests {
             "one /tasks entry: {names:?}"
         );
         assert!(names.contains(&"/debug".to_string()), "{names:?}");
+    }
+
+    #[test]
+    fn pager_visible_matches_render_clamp() {
+        // short pane: the window shrinks with the pane, so the top of a
+        // long result stays reachable (render: height = min(n+5, 30,
+        // pane) and visible = height - 5)
+        assert_eq!(pager_visible(24), 19);
+        assert_eq!(pager_visible(10), 5);
+        // degenerate pane: at least one row
+        assert_eq!(pager_visible(4), 1);
+        // tall pane: capped at the box's own cap
+        assert_eq!(pager_visible(80), 25);
     }
 
     #[test]

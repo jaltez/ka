@@ -666,8 +666,8 @@ async fn read_loop<R: tokio::io::AsyncRead + Unpin + Send + 'static>(
                     }
                     session.stopped.notify_one();
                     // async stop note: fires only when no hand-side wait
-                    // (`wait_stop`/`resume`/`pause`) is mid-flight. The
-                    // latch stays set until the next hand wait resets it.
+                    // (`wait_stop`/`resume`/`pause`) is mid-flight; the
+                    // note task releases the latch once it is out.
                     if session.notes.is_some()
                         && !session.hand_waiting.swap(true, Ordering::Relaxed)
                     {
@@ -681,6 +681,10 @@ async fn read_loop<R: tokio::io::AsyncRead + Unpin + Send + 'static>(
                                 };
                                 let message: String = message.chars().take(200).collect();
                                 notes.send(ka_protocol::Event::Note { message }).await.ok();
+                                // the note is out: further async stops may
+                                // note again (the next hand wait re-arms the
+                                // latch through its own store)
+                                stopped.hand_waiting.store(false, Ordering::Relaxed);
                             });
                         }
                     }

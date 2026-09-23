@@ -41,7 +41,7 @@ Keys: `Enter` send / interject mid-turn · `+text` defer until turn ends · `Esc
 | `ka init` | starter AGENTS.md at the project root, from repo shape |
 | `ka config {schema,print}` | resolved config / JSON schema |
 
-TUI slash commands: `/model <sel>` `/mode [tier]` (picker: needs-approval | accept-edits | full-access | plan) `/plan <task>` `/build` `/review [base]` `/tasks` `/rewind [N]` `/compact [focus]` `/quit` plus custom `/name` from `.ka/commands/*.md` (`$ARGUMENTS` substituted). Double-Esc on an empty input opens the rewind menu — pick a past message to rewind to, or `e` to edit & resend it. `!cmd` runs a shell command directly (no turn, no gate); its output shows in the transcript and rides the next prompt as context.
+TUI slash commands: `/model <sel>` `/mode [tier]` (picker: needs-approval | accept-edits | full-access | plan) `/plan <task>` `/build` `/review [base]` `/tasks` `/debug` `/rewind [N]` `/compact [focus]` `/quit` plus custom `/name` from `.ka/commands/*.md` (`$ARGUMENTS` substituted). `/tasks` opens a picker over background tasks/jobs/DAP sessions — ⏎ pages the selected task's full result; `/debug` shows live debug sessions (breakpoints + console tail). Double-Esc on an empty input opens the rewind menu — pick a past message to rewind to, or `e` to edit & resend it. `!cmd` runs a shell command directly (no turn, no gate); its output shows in the transcript and rides the next prompt as context.
 
 ## Selectors & models
 
@@ -148,7 +148,7 @@ tools: read, grep, glob    # restrict the nested voice's hands
 You explore code and report where things live.
 ```
 
-`delegate {"background": true}` starts an agent detached and returns immediately; the `tasks` hand lists/reads/cancels background work, and `/tasks` in the TUI snapshots tasks + bash jobs.
+`delegate {"background": true}` starts an agent detached and returns immediately; the `tasks` hand lists/reads/cancels background work, and `/tasks` in the TUI opens the picker (⏎ pages a task's full result).
 
 ## Conventions ka reads automatically
 
