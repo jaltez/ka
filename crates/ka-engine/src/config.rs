@@ -216,7 +216,7 @@ pub struct Sandbox {
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields, default)]
 pub struct Tui {
-    /// Title glyph for the transcript window and sidebar (default ◆).
+    /// Title glyph for the transcript window (default ◆).
     pub header_glyph: Option<String>,
     /// Ring the terminal bell when a turn finishes or a permission ask
     /// appears (None = true; terminals mute bells by user choice).
@@ -225,11 +225,13 @@ pub struct Tui {
     /// `{"event":"turn_finished","stop":"done"}`. Example:
     /// `notify-send ka "turn done"`.
     pub notify: Option<String>,
-    /// Mouse mode: `"capture"` (default) — the wheel scrolls the chat,
-    /// ▲▼/skills-header clicks work, and ⇧drag selects natively; or
-    /// `"native"` — no capture at all, so plain drag selects and
-    /// pastes with the terminal's own bindings (chat scrolls with
-    /// PgUp/PgDn). `/mouse` toggles at runtime either way.
+    /// Mouse mode: `"native"` (default) — no capture at all, so plain
+    /// drag selects and pastes with the terminal's own bindings and the
+    /// wheel scrolls the chat via alternate-scroll; or `"capture"` —
+    /// SGR button reporting: the wheel scrolls and the bottom-strip
+    /// buttons become clickable, ⇧drag still selects. Ctrl+M toggles
+    /// at runtime either way. kitty has no alternate-scroll — keep
+    /// `"capture"` there for the wheel.
     pub mouse: Option<String>,
 }
 
@@ -517,10 +519,12 @@ impl Config {
         self.tui.bell.unwrap_or(true)
     }
 
-    /// Whether the TUI starts with the mouse captured (default true).
-    /// `[tui] mouse = "native"` opts into plain terminal selection.
+    /// Whether the TUI starts with the mouse captured. Default is
+    /// native (unset or `"native"`): plain drag selection, wheel via
+    /// alternate-scroll. `[tui] mouse = "capture"` opts into SGR
+    /// button reporting (wheel + clickable strip buttons + ⇧drag).
     pub fn effective_mouse_capture(&self) -> bool {
-        self.tui.mouse.as_deref() != Some("native")
+        self.tui.mouse.as_deref() == Some("capture")
     }
 
     /// Whether web fetches may target private hosts (default false).
@@ -629,8 +633,9 @@ pub fn save_user_settings(
     model: Option<&str>,
     effort: Option<Effort>,
     mode: Option<Mode>,
+    mouse: Option<&str>,
 ) -> Result<std::path::PathBuf, String> {
-    save_settings_to(&user_config_path(), model, effort, mode)
+    save_settings_to(&user_config_path(), model, effort, mode, mouse)
 }
 
 /// [`save_user_settings`] against an explicit path (tests, layers).
@@ -639,6 +644,7 @@ pub fn save_settings_to(
     model: Option<&str>,
     effort: Option<Effort>,
     mode: Option<Mode>,
+    mouse: Option<&str>,
 ) -> Result<std::path::PathBuf, String> {
     let mut layer = std::fs::read_to_string(path)
         .ok()
@@ -652,6 +658,17 @@ pub fn save_settings_to(
     }
     if mode.is_some() {
         layer.mode = mode;
+    }
+    if let Some(mouse) = mouse {
+        // strict-TOML philosophy at the writer too: only the two
+        // documented values ever land in the layer (an unknown value
+        // would parse back as capture silently)
+        if mouse != "capture" && mouse != "native" {
+            return Err(format!(
+                "invalid [tui] mouse {mouse:?} — expected \"capture\" or \"native\""
+            ));
+        }
+        layer.tui.mouse = Some(mouse.to_string());
     }
     let mut text = String::from("# ka user config — written by /settings\n\n");
     text.push_str(&toml::to_string_pretty(&layer).map_err(|e| e.to_string())?);
@@ -707,6 +724,7 @@ mod tests {
             Some("groq/llama-3.3-70b"),
             Some(Effort::High),
             Some(Mode::Free),
+            None,
         )
         .unwrap();
         let text = std::fs::read_to_string(&path).unwrap();
@@ -715,6 +733,51 @@ mod tests {
         assert_eq!(layer.effort, Some(Effort::High));
         assert_eq!(layer.mode, Some(Mode::Free));
         assert_eq!(layer.max_steps, Some(7), "unrelated keys preserved");
+        assert_eq!(layer.tui.mouse, None, "mouse left alone when None");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn save_settings_persists_mouse_mode() {
+        let dir = std::env::temp_dir().join(format!("ka-cfg-mouse-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("ka.toml");
+        std::fs::write(&path, "model = \"a/x\"\n[tui]\nbell = false\n").unwrap();
+        // /mouse toggled to native: the key lands under [tui], the
+        // unrelated bell setting survives
+        save_settings_to(&path, None, None, None, Some("native")).unwrap();
+        let layer = Config::parse_layer(&std::fs::read_to_string(&path).unwrap(), "saved").unwrap();
+        assert_eq!(layer.tui.mouse.as_deref(), Some("native"));
+        assert_eq!(layer.tui.bell, Some(false), "unrelated [tui] keys survive");
+        assert_eq!(layer.model.as_deref(), Some("a/x"));
+        assert!(
+            !layer.effective_mouse_capture(),
+            "native parses back as uncaptured"
+        );
+        // toggling back rewrites the value (no [tui] duplication)
+        save_settings_to(&path, None, None, None, Some("capture")).unwrap();
+        let layer = Config::parse_layer(&std::fs::read_to_string(&path).unwrap(), "saved").unwrap();
+        assert_eq!(layer.tui.mouse.as_deref(), Some("capture"));
+        assert!(layer.effective_mouse_capture());
+        // mouse=None is the model/mode-picker path: an existing mouse
+        // choice (here "capture") must survive untouched
+        save_settings_to(&path, Some("b/y"), None, None, None).unwrap();
+        let layer = Config::parse_layer(&std::fs::read_to_string(&path).unwrap(), "saved").unwrap();
+        assert_eq!(layer.tui.mouse.as_deref(), Some("capture"));
+        assert_eq!(layer.model.as_deref(), Some("b/y"));
+        // non-canonical values are rejected at the writer
+        let err = save_settings_to(&path, None, None, None, Some("bogus")).unwrap_err();
+        assert!(err.contains("invalid [tui] mouse"), "{err}");
+        assert!(
+            Config::parse_layer(&std::fs::read_to_string(&path).unwrap(), "check")
+                .unwrap()
+                .tui
+                .mouse
+                .as_deref()
+                == Some("capture"),
+            "failed save leaves the layer untouched"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -725,6 +788,7 @@ mod tests {
         let c = Config::default();
         assert_eq!(c.effective_mode(), Mode::Free);
         assert!(c.model.is_none());
+        assert!(!c.effective_mouse_capture(), "native is the default mode");
     }
 
     #[test]

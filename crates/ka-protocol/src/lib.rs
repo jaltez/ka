@@ -284,6 +284,12 @@ pub enum Command {
         effort: Option<Effort>,
         /// Default permission mode.
         mode: Option<Mode>,
+        /// TUI mouse mode (`"capture"` = SGR button reporting, wheel
+        /// scrolls, ⇧drag selects; `"native"` = no capture, plain drag
+        /// selects, the wheel rides DECSET 1007 as ↑/↓). None leaves
+        /// the stored value alone.
+        #[serde(default)]
+        mouse: Option<String>,
     },
     /// Ask for a context-usage breakdown (see [`Event::ContextBreakdown`]).
     ContextBreakdown,
@@ -751,6 +757,20 @@ mod tests {
         });
         roundtrip_command(Command::TaskDetail { id: 7 });
         roundtrip_command(Command::DebugRoster);
+        roundtrip_command(Command::SaveSettings {
+            model: None,
+            effort: None,
+            mode: None,
+            mouse: Some("capture".into()),
+        });
+        // older surfaces predating the mouse field still parse (additive)
+        let legacy: Command =
+            from_line(r#"{"type":"save_settings","model":null,"effort":null,"mode":null}"#)
+                .unwrap();
+        assert!(
+            matches!(legacy, Command::SaveSettings { mouse: None, .. }),
+            "{legacy:?}"
+        );
         roundtrip_event(Event::Title {
             title: "fix the parser".into(),
         });

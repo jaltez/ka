@@ -38,7 +38,7 @@ pub fn render(text: &str, width: u16) -> Vec<TuiLine<'static>> {
         let trimmed = line.trim_start();
         if let Some(fence) = trimmed.strip_prefix("```") {
             if in_code {
-                push_code_block(&mut out, &code_lines, &code_lang);
+                push_code_block(&mut out, &code_lines, &code_lang, width);
                 code_lines.clear();
                 code_lang.clear();
                 in_code = false;
@@ -82,13 +82,13 @@ pub fn render(text: &str, width: u16) -> Vec<TuiLine<'static>> {
         }
         if let Some(h) = trimmed.strip_prefix("#### ") {
             out.push(TuiLine::styled(
-                format!("#### {}", strip_atx_closer(h)),
+                strip_atx_closer(h).to_string(),
                 header_style(),
             ));
             push_heading_gap(&mut out, &lines, i);
         } else if let Some(h) = trimmed.strip_prefix("### ") {
             out.push(TuiLine::styled(
-                format!("### {}", strip_atx_closer(h)),
+                strip_atx_closer(h).to_string(),
                 header_style(),
             ));
             push_heading_gap(&mut out, &lines, i);
@@ -148,7 +148,7 @@ pub fn render(text: &str, width: u16) -> Vec<TuiLine<'static>> {
     }
     if in_code {
         // unterminated fence: flush what we have
-        push_code_block(&mut out, &code_lines, &code_lang);
+        push_code_block(&mut out, &code_lines, &code_lang, width);
     }
     wrap_rows(out, width)
 }
@@ -663,8 +663,10 @@ fn parse_link(chars: &[char], start: usize) -> Option<(String, String, usize)> {
     Some((text, url, close_url + 1))
 }
 
-/// Code block: faint ` ``` ` fence lines around syntax-colored code, which
-/// rides the assistant card surface (BG_OUTPUT).
+/// Code block: the ` ``` ` marker rows vanish; every code line carries a
+/// quiet `▎ ` rail (borrowing the transcript's tool-row language) and
+/// rides the assistant card surface (BG_OUTPUT). Content truncates two
+/// columns early so the rail never pushes a row past the wrap width.
 ///
 /// Fences tagged with a known language go through [`CodeHighlighter`],
 /// which tracks block comments across lines within this block; every
@@ -673,22 +675,23 @@ fn parse_link(chars: &[char], start: usize) -> Option<(String, String, usize)> {
 /// code surfaces): comments → SYNTAX_COMMENT, strings → SYNTAX_STRING,
 /// keywords → SYNTAX_KEYWORD, numbers → SYNTAX_NUMBER, everything else
 /// stays CODE_BLOCK.
-fn push_code_block(out: &mut Vec<TuiLine<'static>>, lines: &[String], lang: &str) {
+fn push_code_block(out: &mut Vec<TuiLine<'static>>, lines: &[String], lang: &str, width: u16) {
     if lines.is_empty() {
         return;
     }
-    out.push(TuiLine::styled(
-        format!("```{lang}"),
-        Style::new().fg(palette::FAINT),
-    ));
+    // the two-column rail budget: `▎ ` before every code row
+    let rail = Style::new().fg(palette::BORDER_QUIET);
+    let inner = width.saturating_sub(2) as usize;
     let mut hl = code_lang(lang).map(CodeHighlighter::new);
     for line in lines {
-        out.push(TuiLine::from(match &mut hl {
+        let spans = match &mut hl {
             Some(h) => h.line(line),
             None => highlight(line),
-        }));
+        };
+        let mut row = vec![Span::styled("▎ ", rail)];
+        row.extend(fit_spans(spans, inner));
+        out.push(TuiLine::from(row));
     }
-    out.push(TuiLine::styled("```", Style::new().fg(palette::FAINT)));
     out.push(TuiLine::default());
 }
 
@@ -1074,9 +1077,9 @@ mod tests {
         assert!(lines[1].spans.is_empty(), "gap after h1");
         assert_eq!(line_text(&lines[2]), "Mid", "h2 has no marker");
         assert!(lines[3].spans.is_empty(), "gap after h2");
-        assert_eq!(line_text(&lines[4]), "### Deep", "h3 keeps its hashes");
+        assert_eq!(line_text(&lines[4]), "Deep", "h3 strips its hashes");
         assert!(lines[5].spans.is_empty(), "gap after h3");
-        assert_eq!(line_text(&lines[6]), "#### Deepest");
+        assert_eq!(line_text(&lines[6]), "Deepest", "h4 strips its hashes");
         let joined = format!("{:?}", lines);
         assert!(!joined.contains('═'), "no rules: {joined}");
         assert!(!joined.contains('▍'), "no markers: {joined}");
@@ -1110,12 +1113,22 @@ mod tests {
     }
 
     #[test]
-    fn code_block_uses_dim_fences_and_syntax_colors() {
+    fn fences_hidden_rail_prefix() {
         let md = "```rust\nfn main() { let x = \"hi\"; } // done\n```\n";
         let lines = render(md, 80);
-        assert!(lines.len() >= 3);
-        assert_eq!(line_text(&lines[0]), "```rust", "literal fence kept");
+        // the fence markers vanish; one railed row for the code line and
+        // the trailing blank
+        assert_eq!(lines.len(), 2, "no fence marker rows: {lines:?}");
+        let first = &lines[0];
+        let spans: Vec<&Span> = first.spans.iter().collect();
+        assert_eq!(spans[0].content.as_ref(), "▎ ", "quiet rail prefix");
+        assert_eq!(
+            spans[0].style.fg,
+            Some(palette::BORDER_QUIET),
+            "rail uses the quiet border tone"
+        );
         let rendered = format!("{:?}", lines);
+        assert!(!rendered.contains("```"), "no literal fence glyphs");
         assert!(
             rendered.contains(&format!("{:?}", palette::OK)),
             "string: {rendered}"
@@ -1444,6 +1457,7 @@ mod tests {
             &mut out,
             &["let x = 42; // note".to_string(), "fn f() {}".to_string()],
             "rust",
+            80,
         );
         let joined = format!("{out:?}");
         assert!(
@@ -1463,7 +1477,12 @@ mod tests {
     #[test]
     fn json_and_toml_fences_highlight_basics() {
         let mut out: Vec<TuiLine> = Vec::new();
-        push_code_block(&mut out, &[r#"{"k": true, "n": 1}"#.to_string()], "json");
+        push_code_block(
+            &mut out,
+            &[r#"{"k": true, "n": 1}"#.to_string()],
+            "json",
+            80,
+        );
         let joined = format!("{out:?}");
         assert!(
             joined.contains(&format!("{:?}", palette::OK)),
@@ -1479,7 +1498,7 @@ mod tests {
         );
 
         let mut out: Vec<TuiLine> = Vec::new();
-        push_code_block(&mut out, &["rate = 0.5 # capped".to_string()], "toml");
+        push_code_block(&mut out, &["rate = 0.5 # capped".to_string()], "toml", 80);
         let joined = format!("{out:?}");
         assert!(
             joined.contains(&format!("{:?}", palette::WARN)),
@@ -1491,7 +1510,12 @@ mod tests {
         );
 
         let mut out: Vec<TuiLine> = Vec::new();
-        push_code_block(&mut out, &["for f in *.md; do echo $f; done".into()], "sh");
+        push_code_block(
+            &mut out,
+            &["for f in *.md; do echo $f; done".into()],
+            "sh",
+            80,
+        );
         let joined = format!("{out:?}");
         assert!(
             joined
@@ -1514,10 +1538,13 @@ mod tests {
                 "still comment */ let x = 1;".to_string(),
             ],
             "rust",
+            80,
         );
-        let second = &out[2];
+        // fences no longer emit marker rows: out[1] is the second code
+        // row, carrying the `▎ ` rail
+        let second = &out[1];
         let text: String = second.spans.iter().map(|s| s.content.to_string()).collect();
-        assert_eq!(text, "still comment */ let x = 1;");
+        assert_eq!(text, "▎ still comment */ let x = 1;");
         assert!(
             format!("{second:?}").contains(&format!("{:?}", palette::SYNTAX_KEYWORD)),
             "let styled after the close: {second:?}"
@@ -1529,11 +1556,12 @@ mod tests {
             &mut out,
             &["let s = \"oops".to_string(), "fn after() {}".to_string()],
             "rust",
+            80,
         );
         assert!(
-            format!("{:?}", out[2]).contains(&format!("{:?}", palette::SYNTAX_KEYWORD)),
+            format!("{:?}", out[1]).contains(&format!("{:?}", palette::SYNTAX_KEYWORD)),
             "next line keywords styled: {:?}",
-            out[2]
+            out[1]
         );
 
         // unterminated block comment swallows the rest of the block, no panic
@@ -1542,11 +1570,12 @@ mod tests {
             &mut out,
             &["/* never closed".to_string(), "let x = 1;".to_string()],
             "rust",
+            80,
         );
         assert!(
-            format!("{:?}", out[2]).contains(&format!("{:?}", palette::META)),
+            format!("{:?}", out[1]).contains(&format!("{:?}", palette::META)),
             "rest of the fence stays comment: {:?}",
-            out[2]
+            out[1]
         );
     }
 
@@ -1574,14 +1603,14 @@ mod tests {
         }
         // untagged fences keep the generic highlighter (keywords still styled)
         let mut out: Vec<TuiLine> = Vec::new();
-        push_code_block(&mut out, &["let x = 1".to_string()], "");
+        push_code_block(&mut out, &["let x = 1".to_string()], "", 80);
         assert!(
             format!("{out:?}").contains(&format!("{:?}", palette::SYNTAX_KEYWORD)),
             "generic keyword: {out:?}"
         );
         // apostrophes glued to a word never open a string in rust fences
         let mut out: Vec<TuiLine> = Vec::new();
-        push_code_block(&mut out, &["don't panic;".to_string()], "rust");
+        push_code_block(&mut out, &["don't panic;".to_string()], "rust", 80);
         assert!(
             !format!("{out:?}").contains(&format!("{:?}", palette::OK)),
             "no phantom string: {out:?}"

@@ -1386,8 +1386,14 @@ async fn handle_command(
             model,
             effort,
             mode,
+            mouse,
         } => {
-            match crate::config::save_user_settings(model.as_deref(), effort, mode) {
+            match crate::config::save_user_settings(
+                model.as_deref(),
+                effort,
+                mode,
+                mouse.as_deref(),
+            ) {
                 Ok(path) => {
                     ctx.events
                         .send(Event::Note {

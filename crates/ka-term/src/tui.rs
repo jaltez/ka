@@ -585,7 +585,7 @@ fn word_ws(c: Option<char>) -> bool {
 }
 
 /// Transcript line kinds for rendering.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Line {
     /// User input.
     User(String),
@@ -593,14 +593,61 @@ pub enum Line {
     Assistant(String),
     /// Reasoning (rendered dim).
     Thought(String),
-    /// Tool activity, collapsed.
-    Tool(String),
-    /// System/status note.
-    Note(String),
-    /// Turn report (muted info row).
+    /// One or more consecutive tool calls, each one compact railed row.
+    ToolBlock(Vec<ToolCall>),
+    /// System/status note (`· ` gutter).
+    Info(String),
+    /// Caution row (`⚠ ` gutter): refused actions, usage errors.
+    Warn(String),
+    /// Failure row (`! ` gutter, bold): the loudest system tier.
+    Err(String),
+    /// Turn report: empty = a blank separator row, else `─ {msg}`.
     Report(String),
-    /// Turn report (error row).
-    ReportErr(String),
+    /// `!cmd` passthrough output: plain foreground, no gutter.
+    Shell(String),
+    /// One-row turn verdict (`✓ done · 2.1s · 1.2k in · $0.0042`).
+    Summary {
+        glyph: char,
+        tone: SummaryTone,
+        text: String,
+    },
+}
+
+/// Tone of a [`Line::Summary`] verdict: colors glyph+text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SummaryTone {
+    Ok,
+    Warn,
+    Err,
+}
+
+/// Click target of one rendered transcript row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RowRef {
+    /// The whole entry (thinking blocks toggle on click).
+    Entry(usize),
+    /// One call within a [`Line::ToolBlock`]: `(entry, call)`.
+    ToolCall(usize, usize),
+}
+
+/// One finished tool call inside a [`Line::ToolBlock`] row.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ToolCall {
+    /// `→ {tool} · {detail}` header (the live band's header verbatim).
+    pub head: String,
+    /// Whether the call finished successfully.
+    pub ok: bool,
+    /// First non-blank output line, capped at 40 columns.
+    pub note: String,
+    /// Full output excerpt from CallOutput (already capped upstream).
+    pub excerpt: String,
+    /// Spill-file path from CallOutput, when the engine spilled.
+    pub spill: Option<String>,
+    /// Local elapsed CallStarted→CallFinished; `None` when unknown
+    /// (replayed turns carry no durations).
+    pub dur: Option<f64>,
+    /// Whether the full excerpt is expanded inline (fold state).
+    pub expanded: bool,
 }
 
 /// A provider row for the settings panel (built by the CLI from the
@@ -680,17 +727,80 @@ impl Transcript {
         }
     }
 
-    /// Which transcript entry owns a rendered row (click mapping).
-    pub fn entry_at_row(&self, row: usize) -> Option<usize> {
+    /// What a rendered row belongs to (click mapping): a plain entry
+    /// (thought-toggle target) or one specific call inside a tool
+    /// block (expand target, `(entry, call)`).
+    pub fn row_ref_at(&self, row: usize) -> Option<RowRef> {
         let mut acc = 0usize;
-        for (i, rows) in self.rendered.iter().enumerate() {
+        for (i, (line, rows)) in self.lines.iter().zip(&self.rendered).enumerate() {
             let next = acc + rows.len();
             if row < next {
-                return Some(i);
+                return Some(match line {
+                    Line::ToolBlock(calls) if (row - acc) < calls.len() => {
+                        RowRef::ToolCall(i, row - acc)
+                    }
+                    _ => RowRef::Entry(i),
+                });
             }
             acc = next;
         }
         None
+    }
+
+    /// One tool call by `(entry, call)` index (click-to-expand source).
+    pub fn tool_call(&self, entry: usize, call: usize) -> Option<&ToolCall> {
+        match self.lines.get(entry) {
+            Some(Line::ToolBlock(calls)) => calls.get(call),
+            _ => None,
+        }
+    }
+
+    /// Toggle one call's inline expansion (click / Ctrl+O target) and
+    /// re-render just that block. Indices that no longer point at a
+    /// tool call (rewound transcript) no-op.
+    pub fn toggle_tool_call(&mut self, entry: usize, call: usize) {
+        let Some(Line::ToolBlock(calls)) = self.lines.get_mut(entry) else {
+            return;
+        };
+        let Some(c) = calls.get_mut(call) else {
+            return;
+        };
+        c.expanded = !c.expanded;
+        let line = self.lines[entry].clone();
+        if let Some(slot) = self.rendered.get_mut(entry) {
+            *slot = render_line(&line, self.width, false);
+            self.renders += 1;
+        }
+    }
+
+    /// `(entry, call)` of the most recent call in the last block — the
+    /// Ctrl+O target.
+    pub fn last_tool_ref(&self) -> Option<(usize, usize)> {
+        self.lines
+            .iter()
+            .enumerate()
+            .rev()
+            .find_map(|(i, l)| match l {
+                Line::ToolBlock(v) if !v.is_empty() => Some((i, v.len() - 1)),
+                _ => None,
+            })
+    }
+
+    /// Append a finished tool call, merging into the trailing block
+    /// when consecutive: a run of calls reads as one block of railed
+    /// rows; any other push between calls ends the group.
+    pub fn push_tool_call(&mut self, call: ToolCall) {
+        if let Some(Line::ToolBlock(v)) = self.lines.last_mut() {
+            v.push(call);
+            let idx = self.lines.len() - 1;
+            if let Some(slot) = self.rendered.get_mut(idx) {
+                let line = self.lines[idx].clone();
+                *slot = render_line(&line, self.width, false);
+                self.renders += 1;
+            }
+        } else {
+            self.push_separated(Line::ToolBlock(vec![call]));
+        }
     }
 
     pub fn set_thoughts_open(&mut self, open: bool) {
@@ -818,16 +928,29 @@ impl Transcript {
     }
 }
 
-/// The searchable text of a transcript entry.
-fn line_text(line: &Line) -> &str {
+/// The searchable text of a transcript entry. Tool blocks expose their
+/// heads and notes (excerpts stay out of transcript search).
+fn line_text(line: &Line) -> std::borrow::Cow<'_, str> {
     match line {
         Line::User(t)
         | Line::Assistant(t)
         | Line::Thought(t)
-        | Line::Tool(t)
-        | Line::Note(t)
+        | Line::Info(t)
+        | Line::Warn(t)
+        | Line::Err(t)
         | Line::Report(t)
-        | Line::ReportErr(t) => t,
+        | Line::Shell(t) => t.into(),
+        Line::Summary { text, .. } => text.into(),
+        Line::ToolBlock(calls) => {
+            let mut s = String::new();
+            for c in calls {
+                s.push_str(&c.head);
+                s.push('\n');
+                s.push_str(&c.note);
+                s.push('\n');
+            }
+            s.into()
+        }
     }
 }
 
@@ -851,8 +974,13 @@ fn family(line: &Line) -> Family {
         Line::User(_) => Family::User,
         Line::Assistant(_) => Family::Assistant,
         Line::Thought(_) => Family::Thought,
-        Line::Tool(_) => Family::Tool,
-        Line::Note(_) | Line::Report(_) | Line::ReportErr(_) => Family::Meta,
+        Line::ToolBlock(_) => Family::Tool,
+        Line::Info(_)
+        | Line::Warn(_)
+        | Line::Err(_)
+        | Line::Shell(_)
+        | Line::Summary { .. }
+        | Line::Report(_) => Family::Meta,
     }
 }
 
@@ -902,10 +1030,10 @@ fn render_line(line: &Line, width: u16, thoughts_open: bool) -> Vec<ratatui::tex
             } else {
                 // collapsed: first line plus a count marker, one row
                 let lines = text.lines().count();
-                let marker = format!(" (+{lines} lines · click/Alt+T)");
+                let marker = format!(" … +{lines}");
                 let head = trunc_cols(
                     text.lines().next().unwrap_or(""),
-                    width.saturating_sub(marker.chars().count() as u16 + 4) as usize,
+                    width.saturating_sub(marker.chars().count() as u16 + 6) as usize,
                 );
                 push_gutter(
                     &mut out,
@@ -916,32 +1044,180 @@ fn render_line(line: &Line, width: u16, thoughts_open: bool) -> Vec<ratatui::tex
                 );
             }
         }
-        // finished tool calls cache as ONE full-width band row, so tool
-        // activity reads as its own stratum (the live block's band)
-        Line::Tool(text) => out.push(TuiLine::from(vec![ratatui::text::Span::styled(
-            pad_to_width(format!(" {text}"), width as usize),
-            crate::palette::TOOL_BAND_STYLE,
-        )])),
-        Line::Note(text) => push_gutter(
+        // finished tool calls cache as compact railed rows — one header
+        // row per call, head left, duration + verdict right-aligned;
+        // an expanded call reveals its full output underneath
+        Line::ToolBlock(calls) => {
+            for call in calls {
+                out.extend(tool_call_rows(call, width));
+            }
+        }
+        Line::Info(text) => push_gutter(&mut out, text, width, "· ", crate::palette::META.into()),
+        Line::Warn(text) => push_gutter(&mut out, text, width, "⚠ ", crate::palette::WARN.into()),
+        Line::Err(text) => push_gutter(
             &mut out,
             text,
             width,
             "! ",
-            ratatui::style::Style::new().fg(crate::palette::ERR),
+            ratatui::style::Style::new()
+                .fg(crate::palette::ERR)
+                .add_modifier(ratatui::style::Modifier::BOLD),
         ),
+        // `!cmd` passthrough output: plain prose color, no gutter
+        Line::Shell(text) => out.push(TuiLine::from(vec![ratatui::text::Span::styled(
+            text.clone(),
+            ratatui::style::Style::new().fg(crate::palette::FG),
+        )])),
+        // the turn verdict: tone-colored glyph, muted text, no `─ ` prefix
+        Line::Summary { glyph, tone, text } => {
+            let tone_style = match tone {
+                SummaryTone::Ok => ratatui::style::Style::new().fg(crate::palette::OK),
+                SummaryTone::Warn => ratatui::style::Style::new().fg(crate::palette::WARN),
+                SummaryTone::Err => ratatui::style::Style::new()
+                    .fg(crate::palette::ERR)
+                    .add_modifier(ratatui::style::Modifier::BOLD),
+            };
+            out.push(TuiLine::from(vec![
+                ratatui::text::Span::styled(format!("{glyph} "), tone_style),
+                ratatui::text::Span::styled(
+                    text.clone(),
+                    ratatui::style::Style::new().fg(crate::palette::META),
+                ),
+            ]));
+        }
         // the vertical separator is one true canvas-blank row (gutter
         // text is empty, so the prefix loop would emit nothing)
         Line::Report(text) if text.is_empty() => out.push(TuiLine::default()),
         Line::Report(text) => push_gutter(&mut out, text, width, "─ ", crate::palette::META.into()),
-        Line::ReportErr(text) => push_gutter(
-            &mut out,
-            text,
-            width,
-            "! ",
-            ratatui::style::Style::new().fg(crate::palette::ERR),
-        ),
     }
     out
+}
+
+/// Cached ToolBlock rows for one call: the header (` │ ▸ → tool · detail
+/// note ……… 1.2s ✓`) and, when expanded, the call's full output as faint
+/// railed rows underneath — plus a spill pointer when the engine parked
+/// the full output on disk. Rows clip at the pane edge, never wrap.
+fn tool_call_rows(call: &ToolCall, width: u16) -> Vec<ratatui::text::Line<'static>> {
+    let mut rows = vec![tool_call_header(call, width)];
+    let expandable = !call.excerpt.is_empty() || call.spill.is_some();
+    if !call.expanded || !expandable {
+        return rows;
+    }
+    use ratatui::text::Span;
+    let w = width as usize;
+    // content rows: ` │   line` — rail, two columns of air, faint text;
+    // long lines hard-continue with a wider prefix so nothing is lost
+    for line in call.excerpt.lines() {
+        let mut rest = line;
+        let mut first = true;
+        loop {
+            let (air, room) = if first {
+                ("  ", w.saturating_sub(5))
+            } else {
+                ("    ", w.saturating_sub(6))
+            };
+            let take = rest.chars().count().min(room.max(1));
+            let segment: String = rest.chars().take(take).collect();
+            rows.push(ratatui::text::Line::from(vec![
+                Span::styled(" │ ", crate::palette::BORDER_QUIET_STYLE),
+                Span::raw(air),
+                Span::styled(
+                    segment,
+                    ratatui::style::Style::new().fg(crate::palette::FAINT),
+                ),
+            ]));
+            if take >= rest.chars().count() {
+                break;
+            }
+            rest = &rest[rest
+                .char_indices()
+                .take(take)
+                .map(|(i, c)| i + c.len_utf8())
+                .last()
+                .unwrap_or(0)..];
+            first = false;
+        }
+    }
+    if call.spill.is_some() {
+        rows.push(ratatui::text::Line::from(vec![
+            Span::styled(" │ ", crate::palette::BORDER_QUIET_STYLE),
+            Span::raw("  "),
+            Span::styled(
+                trunc_cols(
+                    "… full output parked in a spill file — /spills",
+                    w.saturating_sub(5),
+                ),
+                ratatui::style::Style::new().fg(crate::palette::META),
+            ),
+        ]));
+    }
+    rows
+}
+
+/// The one header row of a tool call: ` │ [▸|▾] → tool · detail note`
+/// left, duration + verdict glyph right-aligned to the pane edge. The
+/// fold marker appears only when there is something to expand.
+fn tool_call_header(call: &ToolCall, width: u16) -> ratatui::text::Line<'static> {
+    use ratatui::text::Span;
+    use unicode_width::UnicodeWidthStr;
+    let w = width as usize;
+    // right cluster: `1.2s ✓` — the duration only earns cells once it
+    // measured at least a tenth of a second
+    let dur = call.dur.filter(|d| *d >= 0.1).map(|d| format!("{d:.1}s "));
+    let cluster = dur.as_deref().map_or(0, |s| s.width()) + 1;
+    let avail = w.saturating_sub(cluster).max(1);
+    let expandable = !call.excerpt.is_empty() || call.spill.is_some();
+    let marker = if expandable { 2 } else { 0 };
+    // the rail `" │ "` is three columns
+    let room = avail.saturating_sub(3 + marker);
+    let head = trunc_cols(&call.head, room);
+    let note = if call.note.is_empty() {
+        String::new()
+    } else {
+        let note_room = room.saturating_sub(head.width() + 1);
+        if note_room == 0 {
+            String::new()
+        } else {
+            format!(" {}", trunc_cols(&call.note, note_room))
+        }
+    };
+    let used = 3 + marker + head.width() + note.width();
+    let mut spans = vec![Span::styled(" │ ", crate::palette::BORDER_QUIET_STYLE)];
+    if expandable {
+        spans.push(Span::styled(
+            if call.expanded { "▾ " } else { "▸ " },
+            ratatui::style::Style::new().fg(crate::palette::FAINT),
+        ));
+    }
+    spans.push(Span::styled(
+        head,
+        ratatui::style::Style::new().fg(crate::palette::TOOL),
+    ));
+    if !note.is_empty() {
+        spans.push(Span::styled(
+            note,
+            ratatui::style::Style::new().fg(crate::palette::FAINT),
+        ));
+    }
+    if avail > used {
+        spans.push(Span::raw(" ".repeat(avail - used)));
+    }
+    if let Some(d) = dur {
+        spans.push(Span::styled(
+            d,
+            ratatui::style::Style::new().fg(crate::palette::FAINT),
+        ));
+    }
+    let verdict = if call.ok { "✓" } else { "✗" };
+    spans.push(Span::styled(
+        verdict,
+        ratatui::style::Style::new().fg(if call.ok {
+            crate::palette::OK
+        } else {
+            crate::palette::ERR
+        }),
+    ));
+    ratatui::text::Line::from(spans)
 }
 
 /// Viewport window over `total` rendered rows for `visible` rows given the
@@ -978,7 +1254,8 @@ fn rail_thumb(track_h: usize, total: usize, visible: usize, start: usize) -> (us
 /// area, footer, and transcript top border are the four rows carved out
 /// of the viewport.
 fn visible_rows(term_h: u16, input_h: u16) -> usize {
-    term_h.saturating_sub(input_h + 3) as usize
+    // top margin + transcript top border + bottom strip + status bar
+    term_h.saturating_sub(input_h + 4) as usize
 }
 /// Cursor `(row, col)` in `text` for a char-index cursor position.
 fn cursor_row_col(text: &str, cursor_chars: usize) -> (usize, usize) {
@@ -994,30 +1271,14 @@ fn input_height(row_count: usize) -> u16 {
     3 + row_count.saturating_sub(1).min(5) as u16
 }
 
-/// Rows the input area needs: while a permission ask is up the form
-/// (question lines + one options row) borrows the box from the draft,
-/// and the /mode picker borrows it for its four tier rows.
-fn input_area_rows(
-    ask: Option<&PendingAsk>,
-    picker: Option<&ModePicker>,
-    draft: &str,
-    width: usize,
-) -> usize {
-    match ask {
-        Some(a) => {
-            let q = a.question.split('\n').count();
-            let budget = ask_detail_budget(q);
-            q + 1
-                + a.detail.as_ref().map_or(0, |d| {
-                    if budget == 0 {
-                        0
-                    } else {
-                        ask_detail_rows(d, budget).len()
-                    }
-                })
-        }
-        None if picker.is_some() => MODE_CHOICES.len(),
-        None => wrap_rows(draft, width).len(),
+/// Rows the input area needs: the /mode picker borrows the box for its
+/// four tier rows; otherwise the draft wraps to the box width.
+/// (Permission asks render as a centered modal and no longer borrow it.)
+fn input_area_rows(picker: Option<&ModePicker>, draft: &str, width: usize) -> usize {
+    if picker.is_some() {
+        MODE_CHOICES.len()
+    } else {
+        wrap_rows(draft, width).len()
     }
 }
 
@@ -1111,9 +1372,46 @@ fn ask_detail_budget(question_lines: usize) -> usize {
         .saturating_sub(1)
 }
 
+/// Body rows of the permission-ask modal: the question in the strong
+/// foreground, the budgeted diff detail, then one numbered option per
+/// row — the selected row wears the pink selection bar.
+fn ask_modal_body(ask: &PendingAsk, width: usize) -> Vec<ratatui::text::Line<'static>> {
+    use ratatui::text::Line as TuiLine;
+    use ratatui::text::Span;
+    let mut rows: Vec<ratatui::text::Line<'static>> = Vec::new();
+    push_gutter(
+        &mut rows,
+        &ask.question,
+        width as u16,
+        "",
+        ratatui::style::Style::new()
+            .fg(crate::palette::FG_STRONG)
+            .add_modifier(ratatui::style::Modifier::BOLD),
+    );
+    let q_lines = ask.question.split('\n').count();
+    let budget = ask_detail_budget(q_lines);
+    if budget > 0 {
+        if let Some(detail) = &ask.detail {
+            rows.extend(ask_detail_rows(detail, budget));
+        }
+    }
+    for (i, opt) in ask.options.iter().enumerate() {
+        let row = format!("{} {opt}", i + 1);
+        if i == ask.selected {
+            rows.push(TuiLine::from(Span::styled(
+                pad_to_width(row, width),
+                selection_style(),
+            )));
+        } else {
+            rows.push(TuiLine::raw(row));
+        }
+    }
+    rows
+}
+
 /// Colorized rows for an ask's diff detail: additions in OK, removals
 /// in ERR, hunk headers in META, file headers in FAINT, context plain.
-/// Clamped to `max` rows with a `… N more` trailer.
+/// Clamped to `max` rows with a `… +N more` trailer.
 fn ask_detail_rows(detail: &str, max: usize) -> Vec<ratatui::text::Line<'static>> {
     use ratatui::style::Style;
     use ratatui::text::Span;
@@ -1138,7 +1436,7 @@ fn ask_detail_rows(detail: &str, max: usize) -> Vec<ratatui::text::Line<'static>
         let more = rows.len() - max;
         rows.truncate(max);
         rows.push(ratatui::text::Line::from(vec![Span::styled(
-            format!("… {more} more"),
+            format!("… +{more} more"),
             Style::new().fg(crate::palette::FAINT),
         )]));
     }
@@ -1368,8 +1666,9 @@ pub struct Inventory {
     pub prompts: Vec<String>,
 }
 
-/// Everything the right sidebar displays. Session figures come from the
+/// Data behind the bottom-strip popups. Session figures come from the
 /// footer meters at render time; this state carries the rest.
+#[derive(Debug, Clone, Default)]
 pub struct SidebarState {
     /// Bootstrap inventory.
     pub inventory: Inventory,
@@ -1379,45 +1678,44 @@ pub struct SidebarState {
     pub cwd: String,
     /// Git branch when cheaply detectable at startup.
     pub branch: Option<String>,
-    /// Skills section expanded? Folded by default; toggled with Ctrl+T
-    /// or a click on its header. Collapsed, the header renders as
-    /// `skills (+N) ▸`.
-    pub skills_open: bool,
-    /// Window/sidebar title glyph ([tui] header_glyph, default ◆).
-    pub header_glyph: String,
     /// The active session's display title ([`Event::Title`]; stored
     /// record or auto-generated). None until the engine announces one.
     pub title: Option<String>,
 }
 
-impl Default for SidebarState {
-    fn default() -> Self {
-        Self {
-            inventory: Default::default(),
-            todos: Vec::new(),
-            cwd: String::new(),
-            branch: None,
-            skills_open: false,
-            title: None,
-            header_glyph: "◆".to_string(),
-        }
-    }
+/// Clickable bottom-strip buttons, recorded at render time so the
+/// mouse handler can hit-test without duplicating the layout math
+/// (capture mode only — native mode uses the keyboard shortcuts).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+struct StripZones {
+    /// The todos button.
+    todos: ratatui::layout::Rect,
+    /// The skills button.
+    skills: ratatui::layout::Rect,
+    /// The info button.
+    info: ratatui::layout::Rect,
 }
 
-/// A clickable sidebar region, recorded at render time so the mouse
-/// handler can hit-test without duplicating the layout math. New
-/// collapsible sections add a variant here.
+/// Which strip button a click landed on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SidebarZone {
-    /// The skills section header row (spans the sidebar's full width).
-    SkillsHeader(ratatui::layout::Rect),
+enum StripButton {
+    Todos,
+    Skills,
+    Info,
 }
 
-impl SidebarZone {
-    /// Does a terminal-cell click land inside this zone?
-    fn hit(&self, x: u16, y: u16) -> bool {
-        match self {
-            SidebarZone::SkillsHeader(rect) => rect.contains(ratatui::layout::Position { x, y }),
+impl StripZones {
+    /// Does a terminal-cell click land on a button? Returns the button.
+    fn hit(&self, x: u16, y: u16) -> Option<StripButton> {
+        let pos = ratatui::layout::Position { x, y };
+        if self.todos.contains(pos) {
+            Some(StripButton::Todos)
+        } else if self.skills.contains(pos) {
+            Some(StripButton::Skills)
+        } else if self.info.contains(pos) {
+            Some(StripButton::Info)
+        } else {
+            None
         }
     }
 }
@@ -1447,45 +1745,14 @@ impl TitleArrows {
     }
 }
 
-/// Sidebar skills header text: bare when expanded, count-marked when
-/// collapsed (the ` ▾`/` ▸` affordance rides separately as a dim span).
-fn skills_header_label(open: bool, count: usize) -> String {
-    if open {
-        "skills".to_string()
-    } else {
-        format!("skills (+{count})")
-    }
+/// Inner text width of the transcript column: the terminal narrows by
+/// one margin column on each side and the paragraph's side padding.
+/// Both the cache (`Transcript::set_width`) and the live surface derive
+/// from this so they always agree.
+fn transcript_width(term_w: u16) -> u16 {
+    term_w.saturating_sub(4) // 2 margin cols + the paragraph's side padding
 }
 
-/// Full skills header line: label plus the ` ▾`/` ▸` disclosure arrow.
-/// The label keeps its accent-bold look; the arrow stays dim META.
-fn skills_header_line(open: bool, count: usize) -> ratatui::text::Line<'static> {
-    use ratatui::text::{Line as TuiLine, Span};
-    let label = skills_header_label(open, count);
-    let arrow = if open { " ▾" } else { " ▸" };
-    TuiLine::from(vec![
-        Span::styled(label, crate::palette::ACCENT_BOLD),
-        Span::styled(arrow, crate::palette::META),
-    ])
-}
-/// Sidebar column width when shown.
-const SIDEBAR_WIDTH: u16 = 26;
-/// Minimum terminal width for the sidebar; below it the transcript keeps
-/// the full row exactly as before.
-const SIDEBAR_MIN_WIDTH: u16 = 100;
-/// Inner text width of the transcript column: the terminal narrows by
-/// one margin column on each side, by the sidebar's columns once it
-/// fits, and by the paragraph's side padding. Both the cache
-/// (`Transcript::set_width`) and the live surface derive from this so
-/// they always agree.
-fn transcript_width(term_w: u16) -> u16 {
-    let base = if term_w >= SIDEBAR_MIN_WIDTH {
-        term_w - SIDEBAR_WIDTH
-    } else {
-        term_w
-    };
-    base.saturating_sub(4) // 2 margin cols + the paragraph's side padding
-}
 /// Truncate a string to `max_cols` display columns (unicode-width aware),
 /// marking the cut with `…`.
 fn trunc_cols(s: &str, max_cols: usize) -> String {
@@ -1534,20 +1801,111 @@ fn detect_branch() -> Option<String> {
     let branch = String::from_utf8_lossy(&out.stdout).trim().to_string();
     (out.status.success() && !branch.is_empty()).then_some(branch)
 }
-fn sidebar_rows(
+/// Popup rows for the todos strip button: done items struck through,
+/// the first pending item accented as "next".
+fn todos_rows(sidebar: &SidebarState, width: usize) -> Vec<ratatui::text::Line<'static>> {
+    use ratatui::style::{Modifier, Style};
+    use ratatui::text::{Line as TuiLine, Span};
+    if sidebar.todos.is_empty() {
+        return vec![TuiLine::styled(
+            "(no live todo list — the todo hand drives this)".to_string(),
+            crate::palette::META,
+        )];
+    }
+    let done_style = Style::new()
+        .fg(crate::palette::FAINT)
+        .add_modifier(Modifier::CROSSED_OUT);
+    let first_pending = sidebar
+        .todos
+        .iter()
+        .position(|t| t.state == ka_protocol::TodoState::Pending);
+    sidebar
+        .todos
+        .iter()
+        .enumerate()
+        .map(|(i, t)| match t.state {
+            ka_protocol::TodoState::Done => TuiLine::from(vec![
+                Span::styled("\u{2713} ", done_style),
+                Span::styled(trunc_cols(&t.text, width.saturating_sub(2)), done_style),
+            ]),
+            ka_protocol::TodoState::Pending if Some(i) == first_pending => TuiLine::from(vec![
+                Span::styled("\u{b7} ".to_string(), crate::palette::ACCENT_BOLD),
+                Span::styled(
+                    trunc_cols(&t.text, width.saturating_sub(2)),
+                    crate::palette::ACCENT_BOLD,
+                ),
+            ]),
+            ka_protocol::TodoState::Pending => TuiLine::from(format!(
+                "\u{b7} {}",
+                trunc_cols(&t.text, width.saturating_sub(2))
+            )),
+        })
+        .collect()
+}
+
+/// Popup rows for the skills strip button: the discovery inventory —
+/// skills, agents, MCP servers — one labeled section each.
+fn inventory_rows(sidebar: &SidebarState, width: usize) -> Vec<ratatui::text::Line<'static>> {
+    use ratatui::text::{Line as TuiLine, Span};
+    // the one section-header glyph: `▸ name`, accent bold
+    let header = |name: &str| TuiLine::styled(format!("▸ {name}"), crate::palette::ACCENT_BOLD);
+    let plain = |s: String| TuiLine::from(s);
+    let names = |label: &str, items: &[String]| {
+        std::iter::once(header(label))
+            .chain(items.iter().map(|s| plain(trunc_cols(s, width))))
+            .collect::<Vec<_>>()
+    };
+    let mut out = names("skills", &sidebar.inventory.skills);
+    out.extend(names("agents", &sidebar.inventory.agents));
+    out.push(header("mcp"));
+    for m in &sidebar.inventory.mcp {
+        let row = if m.ok {
+            TuiLine::from(vec![
+                Span::raw(format!("{} ", trunc_cols(&m.name, width.saturating_sub(4)))),
+                Span::styled("\u{2713}".to_string(), crate::palette::OK),
+                Span::raw(format!(" {}", m.tools)),
+            ])
+        } else {
+            TuiLine::from(vec![
+                Span::raw(format!("{} ", trunc_cols(&m.name, width.saturating_sub(4)))),
+                Span::styled("\u{2717}".to_string(), crate::palette::ERR),
+            ])
+        };
+        out.push(row);
+    }
+    if out.iter().all(|l| {
+        l.spans.is_empty() || {
+            let s: String = l.spans.iter().map(|s| s.content.clone()).collect();
+            ["skills", "agents", "mcp"].contains(&s.as_str())
+        }
+    }) {
+        out.insert(
+            0,
+            TuiLine::styled(
+                "(nothing discovered — skills, agents, MCP servers land here)".to_string(),
+                crate::palette::META,
+            ),
+        );
+    }
+    out
+}
+
+/// Popup rows for the info strip button: cwd:branch, session, model,
+/// effort, cost, context — the old sidebar's session + info sections.
+fn info_rows(
     sidebar: &SidebarState,
     meters: &Meters,
     width: usize,
-    height: usize,
-    hit: Option<(&std::cell::Cell<Option<SidebarZone>>, ratatui::layout::Rect)>,
 ) -> Vec<ratatui::text::Line<'static>> {
-    use ratatui::style::{Modifier, Style};
-    use ratatui::text::{Line as TuiLine, Span};
-
-    let header = |name: &str| TuiLine::styled(name.to_string(), crate::palette::ACCENT_BOLD);
-    let plain = |s: String| TuiLine::from(s);
-    // ── session: mirrors the sidebar meters, one fact per row ──
-    let mut session = vec![header("session")];
+    let plain = |s: String| ratatui::text::Line::from(s);
+    let mut rows = Vec::new();
+    match &sidebar.branch {
+        Some(b) => rows.push(plain(trunc_cols(&format!("{}:{b}", sidebar.cwd), width))),
+        None if !sidebar.cwd.is_empty() => {
+            rows.push(plain(trunc_cols(&sidebar.cwd, width)));
+        }
+        _ => {}
+    }
     let (used, window) = meters.context;
     let ctx_row = if window > 0 {
         format!(
@@ -1558,161 +1916,21 @@ fn sidebar_rows(
         format!("ctx {used}")
     };
     for row in [
-        short_session(&meters.session).map(|t| format!("#{t}")),
+        short_session(&meters.session).map(|t| format!("session #{t}")),
+        (!meters.model.is_empty()).then(|| format!("model {}", meters.model)),
         (!meters.effort.is_empty()).then(|| format!("effort {}", meters.effort)),
-        (meters.cost > 0.0).then(|| format!("${:.4}", meters.cost)),
+        (meters.cost > 0.0).then(|| format!("cost ${:.4}", meters.cost)),
         (used > 0).then_some(ctx_row),
     ]
     .into_iter()
     .flatten()
     {
-        session.push(plain(trunc_cols(&row, width)));
+        rows.push(plain(trunc_cols(&row, width)));
     }
-
-    let done_style = Style::new()
-        .fg(crate::palette::FAINT)
-        .add_modifier(Modifier::CROSSED_OUT);
-    let first_pending = sidebar
-        .todos
-        .iter()
-        .position(|t| t.state == ka_protocol::TodoState::Pending);
-    let todos = std::iter::once(header("todos"))
-        .chain(
-            sidebar
-                .todos
-                .iter()
-                .enumerate()
-                .map(|(i, t)| match t.state {
-                    ka_protocol::TodoState::Done => TuiLine::from(vec![
-                        Span::styled("✓ ", done_style),
-                        Span::styled(trunc_cols(&t.text, width.saturating_sub(2)), done_style),
-                    ]),
-                    // the first pending item is 'next': accent bold; the rest
-                    // stay plain, both under a uniform `· ` lead
-                    ka_protocol::TodoState::Pending if Some(i) == first_pending => {
-                        TuiLine::from(vec![
-                            Span::styled("· ", crate::palette::ACCENT_BOLD),
-                            Span::styled(
-                                trunc_cols(&t.text, width.saturating_sub(2)),
-                                crate::palette::ACCENT_BOLD,
-                            ),
-                        ])
-                    }
-                    ka_protocol::TodoState::Pending => TuiLine::from(format!(
-                        "· {}",
-                        trunc_cols(&t.text, width.saturating_sub(2))
-                    )),
-                }),
-        )
-        .collect::<Vec<_>>();
-
-    // ── mcp: `name ✓ n` / `name ✗` ──
-    let mut mcp = vec![header("mcp")];
-    for m in &sidebar.inventory.mcp {
-        let row = if m.ok {
-            TuiLine::from(vec![
-                Span::raw(format!("{} ", trunc_cols(&m.name, width.saturating_sub(4)))),
-                Span::styled("✓", Style::new().fg(crate::palette::OK)),
-                Span::raw(format!(" {}", m.tools)),
-            ])
-        } else {
-            TuiLine::from(vec![
-                Span::raw(format!("{} ", trunc_cols(&m.name, width.saturating_sub(4)))),
-                Span::styled("✗", Style::new().fg(crate::palette::ERR)),
-            ])
-        };
-        mcp.push(row);
+    if rows.is_empty() {
+        rows.push(plain("(no session facts yet)".to_string()));
     }
-    let names = |label: &str, items: &[String]| {
-        std::iter::once(header(label))
-            .chain(items.iter().map(|s| plain(trunc_cols(s, width))))
-            .collect::<Vec<_>>()
-    };
-    // skills render folded by default: the collapsed section shows its
-    // header alone, with the count moved into the label; Ctrl+T or a
-    // click on the header unfolds. Without skills the section vanishes.
-    let skills = if sidebar.inventory.skills.is_empty() {
-        Vec::new()
-    } else if sidebar.skills_open {
-        let mut rows = names("skills", &sidebar.inventory.skills);
-        if !rows.is_empty() {
-            rows[0] = skills_header_line(true, sidebar.inventory.skills.len());
-        }
-        rows
-    } else {
-        vec![skills_header_line(false, sidebar.inventory.skills.len())]
-    };
-    let agents = names("agents", &sidebar.inventory.agents);
-
-    // ── info: one `cwd-short:branch` row at the bottom; without a
-    // startup branch snapshot the whole section stays off ──
-    let mut info = vec![header("info")];
-    if let Some(b) = &sidebar.branch {
-        info.push(plain(trunc_cols(&format!("{}:{b}", sidebar.cwd), width)));
-    }
-
-    // flatten top-to-bottom, dropping sections that no longer fit and
-    // capping any list section that would overflow the remaining height.
-    // Air: one blank row after each header and one between sections;
-    // priorities keep their top-down order, the rest truncates.
-    let sections = [session, todos, mcp, skills, agents, info];
-    let mut out: Vec<TuiLine> = Vec::with_capacity(height.min(40));
-    let mut room = height;
-    let mut placed = false;
-    // section index of skills: a collapsed section carries no body but
-    // its header must still land on screen
-    const SKILLS_SECTION: usize = 3;
-    let mut skills_header_row: Option<usize> = None;
-    for (si, section) in sections.into_iter().enumerate() {
-        let Some((head, body)) = section.split_first() else {
-            continue;
-        };
-        let forced = si == SKILLS_SECTION && !sidebar.skills_open && body.is_empty();
-        if body.is_empty() && !forced {
-            continue; // empty sections vanish
-        }
-        if placed {
-            if room == 0 {
-                break;
-            }
-            out.push(TuiLine::default()); // one blank row between sections
-            room -= 1;
-        }
-        let show = (room - 2).min(body.len());
-        if show == 0 && !forced {
-            break; // not even one body row fits under the header air
-        }
-        placed = true;
-        if si == SKILLS_SECTION {
-            skills_header_row = Some(out.len());
-        }
-        out.push(head.clone());
-        out.push(TuiLine::default()); // blank under the header
-        if show < body.len() {
-            // the cut must be visible: the mark replaces the last row
-            out.extend(body[..show - 1].iter().cloned());
-            out.push(TuiLine::styled(
-                format!("(+{})", body.len() - show + 1),
-                crate::palette::META,
-            ));
-        } else {
-            out.extend(body.iter().cloned());
-        }
-        room -= 2 + show;
-    }
-    if let Some((cell, area)) = hit {
-        cell.set(skills_header_row.map(|row| {
-            SidebarZone::SkillsHeader(ratatui::layout::Rect {
-                x: area.x,
-                // the block title consumes the area's first row, so a
-                // rendered row lives one below area.y
-                y: area.y + 1 + row as u16,
-                width: area.width,
-                height: 1,
-            })
-        }));
-    }
-    out
+    rows
 }
 
 /// A pending ask (permission dialog).
@@ -2430,6 +2648,21 @@ pub enum Modal {
         /// Scroll anchor (None = pinned to the tail).
         scroll: Option<usize>,
     },
+    /// Live delegate todo list (bottom-strip button / alt+O).
+    Todos {
+        /// Rendered todo rows.
+        rows: Vec<ratatui::text::Line<'static>>,
+    },
+    /// Discovered skills, agents, MCP servers (bottom strip / ctrl+T).
+    Skills {
+        /// Rendered inventory rows.
+        rows: Vec<ratatui::text::Line<'static>>,
+    },
+    /// Session facts: cwd:branch, session, model, effort, cost, ctx.
+    Info {
+        /// Rendered fact rows.
+        rows: Vec<ratatui::text::Line<'static>>,
+    },
     /// Help overlay.
     Help,
 }
@@ -2463,6 +2696,47 @@ fn task_id_of_row(row: &str) -> Option<u64> {
     let digits = row.strip_prefix("t-")?;
     let end = digits.find(char::is_whitespace).unwrap_or(digits.len());
     digits[..end].parse().ok()
+}
+
+/// Push the terminal sequences for one mouse mode. Captured = SGR
+/// button reporting (wheel scrolls, click zones live, ⇧drag selects);
+/// native = capture off + DECSET 1007, so the wheel still arrives —
+/// as ↑/↓ — while plain drag selection is the terminal's own.
+fn apply_mouse_mode(mouse_captured: bool) {
+    let mut out = std::io::stdout();
+    if mouse_captured {
+        let _ = std::io::Write::write_all(&mut out, b"\x1b[?1007l");
+        let _ = std::io::Write::flush(&mut out);
+        let _ = crossterm::execute!(std::io::stdout(), crossterm::event::EnableMouseCapture);
+    } else {
+        let _ = crossterm::execute!(std::io::stdout(), crossterm::event::DisableMouseCapture);
+        let _ = std::io::Write::write_all(&mut out, b"\x1b[?1007h");
+        let _ = std::io::Write::flush(&mut out);
+    }
+}
+
+/// The `[tui] mouse` value for a capture flag (SaveSettings payload) —
+/// `"capture"` (default) or `"native"`, matching the config docs.
+fn mouse_setting(captured: bool) -> Option<String> {
+    Some(if captured {
+        "capture".to_string()
+    } else {
+        "native".to_string()
+    })
+}
+
+/// The Ctrl+M toggle toast: mode names match the persisted
+/// `[tui] mouse` values.
+fn mouse_mode_text(captured: bool) -> String {
+    format!(
+        "🖱 mouse {} — {}",
+        if captured { "capture" } else { "native" },
+        if captured {
+            "wheel scrolls, strip buttons clickable, ⇧drag selects, right-click pastes; ↑/↓ = prompt history"
+        } else {
+            "plain drag selects natively; the wheel scrolls the chat (kitty: no alternate-scroll — Ctrl+M back to capture for the wheel); ↑/↓ scroll, Ctrl+P/N = prompt history"
+        }
+    )
 }
 
 /// Key handling shared by the pager modals (TaskDetail, Debug): the
@@ -2546,10 +2820,14 @@ pub async fn run(
     let mut terminal = ratatui::init();
     // Kitty keyboard protocol: Shift+Enter as a distinct key + bracketed
     // paste. Best effort — hosts without support degrade to plain Enter;
-    // Ctrl+J always works as the newline fallback. Mouse capture is ON
-    // by default: the wheel scrolls and the ▲▼ arrows / skills header
-    // are clickable; Shift+drag always selects natively (the terminal
-    // bypasses the capture protocol on Shift); /mouse flips to native.
+    // Ctrl+J always works as the newline fallback. Mouse mode defaults
+    // to NATIVE: no capture, so plain drag selects/pastes natively and
+    // the wheel scrolls the chat via DECSET 1007 (kitty: no 1007 — set
+    // `[tui] mouse = "capture"` for the wheel). Capture mode restores
+    // the dashboard: wheel reporting, ▲▼/skills-header click zones,
+    // ⇧drag selects, sidebar visible. Ctrl+M toggles at runtime
+    // (kitty-protocol terminals only — plain terminals read Ctrl+M as
+    // Enter) and persists the choice.
     let _ = crossterm::execute!(
         std::io::stdout(),
         crossterm::event::PushKeyboardEnhancementFlags(
@@ -2558,10 +2836,10 @@ pub async fn run(
         ),
         crossterm::event::EnableBracketedPaste,
     );
-    // capture ON by default (wheel scroll, ▲▼/skills clicks, right-click
-    // paste; ⇧drag selects natively). `[tui] mouse = "native"` starts
-    // uncaptured — plain drag/paste use the terminal's own bindings,
-    // chat scrolls with PgUp/PgDn. /mouse and Ctrl+M toggle at runtime.
+    // native by default (plain drag selection, full-width chat, wheel
+    // via alternate-scroll). `[tui] mouse = "capture"` starts captured —
+    // wheel scroll, ▲▼/skills clicks, right-click paste, ⇧drag selects,
+    // sidebar visible. Ctrl+M toggles and persists either way.
     if mouse_capture {
         let _ = crossterm::execute!(std::io::stdout(), crossterm::event::EnableMouseCapture);
     } else {
@@ -2589,6 +2867,10 @@ pub async fn run(
         crossterm::event::DisableBracketedPaste,
         crossterm::event::DisableMouseCapture
     );
+    // native sessions leave DECSET 1007 set; release it so the next
+    // alt-screen app starts from a clean slate
+    let _ = std::io::Write::write_all(&mut std::io::stdout(), b"\x1b[?1007l");
+    let _ = std::io::Write::flush(&mut std::io::stdout());
     ratatui::restore();
     // Two linked crossterm copies keep separate raw-mode snapshots: our
     // enable at the top of this function runs first (saving cooked
@@ -2658,13 +2940,17 @@ async fn app(
     let mut current_thought = String::new();
     let mut current_tool = String::new();
     let mut live_tool: Option<LiveTool> = None;
+    // the most recent finished call's (entry, call) slot: Ctrl+O and
+    // click-to-expand toggle its inline output
+    let mut last_tool_ref: Option<(usize, usize)> = None;
+    // transient action feedback: (message, shown-at); auto-expires
+    let mut toast: Option<(String, Instant)> = None;
     // pending image attachment: staged by `/image <path>`, consumed by
     // the next sent prompt
     let mut pending_image: Option<ka_protocol::ImagePart> = None;
     let mut sidebar = SidebarState {
         cwd: shorten_cwd(&std::env::current_dir().unwrap_or_default()),
         branch: detect_branch(),
-        header_glyph: header_glyph.to_string(),
         ..Default::default()
     };
     let mut exit = None;
@@ -2679,7 +2965,7 @@ async fn app(
     let mut mode_picker: Option<ModePicker> = None;
     // clickable sidebar regions + ▲▼ title-row jump targets, refreshed
     // every frame by render()
-    let sidebar_zone: std::cell::Cell<Option<SidebarZone>> = std::cell::Cell::new(None);
+    let strip_zone: std::cell::Cell<Option<StripZones>> = std::cell::Cell::new(None);
     let title_arrows: std::cell::Cell<Option<TitleArrows>> = std::cell::Cell::new(None);
     let tx_content: std::cell::Cell<Option<(ratatui::layout::Rect, usize)>> =
         std::cell::Cell::new(None);
@@ -2709,7 +2995,6 @@ async fn app(
             last_w
         };
         let input_h = input_height(input_area_rows(
-            ask.as_ref(),
             mode_picker.as_ref(),
             &input.text,
             input_inner_w(term_w),
@@ -2765,7 +3050,13 @@ async fn app(
                 &meters,
                 &sidebar,
                 fresh,
-                &sidebar_zone,
+                mouse_captured,
+                header_glyph,
+                &strip_zone,
+                toast
+                    .as_ref()
+                    .filter(|(_, at)| at.elapsed() < TOAST_TTL)
+                    .map(|(m, _)| m.as_str()),
                 &title_arrows,
                 &tx_content,
                 &tx_width,
@@ -2800,8 +3091,7 @@ async fn app(
                             exit = Some(Exit::Quit);
                         } else {
                             quit_armed = Some(Instant::now());
-                            transcript
-                                .push_separated(Line::Note("press ctrl+c again to exit".into()));
+                            pop_toast(&mut toast, "press ctrl+c again to exit");
                         }
                         continue;
                     }
@@ -2820,13 +3110,19 @@ async fn app(
                             }
                             KeyCode::Enter | KeyCode::Char(' ') => {
                                 let (id, choice) = (ask.id.clone(), ask.selected);
+                                let label =
+                                    ask.options.get(choice).cloned().unwrap_or_default();
                                 pending = None;
+                                transcript
+                                    .push_separated(Line::Info(format!("· {label}")));
                                 let _ = commands.send(Command::Answer { question: id, choice }).await;
                             }
                             KeyCode::Esc => {
                                 let id = ask.id.clone();
                                 let deny = ask.options.len().saturating_sub(1);
+                                let label = ask.options.get(deny).cloned().unwrap_or_default();
                                 pending = None;
+                                transcript.push_separated(Line::Info(format!("· {label}")));
                                 let _ = commands.send(Command::Answer { question: id, choice: deny }).await;
                             }
                             // direct pick: 1..9 answers that option at once
@@ -2834,7 +3130,10 @@ async fn app(
                                 let idx = (c as u8 - b'1') as usize;
                                 if idx < ask.options.len() {
                                     let id = ask.id.clone();
+                                    let label = ask.options[idx].clone();
                                     pending = None;
+                                    transcript
+                                        .push_separated(Line::Info(format!("· {label}")));
                                     let _ =
                                         commands.send(Command::Answer { question: id, choice: idx }).await;
                                 }
@@ -2872,6 +3171,7 @@ async fn app(
                                         model: None,
                                         effort: None,
                                         mode: Some(mode),
+                                        mouse: None,
                                     })
                                     .await;
                             }
@@ -2935,6 +3235,7 @@ async fn app(
                                         // process now; reflect it in both
                                         // lists so ✓/✗ marks stay truthful
                                         mark_key_set(&mut models, &mut providers, &env_var);
+                                        pop_toast(&mut toast, "✓ key saved");
                                     }
                                     if let Some(selector) = apply {
                                         // the key unblocked this unified
@@ -2949,6 +3250,7 @@ async fn app(
                                                 model: Some(selector),
                                                 effort: None,
                                                 mode: None,
+                                                mouse: None,
                                             })
                                             .await;
                                         modal = None;
@@ -3089,6 +3391,7 @@ async fn app(
                                                 model: Some(selector),
                                                 effort: None,
                                                 mode: None,
+                                                mouse: None,
                                             })
                                             .await;
                                     }
@@ -3172,6 +3475,7 @@ async fn app(
                                                 model,
                                                 effort: panel.effort,
                                                 mode: Some(panel.mode),
+                                                mouse: None,
                                             })
                                             .await;
                                     }
@@ -3200,12 +3504,12 @@ async fn app(
                                         if edit {
                                             input.text = prompt;
                                             input.cursor = input.text.chars().count();
-                                            transcript.push_separated(Line::Note(
+                                            transcript.push_separated(Line::Info(
                                                 "✎ edit & resend — ⏎ sends when ready"
                                                     .into(),
                                             ));
                                         } else {
-                                            transcript.push_separated(Line::Note(format!(
+                                            transcript.push_separated(Line::Info(format!(
                                                 "⏪ rewound {turns} turn(s) — files unchanged (/undo restores edits)"
                                             )));
                                         }
@@ -3255,9 +3559,12 @@ async fn app(
                                     _ => {}
                                 }
                             }
-                            Modal::Usage { .. } => {
-                                modal = None;
-                            }
+                                            Modal::Usage { .. } => {
+                                                modal = None;
+                                            }
+                                            Modal::Todos { .. } | Modal::Skills { .. } | Modal::Info { .. } => {
+                                                modal = None;
+                                            }
                             Modal::Context { .. } => {
                                 modal = None;
                             }
@@ -3338,7 +3645,7 @@ async fn app(
                                     if let Some(path) = items.get(*selected).cloned() {
                                         modal = None;
                                         if !std::path::Path::new(&path).exists() {
-                                            transcript.push_separated(Line::Note(format!(
+                                            transcript.push_separated(Line::Info(format!(
                                                 "spill file is gone: {path}"
                                             )));
                                         } else {
@@ -3351,15 +3658,17 @@ async fn app(
                                                         &pager,
                                                         &[path.as_str()],
                                                         terminal,
+                                                        mouse_captured,
                                                     ),
                                                     None => run_external(
                                                         "less",
                                                         &["-R", path.as_str()],
                                                         terminal,
+                                                        mouse_captured,
                                                     ),
                                                 };
                                             if let Err(e) = opened {
-                                                transcript.push_separated(Line::Note(format!("pager failed: {e}")));
+                                                transcript.push_separated(Line::Info(format!("pager failed: {e}")));
                                             }
                                         }
                                     }
@@ -3538,8 +3847,34 @@ async fn app(
                             continue;
                         }
                         (KeyCode::Char('t'), KeyModifiers::CONTROL) => {
-                            // fold/unfold the sidebar skills section
-                            sidebar.skills_open = !sidebar.skills_open;
+                            // skills & inventory popup (button on the strip)
+                            modal = Some(Modal::Skills {
+                                rows: inventory_rows(&sidebar, 64),
+                            });
+                            continue;
+                        }
+                        (KeyCode::Char('o'), KeyModifiers::CONTROL) => {
+                            // expand/collapse the last tool call in place
+                            match last_tool_ref {
+                                Some((e, c)) => transcript.toggle_tool_call(e, c),
+                                None => transcript
+                                    .push_separated(Line::Info("· no tool output yet".into())),
+                            }
+                            continue;
+                        }
+                        (KeyCode::Char('o'), KeyModifiers::ALT) => {
+                            // todos popup (button on the strip) — works
+                            // mid-turn too, like Ctrl+T
+                            modal = Some(Modal::Todos {
+                                rows: todos_rows(&sidebar, 64),
+                            });
+                            continue;
+                        }
+                        (KeyCode::Char('i'), KeyModifiers::ALT) => {
+                            // session info popup (button on the strip)
+                            modal = Some(Modal::Info {
+                                rows: info_rows(&sidebar, &meters, 64),
+                            });
                             continue;
                         }
                         (KeyCode::Char('t'), KeyModifiers::ALT) => {
@@ -3563,26 +3898,25 @@ async fn app(
                         (KeyCode::Char('m'), KeyModifiers::CONTROL)
                             if !busy && slash_popup.is_none() && path_popup.is_none() =>
                         {
-                            // Ctrl+M: same toggle as /mouse (kitty protocol
-                            // disambiguates it from Enter; terminals without
-                            // it never deliver Ctrl+M separately)
+                            // Ctrl+M: the runtime mouse toggle — capture
+                            // (dashboard: sidebar + click zones + ⇧drag)
+                            // ⇄ native (text mode: full-width chat, plain
+                            // drag selects, wheel via alternate-scroll).
+                            // kitty-protocol terminals deliver Ctrl+M as a
+                            // distinct key; plain terminals read it as
+                            // Enter, so there `[tui] mouse = "capture"`
+                            // is the way back. The choice persists.
                             mouse_captured = !mouse_captured;
-                            let mut out = std::io::stdout();
-                            if mouse_captured {
-                                let _ = std::io::Write::write_all(&mut out, b"\x1b[?1007l");
-                                let _ = std::io::Write::flush(&mut out);
-                                let _ = crossterm::execute!(
-                                    std::io::stdout(),
-                                    crossterm::event::EnableMouseCapture
-                                );
-                            } else {
-                                let _ = crossterm::execute!(
-                                    std::io::stdout(),
-                                    crossterm::event::DisableMouseCapture
-                                );
-                                let _ = std::io::Write::write_all(&mut out, b"\x1b[?1007h");
-                                let _ = std::io::Write::flush(&mut out);
-                            }
+                            apply_mouse_mode(mouse_captured);
+                            let _ = commands
+                                .send(Command::SaveSettings {
+                                    model: None,
+                                    effort: None,
+                                    mode: None,
+                                    mouse: mouse_setting(mouse_captured),
+                                })
+                                .await;
+                            pop_toast(&mut toast, mouse_mode_text(mouse_captured));
                         }
                         (KeyCode::Char('r'), KeyModifiers::CONTROL)
                             if input.searching()
@@ -3600,7 +3934,16 @@ async fn app(
                         (KeyCode::Tab, _) if input.searching() => {}
                         (KeyCode::Up, _) if input.searching() => {}
                         (KeyCode::Down, _) if input.searching() => {}
-                        (KeyCode::Char(c), _) if input.searching() => input.search_push(c),
+                        (KeyCode::Esc, _) if input.searching() => input.search_cancel(),
+                        // a popup or path-completion overlay owns Esc:
+                        // close it, never abort a running turn
+                        (KeyCode::Esc, _)
+                            if slash_popup.is_some() || path_popup.is_some() =>
+                        {
+                            slash_popup = None;
+                            path_popup = None;
+                            continue;
+                        }
                         (KeyCode::Esc, _) if busy => {
                             let _ = commands.send(Command::Abort).await;
                         }
@@ -3651,41 +3994,6 @@ async fn app(
                             if text.trim().is_empty() {
                                 continue;
                             }
-                            if text.trim() == "/mouse" {
-                                // toggle capture ⇄ native at runtime.
-                                // native: plain drag/paste are the terminal's
-                                // own, and 1007 alternate-scroll keeps the
-                                // WHEEL scrolling the chat (the terminal
-                                // translates it to ↑/↓, which scroll in
-                                // native mode); history moves to Ctrl+P/N.
-                                mouse_captured = !mouse_captured;
-                                let mut out = std::io::stdout();
-                                if mouse_captured {
-                                    let _ = std::io::Write::write_all(&mut out, b"\x1b[?1007l");
-                                    let _ = std::io::Write::flush(&mut out);
-                                    let _ = crossterm::execute!(
-                                        std::io::stdout(),
-                                        crossterm::event::EnableMouseCapture
-                                    );
-                                } else {
-                                    let _ = crossterm::execute!(
-                                        std::io::stdout(),
-                                        crossterm::event::DisableMouseCapture
-                                    );
-                                    let _ = std::io::Write::write_all(&mut out, b"\x1b[?1007h");
-                                    let _ = std::io::Write::flush(&mut out);
-                                }
-                                transcript.push_separated(Line::Note(format!(
-                                    "🖱 mouse {} — {}",
-                                    if mouse_captured { "captured" } else { "native" },
-                                    if mouse_captured {
-                                        "wheel scrolls, click zones live, ⇧drag selects, right-click pastes; ↑/↓ = prompt history"
-                                    } else {
-                                        "plain drag selects natively; the wheel scrolls the chat; ↑/↓ scroll, Ctrl+P/N = prompt history"
-                                    }
-                                )));
-                                continue;
-                            }
                             if text.trim() == "/find" || text.trim().starts_with("/find ") {
                                 // transcript search: purely local, no engine
                                 // roundtrip. Fresh query starts at the scroll
@@ -3706,7 +4014,7 @@ async fn app(
                                     None => match &find_last {
                                         Some((q, row)) => (q.clone(), row + 1),
                                         None => {
-                                            transcript.push_separated(Line::Note("no previous /find".into()));
+                                            transcript.push_separated(Line::Info("no previous /find".into()));
                                             continue;
                                         }
                                     },
@@ -3717,7 +4025,7 @@ async fn app(
                                         find_last = Some((q, offset));
                                     }
                                     None => {
-                                        transcript.push_separated(Line::Note(format!("no matches for '{q}'")));
+                                        transcript.push_separated(Line::Info(format!("no matches for '{q}'")));
                                         // resume past the searched-from row so a
                                         // later /find re-scans only fresh rows
                                         find_last = Some((q, from));
@@ -3727,7 +4035,7 @@ async fn app(
                             }
                             if text.trim() == "/retry" {
                                 if busy {
-                                    transcript.push_separated(Line::Note(
+                                    transcript.push_separated(Line::Warn(
                                         "⏳ turn running — esc to abort first".into(),
                                     ));
                                 } else if let Some(p) = last_user.clone() {
@@ -3736,7 +4044,7 @@ async fn app(
                                     busy = true;
                                     let _ = commands.send(Command::Prompt { text: p, schema: None, images: Vec::new() }).await;
                                 } else {
-                                    transcript.push_separated(Line::Note("nothing to retry yet".into()));
+                                    transcript.push_separated(Line::Info("nothing to retry yet".into()));
                                 }
                                 continue;
                             }
@@ -3745,7 +4053,7 @@ async fn app(
                                 // breakdown (the turn owns the command
                                 // channel) — gate it like /retry
                                 if busy {
-                                    transcript.push_separated(Line::Note(
+                                    transcript.push_separated(Line::Warn(
                                         "⏳ turn running — /context works when idle".into(),
                                     ));
                                 } else {
@@ -3763,16 +4071,17 @@ async fn app(
                                         _ => None,
                                     });
                                 match last {
-                                    None => transcript.push_separated(Line::Note(
+                                    None => transcript.push_separated(Line::Info(
                                         "no assistant reply to copy".into(),
                                     )),
                                     Some(s) => {
-                                        // silent success: OSC52 into the clipboard
+                                        // OSC52 into the clipboard; the ack is a toast
                                         let mut stdout = std::io::stdout().lock();
                                         let _ = stdout.write_all(b"\x1b]52;c;");
                                         let _ = stdout.write_all(b64encode(&s).as_bytes());
                                         let _ = stdout.write_all(b"\x07");
                                         let _ = stdout.flush();
+                                        pop_toast(&mut toast, "✓ copied last reply");
                                     }
                                 }
                                 continue;
@@ -3781,9 +4090,9 @@ async fn app(
                             if text.starts_with("/image ") || text == "/image" {
                                 match handle_image_command(&text, &mut pending_image) {
                                     Some(Ok(note)) => {
-                                        transcript.push_separated(Line::Note(note));
+                                        pop_toast(&mut toast, note);
                                     }
-                                    Some(Err(e)) => transcript.push_separated(Line::Note(e)),
+                                    Some(Err(e)) => transcript.push_separated(Line::Info(e)),
                                     None => {}
                                 }
                                 input.text.clear();
@@ -3811,8 +4120,8 @@ async fn app(
                                     Err(e) => Err(e),
                                 };
                                 match staged {
-                                    Ok(note) => transcript.push_separated(Line::Note(note)),
-                                    Err(e) => transcript.push_separated(Line::Note(e)),
+                                    Ok(note) => pop_toast(&mut toast, note),
+                                    Err(e) => transcript.push_separated(Line::Info(e)),
                                 }
                                 continue;
                             }
@@ -3827,7 +4136,12 @@ async fn app(
                                     plan_started = Some(std::time::SystemTime::now());
                                 }
                                 if let Some(note) = cmd.note {
-                                    transcript.push_separated(Line::Note(note));
+                                    // usage errors warn; other notes stay muted
+                                    transcript.push_separated(if note.starts_with("usage:") {
+                                        Line::Warn(note)
+                                    } else {
+                                        Line::Info(note)
+                                    });
                                 }
                                         if let Some(kind) = cmd.modal {
                                             match kind {
@@ -3865,7 +4179,7 @@ async fn app(
                 });
                 match prompt {
                     Some(p) => modal = Some(Modal::Key(p)),
-                    None => transcript.push_separated(Line::Note("no api key variable is known for this model".into())),
+                    None => transcript.push_separated(Line::Warn("no api key variable is known for this model".into())),
                 }
                                                 }
                                                 _ => {
@@ -4009,7 +4323,7 @@ async fn app(
                                     }
                                 }
                                 if let Some(follow) = cmd.followup {
-                                    transcript.push_separated(Line::Note("(mode set; starting)".into()));
+                                    transcript.push_separated(Line::Info("(mode set; starting)".into()));
                                     busy = true;
                                     let _ = commands
                                         .send(Command::Prompt { text: follow, schema: None, images: Vec::new() })
@@ -4028,7 +4342,7 @@ async fn app(
                                     let item = deferred.trim().to_string();
                                     if !item.is_empty() {
                                         queue.push(item);
-                                        transcript.push_separated(Line::Note(format!(
+                                        transcript.push_separated(Line::Info(format!(
                                             "⏳ queued · {} waiting for this turn to end",
                                             queue.len()
                                         )));
@@ -4046,13 +4360,13 @@ async fn app(
                                 .filter(|c| !c.is_empty())
                             {
                                 let command = shell_cmd.to_string();
-                                transcript.push_separated(Line::Note(format!("» {command}")));
+                                transcript.push_separated(Line::Info(format!("» {command}")));
                                 let _ = commands.send(Command::Shell { command }).await;
                                 continue;
                             }
                             transcript.push_separated(Line::User(text.clone()));
                             let cmd = if busy {
-                                transcript.push_separated(Line::Note(
+                                transcript.push_separated(Line::Info(
                                     "⚡ steering this turn".into(),
                                 ));
                                 Command::Interject { text }
@@ -4062,7 +4376,7 @@ async fn app(
                                 last_user = Some(text.clone());
                                 if let Some(img) = &pending_image {
                                     let kb = img.data.len() * 3 / 4 / 1024;
-                                    transcript.push_separated(Line::Note(format!(
+                                    transcript.push_separated(Line::Info(format!(
                                         "[img attachment · {} · {kb}KB]",
                                         img.media_type
                                     )));
@@ -4323,7 +4637,7 @@ async fn app(
                             let path_str = path.to_string_lossy().into_owned();
                             match std::fs::write(&path, &input.text) {
                                 Err(e) => {
-                                    transcript.push_separated(Line::Note(format!("edit failed: {e}")));
+                                    transcript.push_separated(Line::Info(format!("edit failed: {e}")));
                                 }
                                 Ok(()) => {
                                     let editor = std::env::var("EDITOR")
@@ -4334,8 +4648,9 @@ async fn app(
                                         &editor,
                                         &[path_str.as_str()],
                                         terminal,
+                                        mouse_captured,
                                     ) {
-                                        Err(e) => transcript.push_separated(Line::Note(format!("editor failed: {e}"))),
+                                        Err(e) => transcript.push_separated(Line::Info(format!("editor failed: {e}"))),
                                         Ok(()) => {
                                             let read = std::fs::read_to_string(&path);
                                             let _ = std::fs::remove_file(&path);
@@ -4347,7 +4662,7 @@ async fn app(
                                                     slash_popup =
                                                         update_suggestions(&input.text);
                                                 }
-                                                Err(e) => transcript.push_separated(Line::Note(format!(
+                                                Err(e) => transcript.push_separated(Line::Info(format!(
                                                     "edit failed: {e}"
                                                 ))),
                                             }
@@ -4411,7 +4726,10 @@ async fn app(
                             | Modal::Context { .. }
                             | Modal::Tasks { .. }
                             | Modal::TaskDetail { .. }
-                            | Modal::Debug { .. } => {}
+                            | Modal::Debug { .. }
+                            | Modal::Todos { .. }
+                            | Modal::Skills { .. }
+                            | Modal::Info { .. } => {}
                         }
                     } else if path_popup.is_some() {
                         path_popup = None;
@@ -4432,14 +4750,15 @@ async fn app(
                                             .map(|n| n.to_string_lossy().into_owned())
                                             .unwrap_or_default();
                                         pending_image = Some(part);
-                                        transcript.push_separated(Line::Note(format!(
-                                            "[img {name} · {kb}KB] — press enter to send"
-                                        )));
+                                        pop_toast(
+                                            &mut toast,
+                                            format!("[img {name} · {kb}KB] — press enter to send"),
+                                        );
                                         slash_popup = None;
                                         continue;
                                     }
                                     Err(e) => {
-                                        transcript.push_separated(Line::Note(e));
+                                        transcript.push_separated(Line::Info(e));
                                         slash_popup = None;
                                         continue;
                                     }
@@ -4489,8 +4808,17 @@ async fn app(
                                     })
                                 {
                                     let row = start + (mouse_evt.row - area.y) as usize;
-                                    if let Some(entry) = transcript.entry_at_row(row) {
-                                        transcript.toggle_thought(entry);
+                                    match transcript.row_ref_at(row) {
+                                        // a tool row toggles its inline
+                                        // expansion
+                                        Some(RowRef::ToolCall(e, c)) => {
+                                            transcript.toggle_tool_call(e, c);
+                                        }
+                                        // a thinking block toggles
+                                        Some(RowRef::Entry(entry)) => {
+                                            transcript.toggle_thought(entry);
+                                        }
+                                        None => {}
                                     }
                                 }
                                 if let Some(up) = title_arrows
@@ -4502,11 +4830,21 @@ async fn app(
                                     jump_to_user_message(
                                         &mut scroll, &rows, total, view_rows, up,
                                     );
-                                } else if sidebar_zone
-                                    .get()
-                                    .is_some_and(|z| z.hit(mouse_evt.column, mouse_evt.row))
+                                } else if let Some(button) =
+                                    strip_zone.get().and_then(|z| z.hit(mouse_evt.column, mouse_evt.row))
                                 {
-                                    sidebar.skills_open = !sidebar.skills_open;
+                                    // a strip button: open its popup
+                                    modal = Some(match button {
+                                        StripButton::Todos => Modal::Todos {
+                                            rows: todos_rows(&sidebar, 64),
+                                        },
+                                        StripButton::Skills => Modal::Skills {
+                                            rows: inventory_rows(&sidebar, 64),
+                                        },
+                                        StripButton::Info => Modal::Info {
+                                            rows: info_rows(&sidebar, &meters, 64),
+                                        },
+                                    });
                                 }
                             }
                             // right click pastes the clipboard into the
@@ -4548,6 +4886,13 @@ async fn app(
                         // fallback below); TaskDetail always pages
                         if pending_modal.is_some() {
                             match &evt {
+                            // mode/model acks are transient, not transcript rows
+                            Event::ModeChanged { mode } => {
+                                pop_toast(&mut toast, format!("mode · {}", mode_label(*mode)));
+                            }
+                            Event::ModelChanged { selector } => {
+                                pop_toast(&mut toast, format!("model · {selector}"));
+                            }
                                 Event::Tasks { rows }
                                     if pending_modal == Some(PendingModal::Tasks) =>
                                 {
@@ -4585,7 +4930,7 @@ async fn app(
                             Event::DebugRoster { rows } => {
                                 // no pending modal: transcript fallback
                                 transcript
-                                    .push_separated(Line::Note("▬ debug sessions".into()));
+                                    .push_separated(Line::Info("▸ debug sessions".into()));
                                 for row in rows {
                                     transcript
                                         .push_separated(Line::Report(row.clone()));
@@ -4593,7 +4938,7 @@ async fn app(
                             }
                             _ => {}
                         }
-                        apply_event(
+                        if apply_event(
                             &evt,
                             &mut transcript,
                             &mut busy,
@@ -4610,7 +4955,12 @@ async fn app(
                             &mut last_error,
                             &mut spills,
                             &mut sidebar,
-                        );
+                        )
+                        .is_some()
+                        {
+                            // Ctrl+O and click-to-expand target this call
+                            last_tool_ref = transcript.last_tool_ref();
+                        }
                         // a live title lands while the session picker is
                         // open: patch its row too (the picker otherwise
                         // reloads from the strand on every open, and the
@@ -4648,7 +4998,7 @@ async fn app(
                             && plan_drafted(plan_started, &plan_file_path())
                         {
                             plan_started = None;
-                            transcript.push_separated(Line::Note(format!(
+                            transcript.push_separated(Line::Info(format!(
                                 "Plan drafted — review {}, then /approve to build",
                                 plan_file_path().display()
                             )));
@@ -4664,7 +5014,14 @@ async fn app(
                     }
                 }
             }
-            _ = spin.tick(), if busy => {}
+            // redraws while busy (spinner/clock) or while a toast is
+            // alive; the arm also prunes the expired toast so ticking
+            // actually stops once it fades
+            _ = spin.tick(), if busy || toast.is_some() => {
+                if toast.as_ref().is_some_and(|(_, at)| at.elapsed() >= TOAST_TTL) {
+                    toast = None;
+                }
+            }
         }
     }
     let exit = exit.unwrap_or(Exit::Quit);
@@ -4767,6 +5124,9 @@ struct LiveTool {
     preview: Vec<String>,
     /// Last CallOutput excerpt and its error flag.
     last: Option<(String, bool)>,
+    /// Local start time: CallStarted→CallFinished becomes the row's
+    /// duration.
+    started: Instant,
 }
 
 /// Tool call header: `→ {tool}`, or `→ {tool} · {detail}` when the
@@ -4779,16 +5139,19 @@ fn tool_header(tool: &str, detail: &str) -> String {
     }
 }
 
-/// One dim closing row for a turn that produced output:
-/// `{model} · {elapsed}s · ${cost}`, capped at 60 columns.
-fn turn_meta_row(model: &str, elapsed: f64, cost: f64) -> String {
-    let mut segs: Vec<String> = Vec::new();
-    if !model.is_empty() {
-        segs.push(model.to_string());
-    }
-    segs.push(format!("{elapsed:.1}s"));
-    segs.push(format!("${cost:.4}"));
-    trunc_cols(&segs.join(" · "), 60)
+/// How long a toast stays on screen before it self-destructs.
+const TOAST_TTL: Duration = Duration::from_secs(4);
+
+/// Set (or replace) the transient action toast.
+fn pop_toast(toast: &mut Option<(String, Instant)>, msg: impl Into<String>) {
+    *toast = Some((msg.into(), Instant::now()));
+}
+
+/// A finished call's note: the first non-blank output line, capped at
+/// 40 columns (empty when the call produced nothing readable).
+fn tool_note(excerpt: &str) -> String {
+    let first = excerpt.lines().find(|l| !l.trim().is_empty()).unwrap_or("");
+    trunc_cols(first, 40)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4811,7 +5174,9 @@ fn apply_event(
     spills: &mut Vec<String>,
     // sidebar state: inventory + live todo list
     sidebar: &mut SidebarState,
-) {
+) -> Option<ToolCall> {
+    // the most recently finished call, surfaced for Ctrl+O / expand
+    let mut finished: Option<ToolCall> = None;
     match evt {
         Event::TurnStarted { .. } => {
             *busy = true;
@@ -4841,14 +5206,12 @@ fn apply_event(
                 // chronology: text streamed before the call must render
                 // above it, exactly like the turn-end flush
                 flush_live_text(transcript, current_thought, current_assistant);
-                if !current_tool.is_empty() {
-                    transcript.push_separated(Line::Tool(std::mem::take(current_tool)));
-                }
                 *current_tool = tool_header(tool, "");
                 *live_tool = Some(LiveTool {
                     id: id.clone(),
                     preview: Vec::new(),
                     last: None,
+                    started: Instant::now(),
                 });
             }
         },
@@ -4862,16 +5225,26 @@ fn apply_event(
                     *current_tool = tool_header(tool, detail);
                 }
                 // cold start (no stream header) or a different call:
-                // close the old row and open a fresh live block
+                // flush a never-finished header as a bare row, then
+                // open the fresh live block
                 _ => {
                     if !current_tool.is_empty() {
-                        transcript.push_separated(Line::Tool(std::mem::take(current_tool)));
+                        transcript.push_tool_call(ToolCall {
+                            head: std::mem::take(current_tool),
+                            ok: false,
+                            note: String::new(),
+                            excerpt: String::new(),
+                            spill: None,
+                            dur: None,
+                            expanded: false,
+                        });
                     }
                     *current_tool = tool_header(tool, detail);
                     *live_tool = Some(LiveTool {
                         id: id.clone(),
                         preview: Vec::new(),
                         last: None,
+                        started: Instant::now(),
                     });
                 }
             }
@@ -4894,21 +5267,30 @@ fn apply_event(
                     observe_preview(&mut lt.preview, excerpt);
                     lt.last = Some((excerpt.clone(), *is_error));
                 }
-                // no matching block (replay paths, id drift): legacy
-                // one-shot append on the current row
-                _ => append_tool_note(current_tool, excerpt, *is_error),
+                // no matching block (replay paths, id drift): the note
+                // is lost — the row still renders from its head
+                _ => {}
             }
         }
-        Event::CallFinished { .. } => {
+        Event::CallFinished { ok, .. } => {
             // collapse the live block: the preview was transient; the
-            // compact `→ tool ✓|✗ note` row is what gets cached
+            // compact ` │ → tool … ✓` row is what gets cached
             if let Some(lt) = live_tool.take() {
-                if let Some((excerpt, is_error)) = lt.last {
-                    append_tool_note(current_tool, &excerpt, is_error);
-                }
-            }
-            if !current_tool.is_empty() {
-                transcript.push_separated(Line::Tool(std::mem::take(current_tool)));
+                let (note, excerpt) = match lt.last {
+                    Some((excerpt, _)) => (tool_note(&excerpt), excerpt),
+                    None => (String::new(), String::new()),
+                };
+                let call = ToolCall {
+                    head: std::mem::take(current_tool),
+                    ok: *ok,
+                    note,
+                    excerpt,
+                    spill: None,
+                    dur: Some(lt.started.elapsed().as_secs_f64()),
+                    expanded: false,
+                };
+                transcript.push_tool_call(call.clone());
+                finished = Some(call);
             }
         }
         Event::Ask { id, questions } => {
@@ -4939,34 +5321,46 @@ fn apply_event(
                 format!("{output}{tail}")
             };
             for line in body.lines().take(40) {
-                transcript.push_separated(Line::Report(line.to_string()));
+                transcript.push_separated(Line::Shell(line.to_string()));
             }
             let hidden = body.lines().count().saturating_sub(40);
             if hidden > 0 {
-                transcript.push_separated(Line::Report(format!("… {hidden} more lines")));
+                transcript.push_separated(Line::Info(format!("… +{hidden} more")));
             }
-            transcript.push_separated(Line::Note(format!(
+            transcript.push_separated(Line::Info(format!(
                 "» {command} — output joins your next prompt"
             )));
         }
         Event::Tasks { rows } => {
             // /tasks dashboard snapshot rendered as report rows
-            transcript.push_separated(Line::Note("▬ background tasks".into()));
+            transcript.push_separated(Line::Info("▸ background tasks".into()));
             for row in rows {
                 transcript.push_separated(Line::Report(row.clone()));
             }
         }
         Event::TurnFinished { stop, usage } => {
             let elapsed = busy_since.map_or(0.0, |t| t.elapsed().as_secs_f64());
-            let produced = *turn_produced;
             flush_live_text(transcript, current_thought, current_assistant);
+            // a call still running at turn end closes as a row too
+            let mut finished_call = None;
             if let Some(lt) = live_tool.take() {
-                if let Some((excerpt, is_error)) = lt.last {
-                    append_tool_note(current_tool, &excerpt, is_error);
-                }
-            }
-            if !current_tool.is_empty() {
-                transcript.push_separated(Line::Tool(std::mem::take(current_tool)));
+                let (note, excerpt) = match lt.last {
+                    Some((excerpt, _)) => (tool_note(&excerpt), excerpt),
+                    None => (String::new(), String::new()),
+                };
+                let call = ToolCall {
+                    head: std::mem::take(current_tool),
+                    ok: true,
+                    note,
+                    excerpt,
+                    spill: None,
+                    dur: Some(lt.started.elapsed().as_secs_f64()),
+                    expanded: false,
+                };
+                transcript.push_tool_call(call.clone());
+                finished_call = Some(call);
+            } else {
+                current_tool.clear();
             }
             *busy = false;
             *busy_since = None;
@@ -4999,27 +5393,34 @@ fn apply_event(
                 fire_notifications("turn_finished", stop_label);
             }
             if !silent {
-                let row = match stop {
-                    ka_protocol::Stop::Done => Line::Report(format!("done{tail}")),
-                    ka_protocol::Stop::Aborted => {
-                        Line::Report(format!("aborted · partial kept{tail}"))
+                let (glyph, tone, text) = match stop {
+                    ka_protocol::Stop::Done => ('✓', SummaryTone::Ok, format!("done{tail}")),
+                    ka_protocol::Stop::Aborted => (
+                        '◐',
+                        SummaryTone::Warn,
+                        format!("aborted · partial kept{tail}"),
+                    ),
+                    ka_protocol::Stop::Length => (
+                        '◑',
+                        SummaryTone::Warn,
+                        format!("stopped at output limit{tail}"),
+                    ),
+                    ka_protocol::Stop::Error => {
+                        let body = match last_error.take() {
+                            Some(msg) => {
+                                let msg: String = if msg.chars().count() > 90 {
+                                    msg.chars().take(89).chain(std::iter::once('…')).collect()
+                                } else {
+                                    msg
+                                };
+                                format!("failed · {msg} · /retry{tail}")
+                            }
+                            None => format!("failed · /retry{tail}"),
+                        };
+                        ('✗', SummaryTone::Err, body)
                     }
-                    ka_protocol::Stop::Length => {
-                        Line::Report(format!("stopped at output limit{tail}"))
-                    }
-                    ka_protocol::Stop::Error => match last_error.take() {
-                        Some(msg) => {
-                            let msg: String = if msg.chars().count() > 90 {
-                                msg.chars().take(89).chain(std::iter::once('…')).collect()
-                            } else {
-                                msg
-                            };
-                            Line::ReportErr(format!("failed · {msg}{tail} · /retry"))
-                        }
-                        None => Line::ReportErr(format!("failed{tail} · /retry")),
-                    },
                 };
-                transcript.push_separated(row);
+                transcript.push_separated(Line::Summary { glyph, tone, text });
                 // best-effort desktop notification (OSC 9); one write
                 let label = match stop {
                     ka_protocol::Stop::Done => format!("done · {}", fmt_dur(elapsed)),
@@ -5031,14 +5432,7 @@ fn apply_event(
                 let _ = out.write_all(format!("\x1b]9;ka · {label}\x07").as_bytes());
                 let _ = out.flush();
             }
-            // the assistant output's closing metadata row
-            if produced || !silent {
-                transcript.push_separated(Line::Report(turn_meta_row(
-                    &meters.model,
-                    elapsed,
-                    usage.cost,
-                )));
-            }
+            finished = finished_call;
         }
         Event::ModelChanged { selector } => meters.model = selector.clone(),
         Event::ContextMeter { used, window } => {
@@ -5057,7 +5451,7 @@ fn apply_event(
                 // surfaces it once the turn settles
                 *last_error = Some(message.clone());
             } else {
-                transcript.push_separated(Line::ReportErr(message.clone()));
+                transcript.push_separated(Line::Err(message.clone()));
             }
         }
         Event::Replay { messages } => {
@@ -5077,30 +5471,36 @@ fn apply_event(
                 if m.digest || m.role == "digest" {
                     // faint compaction divider: history before this point
                     // lives in the summary, not the transcript
-                    transcript.push_separated(Line::Report("⋯ digest ⋯".into()));
+                    transcript.push_separated(Line::Info("⋯ digest ⋯".into()));
                     continue;
                 }
                 if m.role == "user" {
                     transcript.push_separated(Line::User(m.content.clone()));
                     continue;
                 }
-                // assistant: dim thought first, then one row per tool
-                // call with its merged result note, then the text block
-                // when present
+                // assistant: dim thought first, then one railed row per
+                // tool call (consecutive calls merge into one block),
+                // then the text block when present
                 if let Some(t) = m.thinking.clone().filter(|t| !t.trim().is_empty()) {
                     transcript.push_separated(Line::Thought(t));
                 }
                 for c in &m.calls {
-                    let mut row = tool_header(&c.tool, &c.detail);
-                    append_tool_note(&mut row, c.result.as_deref().unwrap_or(""), c.is_error);
-                    transcript.push_separated(Line::Tool(row));
+                    transcript.push_tool_call(ToolCall {
+                        head: tool_header(&c.tool, &c.detail),
+                        ok: !c.is_error,
+                        note: tool_note(c.result.as_deref().unwrap_or("")),
+                        excerpt: c.result.clone().unwrap_or_default(),
+                        spill: None,
+                        dur: None,
+                        expanded: false,
+                    });
                 }
                 if !m.content.trim().is_empty() {
                     transcript.push_separated(Line::Assistant(m.content.clone()));
                 }
             }
         }
-        Event::Note { message } => transcript.push_separated(Line::Note(message.clone())),
+        Event::Note { message } => transcript.push_separated(Line::Info(message.clone())),
         Event::Inventory {
             tools,
             mcp,
@@ -5110,7 +5510,7 @@ fn apply_event(
         } => {
             let card = inventory_card(mcp, agents);
             if !card.is_empty() {
-                transcript.push_separated(Line::Report(card));
+                transcript.push_separated(Line::Info(card));
             }
             sidebar.inventory = Inventory {
                 tools: tools.clone(),
@@ -5134,15 +5534,16 @@ fn apply_event(
             *busy_since = None;
         }
         Event::DigestStarted => {
-            transcript.push_separated(Line::Note("⋯ digesting context…".to_string()))
+            transcript.push_separated(Line::Info("⋯ digesting context…".to_string()))
         }
         Event::DigestFinished { .. } => {}
         // the run loop opens the /context modal from this event
         Event::ContextBreakdown { .. } => {}
-        // likewise the /tasks pager and /debug overlay: the run loop
-        // owns their modal handling (transcript fallback included)
+        // the run loop opens the /tasks pager and /debug overlay from
+        // these events (transcript fallback included)
         Event::TaskDetail { .. } | Event::DebugRoster { .. } => {}
     }
+    finished
 }
 
 /// Compact bootstrap inventory card for [`Event::Inventory`]: one muted
@@ -5251,11 +5652,15 @@ fn record_spill(spills: &mut Vec<String>, path: &str) {
 /// Suspend the TUI (flush, leave raw mode and the alternate screen), run
 /// `program` with inherited stdio, then restore raw mode + alternate
 /// screen and force a full redraw. The child's exit status is ignored —
-/// editors and pagers exit non-zero routinely.
+/// editors and pagers exit non-zero routinely. The mouse mode is
+/// restored to whatever the session runs in (capture or native+1007) —
+/// an unconditional capture re-arm would desync the flag and kill the
+/// native wheel.
 fn run_external(
     program: &str,
     args: &[&str],
     terminal: &mut ratatui::Terminal<ratatui::backend::CrosstermBackend<std::io::Stdout>>,
+    mouse_captured: bool,
 ) -> std::io::Result<()> {
     use std::io::Write as _;
     let _ = std::io::stdout().flush();
@@ -5265,13 +5670,15 @@ fn run_external(
         crossterm::terminal::LeaveAlternateScreen,
         crossterm::event::DisableMouseCapture
     );
+    let _ = std::io::stdout().write_all(b"\x1b[?1007l");
+    let _ = std::io::stdout().flush();
     let res = std::process::Command::new(program)
         .args(args)
         .status()
         .map(|_| ());
     let _ = crossterm::execute!(std::io::stdout(), crossterm::terminal::EnterAlternateScreen);
     let _ = crossterm::terminal::enable_raw_mode();
-    let _ = crossterm::execute!(std::io::stdout(), crossterm::event::EnableMouseCapture);
+    apply_mouse_mode(mouse_captured);
     let _ = terminal.clear();
     res
 }
@@ -5460,7 +5867,8 @@ async fn clip_image_bytes() -> Result<Vec<u8>, String> {
 
 pub fn available_slash_commands() -> Vec<(String, String)> {
     let mut out = builtin_slash_commands();
-    // custom files come after builtins, prefixed so they read as aliases
+    // custom files come after builtins, named like any slash command so
+    // the popup prefix-filter and Tab-accept work the same way
     let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
     // safe mode: custom commands are customizations — built-ins only
     let custom = if ka_engine::conventions::bare_mode() {
@@ -5475,7 +5883,7 @@ pub fn available_slash_commands() -> Vec<(String, String)> {
             format!(" ({})", c.argument_hint)
         };
         out.push((
-            format!("cmd:{}", c.name),
+            format!("/{}", c.name),
             format!("custom command{hint} — {desc}", desc = c.description),
         ));
     }
@@ -5521,10 +5929,6 @@ fn builtin_slash_commands() -> Vec<(String, String)> {
             "read-only review of current changes ([base])".to_string(),
         ),
         (
-            "/mouse".to_string(),
-            "toggle mouse capture (native select) / chat wheel".to_string(),
-        ),
-        (
             "/approve".to_string(),
             "review the plan file, then build it".to_string(),
         ),
@@ -5561,6 +5965,8 @@ fn builtin_slash_commands() -> Vec<(String, String)> {
             "copy the last reply (OSC52)".to_string(),
         ),
         ("/clip".to_string(), "attach a clipboard image".to_string()),
+        ("/image".to_string(), "attach an image [path]".to_string()),
+        ("/agents".to_string(), "list available agents".to_string()),
         (
             "/find".to_string(),
             "search the transcript: /find <text>, bare repeats".to_string(),
@@ -6212,13 +6618,28 @@ blocker > major > minor > nit, each as `file:line — issue — concrete fix`, \
             followup: Some(build_followup()),
         }),
         "/rewind" => {
-            let turns: u32 = rest.and_then(|r| r.trim().parse().ok()).unwrap_or(1);
-            Some(Slash {
-                note: None,
-                event: Some(Command::Rewind { turns }),
-                quit: false,
-                followup: None,
-                modal: None,
+            // bare /rewind drops the last exchange; an unparsable count
+            // is refused rather than silently defaulted (a wrong rewind
+            // cut loses turns)
+            let turns = match rest {
+                None => Some(1),
+                Some(r) => r.trim().parse::<u32>().ok(),
+            };
+            Some(match turns {
+                Some(turns) => Slash {
+                    note: None,
+                    event: Some(Command::Rewind { turns }),
+                    quit: false,
+                    followup: None,
+                    modal: None,
+                },
+                None => Slash {
+                    note: Some("usage: /rewind [n]".to_string()),
+                    event: None,
+                    quit: false,
+                    followup: None,
+                    modal: None,
+                },
             })
         }
         "/compact" => {
@@ -6517,11 +6938,10 @@ fn preview_row(line: &str, width: usize) -> String {
     trunc_cols(line, width.saturating_sub(1))
 }
 
-/// Live tool block rows on the tool band: the `→ {tool}` header plus up
-/// to [`PREVIEW_WINDOW`] dim preview lines while the call is unfinished.
-/// Every row is inset one column and filled to the full transcript
-/// width with [`BG_TOOL`] — the band is the live block's background,
-/// same fill treatment as the assistant surface.
+/// Live tool block rows while a call is running: the `→ {tool}` header
+/// plus up to [`PREVIEW_WINDOW`] dim preview lines. The violet band
+/// hugs its content — a quiet rail, then content with one column of air
+/// each side; the cached railed rows that replace it sit on the canvas.
 fn tool_live_rows(
     header: &str,
     live: Option<&LiveTool>,
@@ -6531,36 +6951,28 @@ fn tool_live_rows(
     let Some(lt) = live else {
         return Vec::new();
     };
-    // one full-width band row: one column of air, the content, band fill.
-    // The bg must live on a SPAN — Paragraph ignores line-level styles
-    let band_row = |content: String, fg: ratatui::style::Color| {
-        TuiLine::from(vec![ratatui::text::Span::styled(
-            pad_to_width(format!(" {content}"), width),
-            ratatui::style::Style::new()
-                .fg(fg)
-                .bg(crate::palette::BG_TOOL),
-        )])
+    // the bg must live on a SPAN — Paragraph ignores line-level styles
+    let band_span = |content: String, fg: ratatui::style::Color| {
+        TuiLine::from(vec![
+            ratatui::text::Span::styled(" │ ", crate::palette::BORDER_QUIET_STYLE),
+            ratatui::text::Span::styled(
+                content,
+                ratatui::style::Style::new()
+                    .fg(fg)
+                    .bg(crate::palette::BG_TOOL),
+            ),
+        ])
     };
-    let mut rows = vec![band_row(header.to_string(), crate::palette::TOOL)];
+    let head = trunc_cols(header, width.saturating_sub(5));
+    let mut rows = vec![band_span(format!(" {head} "), crate::palette::TOOL)];
     let start = lt.preview.len().saturating_sub(PREVIEW_WINDOW);
     for line in &lt.preview[start..] {
-        rows.push(band_row(
-            format!("  {}", preview_row(line, width)),
+        rows.push(band_span(
+            format!("  {}", preview_row(line, width.saturating_sub(6))),
             crate::palette::FAINT,
         ));
     }
     rows
-}
-
-/// Append the compact ` ✓|✗ {first line ≤120}` note for a finished call.
-fn append_tool_note(row: &mut String, excerpt: &str, is_error: bool) {
-    let first = excerpt.lines().find(|l| !l.trim().is_empty()).unwrap_or("");
-    let note: String = first.chars().take(120).collect();
-    if is_error {
-        row.push_str(&format!(" ✗ {note}"));
-    } else {
-        row.push_str(&format!(" ✓ {note}"));
-    }
 }
 
 /// The one selection identity of the whole TUI: a full-row pink bar
@@ -6715,34 +7127,56 @@ fn hint_spans(pairs: &[(&str, &str)]) -> Vec<ratatui::text::Span<'static>> {
     out
 }
 
-/// The status bar's right zone: `{model} · {mode} · ctx {pct}% ·
+/// Status-bar right side: `{model} · {mode} · ctx {gauge} {pct}% ·
 /// ${cost}` — facts joined only when known, cost always on.
-fn status_right(meters: &Meters) -> String {
+fn status_right(meters: &Meters) -> Vec<ratatui::text::Span<'static>> {
     let (used, window) = meters.context;
-    let mut segs: Vec<String> = Vec::new();
+    let mut segs: Vec<ratatui::text::Span<'static>> = Vec::new();
+    let push = |s: String, segs: &mut Vec<ratatui::text::Span<'static>>| {
+        if !segs.is_empty() {
+            segs.push(ratatui::text::Span::styled(" · ", crate::palette::META));
+        }
+        segs.push(ratatui::text::Span::styled(s, crate::palette::META));
+    };
     if !meters.model.is_empty() {
-        segs.push(meters.model.clone());
+        push(meters.model.clone(), &mut segs);
     }
     if !meters.mode.is_empty() {
-        segs.push(meters.mode.clone());
+        push(meters.mode.clone(), &mut segs);
     }
     if window > 0 {
-        segs.push(format!(
-            "ctx {}%",
-            (used as f64 / window as f64 * 100.0) as u64
+        let pct = (used as f64 / window as f64 * 100.0) as u64;
+        // eight cells, one step per 12.5%; the bar warms as the window fills
+        let filled = ((used as f64 / window as f64) * 8.0).round() as usize;
+        let filled = filled.clamp(0, 8);
+        let gauge_color = if pct >= 95 {
+            crate::palette::ERR
+        } else if pct >= 80 {
+            crate::palette::WARN
+        } else {
+            crate::palette::OK
+        };
+        push("ctx".to_string(), &mut segs);
+        segs.push(ratatui::text::Span::styled(
+            format!(" {}{}", "█".repeat(filled), "·".repeat(8 - filled)),
+            ratatui::style::Style::new().fg(gauge_color),
+        ));
+        segs.push(ratatui::text::Span::styled(
+            format!(" {pct}%"),
+            crate::palette::META,
         ));
     } else if used > 0 {
-        segs.push(format!("~{} tok", fmt_tok(used)));
+        push(format!("~{} tok", fmt_tok(used)), &mut segs);
     }
-    segs.push(format!("${:.4}", meters.cost));
-    segs.join(" · ")
+    push(format!("${:.4}", meters.cost), &mut segs);
+    segs
 }
 
 /// The fresh-conversation welcome: quiet rows centered in the
 /// transcript pane. Rendered only while the transcript is empty and no
 /// turn is in flight — the first exchange (or a replayed older chat)
 /// replaces it.
-fn welcome_rows(width: usize, glyph: &str) -> Vec<ratatui::text::Line<'static>> {
+fn welcome_rows(width: usize, glyph: &str, meters: &Meters) -> Vec<ratatui::text::Line<'static>> {
     use unicode_width::UnicodeWidthStr;
     let center = |text: &str, style: ratatui::style::Style| -> ratatui::text::Line<'static> {
         let pad = width.saturating_sub(text.width()) / 2;
@@ -6752,14 +7186,22 @@ fn welcome_rows(width: usize, glyph: &str) -> Vec<ratatui::text::Line<'static>> 
         ])
     };
     let glyph = if glyph.is_empty() { "◆" } else { glyph };
-    vec![
+    // model + mode ride from the meters; empty segments stay hidden
+    let config = [meters.model.as_str(), meters.mode.as_str()]
+        .into_iter()
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>()
+        .join(" · ");
+    let faint = ratatui::style::Style::new().fg(crate::palette::FAINT);
+    let mut rows = vec![
         center(&format!("· {glyph} ·"), crate::palette::ACCENT_STYLE),
         center("new conversation", crate::palette::THOUGHT),
-        center(
-            "/help for keys · /session for past chats",
-            ratatui::style::Style::new().fg(crate::palette::FAINT),
-        ),
-    ]
+    ];
+    if !config.is_empty() {
+        rows.push(center(&config, faint));
+    }
+    rows.push(center("/help keys · /session past chats", faint));
+    rows
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -6784,7 +7226,13 @@ fn render(
     meters: &Meters,
     sidebar: &SidebarState,
     fresh: bool,
-    sidebar_zone: &std::cell::Cell<Option<SidebarZone>>,
+    // mouse mode: the idle hint bar teaches the selection/scroll story
+    // for whichever mode is live
+    mouse_captured: bool,
+    header_glyph: &str,
+    strip_zone: &std::cell::Cell<Option<StripZones>>,
+    // transient action feedback, auto-expiring; None most of the time
+    toast: Option<&str>,
     title_arrows: &std::cell::Cell<Option<TitleArrows>>,
     // content rows + first visible row: click-to-collapse hit mapping
     tx_content: &std::cell::Cell<Option<(ratatui::layout::Rect, usize)>>,
@@ -6792,7 +7240,6 @@ fn render(
     // tick so the markdown cache keys on the real render width
     tx_width: &std::cell::Cell<u16>,
 ) {
-    let header_glyph = sidebar.header_glyph.as_str();
     use ratatui::layout::Constraint::{Length, Min};
     use ratatui::style::{Modifier, Style};
     use ratatui::text::{Line as TuiLine, Span};
@@ -6811,36 +7258,22 @@ fn render(
         Length(1),
         Min(3),
         Length(input_height(input_area_rows(
-            ask,
             picker,
             input,
             input_inner_w(frame.area().width),
         ))),
+        Length(1), // bottom strip: popup buttons + cwd:branch
         Length(1),
     ])
     .split(outer);
-    // wide terminals: the transcript row splits, the sidebar takes a
-    // fixed right column; narrow terminals keep the full-width row.
-    // The threshold reads the raw terminal width, matching
-    // `transcript_width`'s sidebar check.
-    let (tx_area, sb_area) = if frame.area().width >= SIDEBAR_MIN_WIDTH {
-        let cols = ratatui::layout::Layout::horizontal([
-            ratatui::layout::Constraint::Min(0),
-            ratatui::layout::Constraint::Length(SIDEBAR_WIDTH),
-        ])
-        .split(chunks[1]);
-        (cols[0], Some(cols[1]))
-    } else {
-        (chunks[1], None)
-    };
+    let tx_area = chunks[1];
     let tx_inner = tx_area.width.saturating_sub(2);
     // single width authority: the frame's own layout decides the cache
     // and band width — never a tick-side terminal.size() guess
     tx_width.set(tx_inner);
     transcript.set_width(tx_inner);
     // modals center within the transcript pane, one col clear of its
-    // edges: they never touch the sidebar border, the input box, or the
-    // status bar
+    // edges: they never touch the input box or the status bar
     let modal_area = tx_area.inner(ratatui::layout::Margin::new(1, 0));
 
     // ── transcript: cached rows + live region under a scroll window ──
@@ -6913,12 +7346,21 @@ fn render(
     // an empty, idle, fresh transcript opens on a quiet welcome — the
     // first exchange (or a replayed older chat) replaces it
     if total == 0 && !busy && fresh {
-        window = welcome_rows(tx_inner as usize, header_glyph);
+        window = welcome_rows(tx_inner as usize, header_glyph, meters);
     }
-    let title = if pinned {
-        header_glyph.to_string()
-    } else {
-        format!("{header_glyph} · ↑{} above (pgdn/esc)", start)
+    // the title row: the session glyph, plus the auto-generated session
+    // title once the engine names it; scrolled viewports show how much
+    // history sits above
+    let session_title = sidebar
+        .title
+        .as_deref()
+        .filter(|t| !t.is_empty())
+        .map(|t| trunc_cols(t, 48));
+    let title = match (&session_title, pinned) {
+        (Some(t), true) => format!("{header_glyph} {t}"),
+        (Some(t), false) => format!("{header_glyph} {t} · ↑{} above (pgdn/esc)", start),
+        (None, true) => header_glyph.to_string(),
+        (None, false) => format!("{header_glyph} · ↑{} above (pgdn/esc)", start),
     };
     // cells the padded title occupies (one space of air each side)
     let title_cells = title.chars().count() + 2;
@@ -7007,38 +7449,11 @@ fn render(
         );
     }
 
-    // ── sidebar: session · todos · mcp · skills · agents · info ──
-    if let Some(sb) = sb_area {
-        // left border + horizontal padding: content starts two cols in
-        // from the border, one col of air remains at the right edge
-        let rows = sidebar_rows(
-            sidebar,
-            meters,
-            (SIDEBAR_WIDTH - 3) as usize,
-            sb.height as usize,
-            Some((sidebar_zone, sb)),
-        );
-        let widget = Paragraph::new(rows)
-            .block(
-                Block::default()
-                    .borders(Borders::LEFT)
-                    .title(padded_title(header_glyph))
-                    .border_style(crate::palette::BORDER_STYLE)
-                    .padding(ratatui::widgets::Padding::horizontal(1)),
-            )
-            .style(ratatui::style::Style::new().bg(crate::palette::BG_PANEL));
-        frame.render_widget(widget, sb);
-    } else {
-        // no sidebar column: no clickable zones this frame
-        sidebar_zone.set(None);
-    }
     // ── input ─────────────────────────────────────────────────────
-    // a permission ask borrows the box as a form (the draft returns
-    // after the answer); titles carry only structural/draft state —
-    // the action hints live in the status bar
-    let title = if ask.is_some() {
-        "permission".to_string()
-    } else if picker.is_some() {
+    // permission asks render as centered modals; only the /mode
+    // picker borrows the box now. Titles carry only structural/draft
+    // state — the action hints live in the status bar
+    let title = if picker.is_some() {
         "mode".to_string()
     } else if let Some(q) = rsearch {
         format!("input · {q}")
@@ -7056,7 +7471,7 @@ fn render(
     // window ends at the cursor's visual row and the terminal cursor
     // rides its offset inside that window
     let (draft_window, cursor_vis): (Option<Vec<TuiLine>>, Option<(usize, usize)>) =
-        if ask.is_none() && picker.is_none() {
+        if picker.is_none() {
             let inner_w = chunks[2].width.saturating_sub(4) as usize; // borders + padding
             let rows = wrap_rows(input, inner_w);
             let cur_row = visual_cursor_row(&rows, cursor);
@@ -7076,29 +7491,7 @@ fn render(
         } else {
             (None, None)
         };
-    let body: Vec<TuiLine> = if let Some(ask) = ask {
-        // question text, then one options row: the selected option is
-        // inverse video, every option carries a single leading space so
-        // the text never shifts when the selection moves
-        let question_lines = ask.question.split('\n').count();
-        let budget = ask_detail_budget(question_lines);
-        let mut rows = vec![TuiLine::from(ask.question.as_str())];
-        if budget > 0 {
-            if let Some(detail) = &ask.detail {
-                rows.extend(ask_detail_rows(detail, budget));
-            }
-        }
-        let mut opts: Vec<Span> = Vec::new();
-        for (i, opt) in ask.options.iter().enumerate() {
-            if i == ask.selected {
-                opts.push(Span::styled(format!(" {opt}"), selection_style()));
-            } else {
-                opts.push(Span::raw(format!(" {opt}")));
-            }
-        }
-        rows.push(TuiLine::from(opts));
-        rows
-    } else if let Some(pk) = picker {
+    let body: Vec<TuiLine> = if let Some(pk) = picker {
         // one row per tier: the selected row is a full-width inverse
         // bar, the label column stays padded so descriptions align, and
         // unselected descriptions ride along in DIM
@@ -7132,17 +7525,108 @@ fn render(
         )
         .style(ratatui::style::Style::new().bg(crate::palette::BG_PANEL));
     frame.render_widget(input_widget, chunks[2]);
-    if let (Some(_), Some((row_off, col))) = (&draft_window, cursor_vis) {
-        let area = chunks[2];
-        frame.set_cursor_position((
-            area.x + 2 + col as u16,
-            area.y + 1 + row_off.min(area.height.saturating_sub(2) as usize) as u16,
-        ));
+    // the hardware cursor only rides the draft when it can actually
+    // follow keystrokes (an open ask captures input into its dialog)
+    if ask.is_none() {
+        if let (Some(_), Some((row_off, col))) = (&draft_window, cursor_vis) {
+            let area = chunks[2];
+            frame.set_cursor_position((
+                area.x + 2 + col as u16,
+                area.y + 1 + row_off.min(area.height.saturating_sub(2) as usize) as u16,
+            ));
+        }
+    }
+
+    // ── bottom strip: popup buttons left, cwd:branch right ──────────
+    // capture mode makes the buttons clickable; native mode uses the
+    // keyboard shortcuts printed on them (terminals only deliver clicks
+    // under mouse reporting)
+    {
+        // one span per button: bright label + faint key hint
+        let btn = |label: &str, key: &str| {
+            (
+                Span::styled(
+                    format!(" {label}"),
+                    ratatui::style::Style::new()
+                        .fg(crate::palette::FG_STRONG)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(format!(" {key} "), crate::palette::FAINT),
+            )
+        };
+        let (t, s, i) = (
+            btn("todos", "alt+o"),
+            btn("skills", "^t"),
+            btn("info", "alt+i"),
+        );
+        let sep = Span::styled(" │ ", crate::palette::BORDER_QUIET_STYLE);
+        let span_w = |s: &Span| unicode_width::UnicodeWidthStr::width(s.content.as_ref()) as u16;
+        let (tw, sw, iw) = (
+            span_w(&t.0) + span_w(&t.1),
+            span_w(&s.0) + span_w(&s.1),
+            span_w(&i.0) + span_w(&i.1),
+        );
+        let sep_w: u16 = 3;
+        let x0 = chunks[3].x + 1;
+        let x1 = x0 + tw + sep_w;
+        let x2 = x1 + sw + sep_w;
+        let right = match &sidebar.branch {
+            Some(b) => format!("{}:{b}", sidebar.cwd),
+            None => sidebar.cwd.clone(),
+        };
+        let w = unicode_width::UnicodeWidthStr::width;
+        let used = 1 + (tw + sep_w + sw + sep_w + iw) as usize;
+        let gap = (chunks[3].width as usize)
+            .saturating_sub(used + w(right.as_str()) + 1)
+            .max(1);
+        let spans = vec![
+            Span::raw(" "),
+            t.0,
+            t.1,
+            sep.clone(),
+            s.0,
+            s.1,
+            sep,
+            i.0,
+            i.1,
+            Span::raw(" ".repeat(gap)),
+            Span::styled(right, crate::palette::FAINT),
+        ];
+        strip_zone.set(Some(StripZones {
+            todos: ratatui::layout::Rect {
+                x: x0,
+                y: chunks[3].y,
+                width: tw,
+                height: 1,
+            },
+            skills: ratatui::layout::Rect {
+                x: x1,
+                y: chunks[3].y,
+                width: sw,
+                height: 1,
+            },
+            info: ratatui::layout::Rect {
+                x: x2,
+                y: chunks[3].y,
+                width: iw,
+                height: 1,
+            },
+        }));
+        frame.render_widget(
+            Paragraph::new(ratatui::text::Line::from(spans))
+                .style(ratatui::style::Style::new().bg(crate::palette::BG_PANEL)),
+            chunks[3],
+        );
     }
 
     // ── status bar: contextual key hints left, meters right ───────
     let hints: Vec<Span<'static>> = if ask.is_some() {
-        hint_spans(&[(" ↑↓", "select"), (" ⏎", "confirm"), (" esc", "deny")])
+        hint_spans(&[
+            (" ↑↓", "select"),
+            (" 1-9", "pick"),
+            (" ⏎", "confirm"),
+            (" esc", "deny"),
+        ])
     } else if picker.is_some() {
         hint_spans(&[
             (" ↑↓", "select"),
@@ -7200,6 +7684,9 @@ fn render(
                 }
             }
             Modal::Usage { .. } => hint_spans(&[(" any", "close")]),
+            Modal::Todos { .. } | Modal::Skills { .. } | Modal::Info { .. } => {
+                hint_spans(&[(" any", "close")])
+            }
             Modal::Context { .. } => hint_spans(&[(" esc", "close")]),
             Modal::Tasks { .. } => {
                 hint_spans(&[(" ↑↓", "choose"), (" ⏎", "page result"), (" esc", "close")])
@@ -7220,29 +7707,38 @@ fn render(
         hint_spans(&[(" ctrl+r", "next"), (" ⏎", "accept"), (" esc", "cancel")])
     } else if busy {
         hint_spans(&[(" enter", "interject"), (" +", "defer"), (" esc", "abort")])
+    } else if mouse_captured {
+        hint_spans(&[
+            (" enter", "send"),
+            (" /", "commands"),
+            (" ⇧drag", "select"),
+            (" ^p/^n", "history"),
+        ])
     } else {
         hint_spans(&[
             (" enter", "send"),
             (" /", "commands"),
-            (" ^p/^n", "prompts"),
+            (" drag", "select · ↑↓ scroll"),
+            (" ^p/^n", "history"),
         ])
     };
     let right = status_right(meters);
     let w = unicode_width::UnicodeWidthStr::width;
     let left_cols: usize = hints.iter().map(|s| w(s.content.as_ref())).sum();
+    let right_cols: usize = right.iter().map(|s| w(s.content.as_ref())).sum();
     // one leading + one trailing col of air: the left zone starts a col
     // in, the right zone ends a col before the chunk edge
-    let pad = chunks[3]
+    let pad = chunks[4]
         .width
         .saturating_sub(2)
-        .saturating_sub((left_cols + w(right.as_str())) as u16)
+        .saturating_sub((left_cols + right_cols) as u16)
         .max(1) as usize;
     let mut bar: Vec<Span<'static>> = vec![Span::raw(" ")];
     bar.extend(hints);
     bar.push(Span::raw(" ".repeat(pad)));
-    bar.push(Span::styled(right, crate::palette::META));
+    bar.extend(right);
     bar.push(Span::raw(" "));
-    frame.render_widget(Paragraph::new(TuiLine::from(bar)), chunks[3]);
+    frame.render_widget(Paragraph::new(TuiLine::from(bar)), chunks[4]);
 
     // ── slash autocomplete popup (above input) ────────────────────
     if let Some(popup) = popup {
@@ -7271,13 +7767,7 @@ fn render(
             }
         }
         let widget = Paragraph::new(text)
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title(padded_title("commands"))
-                    .border_style(crate::palette::BORDER_STYLE)
-                    .padding(ratatui::widgets::Padding::horizontal(1)),
-            )
+            .block(modal_frame("commands").padding(ratatui::widgets::Padding::horizontal(1)))
             .style(ratatui::style::Style::new().bg(crate::palette::BG_SURFACE))
             .wrap(Wrap { trim: false });
         frame.render_widget(widget, rect);
@@ -7315,10 +7805,7 @@ fn render(
         }
         let widget = Paragraph::new(text)
             .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title(padded_title(if path.mentions { "files" } else { "path" }))
-                    .border_style(crate::palette::BORDER_STYLE)
+                modal_frame(if path.mentions { "files" } else { "path" })
                     .padding(ratatui::widgets::Padding::horizontal(1)),
             )
             .style(ratatui::style::Style::new().bg(crate::palette::BG_SURFACE))
@@ -7357,13 +7844,7 @@ fn render(
                     }
                 }
                 let widget = Paragraph::new(text)
-                    .block(
-                        Block::default()
-                            .borders(Borders::ALL)
-                            .title(padded_title("sessions"))
-                            .border_style(crate::palette::BORDER_STYLE)
-                            .padding(ratatui::widgets::Padding::new(1, 1, 1, 1)),
-                    )
+                    .block(modal_frame("sessions"))
                     .style(ratatui::style::Style::new().bg(crate::palette::BG_SURFACE))
                     .wrap(Wrap { trim: false });
                 frame.render_widget(widget, rect);
@@ -7374,7 +7855,7 @@ fn render(
                 // canvas (not a bare wipe) keeps the warm ground intact
                 frame.render_widget(Block::new().style(crate::palette::CANVAS), frame.area());
                 let height = 10u16.min(frame.area().height.saturating_sub(2));
-                let width = 64.min(frame.area().width);
+                let width = 68.min(frame.area().width);
                 let rect = centered(width, height, modal_area);
                 // wipe the covered cells first: the paragraph only paints
                 // its own text, and the transcript would bleed through
@@ -7408,77 +7889,21 @@ fn render(
                     Span::styled("▌", crate::palette::ACCENT_STYLE),
                 ]));
                 let widget = Paragraph::new(text)
-                    .block(
-                        Block::default()
-                            .borders(Borders::ALL)
-                            .title(padded_title("api key"))
-                            .border_style(crate::palette::BORDER_STYLE)
-                            .padding(ratatui::widgets::Padding::new(1, 1, 1, 1)),
-                    )
+                    .block(modal_frame("api key"))
                     .style(ratatui::style::Style::new().bg(crate::palette::BG_SURFACE))
                     .wrap(Wrap { trim: false });
                 frame.render_widget(widget, rect);
             }
             Modal::Help => {
                 let height = 34u16.min(frame.area().height.saturating_sub(2));
-                let width = 66.min(frame.area().width);
+                let width = 80.min(frame.area().width);
                 let rect = centered(width, height, modal_area);
                 // wipe the covered cells first: the paragraph only paints
                 // its own text, and the transcript would bleed through
                 frame.render_widget(ratatui::widgets::Clear, rect);
-                let keys = vec![
-                    ("Enter", "send · interject mid-turn"),
-                    ("Esc / Ctrl-C", "abort turn · close overlays · unpin scroll"),
-                    ("Ctrl+C", "quit (abort the running turn first)"),
-                    (
-                        "⇧drag",
-                        "terminal-native text selection (bypasses wheel capture)",
-                    ),
-                    ("Ctrl+T", "fold skills"),
-                    ("Alt+T", "expand/collapse thinking"),
-                    ("PgUp / PgDn", "scroll the transcript"),
-                    ("↑ ↓", "history · navigate pickers"),
-                    ("Tab", "complete slash command"),
-                    ("@path + Tab", "complete any file in the project"),
-                    ("/find <text>", "search the transcript · bare repeats"),
-                    ("/spills", "browse spill files in $PAGER"),
-                    ("Alt+←/→", "word jump"),
-                    ("Ctrl+U/K/W", "kill to line start/end · word"),
-                    ("Ctrl+Y", "yank"),
-                    ("Ctrl+Z", "undo"),
-                    ("Ctrl+L", "clear screen"),
-                ];
-                let mut text = Vec::new();
-                for (k, v) in keys {
-                    text.push(TuiLine::from(vec![
-                        Span::styled(format!("{k:<12} "), crate::palette::ACCENT_STYLE),
-                        Span::styled(v.to_string(), ratatui::style::Style::default()),
-                    ]));
-                }
-                text.push(TuiLine::default());
-                text.push(TuiLine::styled(
-                    "commands:",
-                    ratatui::style::Style::default(),
-                ));
-                text.push(TuiLine::from(Span::styled(
-                    "custom commands: .ka/commands/*.md (project, trust-gated) or \
-~/.config/ka/commands/*.md; body supports $ARGUMENTS",
-                    ratatui::style::Style::default().fg(crate::palette::META),
-                )));
-                for (name, desc) in available_slash_commands() {
-                    text.push(TuiLine::from(vec![
-                        Span::styled(format!("{name:<12} "), crate::palette::ACCENT_STYLE),
-                        Span::styled(desc, ratatui::style::Style::default()),
-                    ]));
-                }
+                let text = help_modal_rows();
                 let widget = Paragraph::new(text)
-                    .block(
-                        Block::default()
-                            .borders(Borders::ALL)
-                            .title(padded_title("help"))
-                            .border_style(crate::palette::BORDER_STYLE)
-                            .padding(ratatui::widgets::Padding::new(1, 1, 1, 1)),
-                    )
+                    .block(modal_frame("help"))
                     .style(ratatui::style::Style::new().bg(crate::palette::BG_SURFACE))
                     .wrap(Wrap { trim: false });
                 frame.render_widget(widget, rect);
@@ -7562,18 +7987,12 @@ fn render(
                     }
                 }
                 let widget = Paragraph::new(text)
-                    .block(
-                        Block::default()
-                            .borders(Borders::ALL)
-                            .title(padded_title(
-                                picker
-                                    .vendor
-                                    .as_ref()
-                                    .map_or("model".to_string(), |v| format!("model · {v}")),
-                            ))
-                            .border_style(crate::palette::BORDER_STYLE)
-                            .padding(ratatui::widgets::Padding::new(1, 1, 1, 1)),
-                    )
+                    .block(modal_frame(
+                        picker
+                            .vendor
+                            .as_ref()
+                            .map_or("model".to_string(), |v| format!("model · {v}")),
+                    ))
                     .style(ratatui::style::Style::new().bg(crate::palette::BG_SURFACE))
                     .wrap(Wrap { trim: false });
                 frame.render_widget(widget, rect);
@@ -7620,13 +8039,7 @@ fn render(
                     ));
                 }
                 let widget = Paragraph::new(text)
-                    .block(
-                        Block::default()
-                            .borders(Borders::ALL)
-                            .title(padded_title("providers"))
-                            .border_style(crate::palette::BORDER_STYLE)
-                            .padding(ratatui::widgets::Padding::new(1, 1, 1, 1)),
-                    )
+                    .block(modal_frame("providers"))
                     .style(ratatui::style::Style::new().bg(crate::palette::BG_SURFACE))
                     .wrap(Wrap { trim: false });
                 frame.render_widget(widget, rect);
@@ -7635,7 +8048,7 @@ fn render(
                 // border(2) + vertical padding(2) + the ROWS/provider rows
                 let height = (SettingsPanel::ROWS + panel.providers.len() + 7) as u16;
                 let height = height.min(frame.area().height.saturating_sub(2));
-                let width = 72.min(frame.area().width);
+                let width = 80.min(frame.area().width);
                 let rect = centered(width, height, modal_area);
                 // wipe the covered cells first: the paragraph only paints
                 // its own text, and the transcript would bleed through
@@ -7722,18 +8135,12 @@ fn render(
                 }
                 if !rest.is_empty() {
                     text.push(TuiLine::styled(
-                        format!("  +{} more (see `ka providers`)", rest.len()),
+                        format!("… +{} more", rest.len()),
                         crate::palette::META,
                     ));
                 }
                 let widget = Paragraph::new(text)
-                    .block(
-                        Block::default()
-                            .borders(Borders::ALL)
-                            .title(padded_title("settings"))
-                            .border_style(crate::palette::BORDER_STYLE)
-                            .padding(ratatui::widgets::Padding::new(1, 1, 1, 1)),
-                    )
+                    .block(modal_frame("settings"))
                     .style(ratatui::style::Style::new().bg(crate::palette::BG_SURFACE))
                     .wrap(Wrap { trim: false });
                 frame.render_widget(widget, rect);
@@ -7769,13 +8176,7 @@ fn render(
                     }
                 }
                 let widget = Paragraph::new(text)
-                    .block(
-                        Block::default()
-                            .borders(Borders::ALL)
-                            .title(padded_title("spills"))
-                            .border_style(crate::palette::BORDER_STYLE)
-                            .padding(ratatui::widgets::Padding::new(1, 1, 1, 1)),
-                    )
+                    .block(modal_frame("spills"))
                     .style(ratatui::style::Style::new().bg(crate::palette::BG_SURFACE))
                     .wrap(Wrap { trim: false });
                 frame.render_widget(widget, rect);
@@ -7810,13 +8211,7 @@ fn render(
                     }
                 }
                 let widget = Paragraph::new(text)
-                    .block(
-                        Block::default()
-                            .borders(Borders::ALL)
-                            .title(padded_title("prompts"))
-                            .border_style(crate::palette::BORDER_STYLE)
-                            .padding(ratatui::widgets::Padding::new(1, 1, 1, 1)),
-                    )
+                    .block(modal_frame("prompts"))
                     .style(ratatui::style::Style::new().bg(crate::palette::BG_SURFACE))
                     .wrap(Wrap { trim: false });
                 frame.render_widget(widget, rect);
@@ -7849,13 +8244,7 @@ fn render(
                     }
                 }
                 let widget = Paragraph::new(text)
-                    .block(
-                        Block::default()
-                            .borders(Borders::ALL)
-                            .title(padded_title("tasks — ⏎ pages a task result"))
-                            .border_style(crate::palette::BORDER_STYLE)
-                            .padding(ratatui::widgets::Padding::new(1, 1, 1, 1)),
-                    )
+                    .block(modal_frame("tasks — ⏎ pages a task result"))
                     .style(ratatui::style::Style::new().bg(crate::palette::BG_SURFACE))
                     .wrap(Wrap { trim: false });
                 frame.render_widget(widget, rect);
@@ -7875,13 +8264,7 @@ fn render(
                     body.push(TuiLine::raw((*line).to_string()));
                 }
                 let widget = Paragraph::new(body)
-                    .block(
-                        Block::default()
-                            .borders(Borders::ALL)
-                            .title(padded_title(format!("task t-{id}")))
-                            .border_style(crate::palette::BORDER_STYLE)
-                            .padding(ratatui::widgets::Padding::new(1, 1, 1, 1)),
-                    )
+                    .block(modal_frame(format!("task t-{id}")))
                     .style(ratatui::style::Style::new().bg(crate::palette::BG_SURFACE))
                     .wrap(Wrap { trim: false });
                 frame.render_widget(widget, rect);
@@ -7900,13 +8283,7 @@ fn render(
                     body.push(TuiLine::styled(row.clone(), crate::palette::META));
                 }
                 let widget = Paragraph::new(body)
-                    .block(
-                        Block::default()
-                            .borders(Borders::ALL)
-                            .title(padded_title("debug sessions"))
-                            .border_style(crate::palette::BORDER_STYLE)
-                            .padding(ratatui::widgets::Padding::new(1, 1, 1, 1)),
-                    )
+                    .block(modal_frame("debug sessions"))
                     .style(ratatui::style::Style::new().bg(crate::palette::BG_SURFACE))
                     .wrap(Wrap { trim: false });
                 frame.render_widget(widget, rect);
@@ -7927,8 +8304,7 @@ fn render(
                 )];
                 let cap = (height as usize).saturating_sub(5);
                 for (i, (turns, prompt)) in items.iter().enumerate().take(cap.max(1)) {
-                    let marker = if i == *selected { "▶ " } else { "  " };
-                    let mut row = format!("{marker}[−{turns}] {prompt}");
+                    let mut row = format!("[−{turns}] {prompt}");
                     if row.chars().count() > inner_w {
                         row = row
                             .chars()
@@ -7936,21 +8312,16 @@ fn render(
                             .collect::<String>()
                             + "…";
                     }
+                    // the one selection idiom: the full-row pink bar
                     let style = if i == *selected {
-                        crate::palette::FG_STRONG
+                        selection_style()
                     } else {
-                        crate::palette::META
+                        ratatui::style::Style::new().fg(crate::palette::META)
                     };
                     text.push(TuiLine::styled(pad_to_width(row, inner_w), style));
                 }
                 let widget = Paragraph::new(text)
-                    .block(
-                        Block::default()
-                            .borders(Borders::ALL)
-                            .title(padded_title("rewind"))
-                            .border_style(crate::palette::BORDER_STYLE)
-                            .padding(ratatui::widgets::Padding::new(1, 1, 1, 1)),
-                    )
+                    .block(modal_frame("rewind"))
                     .style(ratatui::style::Style::new().bg(crate::palette::BG_SURFACE))
                     .wrap(Wrap { trim: false });
                 frame.render_widget(widget, rect);
@@ -7962,7 +8333,7 @@ fn render(
             } => {
                 let extra = if inbox.is_empty() { 0 } else { inbox.len() + 2 };
                 let height = (rows.len() as u16 + extra as u16 + 4).clamp(6, 24);
-                let width = 72.min(frame.area().width);
+                let width = 80.min(frame.area().width);
                 let rect = centered(width, height, modal_area);
                 // wipe the covered cells first: the paragraph only paints
                 // its own text, and the transcript would bleed through
@@ -7997,31 +8368,67 @@ fn render(
                             break;
                         }
                         budget -= 1;
-                        let marker = if i == *selected { "▶ " } else { "  " };
-                        let row = format!("{marker}{line}");
                         let style = if i == *selected {
-                            crate::palette::FG_STRONG
+                            selection_style()
                         } else {
-                            crate::palette::META
+                            ratatui::style::Style::new().fg(crate::palette::META)
                         };
-                        text.push(TuiLine::styled(pad_to_width(row, inner_w), style));
+                        text.push(TuiLine::styled(pad_to_width(line.clone(), inner_w), style));
                     }
                 }
                 let widget = Paragraph::new(text)
-                    .block(
-                        Block::default()
-                            .borders(Borders::ALL)
-                            .title(padded_title("memory"))
-                            .border_style(crate::palette::BORDER_STYLE)
-                            .padding(ratatui::widgets::Padding::new(1, 1, 1, 1)),
-                    )
+                    .block(modal_frame("memory"))
+                    .style(ratatui::style::Style::new().bg(crate::palette::BG_SURFACE))
+                    .wrap(Wrap { trim: false });
+                frame.render_widget(widget, rect);
+            }
+            Modal::Todos { rows } | Modal::Skills { rows } | Modal::Info { rows } => {
+                let (title, rows) = match open {
+                    Modal::Todos { rows } => ("todos", rows),
+                    Modal::Skills { rows } => ("skills · agents · mcp", rows),
+                    _ => ("info", rows),
+                };
+                let height = (rows.len() as u16 + 4).clamp(6, 24);
+                let width = 80.min(frame.area().width);
+                let rect = centered(width, height, modal_area);
+                frame.render_widget(ratatui::widgets::Clear, rect);
+                let inner_w = width.saturating_sub(4) as usize;
+                let mut text = Vec::new();
+                let cap = (height as usize).saturating_sub(4);
+                for row in rows.iter().take(cap) {
+                    let plain: String = row.spans.iter().map(|s| s.content.clone()).collect();
+                    // section headers keep their accent; everything else
+                    // renders plain
+                    if plain == "skills" || plain == "agents" || plain == "mcp" {
+                        text.push(TuiLine::styled(
+                            pad_to_width(plain, inner_w),
+                            crate::palette::META,
+                        ));
+                    } else {
+                        text.push(TuiLine::from(
+                            row.spans
+                                .iter()
+                                .map(|s| Span::styled(s.content.clone(), s.style))
+                                .collect::<Vec<_>>(),
+                        ));
+                    }
+                }
+                let more = rows.len().saturating_sub(cap);
+                if more > 0 {
+                    text.push(TuiLine::styled(
+                        format!("… +{more} more"),
+                        crate::palette::META,
+                    ));
+                }
+                let widget = Paragraph::new(text)
+                    .block(modal_frame(title))
                     .style(ratatui::style::Style::new().bg(crate::palette::BG_SURFACE))
                     .wrap(Wrap { trim: false });
                 frame.render_widget(widget, rect);
             }
             Modal::Usage { rows } => {
                 let height = (rows.len() as u16 + 4).clamp(6, 24);
-                let width = 72.min(frame.area().width);
+                let width = 80.min(frame.area().width);
                 let rect = centered(width, height, modal_area);
                 // wipe the covered cells first: the paragraph only paints
                 // its own text, and the transcript would bleed through
@@ -8040,20 +8447,14 @@ fn render(
                     }
                 }
                 let widget = Paragraph::new(text)
-                    .block(
-                        Block::default()
-                            .borders(Borders::ALL)
-                            .title(padded_title("usage"))
-                            .border_style(crate::palette::BORDER_STYLE)
-                            .padding(ratatui::widgets::Padding::new(1, 1, 1, 1)),
-                    )
+                    .block(modal_frame("usage"))
                     .style(ratatui::style::Style::new().bg(crate::palette::BG_SURFACE))
                     .wrap(Wrap { trim: false });
                 frame.render_widget(widget, rect);
             }
             Modal::Context { rows } => {
                 let height = (rows.len() as u16 + 4).clamp(6, 24);
-                let width = 72.min(frame.area().width);
+                let width = 80.min(frame.area().width);
                 let rect = centered(width, height, modal_area);
                 // wipe the covered cells first: the paragraph only paints
                 // its own text, and the transcript would bleed through
@@ -8072,13 +8473,7 @@ fn render(
                     }
                 }
                 let widget = Paragraph::new(text)
-                    .block(
-                        Block::default()
-                            .borders(Borders::ALL)
-                            .title(padded_title("context"))
-                            .border_style(crate::palette::BORDER_STYLE)
-                            .padding(ratatui::widgets::Padding::new(1, 1, 1, 1)),
-                    )
+                    .block(modal_frame("context"))
                     .style(ratatui::style::Style::new().bg(crate::palette::BG_SURFACE))
                     .wrap(Wrap { trim: false });
                 frame.render_widget(widget, rect);
@@ -8120,18 +8515,62 @@ fn render(
                     }
                 }
                 let widget = Paragraph::new(text)
-                    .block(
-                        Block::default()
-                            .borders(Borders::ALL)
-                            .title(padded_title("tree"))
-                            .border_style(crate::palette::BORDER_STYLE)
-                            .padding(ratatui::widgets::Padding::new(1, 1, 1, 1)),
-                    )
+                    .block(modal_frame("tree"))
                     .style(ratatui::style::Style::new().bg(crate::palette::BG_SURFACE))
                     .wrap(Wrap { trim: false });
                 frame.render_widget(widget, rect);
             }
         }
+    }
+
+    // ── permission ask: a real dialog, layered above everything ────
+    // the safety-critical surface gets the modal treatment: warned
+    // border, bold question, budgeted detail, numbered options on the
+    // pink selection bar. The input box renders normally underneath.
+    if let Some(ask) = ask {
+        let width = 80.min(frame.area().width);
+        let inner_w = width.saturating_sub(4) as usize;
+        let body = ask_modal_body(ask, inner_w);
+        let height = (body.len() as u16 + 4).clamp(5, modal_area.height.max(5));
+        let rect = centered(width, height, modal_area);
+        // wipe the covered cells first: the paragraph only paints
+        // its own text, and the transcript would bleed through
+        frame.render_widget(ratatui::widgets::Clear, rect);
+        let widget = Paragraph::new(body)
+            .block(
+                modal_frame("permission")
+                    .border_style(ratatui::style::Style::new().fg(crate::palette::WARN)),
+            )
+            .style(ratatui::style::Style::new().bg(crate::palette::BG_SURFACE))
+            .wrap(Wrap { trim: false });
+        frame.render_widget(widget, rect);
+    }
+
+    // ── toast: transient action feedback over the transcript tail ──
+    if let Some(msg) = toast {
+        use unicode_width::UnicodeWidthStr;
+        let w = (msg.width() as u16 + 4)
+            .min(tx_area.width.saturating_sub(4))
+            .max(1);
+        let text = if msg.width() as u16 > w.saturating_sub(4) {
+            format!(" {}", trunc_cols(msg, w.saturating_sub(5) as usize))
+        } else {
+            format!(" {msg}")
+        };
+        let rect = ratatui::layout::Rect {
+            x: tx_area.x + (tx_area.width.saturating_sub(w)) / 2,
+            y: tx_area.y + tx_area.height.saturating_sub(1),
+            width: w,
+            height: 1,
+        };
+        frame.render_widget(ratatui::widgets::Clear, rect);
+        let bar = TuiLine::from(vec![Span::styled(
+            pad_to_width(text, w.saturating_sub(1) as usize),
+            ratatui::style::Style::new()
+                .fg(crate::palette::ACCENT)
+                .bg(crate::palette::BG_PANEL),
+        )]);
+        frame.render_widget(Paragraph::new(bar), rect);
     }
 }
 
@@ -8329,6 +8768,157 @@ fn tree_modal_rows(
         targets.push(id.clone());
     }
     (items, targets)
+}
+
+/// The one modal frame: rounded borders on the surface background with
+/// the muted padded title — every overlay speaks this dialect, so a
+/// corner never changes shape between popups.
+fn modal_frame(title: impl Into<String>) -> ratatui::widgets::Block<'static> {
+    ratatui::widgets::Block::default()
+        .borders(ratatui::widgets::Borders::ALL)
+        .border_type(ratatui::widgets::BorderType::Rounded)
+        .title(padded_title(title))
+        .border_style(crate::palette::BORDER_STYLE)
+        .padding(ratatui::widgets::Padding::new(1, 1, 1, 1))
+        .style(ratatui::style::Style::new().bg(crate::palette::BG_SURFACE))
+}
+
+/// Rows of the /help overlay: the full key table, then commands grouped
+/// by what they touch. `{key or /name:<14} {desc}` per row.
+fn help_modal_rows() -> Vec<ratatui::text::Line<'static>> {
+    use ratatui::text::{Line as TuiLine, Span};
+    let key_style = crate::palette::ACCENT_STYLE;
+    let dim = ratatui::style::Style::default().fg(crate::palette::META);
+    let mut text = Vec::new();
+    fn section(text: &mut Vec<TuiLine<'static>>, name: &str) {
+        text.push(TuiLine::styled(
+            format!("▸ {name}"),
+            crate::palette::ACCENT_BOLD,
+        ));
+    }
+    fn rows(
+        text: &mut Vec<TuiLine<'static>>,
+        pairs: &[(&str, &str)],
+        key_style: ratatui::style::Style,
+    ) {
+        for (k, v) in pairs {
+            let desc: String = v.chars().take(44).collect();
+            text.push(TuiLine::from(vec![
+                Span::styled(format!("{k:<14} "), key_style),
+                Span::styled(desc.to_string(), ratatui::style::Style::default()),
+            ]));
+        }
+    }
+    section(&mut text, "keys");
+    let keys: &[(&str, &str)] = &[
+        ("enter", "send · interject mid-turn"),
+        ("⇧⏎ / ctrl+j", "newline in the draft"),
+        ("+text", "defer until the turn ends"),
+        ("!cmd", "run a shell command directly"),
+        ("esc", "close popups & modals · unpin scroll"),
+        ("esc (busy)", "abort the running turn"),
+        ("esc esc", "rewind menu (empty input)"),
+        ("ctrl+c", "quit · clear draft · twice to exit"),
+        ("↑ ↓", "prompt history · navigate pickers"),
+        ("ctrl+p / ctrl+n", "prompt history"),
+        ("ctrl+q", "recall the last queued item"),
+        ("ctrl+r", "search the transcript"),
+        ("ctrl+o", "expand/collapse the last tool call"),
+        ("ctrl+m", "toggle mouse capture ⇄ native"),
+        ("ctrl+t / alt+o / alt+i", "popups: skills · todos · info"),
+        ("alt+t", "fold/unfold thinking"),
+        ("alt+e", "edit the draft in $EDITOR"),
+        ("ctrl+↑ / ctrl+↓", "jump between your messages"),
+        ("pgup / pgdn", "scroll the transcript"),
+        ("tab", "complete slash command or path"),
+        ("1-9", "pick a row in pickers & asks"),
+        ("ctrl+l", "clear screen"),
+        ("ctrl+u/k/w · y · z", "kill to start/end/word · yank · undo"),
+    ];
+    rows(&mut text, keys, key_style);
+    text.push(TuiLine::default());
+    section(&mut text, "session");
+    rows(
+        &mut text,
+        &[
+            ("/session", "pick a session to resume"),
+            ("/resume", "alias for /session"),
+            ("/new", "start a fresh session"),
+            ("/fork", "fork into a copy [turns to drop]"),
+            ("/tree", "current session's fork tree"),
+            ("/rewind", "drop the last N exchanges"),
+            ("/undo", "restore the last edited file"),
+            ("/checkpoint", "snapshot the working tree (git)"),
+            ("/restore", "restore a checkpoint [id | list]"),
+            ("/export", "save this session to markdown [path]"),
+            ("/compact", "digest the context now"),
+            ("/retry", "resend the last prompt"),
+        ],
+        key_style,
+    );
+    text.push(TuiLine::default());
+    section(&mut text, "model & providers");
+    rows(
+        &mut text,
+        &[
+            ("/model", "pick a model"),
+            ("/mode", "pick a permission mode"),
+            ("/key", "set an api key for the current model"),
+            ("/provider", "connect a provider (api key)"),
+            ("/settings", "settings & provider status"),
+        ],
+        key_style,
+    );
+    text.push(TuiLine::default());
+    section(&mut text, "tools & context");
+    rows(
+        &mut text,
+        &[
+            ("/tasks", "background tasks — ⏎ pages a result"),
+            ("/debug", "live debug sessions"),
+            ("/mcp", "refresh MCP tool lists (/mcp refresh)"),
+            ("/prompt", "run an MCP prompt"),
+            ("/spills", "browse spilled tool output"),
+            ("/context", "context usage breakdown"),
+            ("/usage", "usage & cost: session + recent"),
+            ("/find", "search the transcript: /find <text>"),
+            ("/copy", "copy the last reply (OSC52)"),
+            ("/clip", "attach a clipboard image"),
+            ("/image", "attach an image [path]"),
+        ],
+        key_style,
+    );
+    text.push(TuiLine::default());
+    section(&mut text, "safety & plans");
+    rows(
+        &mut text,
+        &[
+            ("/plan", "research the task, draft the plan"),
+            ("/build", "implement the plan file"),
+            ("/review", "read-only review of changes [base]"),
+            ("/approve", "review the plan file, then build"),
+            ("/memory", "show loaded MEMORY.md tiers"),
+        ],
+        key_style,
+    );
+    text.push(TuiLine::default());
+    section(&mut text, "meta");
+    rows(
+        &mut text,
+        &[
+            ("/help", "commands and key bindings"),
+            ("/agents", "list available agents"),
+            ("/quit", "exit"),
+        ],
+        key_style,
+    );
+    text.push(TuiLine::default());
+    text.push(TuiLine::from(Span::styled(
+        "custom commands: .ka/commands/*.md (project, trust-gated) or \
+~/.config/ka/commands/*.md; body supports $ARGUMENTS",
+        dim,
+    )));
+    text
 }
 
 fn centered(width: u16, height: u16, area: ratatui::layout::Rect) -> ratatui::layout::Rect {
@@ -9070,13 +9660,17 @@ mod tests {
         let mut t = Transcript::default();
         t.set_width(40);
         t.push(Line::User("hello".into()));
-        t.push(Line::Note("note".into()));
-        t.push(Line::Tool("→ read".into()));
-        assert_eq!(t.render_passes(), 3, "one pass per pushed entry");
+        t.push(Line::Info("note".into()));
+        t.push_tool_call(ToolCall {
+            head: "→ read".into(),
+            ..no_note_call()
+        });
+        // push_tool_call lands via push_separated: one air row + the row
+        assert_eq!(t.render_passes(), 4, "one pass per pushed entry");
         t.set_width(40); // same width: no rebuild
-        assert_eq!(t.render_passes(), 3, "same width must not re-render");
+        assert_eq!(t.render_passes(), 4, "same width must not re-render");
         t.set_width(72); // resize: one pass per entry again
-        assert_eq!(t.render_passes(), 6, "resize rebuilds the cache");
+        assert_eq!(t.render_passes(), 8, "resize rebuilds the cache");
         assert!(t.total_rows() > 0);
         assert!(t.row(0).is_some());
         assert!(t.row(t.total_rows()).is_none());
@@ -9138,12 +9732,12 @@ mod tests {
     }
     #[test]
     fn visible_rows_carves_out_chrome() {
-        // top margin + input area + footer + transcript top border
-        assert_eq!(visible_rows(24, 3), 18);
+        // top margin + input area + strip + footer + transcript top border
+        assert_eq!(visible_rows(24, 3), 17);
         assert_eq!(visible_rows(5, 3), 0, "never underflows");
         assert_eq!(visible_rows(0, 0), 0);
         // growth of the input eats the viewport one row at a time
-        assert_eq!(visible_rows(24, 8), 13);
+        assert_eq!(visible_rows(24, 8), 12);
     }
 
     #[test]
@@ -9361,9 +9955,89 @@ mod tests {
             "/retry",
             "/copy",
             "/usage",
+            // dispatchable all along, now cataloged too
+            "/image",
+            "/agents",
         ] {
             assert!(names.contains(&want.to_string()), "missing {want}");
         }
+        // customs are named like any slash command, so the popup
+        // prefix-filter matches and Tab inserts a usable command
+        assert!(
+            names.iter().all(|n| n.starts_with('/')),
+            "every catalog entry is a /command: {names:?}"
+        );
+        // popup filter serves /he → /help (prefix match over the names)
+        let popup = update_suggestions("/he").expect("popup for /he");
+        assert!(popup.items.iter().any(|(n, _)| n == "/help"), "{popup:?}");
+    }
+
+    #[test]
+    fn rewind_bad_arg_warns_instead_of_defaulting() {
+        // unparsable count: usage warning, no command sent
+        let cmd = slash_command("/rewind abc").unwrap();
+        assert_eq!(cmd.note.as_deref(), Some("usage: /rewind [n]"));
+        assert!(cmd.event.is_none());
+        // bare /rewind keeps its documented default of one exchange
+        let cmd = slash_command("/rewind").unwrap();
+        assert!(matches!(cmd.event, Some(Command::Rewind { turns: 1 })));
+        // an explicit count passes through
+        let cmd = slash_command("/rewind 3").unwrap();
+        assert!(matches!(cmd.event, Some(Command::Rewind { turns: 3 })));
+    }
+
+    #[test]
+    fn help_lists_all_keys_and_groups() {
+        let text: String = help_modal_rows()
+            .iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.to_string())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        // the previously undocumented keys are taught
+        for key in [
+            "ctrl+r",
+            "ctrl+p / ctrl+n",
+            "ctrl+q",
+            "ctrl+o",
+            "ctrl+m",
+            "ctrl+t / alt+o / alt+i",
+            "alt+t",
+            "alt+e",
+            "ctrl+↑ / ctrl+↓",
+            "esc esc",
+        ] {
+            assert!(text.contains(key), "help lacks {key}");
+        }
+        // command groups in order
+        for group in [
+            "keys",
+            "session",
+            "model & providers",
+            "tools & context",
+            "safety & plans",
+            "meta",
+        ] {
+            assert!(
+                text.contains(&format!("▸ {group}")),
+                "help lacks group {group}"
+            );
+        }
+        // rows keep the `{name:<14} {desc}` shape: 15 cols before the text
+        let rows = help_modal_rows();
+        let line = rows
+            .iter()
+            .find(|l| {
+                let t: String = l.spans.iter().map(|s| s.content.to_string()).collect();
+                t.starts_with("/session")
+            })
+            .expect("/session row");
+        assert_eq!(line.spans[0].content.len(), 15, "{line:?}");
+
         assert!(matches!(
             slash_command("/new"),
             Some(Slash {
@@ -9672,12 +10346,43 @@ mod tests {
             cost: 0.0123,
             ..Default::default()
         };
+        let text = |spans: &[ratatui::text::Span<'static>]| {
+            spans.iter().map(|s| s.content.as_ref()).collect::<String>()
+        };
+        // 10% of the window: one green cell of the eight-cell gauge
         assert_eq!(
-            status_right(&m),
-            "ollama/qwen3.5:9b · guarded · ctx 10% · $0.0123"
+            text(&status_right(&m)),
+            "ollama/qwen3.5:9b · guarded · ctx █······· 10% · $0.0123"
         );
+        assert_eq!(status_right(&m)[5].style.fg, Some(crate::palette::OK));
         // fresh session: unknown model/mode/window collapse away
-        assert_eq!(status_right(&Meters::default()), "$0.0000");
+        assert_eq!(text(&status_right(&Meters::default())), "$0.0000");
+    }
+
+    #[test]
+    fn ctx_gauge_cells_and_thresholds() {
+        let gauge = |used, window| {
+            let m = Meters {
+                context: (used, window),
+                ..Default::default()
+            };
+            let spans = status_right(&m);
+            spans
+                .iter()
+                .find(|s| s.content.contains('█'))
+                .map(|s| (s.content.trim_start().to_string(), s.style.fg))
+                .unwrap()
+        };
+        // 12.5% per cell, thresholds at 80% (WARN) and 95% (ERR)
+        assert_eq!(gauge(25_000, 100_000).0, "██······");
+        assert_eq!(gauge(50_000, 100_000).0, "████····");
+        assert_eq!(gauge(79_000, 100_000).1, Some(crate::palette::OK));
+        assert_eq!(gauge(80_000, 100_000).1, Some(crate::palette::WARN));
+        assert_eq!(gauge(94_000, 100_000).1, Some(crate::palette::WARN));
+        assert_eq!(gauge(95_000, 100_000).1, Some(crate::palette::ERR));
+        assert_eq!(gauge(100_000, 100_000).0, "████████");
+        // rounding at cell edges: 6.25% = half a cell rounds to one
+        assert_eq!(gauge(6_250, 100_000).0, "█·······");
     }
 
     #[test]
@@ -9995,7 +10700,7 @@ mod tests {
         let mut spills: Vec<String> = Vec::new();
         let mut sidebar = SidebarState::default();
 
-        apply_event(
+        let _ = apply_event(
             &Event::Delta {
                 kind: ka_protocol::DeltaKind::Text("hi ".into()),
             },
@@ -10015,7 +10720,7 @@ mod tests {
             &mut spills,
             &mut sidebar,
         );
-        apply_event(
+        let _ = apply_event(
             &Event::Delta {
                 kind: ka_protocol::DeltaKind::Text("there".into()),
             },
@@ -10035,7 +10740,7 @@ mod tests {
             &mut spills,
             &mut sidebar,
         );
-        apply_event(
+        let _ = apply_event(
             &Event::CallStarted {
                 tool: "read".into(),
                 id: "c1".into(),
@@ -10057,7 +10762,7 @@ mod tests {
             &mut spills,
             &mut sidebar,
         );
-        apply_event(
+        let _ = apply_event(
             &Event::CallOutput {
                 tool: "read".into(),
                 id: "c1".into(),
@@ -10081,7 +10786,7 @@ mod tests {
             &mut spills,
             &mut sidebar,
         );
-        apply_event(
+        let _ = apply_event(
             &Event::TurnFinished {
                 stop: ka_protocol::Stop::Done,
                 usage: ka_protocol::Usage {
@@ -10112,15 +10817,24 @@ mod tests {
             .entries()
             .iter()
             .filter_map(|l| match l {
-                Line::Assistant(t) | Line::Tool(t) => Some(t.as_str()),
+                Line::Assistant(t) => Some(t.as_str()),
                 _ => None,
             })
             .collect();
         assert!(texts.contains(&"hi there"), "{texts:?}");
-        assert!(
-            texts.iter().any(|t| t.contains("read") && t.contains("✓")),
-            "{texts:?}"
-        );
+        // the tool call lands as a block with a railed row: head from
+        // the CallStarted detail, verdict from CallFinished
+        let calls: Vec<&ToolCall> = lines
+            .entries()
+            .iter()
+            .filter_map(|l| match l {
+                Line::ToolBlock(v) => v.first(),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(calls.len(), 1, "{calls:?}");
+        assert!(calls[0].head.contains("read"), "{calls:?}");
+        assert!(calls[0].ok, "{calls:?}");
     }
 
     #[test]
@@ -10141,7 +10855,7 @@ mod tests {
         let mut spills: Vec<String> = Vec::new();
         let mut sidebar = SidebarState::default();
 
-        apply_event(
+        let _ = apply_event(
             &Event::Delta {
                 kind: ka_protocol::DeltaKind::Thought("pondering".into()),
             },
@@ -10161,7 +10875,7 @@ mod tests {
             &mut spills,
             &mut sidebar,
         );
-        apply_event(
+        let _ = apply_event(
             &Event::Delta {
                 kind: ka_protocol::DeltaKind::Text("before ".into()),
             },
@@ -10181,7 +10895,7 @@ mod tests {
             &mut spills,
             &mut sidebar,
         );
-        apply_event(
+        let _ = apply_event(
             &Event::Delta {
                 kind: ka_protocol::DeltaKind::Call {
                     tool: "bash".into(),
@@ -10210,7 +10924,7 @@ mod tests {
             a.is_empty() && t.is_empty(),
             "buffers taken at the boundary"
         );
-        apply_event(
+        let _ = apply_event(
             &Event::CallOutput {
                 tool: "bash".into(),
                 id: "c1".into(),
@@ -10234,7 +10948,7 @@ mod tests {
             &mut spills,
             &mut sidebar,
         );
-        apply_event(
+        let _ = apply_event(
             &Event::CallOutput {
                 tool: "bash".into(),
                 id: "c1".into(),
@@ -10261,7 +10975,7 @@ mod tests {
         let lt = live_tool.as_ref().unwrap();
         assert_eq!(lt.preview, vec!["line-1", "line-2", "line-3"]);
         assert_eq!(tool, "→ bash", "partials must not append the note");
-        apply_event(
+        let _ = apply_event(
             &Event::CallFinished {
                 tool: "bash".into(),
                 id: "c1".into(),
@@ -10284,7 +10998,7 @@ mod tests {
             &mut sidebar,
         );
         assert!(live_tool.is_none(), "block collapses on finish");
-        apply_event(
+        let _ = apply_event(
             &Event::Delta {
                 kind: ka_protocol::DeltaKind::Text("after".into()),
             },
@@ -10304,7 +11018,7 @@ mod tests {
             &mut spills,
             &mut sidebar,
         );
-        apply_event(
+        let _ = apply_event(
             &Event::CallStarted {
                 tool: "bash".into(),
                 id: "c2".into(),
@@ -10326,7 +11040,7 @@ mod tests {
             &mut spills,
             &mut sidebar,
         );
-        apply_event(
+        let _ = apply_event(
             &Event::CallOutput {
                 tool: "bash".into(),
                 id: "c2".into(),
@@ -10350,7 +11064,7 @@ mod tests {
             &mut spills,
             &mut sidebar,
         );
-        apply_event(
+        let _ = apply_event(
             &Event::CallFinished {
                 tool: "bash".into(),
                 id: "c2".into(),
@@ -10372,7 +11086,7 @@ mod tests {
             &mut spills,
             &mut sidebar,
         );
-        apply_event(
+        let _ = apply_event(
             &Event::TurnFinished {
                 stop: ka_protocol::Stop::Done,
                 usage: ka_protocol::Usage::default(),
@@ -10400,7 +11114,13 @@ mod tests {
             .map(|l| match l {
                 Line::Thought(s) => format!("T:{s}"),
                 Line::Assistant(s) => format!("A:{s}"),
-                Line::Tool(s) => format!("T:{s}"),
+                Line::ToolBlock(v) => format!(
+                    "T:{}",
+                    v.iter()
+                        .map(|c| c.head.as_str())
+                        .collect::<Vec<_>>()
+                        .join("|")
+                ),
                 Line::Report(s) => format!("R:{s}"),
                 Line::User(s) => format!("U:{s}"),
                 _ => "?".to_string(),
@@ -10413,16 +11133,29 @@ mod tests {
                 "R:",
                 "A:before ",
                 "R:",
-                "T:→ bash ✓ line-3",
+                "T:→ bash",
                 "R:",
                 "A:after",
                 "R:",
-                "T:→ bash ✗ boom",
-                "R:",
-                "R:0.0s · $0.0000",
+                "T:→ bash",
             ],
             "final order must interleave text and tools: {shapes:?}"
         );
+        // verdict + note live on the call, not the head: the first call
+        // closed ok, the second failed
+        let blocks: Vec<&Vec<ToolCall>> = lines
+            .entries()
+            .iter()
+            .filter_map(|l| match l {
+                Line::ToolBlock(v) => Some(v),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(blocks.len(), 2, "text between calls splits the blocks");
+        assert!(blocks[0][0].ok);
+        assert_eq!(blocks[0][0].note, "line-3");
+        assert!(!blocks[1][0].ok);
+        assert_eq!(blocks[1][0].note, "boom");
     }
 
     #[test]
@@ -10469,6 +11202,7 @@ mod tests {
             id: "c1".into(),
             preview: window.clone(),
             last: Some(("line-5".into(), false)),
+            started: Instant::now(),
         };
         let rows = tool_live_rows("→ bash", Some(&lt), 40);
         assert_eq!(rows.len(), 1 + PREVIEW_WINDOW);
@@ -10481,20 +11215,22 @@ mod tests {
                     .collect::<String>()
             })
             .collect();
-        // inset one col, padded to the full band width
-        assert_eq!(texts[0].trim_end(), " → bash");
+        // quiet rail, then band content with one col of air each side —
+        // the band hugs its content, no full-width fill
+        assert_eq!(texts[0], " │  → bash ");
         assert_eq!(
             texts[1..].iter().map(|t| t.trim_end()).collect::<Vec<_>>(),
-            ["   line-3", "   line-4", "   line-5"]
+            [" │   line-3", " │   line-4", " │   line-5"]
         );
-        for (i, row) in rows.iter().enumerate() {
-            assert_eq!(texts[i].chars().count(), 40, "band row fills the width");
+        for row in &rows {
+            // the rail stays canvas-clean; the band content rides BG_TOOL
             assert!(
-                row.spans
+                &row.spans[1..]
                     .iter()
                     .all(|s| s.style.bg == Some(crate::palette::BG_TOOL)),
-                "live rows ride BG_TOOL: {row:?}"
+                "live band content rides BG_TOOL: {row:?}"
             );
+            assert_eq!(row.spans[0].style.bg, None, "rail has no fill");
         }
         assert_eq!(tool_live_rows("→ bash", None, 40).len(), 0);
     }
@@ -10517,7 +11253,7 @@ mod tests {
         let mut spills: Vec<String> = Vec::new();
         let mut sidebar = SidebarState::default();
 
-        apply_event(
+        let _ = apply_event(
             &Event::TurnStarted {
                 context: ka_protocol::ContextMeter {
                     used: 100,
@@ -10540,7 +11276,7 @@ mod tests {
             &mut spills,
             &mut sidebar,
         );
-        apply_event(
+        let _ = apply_event(
             &Event::Delta {
                 kind: ka_protocol::DeltaKind::Text("hi".into()),
             },
@@ -10560,7 +11296,7 @@ mod tests {
             &mut spills,
             &mut sidebar,
         );
-        apply_event(
+        let _ = apply_event(
             &Event::Error {
                 class: ka_protocol::ErrorClass::RateLimit,
                 retryable: true,
@@ -10586,7 +11322,7 @@ mod tests {
             lines.entries().is_empty(),
             "busy in-turn error must not push a standalone row"
         );
-        apply_event(
+        let _ = apply_event(
             &Event::TurnFinished {
                 stop: ka_protocol::Stop::Error,
                 usage: ka_protocol::Usage {
@@ -10615,21 +11351,20 @@ mod tests {
         let entries = lines.entries();
         assert_eq!(
             entries.len(),
-            4,
-            "assistant, air, error report, meta row — nothing stranded: {entries:?}"
+            3,
+            "assistant, air, one bold failure summary — no second meta row: {entries:?}"
         );
         assert!(matches!(entries[0], Line::Assistant(_)));
-        // air opens between the card and the error report (family change)
+        // air opens between the card and the failure summary (family change)
         assert_eq!(&entries[1], &Line::Report(String::new()));
-        let Line::ReportErr(report) = &entries[2] else {
-            panic!("third entry must be a ReportErr: {entries:?}");
+        let Line::Summary { glyph, tone, text } = &entries[2] else {
+            panic!("third entry must be a failure Summary: {entries:?}");
         };
+        assert_eq!(*glyph, '✗');
+        assert_eq!(*tone, SummaryTone::Err);
         for want in ["failed", "429", "/retry", "in", "out", "$0.0002"] {
-            assert!(report.contains(want), "report {report:?} lacks {want}");
+            assert!(text.contains(want), "summary {text:?} lacks {want}");
         }
-        // the closing meta row follows its ReportErr sibling tight: same
-        // meta family, and no blank is stranded after the turn's last row
-        assert_eq!(&entries[3], &Line::Report("0.0s · $0.0002".into()));
         assert!(
             last_error.is_none(),
             "buffered error consumed by the report"
@@ -10654,7 +11389,7 @@ mod tests {
         let mut spills: Vec<String> = Vec::new();
         let mut sidebar = SidebarState::default();
 
-        apply_event(
+        let _ = apply_event(
             &Event::TurnStarted {
                 context: ka_protocol::ContextMeter::default(),
             },
@@ -10674,7 +11409,7 @@ mod tests {
             &mut spills,
             &mut sidebar,
         );
-        apply_event(
+        let _ = apply_event(
             &Event::TurnFinished {
                 stop: ka_protocol::Stop::Done,
                 usage: ka_protocol::Usage::default(),
@@ -11050,7 +11785,7 @@ mod tests {
         t.set_width(40);
         t.push(Line::User("hello world".into()));
         t.push(Line::Assistant("quick brown".into()));
-        t.push(Line::Note("HELLO again".into()));
+        t.push(Line::Info("HELLO again".into()));
         // case-insensitive scan from the top
         let (first_i, first_off) = t.find_from(0, "HeLLo").unwrap();
         assert_eq!(first_i, 0, "first match from the top");
@@ -11079,7 +11814,7 @@ mod tests {
         t.set_width(40);
         t.push_separated(Line::User("alpha".into()));
         t.push_separated(Line::Assistant("needle here".into()));
-        t.push_separated(Line::Note("beta".into()));
+        t.push_separated(Line::Info("beta".into()));
         // every anchor row must land on a content entry — the Report("")
         // separators hold no text and can never be hits
         let mut hits: Vec<usize> = Vec::new();
@@ -11207,7 +11942,7 @@ mod tests {
         let mut last_error: Option<String> = None;
         let mut spills: Vec<String> = Vec::new();
         let mut sidebar = SidebarState::default();
-        apply_event(
+        let _ = apply_event(
             evt,
             lines,
             &mut busy,
@@ -11274,8 +12009,8 @@ mod tests {
             },
         );
         let entries = lines.entries();
-        let [Line::Report(text)] = entries else {
-            panic!("one Report row expected, got {entries:?}")
+        let [Line::Info(text)] = entries else {
+            panic!("one Info card expected, got {entries:?}")
         };
         let rows: Vec<&str> = text.split('\n').collect();
         assert_eq!(rows, ["mcp: fetch ✓ 3 · jira ✗"]);
@@ -11298,8 +12033,8 @@ mod tests {
             },
         );
         let entries = lines.entries();
-        let [Line::Report(text)] = entries else {
-            panic!("one Report row expected, got {entries:?}")
+        let [Line::Info(text)] = entries else {
+            panic!("one Info card expected, got {entries:?}")
         };
         assert!(
             text.starts_with("agents: agent-with-a-long-name-0"),
@@ -11355,12 +12090,25 @@ mod tests {
     #[test]
     fn tool_run_stays_tight_then_reopens_air() {
         let mut t = Transcript::default();
-        t.push_separated(Line::Tool("→ read · lib.rs".into()));
-        t.push_separated(Line::Tool("→ bash ✓ ok".into()));
+        t.push_tool_call(ToolCall {
+            head: "→ read · lib.rs".into(),
+            ok: true,
+            ..no_note_call()
+        });
+        t.push_tool_call(ToolCall {
+            head: "→ bash · cargo build".into(),
+            ok: true,
+            note: "ok".into(),
+            ..no_note_call()
+        });
         t.push_separated(Line::Assistant("answer".into()));
         // a turn ends on meta; the next user card reopens the air
-        t.push_separated(Line::Report("done · 0.0s".into()));
-        t.push_separated(Line::Report("mock · 0.0s · $0".into()));
+        t.push_separated(Line::Summary {
+            glyph: '✓',
+            tone: SummaryTone::Ok,
+            text: "done · 0.0s".into(),
+        });
+        t.push_separated(Line::Report("task row".into()));
         t.push_separated(Line::User("again".into()));
         let shapes: Vec<String> = t
             .entries()
@@ -11368,7 +12116,14 @@ mod tests {
             .map(|l| match l {
                 Line::User(s) => format!("U:{s}"),
                 Line::Assistant(s) => format!("A:{s}"),
-                Line::Tool(s) => format!("T:{s}"),
+                Line::ToolBlock(v) => format!(
+                    "T:{}",
+                    v.iter()
+                        .map(|c| c.head.as_str())
+                        .collect::<Vec<_>>()
+                        .join("|")
+                ),
+                Line::Summary { text, .. } => format!("S:{text}"),
                 Line::Report(s) => format!("R:{s}"),
                 _ => "?".to_string(),
             })
@@ -11376,17 +12131,16 @@ mod tests {
         assert_eq!(
             shapes,
             [
-                "T:→ read · lib.rs",
-                "T:→ bash ✓ ok",
+                "T:→ read · lib.rs|→ bash · cargo build",
                 "R:",
                 "A:answer",
                 "R:",
-                "R:done · 0.0s",
-                "R:mock · 0.0s · $0",
+                "S:done · 0.0s",
+                "R:task row",
                 "R:",
                 "U:again",
             ],
-            "tool runs stay tight, meta runs stay tight, families get air"
+            "consecutive calls merge tight, meta runs stay tight, families get air"
         );
         // nothing is stranded: the blank is exactly BETWEEN the blocks
         assert_ne!(
@@ -11394,6 +12148,20 @@ mod tests {
             Some(&Line::Report(String::new())),
             "no trailing blank after the final user row"
         );
+    }
+
+    /// A [`ToolCall`] with no output, no spill, no duration — the
+    /// replay/shape-test baseline.
+    fn no_note_call() -> ToolCall {
+        ToolCall {
+            head: String::new(),
+            ok: true,
+            note: String::new(),
+            excerpt: String::new(),
+            spill: None,
+            dur: None,
+            expanded: false,
+        }
     }
 
     #[test]
@@ -11414,7 +12182,7 @@ mod tests {
         let mut spills: Vec<String> = Vec::new();
         let mut sidebar = SidebarState::default();
         let mut feed = |lines: &mut Transcript, evt: &Event| -> (String, Option<Line>) {
-            apply_event(
+            let _ = apply_event(
                 evt,
                 lines,
                 &mut busy,
@@ -11462,20 +12230,227 @@ mod tests {
                 detail: "lib.rs".into(),
             },
         );
-        assert_eq!(
-            last,
-            Some(Line::Tool("→ bash · cargo build".into())),
-            "new call closes the old row"
-        );
+        // the never-finished bash header closes as a bare block row
+        let got = last.expect("new call closes the old row");
+        let Line::ToolBlock(v) = got else {
+            panic!("expected a ToolBlock, got {got:?}");
+        };
+        assert_eq!(v[0].head, "→ bash · cargo build");
+        assert!(!v[0].ok, "a call closed without CallFinished reads failed");
         assert_eq!(head, "→ read · lib.rs");
     }
 
     #[test]
-    fn turn_meta_row_joins_and_caps_at_sixty_columns() {
-        assert_eq!(turn_meta_row("m/1", 3.25, 0.0002), "m/1 · 3.2s · $0.0002");
-        assert_eq!(turn_meta_row("", 0.0, 0.0), "0.0s · $0.0000");
-        let wide = turn_meta_row(&"x".repeat(80), 1.0, 0.0);
-        assert!(wide.width() <= 60, "{wide}");
+    fn info_warn_err_render_three_tiers() {
+        let info = super::render_line(&Line::Info("steering this turn".into()), 40, false);
+        let warn = super::render_line(&Line::Warn("turn running".into()), 40, false);
+        let err = super::render_line(&Line::Err("429 too many requests".into()), 40, false);
+        let text = |rows: &Vec<ratatui::text::Line<'static>>| {
+            rows[0]
+                .spans
+                .iter()
+                .map(|s| s.content.to_string())
+                .collect::<String>()
+        };
+        // gutter rows carry their style on the line (push_gutter), so
+        // Paragraph paints prefix and text alike
+        let fg = |rows: &Vec<ratatui::text::Line<'static>>| rows[0].style.fg;
+        // info: `· ` muted
+        assert_eq!(text(&info), "· steering this turn");
+        assert_eq!(fg(&info), Some(crate::palette::META));
+        // warn: `⚠ ` salmon
+        assert_eq!(text(&warn), "⚠ turn running");
+        assert_eq!(fg(&warn), Some(crate::palette::WARN));
+        // err: `! ` bold — the loudest system row
+        assert_eq!(text(&err), "! 429 too many requests");
+        assert_eq!(fg(&err), Some(crate::palette::ERR));
+        assert!(
+            err[0]
+                .style
+                .add_modifier
+                .contains(ratatui::style::Modifier::BOLD)
+        );
+    }
+
+    #[test]
+    fn shell_rows_render_plain_fg() {
+        let rows = super::render_line(&Line::Shell("hello world".into()), 40, false);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].spans[0].content.as_ref(), "hello world");
+        assert_eq!(rows[0].spans[0].style.fg, Some(crate::palette::FG));
+    }
+
+    #[test]
+    fn summary_rows_render_tone_glyph_and_muted_text() {
+        let row = |glyph, tone| {
+            super::render_line(
+                &Line::Summary {
+                    glyph,
+                    tone,
+                    text: "done · 2.0s".into(),
+                },
+                40,
+                false,
+            )
+        };
+        for (glyph, tone, fg) in [
+            ('✓', SummaryTone::Ok, crate::palette::OK),
+            ('◐', SummaryTone::Warn, crate::palette::WARN),
+        ] {
+            let rows = row(glyph, tone);
+            let first = &rows[0].spans[0];
+            assert_eq!(first.content.as_ref(), format!("{glyph} "));
+            assert_eq!(first.style.fg, Some(fg));
+            assert_eq!(rows[0].spans[1].style.fg, Some(crate::palette::META));
+        }
+        // the error tone is bold so failures outweigh every other row
+        let rows = row('✗', SummaryTone::Err);
+        assert_eq!(rows[0].spans[0].style.fg, Some(crate::palette::ERR));
+        assert!(
+            rows[0].spans[0]
+                .style
+                .add_modifier
+                .contains(ratatui::style::Modifier::BOLD)
+        );
+    }
+
+    #[test]
+    fn row_refs_map_toolblock_rows() {
+        let mut t = Transcript::default();
+        t.push(Line::Thought("deep\nthoughts".into()));
+        t.push_tool_call(ToolCall {
+            head: "→ a".into(),
+            ..no_note_call()
+        });
+        t.push_tool_call(ToolCall {
+            head: "→ b".into(),
+            ..no_note_call()
+        });
+        // rows 0..2 belong to the thought entry (2 rendered rows + air)
+        let air = t.rendered_rows_of(0);
+        assert_eq!(t.row_ref_at(0), Some(RowRef::Entry(0)));
+        assert_eq!(t.row_ref_at(air - 1), Some(RowRef::Entry(0)));
+        // the blank separator between the families reads as its own entry
+        assert_eq!(t.row_ref_at(air), Some(RowRef::Entry(1)));
+        // the block's two rows map to their call index
+        assert_eq!(t.row_ref_at(air + 1), Some(RowRef::ToolCall(2, 0)));
+        assert_eq!(t.row_ref_at(air + 2), Some(RowRef::ToolCall(2, 1)));
+        assert_eq!(
+            t.tool_call(2, 1).map(|c| c.head.as_str()),
+            Some("→ b"),
+            "the click source resolves the call"
+        );
+    }
+
+    #[test]
+    fn tool_call_expands_full_content_inline() {
+        let call = ToolCall {
+            head: "→ bash · cargo build".into(),
+            ok: true,
+            note: "first line".into(),
+            excerpt: "first line\n\nthird line".into(),
+            spill: None,
+            dur: Some(1.25),
+            expanded: false,
+        };
+        // collapsed: one header row with the fold marker
+        let out = super::render_line(&Line::ToolBlock(vec![call.clone()]), 40, false);
+        assert_eq!(out.len(), 1, "collapsed = one row");
+        let text: String = out[0].spans.iter().map(|s| s.content.to_string()).collect();
+        assert!(text.starts_with(" │ ▸ → bash"), "{text:?}");
+        // expanded: header (▾) + every excerpt line, blank line included,
+        // each railed and faint
+        let expanded = ToolCall {
+            expanded: true,
+            ..call
+        };
+        let out = super::render_line(&Line::ToolBlock(vec![expanded]), 40, false);
+        assert_eq!(out.len(), 4, "header + 3 excerpt lines: {out:?}");
+        let texts: Vec<String> = out
+            .iter()
+            .map(|l| l.spans.iter().map(|s| s.content.to_string()).collect())
+            .collect();
+        assert!(texts[0].starts_with(" │ ▾ → bash"), "{texts:?}");
+        assert_eq!(texts[1], " │   first line");
+        assert_eq!(texts[2], " │   ");
+        assert_eq!(texts[3], " │   third line");
+        assert_eq!(out[1].spans[2].style.fg, Some(crate::palette::FAINT));
+        // long lines hard-continue with a deeper prefix
+        let long = ToolCall {
+            excerpt: "x".repeat(100),
+            expanded: true,
+            ..no_note_call()
+        };
+        let out = super::render_line(&Line::ToolBlock(vec![long]), 20, false);
+        assert!(out.len() > 2, "wrapped into continuations");
+        for row in &out[1..] {
+            assert!(row.spans[1].content.starts_with(' '));
+        }
+    }
+
+    #[test]
+    fn expanded_call_points_at_the_spill_file() {
+        let call = ToolCall {
+            head: "→ bash".into(),
+            excerpt: "tail of the run".into(),
+            spill: Some("/tmp/spill-1".into()),
+            expanded: true,
+            ..no_note_call()
+        };
+        let out = super::render_line(&Line::ToolBlock(vec![call]), 60, false);
+        let last = out.last().unwrap();
+        let text: String = last.spans.iter().map(|s| s.content.to_string()).collect();
+        assert!(
+            text.contains("spill file") && text.contains("/spills"),
+            "{text:?}"
+        );
+        // the trailer rides the muted tier, not the content tier
+        assert_eq!(
+            last.spans.last().unwrap().style.fg,
+            Some(crate::palette::META)
+        );
+    }
+
+    #[test]
+    fn toggling_expands_and_collapses_in_place() {
+        let mut t = Transcript::default();
+        t.set_width(40);
+        t.push_tool_call(ToolCall {
+            head: "→ bash".into(),
+            excerpt: "line one\nline two".into(),
+            expanded: false,
+            ..no_note_call()
+        });
+        let (entry, call) = t.last_tool_ref().expect("ref for the fresh block");
+        assert_eq!(t.rendered_rows_of(entry), 1, "collapsed: one header row");
+        // expand: header + two content rows, flag lives on the call
+        t.toggle_tool_call(entry, call);
+        assert!(t.tool_call(entry, call).unwrap().expanded, "flag flipped");
+        assert_eq!(t.rendered_rows_of(entry), 3, "header + 2 content rows");
+        let row_text = |r: usize| -> String {
+            t.row(r)
+                .unwrap()
+                .spans
+                .iter()
+                .map(|s| s.content.to_string())
+                .collect()
+        };
+        assert_eq!(row_text(1), " │   line one");
+        assert_eq!(row_text(2), " │   line two");
+        // collapse again: back to one row
+        t.toggle_tool_call(entry, call);
+        assert!(!t.tool_call(entry, call).unwrap().expanded);
+        assert_eq!(t.rendered_rows_of(entry), 1);
+        // stale indices (rewound past the block) no-op instead of panicking
+        t.toggle_tool_call(99, 0);
+        assert_eq!(t.rendered_rows_of(entry), 1);
+        // the fold flag survives a width rebuild (it rides the entry data)
+        t.toggle_tool_call(entry, call);
+        t.set_width(72);
+        assert!(
+            t.tool_call(entry, call).unwrap().expanded,
+            "flag survives resize"
+        );
     }
 
     #[test]
@@ -11501,33 +12476,51 @@ mod tests {
     }
 
     #[test]
-    fn ask_form_borrows_the_input_box_rows() {
-        let ask = PendingAsk {
-            id: AskId("a".into()),
-            question: "two\nlines".into(),
-            options: vec!["allow".into(), "deny".into()],
-            detail: None,
-            selected: 0,
-        };
-        // question lines + one options row, draft ignored while pending
-        assert_eq!(
-            input_area_rows(Some(&ask), None, "long\ndraft\ntext", 40),
-            3
-        );
-        assert_eq!(input_area_rows(None, None, "long\ndraft\ntext", 40), 3);
-        assert_eq!(input_area_rows(None, None, "one line", 40), 1);
+    fn input_area_rows_picker_and_draft_only() {
+        assert_eq!(input_area_rows(None, "long\ndraft\ntext", 40), 3);
+        assert_eq!(input_area_rows(None, "one line", 40), 1);
         // the draft arm folds long lines: 200 cols at width 40 → 5 rows
-        assert_eq!(input_area_rows(None, None, &"x".repeat(200), 40), 5);
+        assert_eq!(input_area_rows(None, &"x".repeat(200), 40), 5);
         // the picker borrows the box for its four tier rows
         assert_eq!(
             input_area_rows(
-                None,
                 Some(&ModePicker::for_mode(ka_protocol::Mode::Free)),
                 "x",
                 40
             ),
             4
         );
+    }
+
+    #[test]
+    fn ask_renders_numbered_modal_options() {
+        let ask = PendingAsk {
+            id: AskId("a".into()),
+            question: "allow write to modify files?".into(),
+            options: vec!["allow".into(), "deny".into()],
+            detail: Some("+a\n".into()),
+            selected: 0,
+        };
+        let rows = ask_modal_body(&ask, 40);
+        let text = |l: &ratatui::text::Line<'static>| {
+            l.spans
+                .iter()
+                .map(|s| s.content.to_string())
+                .collect::<String>()
+        };
+        // bold question, then the budgeted detail, then numbered options
+        assert_eq!(text(&rows[0]), "allow write to modify files?");
+        assert_eq!(text(&rows[1]), "+a");
+        // the selected option wears the full-row pink bar
+        assert_eq!(text(&rows[2]), pad_to_width("1 allow".to_string(), 40));
+        assert_eq!(text(&rows[3]), "2 deny");
+        assert_eq!(rows[2].spans[0].style, selection_style());
+        assert_ne!(rows[3].spans[0].style, selection_style());
+        // the bar follows the selection
+        let ask = PendingAsk { selected: 1, ..ask };
+        let rows = ask_modal_body(&ask, 40);
+        assert_eq!(rows[3].spans[0].style, selection_style());
+        assert_ne!(rows[2].spans[0].style, selection_style());
     }
 
     #[test]
@@ -11552,44 +12545,9 @@ mod tests {
             "{:?}",
             clamped[2].spans[0].content
         );
-        // the ask form reserves rows for the detail block
-        let ask = PendingAsk {
-            id: AskId("a".into()),
-            question: "allow?".into(),
-            options: vec!["allow".into()],
-            selected: 0,
-            detail: Some("ctx\n+added\n".into()),
-        };
-        assert_eq!(input_area_rows(Some(&ask), None, "", 40), 4);
-        // regression: a huge diff must never push the options row past
-        // the input box's six-content-row cap (the choices stay visible)
-        let ask = PendingAsk {
-            id: AskId("a".into()),
-            question: "allow write to modify files?".into(),
-            options: vec!["allow".into(), "deny".into()],
-            selected: 0,
-            detail: Some((0..9).map(|i| format!("+line{i}\n")).collect()),
-        };
-        let total = input_area_rows(Some(&ask), None, "", 40);
-        assert!(total <= 6, "ask form grew to {total} rows");
-        // a four-line question leaves no detail budget (trailer headroom)
-        let ask = PendingAsk {
-            id: AskId("a".into()),
-            question: "q1\nq2\nq3\nq4".into(),
-            options: vec!["allow".into()],
-            selected: 0,
-            detail: Some("+a\n".into()),
-        };
-        assert_eq!(input_area_rows(Some(&ask), None, "", 40), 5);
-        // six question lines: no budget left, detail omitted entirely
-        let ask = PendingAsk {
-            id: AskId("a".into()),
-            question: "q1\nq2\nq3\nq4\nq5\nq6".into(),
-            options: vec!["allow".into()],
-            selected: 0,
-            detail: Some("+a\n".into()),
-        };
-        assert_eq!(input_area_rows(Some(&ask), None, "", 40), 7);
+        // the budget keeps trailer headroom: 2 allowed rows means the
+        // third detail row becomes the `… +N more` trailer
+        assert_eq!(clamped.len(), 3, "trailer rides in the budget");
     }
 
     #[test]
@@ -11654,35 +12612,29 @@ mod tests {
     }
 
     #[test]
-    fn sidebar_omits_empty_sections_and_shows_session_info() {
+    fn info_rows_reports_session_facts() {
         let sidebar = SidebarState {
-            cwd: "…/projects/ka".into(),
+            cwd: "\u{2026}/projects/ka".into(),
             branch: Some("main".into()),
             ..Default::default()
         };
-        let rows = sidebar_rows(&sidebar, &meters_sample(), 24, 40, None);
+        let rows = info_rows(&sidebar, &meters_sample(), 60);
         let text = plain_text(&rows);
-        assert_eq!(text[2], "#3f9c2a81", "session id is the first fact row");
-        assert!(!text.contains(&"model mockco/mock".to_string()), "{text:?}");
-        assert!(!text.contains(&"mode free".to_string()), "{text:?}");
-        assert!(text.contains(&"$0.0123".to_string()), "{text:?}");
+        assert!(
+            text.contains(&"\u{2026}/projects/ka:main".to_string()),
+            "{text:?}"
+        );
+        assert!(text.contains(&"session #3f9c2a81".to_string()), "{text:?}");
+        assert!(text.contains(&"model mockco/mock".to_string()), "{text:?}");
+        assert!(text.contains(&"cost $0.0123".to_string()), "{text:?}");
         assert!(
             text.iter().any(|t| t.starts_with("ctx 12000/200000")),
             "{text:?}"
         );
-        // no todos/mcp/skills/agents sections when empty
-        assert!(!text.contains(&"todos".to_string()), "{text:?}");
-        assert!(!text.contains(&"mcp".to_string()), "{text:?}");
-        assert!(!text.contains(&"skills".to_string()), "{text:?}");
-        assert!(!text.contains(&"agents".to_string()), "{text:?}");
-        // info: one `cwd-short:branch` row; the section vanishes without
-        // a startup branch snapshot
-        assert!(text.contains(&"info".to_string()), "{text:?}");
-        assert!(text.contains(&"…/projects/ka:main".to_string()), "{text:?}");
     }
 
     #[test]
-    fn sidebar_todos_mark_done_rows_and_mcp_health() {
+    fn todos_rows_mark_done_and_next() {
         let sidebar = SidebarState {
             todos: vec![
                 ka_protocol::TodoItem {
@@ -11694,6 +12646,49 @@ mod tests {
                     state: ka_protocol::TodoState::Pending,
                 },
             ],
+            ..Default::default()
+        };
+        let rows = todos_rows(&sidebar, 60);
+        let text = plain_text(&rows);
+        let done = text
+            .iter()
+            .find(|t| t.contains("survey"))
+            .expect("done row");
+        assert!(done.starts_with("\u{2713} "), "{done}");
+        let pending = text
+            .iter()
+            .find(|t| t.contains("implement"))
+            .expect("pending row");
+        assert!(pending.starts_with("\u{b7} "), "{pending}");
+        // done rows carry the crossed-out modifier, the first pending
+        // row is accented bold ('next')
+        let done_idx = rows
+            .iter()
+            .position(|l| l.spans.iter().any(|s| s.content.contains("survey")))
+            .unwrap();
+        assert!(rows[done_idx].spans.iter().any(|s| {
+            s.style
+                .add_modifier
+                .contains(ratatui::style::Modifier::CROSSED_OUT)
+        }));
+        let pend_idx = rows
+            .iter()
+            .position(|l| l.spans.iter().any(|s| s.content.contains("implement")))
+            .unwrap();
+        assert!(rows[pend_idx].spans.iter().any(|s| {
+            s.style
+                .add_modifier
+                .contains(ratatui::style::Modifier::BOLD)
+                && s.style.fg == Some(crate::palette::ACCENT)
+        }));
+        // empty state explains itself instead of rendering nothing
+        let empty = todos_rows(&SidebarState::default(), 60);
+        assert!(plain_text(&empty)[0].contains("no live todo list"));
+    }
+
+    #[test]
+    fn inventory_rows_list_skills_agents_and_mcp_health() {
+        let sidebar = SidebarState {
             inventory: Inventory {
                 mcp: vec![
                     ka_protocol::McpSummary {
@@ -11708,123 +12703,46 @@ mod tests {
                     },
                 ],
                 skills: vec!["rust-docs".into()],
+                agents: vec!["scout".into()],
                 prompts: Vec::new(),
                 ..Default::default()
             },
             ..Default::default()
         };
-        let rows = sidebar_rows(&sidebar, &Meters::default(), 24, 40, None);
-        let text = plain_text(&rows);
-        let done = text
-            .iter()
-            .find(|t| t.contains("survey"))
-            .expect("done row");
-        assert!(done.starts_with("✓ "), "{done}");
-        let pending = text
-            .iter()
-            .find(|t| t.contains("implement"))
-            .expect("pending row");
-        assert!(pending.starts_with("· "), "{pending}");
-        assert!(text.iter().any(|t| t == "demo ✓ 2"), "{text:?}");
-        assert!(text.iter().any(|t| t == "jira ✗"), "{text:?}");
-        assert!(
-            text.iter().any(|t| t == "skills (+1) ▸"),
-            "folded skills render their header alone: {text:?}"
-        );
-        // done rows carry the crossed-out modifier, pending rows do not
-        let done_idx = rows
-            .iter()
-            .position(|l| l.spans.iter().any(|s| s.content.contains("survey")))
-            .unwrap();
-        assert!(rows[done_idx].spans.iter().any(|s| {
-            s.style
-                .add_modifier
-                .contains(ratatui::style::Modifier::CROSSED_OUT)
-        }));
-        let pend_idx = rows
-            .iter()
-            .position(|l| l.spans.iter().any(|s| s.content.contains("implement")))
-            .unwrap();
-        // the first pending item is 'next': ACCENT fg + BOLD, others plain
-        assert!(rows[pend_idx].spans.iter().any(|s| {
-            s.style
-                .add_modifier
-                .contains(ratatui::style::Modifier::BOLD)
-                && s.style.fg == Some(crate::palette::ACCENT)
-        }));
+        let text = plain_text(&inventory_rows(&sidebar, 60));
+        assert!(text.contains(&"rust-docs".to_string()), "{text:?}");
+        assert!(text.contains(&"scout".to_string()), "{text:?}");
+        assert!(text.iter().any(|t| t == "demo \u{2713} 2"), "{text:?}");
+        assert!(text.iter().any(|t| t == "jira \u{2717}"), "{text:?}");
     }
 
     #[test]
-    fn sidebar_caps_lists_with_overflow_marks() {
-        let many: Vec<String> = (0..30).map(|i| format!("skill-{i}")).collect();
+    fn popup_rows_truncate_multibyte_to_width() {
         let sidebar = SidebarState {
-            inventory: Inventory {
-                skills: many,
-                prompts: Vec::new(),
-                ..Default::default()
-            },
-            skills_open: true,
-            ..Default::default()
-        };
-        // Meters::default leaves session/todos/mcp empty, so skills owns
-        // the whole budget: header + air + show = min(height-2, 30) list
-        // rows, where the cut mark replaces the last one. At height 8:
-        // header, blank, skill-0..4, mark.
-        let rows = sidebar_rows(&sidebar, &Meters::default(), 24, 8, None);
-        let text = plain_text(&rows);
-        assert_eq!(text.len(), 8, "{text:?}");
-        assert_eq!(text[0], "skills ▾", "{text:?}");
-        assert_eq!(text[2], "skill-0", "{text:?}");
-        assert_eq!(text[6], "skill-4", "{text:?}");
-        assert_eq!(text[7], "(+25)", "{text:?}");
-    }
-
-    #[test]
-    fn sidebar_puts_air_between_sections_and_under_headers() {
-        let sidebar = SidebarState {
-            cwd: "…/ka".into(),
+            cwd: "\u{2026}/\u{4e16}\u{754c}/\u{4e16}\u{754c}".into(),
             branch: Some("main".into()),
             todos: vec![ka_protocol::TodoItem {
-                text: "only todo".into(),
+                text: "\u{4e16}\u{754c}\u{4e16}\u{754c}\u{4e16}\u{754c}".into(),
                 state: ka_protocol::TodoState::Pending,
             }],
             ..Default::default()
         };
-        let rows = sidebar_rows(&sidebar, &Meters::default(), 24, 40, None);
-        let text = plain_text(&rows);
-        // every section header is followed by a blank row; a blank row
-        // also separates each section from the previous one
-        for (i, row) in text.iter().enumerate() {
-            if matches!(row.as_str(), "session" | "todos" | "info") {
-                assert_eq!(text[i + 1], "", "blank under header {row}: {text:?}");
-                if i > 0 {
-                    assert_eq!(text[i - 1], "", "blank before header {row}: {text:?}");
-                }
-            }
+        for row in info_rows(&sidebar, &Meters::default(), 10) {
+            let text: String = row.spans.iter().map(|s| s.content.as_ref()).collect();
+            assert!(text.width() <= 10, "{text}");
         }
-        assert!(text.contains(&"· only todo".to_string()), "{text:?}");
-        assert!(text.contains(&"…/ka:main".to_string()), "{text:?}");
-    }
-
-    #[test]
-    fn sidebar_truncates_multibyte_rows_to_width() {
-        let sidebar = SidebarState {
-            cwd: "…/世界/世界".into(),
-            ..Default::default()
-        };
-        let rows = sidebar_rows(&sidebar, &Meters::default(), 10, 40, None);
-        for row in &rows {
+        for row in todos_rows(&sidebar, 10) {
             let text: String = row.spans.iter().map(|s| s.content.as_ref()).collect();
             assert!(text.width() <= 10, "{text}");
         }
     }
 
     #[test]
-    fn transcript_width_shrinks_only_when_sidebar_fits() {
-        // margin cols on each side, sidebar once it fits, side padding
-        assert_eq!(transcript_width(90), 86, "narrow: margins + padding");
-        assert_eq!(transcript_width(100), 70, "at threshold: minus sidebar");
-        assert_eq!(transcript_width(120), 90);
+    fn transcript_width_is_full_width_minus_chrome() {
+        // margin cols on each side + the paragraph's side padding; no
+        // sidebar column anywhere in the layout anymore
+        assert_eq!(transcript_width(120), 116);
+        assert_eq!(transcript_width(100), 96);
         assert_eq!(transcript_width(60), 56, "never underflows");
     }
 
@@ -11854,7 +12772,7 @@ mod tests {
         let mut spills: Vec<String> = Vec::new();
         let mut sidebar = SidebarState::default();
 
-        apply_event(
+        let _ = apply_event(
             &Event::Inventory {
                 tools: vec!["read".into()],
                 mcp: vec![ka_protocol::McpSummary {
@@ -11885,7 +12803,7 @@ mod tests {
         assert_eq!(sidebar.inventory.tools, vec!["read".to_string()]);
         assert_eq!(sidebar.inventory.skills, vec!["rust-docs".to_string()]);
 
-        apply_event(
+        let _ = apply_event(
             &Event::Todos {
                 items: vec![ka_protocol::TodoItem {
                     text: "dig".into(),
@@ -11911,7 +12829,7 @@ mod tests {
         assert_eq!(sidebar.todos.len(), 1);
         assert_eq!(sidebar.todos[0].state, ka_protocol::TodoState::Done);
         // whole-list replacement: a follow-up event supersedes
-        apply_event(
+        let _ = apply_event(
             &Event::Todos { items: Vec::new() },
             &mut lines,
             &mut busy,
@@ -11949,7 +12867,7 @@ mod tests {
         let mut spills: Vec<String> = Vec::new();
         let mut sidebar = SidebarState::default();
         let mut feed = |evt: &Event, sidebar: &mut SidebarState| {
-            apply_event(
+            let _ = apply_event(
                 evt,
                 &mut lines,
                 &mut busy,
@@ -11985,20 +12903,7 @@ mod tests {
         );
         assert_eq!(sidebar.title.as_deref(), Some("Fix the parser"));
 
-        // the title is stored (for /session) but no longer rendered in
-        // the sidebar session block
-        let rendered = plain_text(&sidebar_rows(&sidebar, &meters, 26, 40, None));
-        assert!(
-            !rendered.iter().any(|r| r.contains("Fix the parser")),
-            "got: {rendered:?}"
-        );
-    }
-
-    #[test]
-    fn sidebar_without_title_shows_no_title_row() {
-        let sidebar = SidebarState::default();
-        let rows = sidebar_rows(&sidebar, &Meters::default(), 26, 40, None);
-        assert!(rows.is_empty(), "no session facts → the section vanishes");
+        assert_eq!(sidebar.title.as_deref(), Some("Fix the parser"));
     }
 
     #[test]
@@ -12013,7 +12918,7 @@ mod tests {
             .map(|s| s.content.to_string())
             .collect();
         assert!(text.contains("first line"), "{text}");
-        assert!(text.contains("(+3 lines · click/Alt+T)"), "{text}");
+        assert!(text.contains("… +3"), "{text}");
         assert!(text.contains("▸"), "collapsed marker: {text}");
         assert!(
             !text.contains("second line"),
@@ -12053,20 +12958,355 @@ mod tests {
         assert_eq!(t.total_rows(), 1, "collapsed again");
     }
     #[test]
-    fn cached_tool_row_is_a_single_band_row() {
-        let out = super::render_line(&Line::Tool("→ bash ✓ done".into()), 40, false);
-        assert_eq!(out.len(), 1, "exactly one band row, no trailing blank");
+    fn tool_row_verdict_right_aligned() {
+        let call = ToolCall {
+            head: "→ bash · cargo build".into(),
+            ok: true,
+            note: "done".into(),
+            excerpt: "done".into(),
+            spill: None,
+            dur: Some(1.25),
+            expanded: false,
+        };
+        let out = super::render_line(&Line::ToolBlock(vec![call]), 40, false);
+        assert_eq!(out.len(), 1, "one call = one row, no wrap");
         let row = &out[0];
         let text: String = row.spans.iter().map(|s| s.content.to_string()).collect();
-        assert_eq!(text.trim_end(), " → bash ✓ done", "inset one col");
-        assert_eq!(text.chars().count(), 40, "band fills the width");
-        let band = crate::palette::TOOL_BAND_STYLE;
+        // rail + fold marker on the left, verdict glyph at the right edge
+        assert!(text.starts_with(" │ ▸ → bash"), "{text:?}");
+        assert!(text.ends_with('✓'), "{text:?}");
+        assert_eq!(text.chars().count(), 40, "row fills exactly the width");
+        // the verdict is OK-colored; the duration right before it is faint
+        let last = row.spans.last().unwrap();
+        assert_eq!(last.content.as_ref(), "✓");
+        assert_eq!(last.style.fg, Some(crate::palette::OK));
+        let dur = &row.spans[row.spans.len() - 2];
+        assert_eq!(dur.content.as_ref(), "1.2s ");
+        assert_eq!(dur.style.fg, Some(crate::palette::FAINT));
+        // a failed call flips the verdict to the red ✗
+        let fail = ToolCall {
+            ok: false,
+            ..no_note_call()
+        };
+        let out = super::render_line(&Line::ToolBlock(vec![fail]), 20, false);
+        let last = out[0].spans.last().unwrap();
+        assert_eq!(last.content.as_ref(), "✗");
+        assert_eq!(last.style.fg, Some(crate::palette::ERR));
+        // sub-tenth durations and replayed calls omit the duration
+        let quiet = ToolCall {
+            head: "→ x".into(),
+            dur: Some(0.04),
+            ..no_note_call()
+        };
+        let out = super::render_line(&Line::ToolBlock(vec![quiet]), 20, false);
+        let text: String = out[0].spans.iter().map(|s| s.content.to_string()).collect();
+        assert!(!text.contains("0.0s"), "{text:?}");
+    }
+
+    /// Every overlay speaks one dialect: rounded corners. Opens each
+    /// modal on a test backend and checks its top-left corner glyph.
+    #[test]
+    fn all_modals_rounded() {
+        use ratatui::backend::TestBackend;
+        let mk = |modal: Modal| -> ratatui::Terminal<TestBackend> {
+            let mut terminal = ratatui::Terminal::new(TestBackend::new(120, 40)).unwrap();
+            terminal
+                .draw(|f| {
+                    let mut t = Transcript::default();
+                    super::render(
+                        f,
+                        &mut t,
+                        None,
+                        "",
+                        0,
+                        false,
+                        None,
+                        Instant::now(),
+                        0,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        Some(&modal),
+                        None,
+                        &Meters::default(),
+                        &SidebarState::default(),
+                        false,
+                        true,
+                        "◆",
+                        &std::cell::Cell::new(None::<StripZones>),
+                        None,
+                        &std::cell::Cell::new(None::<TitleArrows>),
+                        &std::cell::Cell::new(None::<(ratatui::layout::Rect, usize)>),
+                        &std::cell::Cell::new(0u16),
+                    )
+                })
+                .unwrap();
+            terminal
+        };
+        let modals = vec![
+            Modal::Session(SessionPicker {
+                sessions: vec![],
+                selected: 0,
+                filter: String::new(),
+                current: None,
+            }),
+            Modal::Help,
+            Modal::Model(ModelPicker {
+                models: vec![],
+                vendor: None,
+                configured_only: false,
+                selected: 0,
+                filter: String::new(),
+            }),
+            Modal::Provider(ProviderPicker {
+                providers: vec![],
+                counts: vec![],
+                selected: 0,
+                filter: String::new(),
+            }),
+            Modal::Key(KeyPrompt {
+                provider: "mockco".into(),
+                env_var: "MOCK_KEY".into(),
+                doc_url: String::new(),
+                drill: None,
+                input: String::new(),
+                pending_model: None,
+            }),
+            Modal::Spills {
+                items: vec![],
+                selected: 0,
+            },
+            Modal::Prompts {
+                items: vec![],
+                selected: 0,
+            },
+            Modal::Rewind {
+                items: vec![(1, "hello".into())],
+                selected: 0,
+            },
+            Modal::Memory {
+                rows: vec![],
+                inbox: vec![],
+                selected: 0,
+            },
+            Modal::Usage { rows: vec![] },
+            Modal::Context { rows: vec![] },
+            Modal::Tree {
+                items: vec![],
+                targets: vec![],
+                selected: 0,
+            },
+            Modal::Tasks {
+                entries: vec![],
+                selected: 0,
+            },
+            Modal::TaskDetail {
+                id: 1,
+                text: "x".into(),
+                scroll: None,
+            },
+            Modal::Debug {
+                rows: vec![],
+                scroll: None,
+            },
+            Modal::Todos { rows: vec![] },
+            Modal::Skills { rows: vec![] },
+            Modal::Info { rows: vec![] },
+        ];
+        for m in modals {
+            let terminal = mk(m.clone());
+            let buf = terminal.backend().buffer();
+            // find the modal's top border row: a `╭` somewhere on the frame
+            let has_rounded_top_left = (0..buf.area.width).any(|x| buf[(x, 0)].symbol() == "╭")
+                || (1..buf.area.height.saturating_sub(8))
+                    .any(|y| (0..buf.area.width).any(|x| buf[(x, y)].symbol() == "╭"));
+            assert!(has_rounded_top_left, "{m:?} must draw a rounded corner");
+        }
+    }
+
+    #[test]
+    fn title_row_shows_session_title() {
+        use ratatui::backend::TestBackend;
+        let frame_title = |sidebar: &SidebarState| -> String {
+            let mut terminal = ratatui::Terminal::new(TestBackend::new(120, 40)).unwrap();
+            terminal
+                .draw(|f| {
+                    let mut t = Transcript::default();
+                    super::render(
+                        f,
+                        &mut t,
+                        None,
+                        "",
+                        0,
+                        false,
+                        None,
+                        Instant::now(),
+                        0,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        &Meters::default(),
+                        sidebar,
+                        true,
+                        true,
+                        "◆",
+                        &std::cell::Cell::new(None::<StripZones>),
+                        None,
+                        &std::cell::Cell::new(None::<TitleArrows>),
+                        &std::cell::Cell::new(None::<(ratatui::layout::Rect, usize)>),
+                        &std::cell::Cell::new(0u16),
+                    )
+                })
+                .unwrap();
+            (1..100u16)
+                .map(|x| terminal.backend().buffer()[(x, 1)].symbol())
+                .collect()
+        };
+        let mut sidebar = SidebarState::default();
         assert!(
-            row.spans
-                .iter()
-                .all(|s| s.style.fg == band.fg && s.style.bg == band.bg),
-            "cached row rides the tool band: {row:?}"
+            frame_title(&sidebar).contains('◆'),
+            "bare glyph with no title"
         );
+        sidebar.title = Some("refactor the login flow".into());
+        let row = frame_title(&sidebar);
+        assert!(row.contains("◆ refactor the login flow"), "{row}");
+    }
+
+    #[test]
+    fn strip_buttons_bright_label_faint_key() {
+        use ratatui::backend::TestBackend;
+        let mut terminal = ratatui::Terminal::new(TestBackend::new(120, 40)).unwrap();
+        terminal
+            .draw(|f| {
+                let mut t = Transcript::default();
+                super::render(
+                    f,
+                    &mut t,
+                    None,
+                    "",
+                    0,
+                    false,
+                    None,
+                    Instant::now(),
+                    0,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    &Meters::default(),
+                    &SidebarState::default(),
+                    true,
+                    true,
+                    "◆",
+                    &std::cell::Cell::new(None::<StripZones>),
+                    None,
+                    &std::cell::Cell::new(None::<TitleArrows>),
+                    &std::cell::Cell::new(None::<(ratatui::layout::Rect, usize)>),
+                    &std::cell::Cell::new(0u16),
+                )
+            })
+            .unwrap();
+        let buf = terminal.backend().buffer();
+        let strip: String = (0..30u16).map(|x| buf[(x, 38)].symbol()).collect();
+        assert!(strip.contains("todos"), "{strip}");
+        // locate the label vs its key hint, compare fg tones
+        let todos_x = strip.find('t').unwrap() as u16;
+        let alt_x = strip.find("alt").unwrap() as u16;
+        let label_fg = buf[(todos_x, 38)].fg;
+        let hint_fg = buf[(alt_x, 38)].fg;
+        assert_eq!(label_fg, crate::palette::FG_STRONG);
+        assert_eq!(hint_fg, crate::palette::FAINT);
+        // the separator rides the quiet border tone
+        let sep_x = strip.find('│').unwrap() as u16;
+        assert_eq!(buf[(sep_x, 38)].fg, crate::palette::BORDER_QUIET);
+    }
+
+    #[test]
+    fn toast_renders_and_expires() {
+        use ratatui::backend::TestBackend;
+        let draw = |toast: Option<&str>| -> (String, usize) {
+            let mut terminal = ratatui::Terminal::new(TestBackend::new(120, 40)).unwrap();
+            let mut rows_with = 0;
+            terminal
+                .draw(|f| {
+                    let mut t = Transcript::default();
+                    super::render(
+                        f,
+                        &mut t,
+                        None,
+                        "",
+                        0,
+                        false,
+                        None,
+                        Instant::now(),
+                        0,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        &Meters::default(),
+                        &SidebarState::default(),
+                        false,
+                        true,
+                        "◆",
+                        &std::cell::Cell::new(None::<StripZones>),
+                        toast,
+                        &std::cell::Cell::new(None::<TitleArrows>),
+                        &std::cell::Cell::new(None::<(ratatui::layout::Rect, usize)>),
+                        &std::cell::Cell::new(0u16),
+                    )
+                })
+                .unwrap();
+            let buf = terminal.backend().buffer();
+            let text: String = buf.content.iter().map(|c| c.symbol().to_string()).collect();
+            let _ = &mut rows_with;
+            (text, rows_with)
+        };
+        let (with_toast, _) = draw(Some("✓ copied last reply"));
+        assert!(
+            with_toast.contains("copied last reply"),
+            "toast visible while fresh"
+        );
+        let (without, _) = draw(None);
+        assert!(
+            !without.contains("copied last reply"),
+            "no toast row without a toast"
+        );
+        // the run loop only passes the message while younger than the TTL
+        let mut toast = Some(("hi".to_string(), Instant::now()));
+        assert!(
+            toast
+                .as_ref()
+                .is_some_and(|(_, at)| at.elapsed() < TOAST_TTL)
+        );
+        toast = Some((
+            "hi".to_string(),
+            Instant::now() - TOAST_TTL - Duration::from_secs(1),
+        ));
+        assert!(
+            toast
+                .as_ref()
+                .is_none_or(|(_, at)| at.elapsed() >= TOAST_TTL)
+        );
+    }
+
+    #[test]
+    fn mouse_toggle_toasts() {
+        // the toggle announces itself with the persisted mode names
+        assert!(mouse_mode_text(true).contains("capture"));
+        assert!(mouse_mode_text(false).contains("native"));
     }
 
     #[test]
@@ -12096,7 +13336,10 @@ mod tests {
                     &Meters::default(),
                     &SidebarState::default(),
                     true,
-                    &std::cell::Cell::new(None::<SidebarZone>),
+                    true,
+                    "◆",
+                    &std::cell::Cell::new(None::<StripZones>),
+                    None,
                     &std::cell::Cell::new(None::<TitleArrows>),
                     &std::cell::Cell::new(None::<(ratatui::layout::Rect, usize)>),
                     &std::cell::Cell::new(0u16),
@@ -12113,14 +13356,21 @@ mod tests {
         // the transcript title row carries the header glyph (◆ default)
         let title_row: String = (1..93u16).map(|x| buf[(x, 1)].symbol()).collect();
         assert!(title_row.contains('◆'), "glyph title: {title_row}");
-        // the sidebar title carries it too
-        let sb_title: String = (93..119u16).map(|x| buf[(x, 1)].symbol()).collect();
-        assert!(sb_title.contains('◆'), "sidebar glyph title: {sb_title}");
-        // the input box closes with rounded corners (rows 36..39)
-        assert_eq!(buf[(1, 36)].symbol(), "╭");
-        assert_eq!(buf[(118, 36)].symbol(), "╮");
-        assert_eq!(buf[(1, 38)].symbol(), "╰");
-        assert_eq!(buf[(118, 38)].symbol(), "╯");
+        // the chat owns the full width (no sidebar column): the title
+        // row runs to the right margin
+        let tx_end: String = (110..119u16).map(|x| buf[(x, 1)].symbol()).collect();
+        assert!(tx_end.contains('─') || tx_end.contains('◆'), "{tx_end}");
+        // the input box closes with rounded corners (rows 35..38)
+        assert_eq!(buf[(1, 35)].symbol(), "╭");
+        assert_eq!(buf[(118, 35)].symbol(), "╮");
+        assert_eq!(buf[(1, 37)].symbol(), "╰");
+        assert_eq!(buf[(118, 37)].symbol(), "╯");
+        // the strip row carries the popup buttons
+        let strip: String = (0..120u16).map(|x| buf[(x, 38)].symbol()).collect();
+        assert!(
+            strip.contains("todos") && strip.contains("skills") && strip.contains("info"),
+            "{strip}"
+        );
         // the status bar still owns the last row (no bottom margin)
         let last_row: String = (0..120u16).map(|x| buf[(x, 39)].symbol()).collect();
         assert!(last_row.contains("enter"), "status hints on the last row");
@@ -12153,7 +13403,10 @@ mod tests {
                         &Meters::default(),
                         &SidebarState::default(),
                         fresh,
-                        &std::cell::Cell::new(None::<SidebarZone>),
+                        true,
+                        "◆",
+                        &std::cell::Cell::new(None::<StripZones>),
+                        None,
                         &std::cell::Cell::new(None::<TitleArrows>),
                         &std::cell::Cell::new(None::<(ratatui::layout::Rect, usize)>),
                         &std::cell::Cell::new(0u16),
@@ -12170,7 +13423,7 @@ mod tests {
         };
         let frame = frame_text(&mut Transcript::default(), false, true);
         assert!(frame.contains("new conversation"), "welcome on fresh chat");
-        assert!(frame.contains("/help for keys"), "hint row present");
+        assert!(frame.contains("/help keys"), "hint row present");
         // busy, carrying entries, or an older chat still replaying: the
         // welcome steps aside
         assert!(
@@ -12187,6 +13440,96 @@ mod tests {
         assert!(
             !frame_text(&mut t, false, true).contains("new conversation"),
             "carrying entries: no welcome"
+        );
+    }
+
+    #[test]
+    fn idle_hints_teach_the_active_mouse_mode() {
+        use ratatui::backend::TestBackend;
+        let draw = |captured: bool| -> String {
+            // the info section renders `cwd:branch`; with a default
+            // (empty) SidebarState every section is skipped, so seed the
+            // cwd to make the sidebar visible at all
+            let sidebar = SidebarState {
+                cwd: "/tmp/ka".to_string(),
+                branch: Some("main".to_string()),
+                ..Default::default()
+            };
+            let mut terminal = ratatui::Terminal::new(TestBackend::new(120, 40)).unwrap();
+            terminal
+                .draw(|f| {
+                    super::render(
+                        f,
+                        &mut Transcript::default(),
+                        None,
+                        "",
+                        0,
+                        false,
+                        None,
+                        Instant::now(),
+                        0,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        &Meters::default(),
+                        &sidebar,
+                        false,
+                        captured,
+                        "◆",
+                        &std::cell::Cell::new(None::<StripZones>),
+                        None,
+                        &std::cell::Cell::new(None::<TitleArrows>),
+                        &std::cell::Cell::new(None::<(ratatui::layout::Rect, usize)>),
+                        &std::cell::Cell::new(0u16),
+                    )
+                })
+                .unwrap();
+            terminal
+                .backend()
+                .buffer()
+                .content
+                .iter()
+                .map(|c| c.symbol().to_string())
+                .collect()
+        };
+        let captured = draw(true);
+        assert!(
+            captured.contains("⇧drag"),
+            "captured mode teaches the shift bypass: {:?}",
+            captured
+                .chars()
+                .filter(|c| *c != ' ')
+                .take(400)
+                .collect::<String>()
+        );
+        let native = draw(false);
+        assert!(
+            native.contains("drag") && native.contains("↑↓ scroll"),
+            "native mode teaches plain drag + scroll: {native}"
+        );
+        assert!(
+            !native.contains("⇧drag"),
+            "no shift bypass advertised without capture"
+        );
+        // the bottom strip renders in both modes; cwd:branch rides the
+        // right side (seeded on the state above)
+        assert!(
+            native.contains("todos alt+o")
+                && native.contains("skills ^t")
+                && native.contains("info alt+i"),
+            "strip buttons visible in native mode: {native}"
+        );
+        assert!(
+            native.contains("/tmp/ka:main"),
+            "strip carries cwd:branch: {native}"
+        );
+        assert!(
+            draw(true).contains("todos alt+o"),
+            "strip visible in capture too"
         );
     }
 
@@ -12245,18 +13588,33 @@ mod tests {
     }
 
     #[test]
-    fn sidebar_zone_hit_testing() {
-        let zone = SidebarZone::SkillsHeader(ratatui::layout::Rect {
-            x: 94,
-            y: 5,
-            width: 26,
-            height: 1,
-        });
-        assert!(zone.hit(94, 5));
-        assert!(zone.hit(119, 5), "right edge of the sidebar chunk");
-        assert!(!zone.hit(120, 5), "past the sidebar");
-        assert!(!zone.hit(100, 6), "row below the header");
-        assert!(!zone.hit(93, 5), "left of the sidebar");
+    fn strip_zone_hit_testing() {
+        let zone = StripZones {
+            todos: ratatui::layout::Rect {
+                x: 1,
+                y: 38,
+                width: 11,
+                height: 1,
+            },
+            skills: ratatui::layout::Rect {
+                x: 15,
+                y: 38,
+                width: 9,
+                height: 1,
+            },
+            info: ratatui::layout::Rect {
+                x: 27,
+                y: 38,
+                width: 11,
+                height: 1,
+            },
+        };
+        assert_eq!(zone.hit(1, 38), Some(StripButton::Todos));
+        assert_eq!(zone.hit(11, 38), Some(StripButton::Todos));
+        assert_eq!(zone.hit(15, 38), Some(StripButton::Skills));
+        assert_eq!(zone.hit(27, 38), Some(StripButton::Info));
+        assert_eq!(zone.hit(14, 38), None, "gap between buttons");
+        assert_eq!(zone.hit(15, 37), None, "row above the strip");
     }
 
     #[test]
@@ -12284,43 +13642,13 @@ mod tests {
     }
 
     #[test]
-    fn skills_header_label_marks_count_when_collapsed() {
-        assert_eq!(skills_header_label(true, 4), "skills");
-        assert_eq!(skills_header_label(false, 0), "skills (+0)");
-        assert_eq!(skills_header_label(false, 12), "skills (+12)");
-    }
-
-    #[test]
-    fn sidebar_collapsed_skills_render_header_alone() {
-        let sidebar = SidebarState {
-            inventory: Inventory {
-                skills: vec!["a".into(), "b".into(), "c".into()],
-                prompts: Vec::new(),
-                ..Default::default()
-            },
-            skills_open: false,
-            ..Default::default()
-        };
-        let rows = sidebar_rows(&sidebar, &Meters::default(), 24, 40, None);
-        let text = plain_text(&rows);
-        let idx = text
-            .iter()
-            .position(|t| t == "skills (+3) ▸")
-            .expect("collapsed header present");
-        // only the header row: the next rendered row is another section's
-        // separating blank / header, never a skill name
-        assert!(!text.iter().any(|t| t == "a" || t == "b" || t == "c"));
-        assert!(idx + 1 < text.len());
-    }
-
-    #[test]
     fn title_arrows_render_and_record_click_zones() {
         use ratatui::backend::TestBackend;
         let mut t = Transcript::default();
         t.set_width(80);
         t.push(Line::User("hello".into()));
         let mut terminal = ratatui::Terminal::new(TestBackend::new(120, 40)).unwrap();
-        let sidebar_zone: std::cell::Cell<Option<SidebarZone>> = std::cell::Cell::new(None);
+        let strip_zone: std::cell::Cell<Option<StripZones>> = std::cell::Cell::new(None);
         let title_arrows: std::cell::Cell<Option<TitleArrows>> = std::cell::Cell::new(None);
         terminal
             .draw(|f| {
@@ -12344,7 +13672,10 @@ mod tests {
                     &Meters::default(),
                     &SidebarState::default(),
                     true,
-                    &sidebar_zone,
+                    false,
+                    "◆",
+                    &strip_zone,
+                    None,
                     &title_arrows,
                     &std::cell::Cell::new(None::<(ratatui::layout::Rect, usize)>),
                     &std::cell::Cell::new(0u16),
@@ -12367,7 +13698,10 @@ mod tests {
         // wrap-driven row drift, no band/surface bg outside the
         // transcript pane)
         let mut t = Transcript::default();
-        t.push(Line::Tool("→ bash ✓ done".into()));
+        t.push_tool_call(ToolCall {
+            head: "→ bash · cargo build".into(),
+            ..no_note_call()
+        });
         let live = LiveBlock {
             thought: "thinking".into(),
             tool_header: "→ bash · cargo build".into(),
@@ -12378,12 +13712,13 @@ mod tests {
                     "second line".to_string(),
                 ],
                 last: None,
+                started: Instant::now(),
             }),
             md: crate::markdown::render("# heading\ntext", 60),
         };
         for width in [99u16, 100, 101] {
             let mut terminal = ratatui::Terminal::new(TestBackend::new(width, 24)).unwrap();
-            let sb_zone = std::cell::Cell::new(None::<SidebarZone>);
+            let sb_zone = std::cell::Cell::new(None::<StripZones>);
             terminal
                 .draw(|f| {
                     super::render(
@@ -12406,7 +13741,10 @@ mod tests {
                         &Meters::default(),
                         &SidebarState::default(),
                         false,
+                        true,
+                        "◆",
                         &sb_zone,
+                        None,
                         &std::cell::Cell::new(None::<TitleArrows>),
                         &std::cell::Cell::new(None::<(ratatui::layout::Rect, usize)>),
                         &std::cell::Cell::new(0u16),
@@ -12415,29 +13753,35 @@ mod tests {
                 .unwrap();
             let buf = terminal.backend().buffer();
             let area = buf.area;
-            // band keeps its header + PREVIEW_WINDOW rows at every width
+            // the live band owns BG_TOOL now: header + its preview rows
+            // (the cached railed rows sit on the canvas, no band fill)
             let band_rows = (0..area.height)
                 .filter(|&y| (0..area.width).any(|x| buf[(x, y)].bg == crate::palette::BG_TOOL))
                 .count();
-            assert_eq!(band_rows, 1 + PREVIEW_WINDOW, "band rows at width {width}");
-            // nothing band- or output-colored lands at or right of the
-            // sidebar's left border column once the sidebar shows
-            if width >= SIDEBAR_MIN_WIDTH {
-                let sb_left = area.width - SIDEBAR_WIDTH - 1;
-                for y in 0..area.height {
-                    for x in sb_left..area.width {
-                        let cell = &buf[(x, y)];
-                        assert_ne!(
-                            cell.bg,
-                            crate::palette::BG_TOOL,
-                            "tool bleed at {x},{y} w{width}"
-                        );
-                        assert_ne!(
-                            cell.bg,
-                            crate::palette::BG_OUTPUT,
-                            "output bleed at {x},{y} w{width}"
-                        );
-                    }
+            assert_eq!(
+                band_rows,
+                1 + live
+                    .live_tool
+                    .as_ref()
+                    .map(|lt| lt.preview.len())
+                    .unwrap_or(0),
+                "band rows at width {width}"
+            );
+            // nothing band- or output-colored bleeds past the input box's
+            // top edge (the strip and status rows stay chrome-clean)
+            for y in (area.height - 2)..area.height {
+                for x in 0..area.width {
+                    let cell = &buf[(x, y)];
+                    assert_ne!(
+                        cell.bg,
+                        crate::palette::BG_TOOL,
+                        "tool bleed at {x},{y} w{width}"
+                    );
+                    assert_ne!(
+                        cell.bg,
+                        crate::palette::BG_OUTPUT,
+                        "output bleed at {x},{y} w{width}"
+                    );
                 }
             }
         }
@@ -12546,10 +13890,13 @@ mod tests {
         );
         let text = format!("{:?}", lines.entries());
         assert!(text.contains("scanning the tree"), "thought row: {text:?}");
-        assert!(text.contains("→ read · lib.rs"), "tool header: {text:?}");
         assert!(
-            text.contains("✓ fn main() {}"),
-            "merged result note: {text:?}"
+            text.contains("ToolBlock([ToolCall { head: \"→ read · lib.rs\""),
+            "tool block: {text:?}"
+        );
+        assert!(
+            text.contains(r#"note: "fn main() {}""#) && text.contains("ok: true"),
+            "merged result note + verdict: {text:?}"
         );
         assert!(text.contains("found it"), "assistant text: {text:?}");
     }
@@ -12790,13 +14137,17 @@ mod tests {
         t.toggle_thought(2);
         assert_eq!(t.rendered_rows_of(2), solo_before);
 
-        // row -> entry mapping: the first row of each entry maps back
+        // row -> ref mapping: the first row of each entry maps back
         // to it (user blocks render with padding, so use real heights)
-        let e = t.entry_at_row(0).unwrap();
-        assert_eq!(e, 0, "row 0 is the user block");
+        let e = t.row_ref_at(0).unwrap();
+        assert_eq!(e, RowRef::Entry(0), "row 0 is the user block");
         let first_of_1 = t.rendered_rows_of(0);
-        let e1 = t.entry_at_row(first_of_1).unwrap();
-        assert_eq!(e1, 1, "row {first_of_1} is the thought block");
+        let e1 = t.row_ref_at(first_of_1).unwrap();
+        assert_eq!(
+            e1,
+            RowRef::Entry(1),
+            "row {first_of_1} is the thought block"
+        );
 
         // global Alt+T reset clears per-block overrides
         t.set_thoughts_open(true);
