@@ -7374,11 +7374,12 @@ fn render(
     frame.render_widget(widget, tx_area);
 
     // ── ▲▼ user-message jump arrows at the end of the title row ──
-    // Only in captured-mouse mode (the zones are click targets), once
-    // the user has sent a message, and only when the pane is wide
-    // enough that the arrows never collide with the title text. ▲
-    // steps to the previous user message, ▼ to the next; Ctrl+↑/↓ are
-    // the keyboard twin.
+    // Only in captured-mouse mode (the zones are click targets — in
+    // native mode they would be dead pixels; Ctrl+↑/↓ are the keyboard
+    // twin and always work), once the user has sent a message, and only
+    // when the pane is wide enough that the arrows never collide with
+    // the title text. ▲ steps to the previous user message, ▼ to the
+    // next.
     title_arrows.set(None);
     // content rows (below the title) + the first visible transcript row:
     // click-to-collapse maps screen rows back to entries through this
@@ -7393,7 +7394,7 @@ fn render(
         .entries()
         .iter()
         .any(|l| matches!(l, Line::User(_)));
-    if has_user && tx_area.width >= 12 {
+    if has_user && tx_area.width >= 12 && mouse_captured {
         let need = title_cells + 7;
         if tx_area.width as usize >= need {
             let y = tx_area.y;
@@ -7754,10 +7755,17 @@ fn render(
         frame.render_widget(ratatui::widgets::Clear, rect);
         let inner_w = rect.width.saturating_sub(4) as usize; // borders + padding
         let mut text = Vec::new();
-        for (i, (name, desc)) in popup.items.iter().take(7).enumerate() {
+        // window the list so the selection always stays visible: the
+        // filter can match far more commands than the 7 shown rows
+        const CAP: usize = 7;
+        let offset = popup
+            .selected
+            .saturating_sub(CAP - 1)
+            .min(popup.items.len().saturating_sub(CAP));
+        for (i, (name, desc)) in popup.items.iter().skip(offset).take(CAP).enumerate() {
             let desc_trim: String = desc.chars().take(32).collect();
             let row = format!("{name:<12} {desc_trim}");
-            if i == popup.selected {
+            if i + offset == popup.selected {
                 text.push(TuiLine::styled(
                     pad_to_width(row, inner_w),
                     selection_style(),
@@ -7787,9 +7795,15 @@ fn render(
         frame.render_widget(ratatui::widgets::Clear, rect);
         let inner_w = rect.width.saturating_sub(4) as usize; // borders + padding
         let mut text = Vec::new();
-        for (i, (name, is_dir)) in path.entries.iter().take(7).enumerate() {
+        // window the list so the selection always stays visible
+        const CAP: usize = 7;
+        let offset = path
+            .selected
+            .saturating_sub(CAP - 1)
+            .min(path.entries.len().saturating_sub(CAP));
+        for (i, (name, is_dir)) in path.entries.iter().skip(offset).take(CAP).enumerate() {
             let slash = if *is_dir { "/" } else { "" };
-            if i == path.selected {
+            if i + offset == path.selected {
                 text.push(TuiLine::styled(
                     pad_to_width(format!("{name}{slash}"), inner_w),
                     selection_style(),
@@ -13310,6 +13324,70 @@ mod tests {
     }
 
     #[test]
+    fn slash_popup_selection_stays_visible() {
+        use ratatui::backend::TestBackend;
+        let items: Vec<(String, String)> = (0..30)
+            .map(|i| (format!("/cmd{i:02}"), format!("desc {i}")))
+            .collect();
+        let draw = |selected: usize| -> String {
+            let popup = SlashPopup {
+                items: items.clone(),
+                selected,
+            };
+            let mut terminal = ratatui::Terminal::new(TestBackend::new(120, 40)).unwrap();
+            terminal
+                .draw(|f| {
+                    let mut t = Transcript::default();
+                    super::render(
+                        f,
+                        &mut t,
+                        None,
+                        "/c",
+                        2,
+                        false,
+                        None,
+                        Instant::now(),
+                        0,
+                        None,
+                        None,
+                        Some(&popup),
+                        None,
+                        None,
+                        None,
+                        None,
+                        &Meters::default(),
+                        &SidebarState::default(),
+                        false,
+                        true,
+                        "◆",
+                        &std::cell::Cell::new(None::<StripZones>),
+                        None,
+                        &std::cell::Cell::new(None::<TitleArrows>),
+                        &std::cell::Cell::new(None::<(ratatui::layout::Rect, usize)>),
+                        &std::cell::Cell::new(0u16),
+                    )
+                })
+                .unwrap();
+            terminal
+                .backend()
+                .buffer()
+                .content
+                .iter()
+                .map(|c| c.symbol().to_string())
+                .collect()
+        };
+        // selection 0: /cmd00 visible
+        assert!(draw(0).contains("/cmd00"));
+        // deep in the list: the selected row is on screen, the top of the
+        // list is scrolled away — the old take(7) render lost the selection
+        let deep = draw(24);
+        assert!(deep.contains("/cmd24"), "selected row must be visible");
+        assert!(!deep.contains("/cmd00"), "list is windowed");
+        // bottom of the list
+        assert!(draw(29).contains("/cmd29"));
+    }
+
+    #[test]
     fn frame_has_top_margin_glyph_title_and_rounded_input() {
         use ratatui::backend::TestBackend;
         let mut terminal = ratatui::Terminal::new(TestBackend::new(120, 40)).unwrap();
@@ -13672,7 +13750,7 @@ mod tests {
                     &Meters::default(),
                     &SidebarState::default(),
                     true,
-                    false,
+                    true,
                     "◆",
                     &strip_zone,
                     None,

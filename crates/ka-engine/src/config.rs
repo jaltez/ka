@@ -520,11 +520,13 @@ impl Config {
     }
 
     /// Whether the TUI starts with the mouse captured. Default is
-    /// native (unset or `"native"`): plain drag selection, wheel via
-    /// alternate-scroll. `[tui] mouse = "capture"` opts into SGR
-    /// button reporting (wheel + clickable strip buttons + ⇧drag).
+    /// capture (unset or `"capture"`): clickable tool rows, jump arrows
+    /// and strip buttons, wheel scroll at line granularity; ⇧drag still
+    /// selects natively on every major terminal. `[tui] mouse =
+    /// "native"` opts out (plain drag select/paste, wheel via
+    /// alternate-scroll, keyboard-only affordances).
     pub fn effective_mouse_capture(&self) -> bool {
-        self.tui.mouse.as_deref() == Some("capture")
+        self.tui.mouse.as_deref() != Some("native")
     }
 
     /// Whether web fetches may target private hosts (default false).
@@ -788,7 +790,7 @@ mod tests {
         let c = Config::default();
         assert_eq!(c.effective_mode(), Mode::Free);
         assert!(c.model.is_none());
-        assert!(!c.effective_mouse_capture(), "native is the default mode");
+        assert!(c.effective_mouse_capture(), "capture is the default mode");
     }
 
     #[test]
