@@ -122,9 +122,9 @@ Order: 8.1 → 8.2 → 8.3 → 8.4. 8.4 items are filler and never block.
 ### 8.2 DAP — the probe (shipped 2026-09)
 - **[M]** DAP client + debug hand + adapter catalog + `[debug]` gate — **shipped** (16 actions; embedded catalog + `[debug.adapters]` overlay; shared Content-Length codec extracted to `wire.rs`, consumed by `lsp.rs` + `dap.rs`; real-adapter dogfood vs debugpy 1.8.22 passes: launch → entry stop → breakpoints → stack/vars/eval → exit)
 - **[M]** Clearance: control-flow actions (launch/attach/step/continue/terminate) = Exec; inspection (stack/scopes/variables/evaluate/threads) = Read
-- **[O]** TUI roster (tasks-style session list) — **partially**: DAP sessions surface in the `/tasks` dashboard; dedicated overlay still open. Breakpoint-stop Notes: not shipped
+- **[M]** TUI roster (tasks-style session list) — **shipped 2026-09**: `/debug` overlay (`Command::DebugRoster` → pager modal: session headers, per-file breakpoint lines, console tail), plus async breakpoint-stop Notes — a stop with no hand wait in flight emits `debug d1 stopped at …` (200-char cap, `hand_waiting` latch prevents duplicates with the tool result)
 - **[O]** cargo feature `dap` if `xtask size` says >100 KB — moot at 6.42 MB total
-- Tests: fake DAP adapter fixture (handshake, breakpoint, stop-read loop) + **real debugpy dogfood** (launch → entry stop → bp → stack/vars/eval → exit); catalog schema contract
+- Tests: fake DAP adapter fixture (handshake, breakpoint, stop-read loop) + **real debugpy dogfood** (launch → entry stop → bp → stack/vars/eval → exit) + **real lldb-dap dogfood** (Ubuntu's `lldb-vscode-14`, the pre-rename binary: entry stop → verified line-2 bp → exit 0); catalog schema contract
 - Notes: launch is fire-and-forget (debugpy defers its response to `configurationDone`); the client never echoes the adapter's `initialized` event (debugpy starts the debuggee on it, which would race breakpoint setup)
 
 ### 8.3 Delegation 2.0 — contracts, steering, merge-back (shipped 2026-09)
@@ -132,7 +132,7 @@ Order: 8.1 → 8.2 → 8.3 → 8.4. 8.4 items are filler and never block.
 - **[M]** `tasks send <id> <text>` — steer running background agents via their (currently empty) interjection queues
 - **[M]** Sibling messaging: engine-mediated roster injected into spawned context; `tasks inbox`; messages to finished agents surface as notes (no revival in v1)
 - **[M]** `tasks merge <id>` — clean-only patch apply from the surviving `ka-<name>-<uuid>` worktree branch; on conflict surface the `.patch` path and stop; parent-mode gated (accept-edits/free, else Ask)
-- **[O]** TUI `/tasks` roster w/ status/cost + transcript pager
+- **[M]** TUI `/tasks` roster w/ status/cost + transcript pager — **shipped 2026-09**: `/tasks` opens a picker modal (Enter sends `Command::TaskDetail`, the full uncapped result pages in a scrollable modal; job/dap rows listed, non-pickable)
 - Declined: CoW isolation backends (fuse/overlayfs daemons violate one-process children-only; git worktrees are the Claude Code-shipped subset)
 
 ### 8.4 Convenience set (filler)

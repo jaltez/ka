@@ -203,6 +203,14 @@ pub enum Command {
     Abort,
     /// Snapshot background tasks/jobs for the /tasks dashboard.
     ListTasks,
+    /// Full result of background task `t-<id>` for the TUI pager
+    /// (uncapped).
+    TaskDetail {
+        /// Task id (the `t-<id>` roster prefix).
+        id: u64,
+    },
+    /// Live DAP session roster for the `/debug` overlay.
+    DebugRoster,
     /// Switch the active model.
     SetModel {
         /// Model selector, e.g. `vendor/model:effort`.
@@ -522,6 +530,18 @@ pub enum Event {
         /// Rendered rows.
         rows: Vec<String>,
     },
+    /// Uncapped task result (answer to [`Command::TaskDetail`]).
+    TaskDetail {
+        /// Task id.
+        id: u64,
+        /// Full result text.
+        text: String,
+    },
+    /// Pre-rendered DAP session rows (answer to [`Command::DebugRoster`]).
+    DebugRoster {
+        /// Rendered rows.
+        rows: Vec<String>,
+    },
     /// Context-usage breakdown (/context): estimated tokens per
     /// component plus the active window.
     ContextBreakdown {
@@ -729,6 +749,8 @@ mod tests {
                 cost: 0.001,
             },
         });
+        roundtrip_command(Command::TaskDetail { id: 7 });
+        roundtrip_command(Command::DebugRoster);
         roundtrip_event(Event::Title {
             title: "fix the parser".into(),
         });
@@ -756,6 +778,13 @@ mod tests {
         });
         roundtrip_event(Event::Tasks {
             rows: vec!["t-1  running  12s  reviewer — audit".into()],
+        });
+        roundtrip_event(Event::TaskDetail {
+            id: 1,
+            text: "full result text".into(),
+        });
+        roundtrip_event(Event::DebugRoster {
+            rows: vec!["no debug sessions (debug action \"start\")".into()],
         });
         roundtrip_event(Event::Error {
             class: ErrorClass::Unsupported,

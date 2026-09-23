@@ -2405,8 +2405,83 @@ pub enum Modal {
         /// Selected row index.
         selected: usize,
     },
+    /// /tasks picker: background task/job/DAP rows; Enter pages the
+    /// selected task's full result.
+    Tasks {
+        /// Row label plus its parseable task id (None for job-/dap rows).
+        entries: Vec<(Option<u64>, String)>,
+        /// Selected row index.
+        selected: usize,
+    },
+    /// Full result of one background task (the pager over
+    /// `Command::TaskDetail`).
+    TaskDetail {
+        /// Task id (roster `t-<id>`).
+        id: u64,
+        /// Uncapped result text.
+        text: String,
+        /// Scroll anchor (None = pinned to the tail).
+        scroll: Option<usize>,
+    },
+    /// /debug overlay: live DAP session roster rows.
+    Debug {
+        /// Rendered roster rows.
+        rows: Vec<String>,
+        /// Scroll anchor (None = pinned to the tail).
+        scroll: Option<usize>,
+    },
     /// Help overlay.
     Help,
+}
+
+/// Which modal the next roster event should open instead of rendering
+/// transcript rows (set by `/tasks` and `/debug`, consumed once).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PendingModal {
+    Tasks,
+    Debug,
+}
+
+/// Visible rows in the TaskDetail/Debug pager modals — the render
+/// height cap (30) minus the box chrome (border 2 + padding 2 + 1).
+const PAGER_VISIBLE: usize = 25;
+
+/// Task id off a /tasks roster row: `t-<id>  …` → `Some(id)`, any
+/// other row shape (job-`, dap, placeholders) → None.
+fn task_id_of_row(row: &str) -> Option<u64> {
+    let row = row.trim();
+    let digits = row.strip_prefix("t-")?;
+    let end = digits.find(char::is_whitespace).unwrap_or(digits.len());
+    digits[..end].parse().ok()
+}
+
+/// Key handling shared by the pager modals (TaskDetail, Debug): the
+/// page keys scroll the window, Home jumps to the top, End re-pins to
+/// the tail; any other key closes. Returns true when the modal should
+/// close.
+fn pager_keys(code: crossterm::event::KeyCode, total: usize, scroll: &mut Option<usize>) -> bool {
+    use crossterm::event::KeyCode;
+    match code {
+        KeyCode::PageUp => {
+            page_up(scroll, total, PAGER_VISIBLE);
+            false
+        }
+        KeyCode::PageDown => {
+            page_down(scroll, total, PAGER_VISIBLE);
+            false
+        }
+        KeyCode::Home => {
+            if total > PAGER_VISIBLE {
+                *scroll = Some(0);
+            }
+            false
+        }
+        KeyCode::End => {
+            *scroll = None;
+            false
+        }
+        _ => true,
+    }
 }
 
 /// API key entry for a provider's env var.
@@ -2583,6 +2658,9 @@ async fn app(
     // last /find query + the row to resume a bare /find after
     let mut find_last: Option<(String, usize)> = None;
     let mut modal: Option<Modal> = None;
+    // /tasks and /debug set this so the roster event opens the modal
+    // instead of rendering transcript rows; consumed once
+    let mut pending_modal: Option<PendingModal> = None;
     let mut mode_picker: Option<ModePicker> = None;
     // clickable sidebar regions + ▲▼ title-row jump targets, refreshed
     // every frame by render()
@@ -3273,6 +3351,36 @@ async fn app(
                                 }
                                 _ => {}
                             },
+                            Modal::Tasks { entries, selected } => match key.code {
+                                KeyCode::Esc => modal = None,
+                                KeyCode::Up => {
+                                    *selected = selected.saturating_sub(1);
+                                }
+                                KeyCode::Down => {
+                                    if *selected + 1 < entries.len() {
+                                        *selected += 1;
+                                    }
+                                }
+                                KeyCode::Enter => {
+                                    // page the selected task's full result;
+                                    // the modal stays open and is replaced
+                                    // when TaskDetail arrives
+                                    if let Some((Some(id), _)) = entries.get(*selected) {
+                                        let _ = commands.send(Command::TaskDetail { id: *id }).await;
+                                    }
+                                }
+                                _ => {}
+                            },
+                            Modal::TaskDetail { text, scroll, .. } => {
+                                if pager_keys(key.code, text.lines().count(), scroll) {
+                                    modal = None;
+                                }
+                            }
+                            Modal::Debug { rows, scroll } => {
+                                if pager_keys(key.code, rows.len(), scroll) {
+                                    modal = None;
+                                }
+                            }
                         }
                         continue;
                     }
@@ -3843,10 +3951,35 @@ async fn app(
                                         // arm) and Key the outer arm above:
                                         // neither ever becomes a modal
                                         ModalKind::Mode | ModalKind::Key => Modal::Help,
+                                        // unreachable in practice: /tasks and
+                                        // /debug send events, and the modal is
+                                        // built from the event payload — these
+                                        // arms only satisfy exhaustiveness
+                                        ModalKind::Tasks => Modal::Tasks {
+                                            entries: Vec::new(),
+                                            selected: 0,
+                                        },
+                                        ModalKind::Debug => Modal::Debug {
+                                            rows: Vec::new(),
+                                            scroll: None,
+                                        },
                                     });
                             }
                                             }
                         }
+                                // /tasks and /debug flag the roster event to
+                                // open its modal instead of transcript rows
+                                if modal.is_none() {
+                                    match cmd.event {
+                                        Some(Command::ListTasks) => {
+                                            pending_modal = Some(PendingModal::Tasks)
+                                        }
+                                        Some(Command::DebugRoster) => {
+                                            pending_modal = Some(PendingModal::Debug)
+                                        }
+                                        _ => {}
+                                    }
+                                }
                                 if let Some(evt) = cmd.event {
                                     let mut is_switch = false;
                                     if let Command::SwitchStrand { id } = &evt {
@@ -4258,7 +4391,10 @@ async fn app(
                             Modal::Help
                             | Modal::Spills { .. }
                             | Modal::Usage { .. }
-                            | Modal::Context { .. } => {}
+                            | Modal::Context { .. }
+                            | Modal::Tasks { .. }
+                            | Modal::TaskDetail { .. }
+                            | Modal::Debug { .. } => {}
                         }
                     } else if path_popup.is_some() {
                         path_popup = None;
@@ -4389,6 +4525,56 @@ async fn app(
                                     .filter(|m| m.role == "user" && !m.digest)
                                     .map(|m| m.content.clone()),
                             );
+                        }
+                        // /tasks and /debug modals: a flagged roster event
+                        // reroutes into the modal (skipping the transcript
+                        // fallback below); TaskDetail always pages
+                        if pending_modal.is_some() {
+                            match &evt {
+                                Event::Tasks { rows }
+                                    if pending_modal == Some(PendingModal::Tasks) =>
+                                {
+                                    pending_modal = None;
+                                    modal = Some(Modal::Tasks {
+                                        entries: rows
+                                            .iter()
+                                            .map(|r| (task_id_of_row(r), r.clone()))
+                                            .collect(),
+                                        selected: 0,
+                                    });
+                                    continue;
+                                }
+                                Event::DebugRoster { rows }
+                                    if pending_modal == Some(PendingModal::Debug) =>
+                                {
+                                    pending_modal = None;
+                                    modal = Some(Modal::Debug {
+                                        rows: rows.clone(),
+                                        scroll: None,
+                                    });
+                                    continue;
+                                }
+                                _ => {}
+                            }
+                        }
+                        match &evt {
+                            Event::TaskDetail { id, text } => {
+                                modal = Some(Modal::TaskDetail {
+                                    id: *id,
+                                    text: text.clone(),
+                                    scroll: None,
+                                });
+                            }
+                            Event::DebugRoster { rows } => {
+                                // no pending modal: transcript fallback
+                                transcript
+                                    .push_separated(Line::Note("▬ debug sessions".into()));
+                                for row in rows {
+                                    transcript
+                                        .push_separated(Line::Report(row.clone()));
+                                }
+                            }
+                            _ => {}
                         }
                         apply_event(
                             &evt,
@@ -4936,6 +5122,9 @@ fn apply_event(
         Event::DigestFinished { .. } => {}
         // the run loop opens the /context modal from this event
         Event::ContextBreakdown { .. } => {}
+        // likewise the /tasks pager and /debug overlay: the run loop
+        // owns their modal handling (transcript fallback included)
+        Event::TaskDetail { .. } | Event::DebugRoster { .. } => {}
     }
 }
 
@@ -5293,7 +5482,11 @@ fn builtin_slash_commands() -> Vec<(String, String)> {
         ),
         (
             "/tasks".to_string(),
-            "background tasks and jobs snapshot".to_string(),
+            "background tasks, DAP sessions — ⏎ pages a task result".to_string(),
+        ),
+        (
+            "/debug".to_string(),
+            "live debug sessions (breakpoints + output)".to_string(),
         ),
         ("/prompt".to_string(), "run an MCP prompt".to_string()),
         (
@@ -5309,10 +5502,6 @@ fn builtin_slash_commands() -> Vec<(String, String)> {
         (
             "/review".to_string(),
             "read-only review of current changes ([base])".to_string(),
-        ),
-        (
-            "/tasks".to_string(),
-            "background tasks & jobs snapshot".to_string(),
         ),
         (
             "/mouse".to_string(),
@@ -5688,6 +5877,10 @@ pub enum ModalKind {
     Memory,
     /// Usage dashboard.
     Usage,
+    /// /tasks picker (rows arrive with `Event::Tasks`).
+    Tasks,
+    /// /debug overlay (rows arrive with `Event::DebugRoster`).
+    Debug,
     /// Strand tree.
     Tree,
     /// Help overlay.
@@ -5889,6 +6082,7 @@ pub fn slash_command(text: &str) -> Option<Slash> {
             | "/tree"
             | "/memory"
             | "/tasks"
+            | "/debug"
     ) {
         if let Some(body) = custom_command(head, rest) {
             return Some(Slash {
@@ -6136,6 +6330,13 @@ blocker > major > minor > nit, each as `file:line — issue — concrete fix`, \
         "/tasks" => Some(Slash {
             note: None,
             event: Some(Command::ListTasks),
+            quit: false,
+            followup: None,
+            modal: None,
+        }),
+        "/debug" => Some(Slash {
+            note: None,
+            event: Some(Command::DebugRoster),
             quit: false,
             followup: None,
             modal: None,
@@ -6983,6 +7184,14 @@ fn render(
             }
             Modal::Usage { .. } => hint_spans(&[(" any", "close")]),
             Modal::Context { .. } => hint_spans(&[(" esc", "close")]),
+            Modal::Tasks { .. } => {
+                hint_spans(&[(" ↑↓", "choose"), (" ⏎", "page result"), (" esc", "close")])
+            }
+            Modal::TaskDetail { .. } | Modal::Debug { .. } => hint_spans(&[
+                (" pgup/pgdn", "scroll"),
+                (" home/end", "top/tail"),
+                (" esc", "close"),
+            ]),
             Modal::Key(_) => hint_spans(&[(" type", "value"), (" ⏎", "save"), (" esc", "cancel")]),
             Modal::Help => hint_spans(&[(" ⏎", "close")]),
         }
@@ -7588,6 +7797,96 @@ fn render(
                         Block::default()
                             .borders(Borders::ALL)
                             .title(padded_title("prompts"))
+                            .border_style(crate::palette::BORDER_STYLE)
+                            .padding(ratatui::widgets::Padding::new(1, 1, 1, 1)),
+                    )
+                    .style(ratatui::style::Style::new().bg(crate::palette::BG_SURFACE))
+                    .wrap(Wrap { trim: false });
+                frame.render_widget(widget, rect);
+            }
+            Modal::Tasks { entries, selected } => {
+                let height = (entries.len() as u16 + 5).clamp(7, 21);
+                let width = 90.min(frame.area().width);
+                let rect = centered(width, height, modal_area);
+                frame.render_widget(ratatui::widgets::Clear, rect);
+                let inner_w = width.saturating_sub(4) as usize;
+                let mut text = Vec::new();
+                if entries.is_empty() {
+                    text.push(TuiLine::styled(
+                        "(no background tasks or jobs)".to_string(),
+                        crate::palette::META,
+                    ));
+                }
+                let cap = (height as usize).saturating_sub(5);
+                let offset = (*selected)
+                    .saturating_sub(cap.saturating_sub(1))
+                    .min(entries.len().saturating_sub(cap));
+                for (i, (_, row)) in entries.iter().enumerate().skip(offset).take(cap) {
+                    if i == *selected {
+                        text.push(TuiLine::styled(
+                            pad_to_width(row.clone(), inner_w),
+                            selection_style(),
+                        ));
+                    } else {
+                        text.push(TuiLine::raw(row.clone()));
+                    }
+                }
+                let widget = Paragraph::new(text)
+                    .block(
+                        Block::default()
+                            .borders(Borders::ALL)
+                            .title(padded_title("tasks — ⏎ pages a task result"))
+                            .border_style(crate::palette::BORDER_STYLE)
+                            .padding(ratatui::widgets::Padding::new(1, 1, 1, 1)),
+                    )
+                    .style(ratatui::style::Style::new().bg(crate::palette::BG_SURFACE))
+                    .wrap(Wrap { trim: false });
+                frame.render_widget(widget, rect);
+            }
+            Modal::TaskDetail { id, text, scroll } => {
+                let lines: Vec<&str> = text.lines().collect();
+                let height = (lines.len() as u16 + 5)
+                    .clamp(7, 30)
+                    .min(frame.area().height);
+                let width = 90.min(frame.area().width);
+                let rect = centered(width, height, modal_area);
+                frame.render_widget(ratatui::widgets::Clear, rect);
+                let visible = (height as usize).saturating_sub(5);
+                let (start, _) = window_range(lines.len(), visible, *scroll);
+                let mut body = Vec::new();
+                for line in &lines[start..(start + visible).min(lines.len())] {
+                    body.push(TuiLine::raw((*line).to_string()));
+                }
+                let widget = Paragraph::new(body)
+                    .block(
+                        Block::default()
+                            .borders(Borders::ALL)
+                            .title(padded_title(format!("task t-{id}")))
+                            .border_style(crate::palette::BORDER_STYLE)
+                            .padding(ratatui::widgets::Padding::new(1, 1, 1, 1)),
+                    )
+                    .style(ratatui::style::Style::new().bg(crate::palette::BG_SURFACE))
+                    .wrap(Wrap { trim: false });
+                frame.render_widget(widget, rect);
+            }
+            Modal::Debug { rows, scroll } => {
+                let height = (rows.len() as u16 + 5)
+                    .clamp(7, 30)
+                    .min(frame.area().height);
+                let width = 90.min(frame.area().width);
+                let rect = centered(width, height, modal_area);
+                frame.render_widget(ratatui::widgets::Clear, rect);
+                let visible = (height as usize).saturating_sub(5);
+                let (start, _) = window_range(rows.len(), visible, *scroll);
+                let mut body = Vec::new();
+                for row in &rows[start..(start + visible).min(rows.len())] {
+                    body.push(TuiLine::styled(row.clone(), crate::palette::META));
+                }
+                let widget = Paragraph::new(body)
+                    .block(
+                        Block::default()
+                            .borders(Borders::ALL)
+                            .title(padded_title("debug sessions"))
                             .border_style(crate::palette::BORDER_STYLE)
                             .padding(ratatui::widgets::Padding::new(1, 1, 1, 1)),
                     )
@@ -9604,6 +9903,48 @@ mod tests {
                 html: true
             }) if p == &std::path::PathBuf::from("page.html")
         ));
+    }
+
+    #[test]
+    fn slash_tasks_and_debug_parse() {
+        assert!(matches!(
+            slash_command("/tasks").unwrap().event,
+            Some(Command::ListTasks)
+        ));
+        assert!(matches!(
+            slash_command("/debug").unwrap().event,
+            Some(Command::DebugRoster)
+        ));
+        // both appear in the help listing
+        let names: Vec<String> = builtin_slash_commands()
+            .into_iter()
+            .map(|(n, _)| n)
+            .collect();
+        assert_eq!(
+            names.iter().filter(|n| n.as_str() == "/tasks").count(),
+            1,
+            "one /tasks entry: {names:?}"
+        );
+        assert!(names.contains(&"/debug".to_string()), "{names:?}");
+    }
+
+    #[test]
+    fn task_id_of_row_parses_roster_shapes() {
+        assert_eq!(task_id_of_row("t-3  running  12s  coder — audit"), Some(3));
+        assert_eq!(task_id_of_row("t-42  done    1m03s  x"), Some(42));
+        assert_eq!(task_id_of_row("  t-7  running"), Some(7), "leading space");
+        assert_eq!(task_id_of_row("t-x  running"), None, "non-numeric id");
+        assert_eq!(
+            task_id_of_row("job-1`  exit 0  cargo test"),
+            None,
+            "job rows carry no task id"
+        );
+        assert_eq!(
+            task_id_of_row("dap d1  live     breakpoints in 2 file(s)"),
+            None,
+            "dap rows carry no task id"
+        );
+        assert_eq!(task_id_of_row("no background tasks or jobs"), None);
     }
 
     #[test]

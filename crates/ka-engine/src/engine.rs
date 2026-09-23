@@ -503,8 +503,12 @@ async fn run(
     // Exec-tier control flow, Read-tier inspection — only under
     // [debug] enable = true
     let debug_cfg = effective_debug_cfg(&config);
-    let debug = (debug_cfg.enable == Some(true))
-        .then(|| std::sync::Arc::new(crate::dap::DebugManager::new(debug_cfg.adapters.clone())));
+    let debug = (debug_cfg.enable == Some(true)).then(|| {
+        std::sync::Arc::new(crate::dap::DebugManager::new(
+            debug_cfg.adapters.clone(),
+            Some(events.clone()),
+        ))
+    });
     if let Some(debug) = &debug {
         voice.push_hand(std::sync::Arc::new(crate::hands::debug::DebugHand::new(
             debug.clone(),
@@ -980,6 +984,32 @@ async fn handle_command(
                 rows.push("no background tasks or jobs".to_string());
             }
             ctx.events.send(Event::Tasks { rows }).await.ok();
+        }
+        Command::TaskDetail { id } => {
+            match ctx.agent_tasks.result(id) {
+                Some(text) => {
+                    ctx.events.send(Event::TaskDetail { id, text }).await.ok();
+                }
+                None => {
+                    ctx.events
+                        .send(Event::Error {
+                            class: ErrorClass::Unsupported,
+                            retryable: false,
+                            message: format!("no such task: t-{id}"),
+                        })
+                        .await
+                        .ok();
+                }
+            }
+            ctx.events.send(Event::Idle).await.ok();
+        }
+        Command::DebugRoster => {
+            let rows = match &ctx.debug {
+                Some(debug) => debug.roster(),
+                None => vec!["debug tier disabled ([debug] enable)".to_string()],
+            };
+            ctx.events.send(Event::DebugRoster { rows }).await.ok();
+            ctx.events.send(Event::Idle).await.ok();
         }
         Command::Interject { text } => ctx.state.interjections.push(text),
         Command::Defer { text } => ctx.state.deferrals.push_back(text),

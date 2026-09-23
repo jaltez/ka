@@ -271,6 +271,62 @@ async fn list_tasks_reports_snapshot() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// /tasks pager: an unknown task id errors with the documented message
+/// (the picker stays open, the engine stays responsive).
+#[tokio::test]
+async fn task_detail_unknown_id_errors() {
+    let dir = tmp_dir("task-detail");
+    let cfg = ka_engine::Config {
+        cwd: Some(dir.to_string_lossy().into_owned()),
+        ..Default::default()
+    };
+    let mut handle = ka_engine::spawn_with(cfg, test_catalog());
+    let events = settle(&mut handle, Command::TaskDetail { id: 99 }, |e| {
+        matches!(e, Event::Error { .. })
+    })
+    .await;
+    match events.iter().find(|e| matches!(e, Event::Error { .. })) {
+        Some(Event::Error { message, .. }) => {
+            assert!(message.contains("no such task: t-99"), "{events:?}");
+        }
+        other => panic!("expected Error, got {other:?}"),
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// /debug overlay: with no [debug] config the roster says the tier is
+/// disabled and the engine still reaches Idle.
+#[tokio::test]
+async fn debug_roster_reports_disabled_tier() {
+    let dir = tmp_dir("debug-roster");
+    let cfg = ka_engine::Config {
+        cwd: Some(dir.to_string_lossy().into_owned()),
+        ..Default::default()
+    };
+    let mut handle = ka_engine::spawn_with(cfg, test_catalog());
+    let events = settle(&mut handle, Command::DebugRoster, |e| {
+        matches!(e, Event::DebugRoster { .. })
+    })
+    .await;
+    match events
+        .iter()
+        .find(|e| matches!(e, Event::DebugRoster { .. }))
+    {
+        Some(Event::DebugRoster { rows }) => {
+            assert!(
+                rows.iter().any(|r| r.contains("debug tier disabled")),
+                "{rows:?}"
+            );
+        }
+        other => panic!("expected DebugRoster, got {other:?}"),
+    }
+    assert!(
+        events.iter().any(|e| matches!(e, Event::Idle)),
+        "the arm ends in Idle: {events:?}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Rewind on an empty session errors with the documented message
 /// instead of corrupting state.
 #[tokio::test]

@@ -365,7 +365,7 @@ fn conditional_hands_contract() {
 
     // the debug probe ([debug] enable = true only): control flow runs at
     // Exec, inspection reads, unknown actions fail closed at Exec
-    let dbg = hands::debug::DebugHand::new(Arc::new(ka_engine::dap::DebugManager::new(None)));
+    let dbg = hands::debug::DebugHand::new(Arc::new(ka_engine::dap::DebugManager::new(None, None)));
     let d = dbg.def();
     assert_eq!(d.name, "debug");
     assert_eq!(d.clearance, hands::Clearance::Exec);

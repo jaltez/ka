@@ -23,7 +23,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::io::BufReader;
 use tokio::process::{Child, ChildStdin, Command};
-use tokio::sync::{Notify, oneshot};
+use tokio::sync::{Notify, mpsc, oneshot};
 
 /// Adapters can be slow to boot (gdb initializes its symbols).
 const READY_TIMEOUT: Duration = Duration::from_secs(15);
@@ -87,6 +87,11 @@ pub struct Session {
     dead: AtomicBool,
     /// Breakpoints as set: file → lines (hand-side bookkeeping).
     breaks: Mutex<Vec<(String, Vec<u64>)>>,
+    /// Engine event channel for async stop Notes (None in tests).
+    notes: Option<mpsc::Sender<ka_protocol::Event>>,
+    /// A hand-side wait (`wait_stop`/`resume`/`pause`) is in flight —
+    /// the stop it awaits must not also fire a Note.
+    hand_waiting: AtomicBool,
     last_used: Mutex<Instant>,
 }
 
@@ -208,18 +213,28 @@ impl Session {
     /// Wait for the debuggee to stop. `Wait::Running` = the cap passed
     /// with no stop (not an error — the debuggee may simply be running).
     pub async fn wait_stop(&self) -> Wait {
-        tokio::select! {
+        self.hand_waiting.store(true, Ordering::Relaxed);
+        let wait = tokio::select! {
             _ = self.stopped.notified() => Wait::Stopped,
             _ = self.ended.notified() => Wait::Ended,
             _ = tokio::time::sleep(STOP_WAIT) => Wait::Running,
-        }
+        };
+        self.hand_waiting.store(false, Ordering::Relaxed);
+        wait
     }
 
     /// Resume execution (`continue`, `next`, `stepIn`, `stepOut`) and
     /// wait for the next stop.
     pub async fn resume(&self, what: &str) -> Result<Wait, String> {
         let thread = self.stopped_thread()?;
-        self.request(what, json!({ "threadId": thread })).await?;
+        // hold hand_waiting across the request too: a stop landing while
+        // the continue response is in flight belongs to this wait, not a
+        // Note
+        self.hand_waiting.store(true, Ordering::Relaxed);
+        if let Err(e) = self.request(what, json!({ "threadId": thread })).await {
+            self.hand_waiting.store(false, Ordering::Relaxed);
+            return Err(e);
+        }
         Ok(self.wait_stop().await)
     }
 
@@ -334,7 +349,11 @@ impl Session {
     /// Pause the last-known thread and wait for the resulting stop.
     pub async fn pause(&self) -> Result<Wait, String> {
         let thread = self.stopped_thread()?;
-        self.request("pause", json!({ "threadId": thread })).await?;
+        self.hand_waiting.store(true, Ordering::Relaxed);
+        if let Err(e) = self.request("pause", json!({ "threadId": thread })).await {
+            self.hand_waiting.store(false, Ordering::Relaxed);
+            return Err(e);
+        }
         Ok(self.wait_stop().await)
     }
 
@@ -391,6 +410,29 @@ impl Session {
         Ok(n)
     }
 
+    /// Roster rows for the /debug overlay: a header mirroring the /tasks
+    /// dap row, one indented line per breakpoint file, then the tail of
+    /// the adapter console.
+    pub fn roster(&self) -> Vec<String> {
+        let bps = self.breakpoints();
+        let mut rows = vec![format!(
+            "dap {}  {}  breakpoints in {} file(s)",
+            self.id(),
+            self.status(),
+            bps.len()
+        )];
+        for (file, lines) in bps {
+            let lines: Vec<String> = lines.iter().map(|l| l.to_string()).collect();
+            rows.push(format!("  {}: lines {}", file, lines.join(",")));
+        }
+        let out = self.output_lines();
+        let start = out.len().saturating_sub(5);
+        for line in &out[start..] {
+            rows.push(format!("  | {line}"));
+        }
+        rows
+    }
+
     /// Disconnect (terminate debuggee) and end the session.
     pub async fn disconnect(&self) -> Result<(), String> {
         let _ = self
@@ -412,17 +454,35 @@ impl Drop for Session {
 /// The session table: ids `d1..`, capped, lazily reaped.
 pub struct DebugManager {
     adapters: Option<BTreeMap<String, String>>,
+    /// Engine event channel for async stop Notes (cloned into each
+    /// session; None in tests).
+    notes: Option<mpsc::Sender<ka_protocol::Event>>,
     sessions: Mutex<Vec<Arc<Session>>>,
     counter: AtomicU64,
 }
 
 impl DebugManager {
-    pub fn new(overlay: Option<BTreeMap<String, String>>) -> Self {
+    /// `notes` receives async stop Notes for stops no hand is waiting
+    /// on (None keeps the manager silent — tests).
+    pub fn new(
+        overlay: Option<BTreeMap<String, String>>,
+        notes: Option<mpsc::Sender<ka_protocol::Event>>,
+    ) -> Self {
         Self {
             adapters: overlay,
+            notes,
             sessions: Mutex::new(Vec::new()),
             counter: AtomicU64::new(1),
         }
+    }
+
+    /// Roster rows across live sessions; a hint row when none.
+    pub fn roster(&self) -> Vec<String> {
+        let sessions = self.sessions();
+        if sessions.is_empty() {
+            return vec!["no debug sessions (debug action \"start\")".to_string()];
+        }
+        sessions.iter().flat_map(|s| s.roster()).collect()
     }
 
     /// Live sessions, oldest first (reaps dead/expired first).
@@ -520,6 +580,8 @@ impl DebugManager {
             frame: Mutex::new(0),
             dead: AtomicBool::new(false),
             breaks: Mutex::new(Vec::new()),
+            notes: self.notes.clone(),
+            hand_waiting: AtomicBool::new(false),
             last_used: Mutex::new(Instant::now()),
         });
         tokio::spawn(read_loop(stdout, session.clone()));
@@ -603,6 +665,25 @@ async fn read_loop<R: tokio::io::AsyncRead + Unpin + Send + 'static>(
                         *session.thread.lock() = Some(t);
                     }
                     session.stopped.notify_one();
+                    // async stop note: fires only when no hand-side wait
+                    // (`wait_stop`/`resume`/`pause`) is mid-flight. The
+                    // latch stays set until the next hand wait resets it.
+                    if session.notes.is_some()
+                        && !session.hand_waiting.swap(true, Ordering::Relaxed)
+                    {
+                        let stopped = session.clone();
+                        if let Some(notes) = stopped.notes.clone() {
+                            tokio::spawn(async move {
+                                let id = stopped.id().to_string();
+                                let message = match stopped.stopped_at().await {
+                                    Ok(at) => format!("debug {id} stopped at {at}"),
+                                    Err(_) => format!("debug {id} stopped"),
+                                };
+                                let message: String = message.chars().take(200).collect();
+                                notes.send(ka_protocol::Event::Note { message }).await.ok();
+                            });
+                        }
+                    }
                 }
                 Some("output") => {
                     let text = msg["body"]["output"].as_str().unwrap_or("");
@@ -682,7 +763,7 @@ mod tests {
 
     #[test]
     fn unknown_adapter_names_the_known_set() {
-        let mgr = DebugManager::new(None);
+        let mgr = DebugManager::new(None, None);
         let err = mgr.adapter_command("nope").unwrap_err();
         assert!(
             err.contains("gdb") && err.contains("[debug.adapters]"),
@@ -790,7 +871,7 @@ while True:
         .unwrap();
         let mut ov = BTreeMap::new();
         ov.insert("fake".to_string(), format!("python3 {}", fake.display()));
-        DebugManager::new(Some(ov))
+        DebugManager::new(Some(ov), None)
     }
 
     #[cfg(unix)]
@@ -859,6 +940,39 @@ while True:
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// roster(): header + indented breakpoint row + `| `-prefixed
+    /// console tail — the /debug overlay rows.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn dap_roster_renders_breakpoints_and_output_tail() {
+        if !which_python3() {
+            return;
+        }
+        let dir = dap_dir("roster");
+        let mgr = fake_dap(&dir);
+        let file = format!("{}/x.py", dir.display());
+        let s = mgr
+            .start(
+                "fake",
+                true,
+                json!({ "program": file.clone() }),
+                &[(file.clone(), vec![7u64])],
+                &dir,
+            )
+            .await
+            .unwrap();
+        assert_eq!(s.wait_stop().await, Wait::Stopped);
+        let roster = s.roster().join("\n");
+        assert!(
+            roster.contains(&format!("dap {}  live  breakpoints in 1 file(s)", s.id())),
+            "{roster}"
+        );
+        assert!(roster.contains(&format!("  {file}: lines 7")), "{roster}");
+        assert!(roster.contains("| ka_rejected=true"), "{roster}");
+        s.disconnect().await.unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Disconnect removes the session; `session()` reports it gone.
     #[cfg(unix)]
     #[tokio::test]
@@ -889,7 +1003,7 @@ while True:
             "broken".to_string(),
             "ka-no-such-adapter-binary --dap".to_string(),
         );
-        let mgr = DebugManager::new(Some(ov));
+        let mgr = DebugManager::new(Some(ov), None);
         let err = match mgr
             .start(
                 "broken",
@@ -942,7 +1056,7 @@ while True:
             "debugpy".to_string(),
             "python3 -m debugpy.adapter".to_string(),
         );
-        let mgr = DebugManager::new(Some(ov));
+        let mgr = DebugManager::new(Some(ov), None);
         let breaks = vec![(script.display().to_string(), vec![5u64])];
         let s = mgr
             .start(
@@ -976,6 +1090,88 @@ while True:
             "frame locals carry the argument: {vars:?}"
         );
         assert_eq!(s.evaluate("n * 2").await.unwrap(), "82");
+        assert_eq!(s.resume("continue").await.unwrap(), Wait::Ended);
+        s.disconnect().await.unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// REAL second-adapter dogfood (roadmap 8.3): lldb's DAP adapter
+    /// over a native C binary — entry stop, a verified line-2
+    /// breakpoint, exit code 0. Ubuntu's LLVM ≤ 16 ships the adapter
+    /// as `lldb-vscode` (the pre-rename binary); newer releases call
+    /// it `lldb-dap`. Skips when no adapter binary or `cc` exists.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn dap_lldb_real_adapter_round_trip() {
+        let adapter = ["lldb-dap", "lldb-dap-14", "lldb-vscode-14"]
+            .into_iter()
+            .find(|bin| {
+                std::process::Command::new(bin)
+                    .arg("--help")
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .status()
+                    .is_ok_and(|s| s.success())
+            });
+        let Some(adapter) = adapter else {
+            return;
+        };
+        if !std::process::Command::new("cc")
+            .arg("--version")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| !s.success())
+            .unwrap_or(true)
+        {
+            return;
+        }
+        let dir = dap_dir("lldb");
+        let src = dir.join("main.c");
+        std::fs::write(
+            &src,
+            "int main(void) {\n    int n = 41;\n    n = n + 1;\n    return n - 42;\n}\n",
+        )
+        .unwrap();
+        let exe = dir.join("main");
+        let built = std::process::Command::new("cc")
+            .args(["-g", "-O0"])
+            .arg("-o")
+            .arg(&exe)
+            .arg(&src)
+            .status()
+            .unwrap();
+        assert!(built.success(), "cc -g -O0 must build the fixture");
+        let mut ov = BTreeMap::new();
+        ov.insert("lldb-dap".to_string(), adapter.to_string());
+        let mgr = DebugManager::new(Some(ov), None);
+        let breaks = vec![(src.display().to_string(), vec![2u64])];
+        let s = mgr
+            .start(
+                "lldb-dap",
+                true,
+                json!({
+                    "program": exe.display().to_string(),
+                    "stopOnEntry": true
+                }),
+                &breaks,
+                &dir,
+            )
+            .await
+            .unwrap();
+        // entry stop: the debuggee is released by configurationDone
+        assert_eq!(s.wait_stop().await, Wait::Stopped);
+        assert!(
+            s.stopped_at().await.unwrap().contains("main"),
+            "the entry stop is inside main"
+        );
+        // continue → the verified line-2 breakpoint
+        assert_eq!(s.resume("continue").await.unwrap(), Wait::Stopped);
+        assert!(
+            s.stopped_at().await.unwrap().contains(":2"),
+            "second stop is the line-2 breakpoint"
+        );
+        // continue → the program returns 0 and ends
         assert_eq!(s.resume("continue").await.unwrap(), Wait::Ended);
         s.disconnect().await.unwrap();
         let _ = std::fs::remove_dir_all(&dir);
