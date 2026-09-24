@@ -520,11 +520,15 @@ impl Config {
     }
 
     /// Whether the TUI starts with the mouse captured. Default is
-    /// capture (unset or `"capture"`): clickable tool rows, jump arrows
-    /// and strip buttons, wheel scroll at line granularity; ⇧drag still
-    /// selects natively on every major terminal. `[tui] mouse =
-    /// "native"` opts out (plain drag select/paste, wheel via
-    /// alternate-scroll, keyboard-only affordances).
+    /// capture (unset or `"capture"`): clickable tool cards, jump
+    /// arrows and strip buttons, wheel scroll at line granularity,
+    /// ↑/↓ recall history, and plain left-drag over the transcript
+    /// selects rows and copies them to the clipboard (OSC 52, toast
+    /// confirms); ⇧drag still selects natively on every major
+    /// terminal. `[tui] mouse = "native"` opts out entirely (plain
+    /// drag select/paste, wheel via alternate-scroll, keyboard-only
+    /// affordances — though overlay clicks still work: tracking turns
+    /// on while a popup or modal is open).
     pub fn effective_mouse_capture(&self) -> bool {
         self.tui.mouse.as_deref() != Some("native")
     }
