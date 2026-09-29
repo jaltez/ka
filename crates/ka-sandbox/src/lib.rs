@@ -695,7 +695,6 @@ mod tests {
     }
 
     #[test]
-    #[test]
     fn home_dotdirs_and_tilde_user_never_earn_write_grants() {
         // policy: everything writable, nothing allowed — every write
         // target becomes a candidate grant
@@ -735,6 +734,7 @@ mod tests {
         }
     }
 
+    #[test]
     fn covers_requires_stored_dir_equal_or_parent() {
         let data = Grants {
             write_paths: vec![PathBuf::from("/opt/data")],
