@@ -11,7 +11,8 @@ use ka_term::tui::{
 
 /// Every built-in slash command documented in the README parses. A
 /// command removed or renamed without updating this list is a breaking
-/// UX change.
+/// UX change. (The list is a superset of the README's — it pins every
+/// builtin the TUI ships, documented or not.)
 #[test]
 fn every_documented_slash_command_parses() {
     // handled by slash_command dispatch (the modal/event layer)
@@ -22,6 +23,8 @@ fn every_documented_slash_command_parses() {
         "/provider",
         "/mode",
         "/plan",
+        "/thinking",
+        "/debug",
         "/build",
         "/review",
         "/tasks",
@@ -78,6 +81,12 @@ fn slash_commands_accept_documented_arguments() {
         s.event,
         Some(ka_protocol::Command::Rewind { turns: 3 })
     ));
+    // /thinking with a level (session-scoped, like /mode <tier>)
+    let s = slash_command("/thinking high").expect("/thinking <level>");
+    assert!(
+        matches!(s.event, Some(ka_protocol::Command::SetEffort { level })
+            if level == ka_protocol::Effort::High)
+    );
     // /tasks carries the snapshot command
     let s = slash_command("/tasks").expect("/tasks");
     assert!(matches!(s.event, Some(ka_protocol::Command::ListTasks)));
@@ -89,7 +98,14 @@ fn slash_commands_accept_documented_arguments() {
 /// settings panel, memory view) rather than emitting engine commands.
 #[test]
 fn modal_slash_commands_open_pick() {
-    for cmd in ["/mode", "/session", "/settings", "/memory", "/help"] {
+    for cmd in [
+        "/mode",
+        "/thinking",
+        "/session",
+        "/settings",
+        "/memory",
+        "/help",
+    ] {
         let s = slash_command(cmd).unwrap_or_else(|| panic!("{cmd}"));
         assert!(
             s.modal.is_some(),
@@ -239,4 +255,68 @@ fn notify_settings_contract() {
         ka_engine::config::Config::default().effective_bell(),
         "[tui] bell defaults to on (terminals mute by user choice)"
     );
+}
+
+/// Phase 9.7 contract: custom commands carry frontmatter —
+/// `argument-hint` shows in the popup, `allowed-tools` scopes the
+/// turn's toolset, `model` overrides the turn's model (never
+/// persisted). Documented in the README's slash-commands paragraph.
+#[test]
+fn custom_command_frontmatter_scopes_the_turn() {
+    use ka_term::tui::{parse_command_md, slash_command};
+
+    // the pure parser: every documented key, hyphen or underscore
+    let (fm, body) = parse_command_md(
+        "---\ndescription: audit the tree\nargument-hint: path\nallowed-tools: read, grep glob\nmodel: zai/glm-5.3@low\n---\nAudit $ARGUMENTS\n",
+    );
+    assert_eq!(fm.description, "audit the tree");
+    assert_eq!(fm.argument_hint, "path");
+    assert_eq!(fm.allowed_tools, vec!["read", "grep", "glob"]);
+    assert_eq!(fm.model.as_deref(), Some("zai/glm-5.3@low"));
+    assert_eq!(body, "Audit $ARGUMENTS");
+    // no frontmatter: body passes through, description falls back
+    let (fm, body) = parse_command_md("Just a body\n");
+    assert!(fm.allowed_tools.is_empty() && fm.model.is_none());
+    assert_eq!(body, "Just a body");
+    assert_eq!(fm.description, "Just a body");
+
+    // the wire: a user-dir command with frontmatter dispatches a Prompt
+    // carrying both scopes
+    let home = std::env::var("HOME").unwrap_or_default();
+    if home.is_empty() {
+        return; // nothing to install against
+    }
+    // KNOWN COUPLING: the user-commands scan reads the real
+    // ~/.config/ka (no injectable root at the tui.rs source); the
+    // fixture uses a distinctive stem and removes both file and dir
+    // so nothing of the user's is touched or left behind
+    let dir = std::path::PathBuf::from(&home).join(".config/ka/commands");
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("ka-contract-frontmatter.md");
+    std::fs::write(
+        &file,
+        "---\nallowed-tools: read, grep\nmodel: test/m\n---\nLook at $ARGUMENTS\n",
+    )
+    .unwrap();
+    let slash = slash_command("/ka-contract-frontmatter audit.md");
+    std::fs::remove_file(&file).unwrap();
+    let _ = std::fs::remove_dir(&dir);
+    let slash = slash.expect("user-dir command dispatches");
+    match slash.event {
+        Some(ka_protocol::Command::Prompt {
+            allowed_tools,
+            model,
+            text,
+            ..
+        }) => {
+            assert_eq!(
+                allowed_tools.as_deref(),
+                Some(["read".to_string(), "grep".to_string()].as_slice()),
+                "allowed-tools rides the prompt"
+            );
+            assert_eq!(model.as_deref(), Some("test/m"), "model rides the prompt");
+            assert_eq!(text, "Look at audit.md");
+        }
+        other => panic!("expected a scoped prompt, got {other:?}"),
+    }
 }

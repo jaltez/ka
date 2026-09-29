@@ -100,6 +100,9 @@ use ka_dialect::speaker::{
 struct Scripted {
     calls: parking_lot::Mutex<VecDeque<(&'static str, serde_json::Value)>>,
     requests: parking_lot::Mutex<Vec<Vec<TurnMessage>>>,
+    models: parking_lot::Mutex<Vec<String>>,
+    efforts: parking_lot::Mutex<Vec<Option<String>>>,
+    tool_counts: parking_lot::Mutex<Vec<usize>>,
 }
 
 impl Scripted {
@@ -107,6 +110,9 @@ impl Scripted {
         std::sync::Arc::new(Self {
             calls: parking_lot::Mutex::new(calls.into()),
             requests: parking_lot::Mutex::new(Vec::new()),
+            models: parking_lot::Mutex::new(Vec::new()),
+            efforts: parking_lot::Mutex::new(Vec::new()),
+            tool_counts: parking_lot::Mutex::new(Vec::new()),
         })
     }
 }
@@ -119,6 +125,9 @@ impl Speaker for Scripted {
     ) -> SpeakFuture<'a> {
         Box::pin(async move {
             self.requests.lock().push(req.messages.clone());
+            self.models.lock().push(req.model_id.clone());
+            self.efforts.lock().push(req.effort.clone());
+            self.tool_counts.lock().push(req.tools.len());
             let next = self.calls.lock().pop_front();
             if let Some((tool, args)) = next {
                 out.send(StreamEvent::Call(ToolCall {
@@ -159,6 +168,8 @@ async fn prompt_canned_turn_contract() {
     let events = settle(
         &mut handle,
         Command::Prompt {
+            allowed_tools: None,
+            model: None,
             text: "hello".into(),
             schema: None,
             images: Vec::new(),
@@ -491,6 +502,8 @@ async fn export_markdown_contract() {
     let _ = settle(
         &mut handle,
         Command::Prompt {
+            allowed_tools: None,
+            model: None,
             text: "record me".into(),
             schema: None,
             images: Vec::new(),
@@ -574,6 +587,8 @@ async fn auto_commit_off_by_default_leaves_repo_untouched() {
     let _ = settle(
         &mut handle,
         Command::Prompt {
+            allowed_tools: None,
+            model: None,
             text: "hello".into(),
             schema: None,
             images: Vec::new(),
@@ -628,6 +643,8 @@ async fn verify_failure_feeds_back_exactly_one_fix_round() {
     let events = settle(
         &mut handle,
         Command::Prompt {
+            allowed_tools: None,
+            model: None,
             text: "edit the file".into(),
             schema: None,
             images: Vec::new(),
@@ -709,6 +726,8 @@ async fn verify_pass_is_announced_without_fix_round() {
     let events = settle(
         &mut handle,
         Command::Prompt {
+            allowed_tools: None,
+            model: None,
             text: "edit the file".into(),
             schema: None,
             images: Vec::new(),
@@ -764,6 +783,8 @@ async fn verify_test_is_abortable() {
     handle
         .commands
         .send(Command::Prompt {
+            allowed_tools: None,
+            model: None,
             text: "edit the file".into(),
             schema: None,
             images: Vec::new(),
@@ -799,6 +820,247 @@ async fn verify_test_is_abortable() {
             .iter()
             .any(|e| matches!(e, Event::Note { message } if message.contains("passed"))),
         "a cancelled test must not report passed: {events:?}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Lifecycle hooks (roadmap 9.2): session_start, user_prompt_submit,
+/// pre_compact, stop, and turn_end all fire over the real engine loop
+/// with the documented stdin payloads' event names; session_end fires
+/// when the command channel closes.
+#[tokio::test]
+async fn lifecycle_hooks_fire_across_the_engine_loop() {
+    let dir = tmp_dir("hooks-lifecycle");
+    let hook = |event: &str, name: &str| {
+        format!(
+            "[[hooks]]\nevent = \"{event}\"\ncommand = \"touch {}\"\n",
+            dir.join(format!("{name}.txt")).display()
+        )
+    };
+    let layer = format!(
+        "model = \"test/m\"\ncwd = \"{}\"\n{}{}{}{}{}{}",
+        dir.display(),
+        hook("session_start", "start"),
+        hook("user_prompt_submit", "prompt"),
+        hook("pre_compact", "compact"),
+        hook("stop", "stop"),
+        hook("turn_end", "turnend"),
+        hook("session_end", "end"),
+    );
+    let cfg = ka_engine::config::Config::parse_layer(&layer, "test").unwrap();
+    let mut handle = ka_engine::spawn_with_speaker(
+        cfg,
+        test_catalog(),
+        ka_engine::StrandChoice::New,
+        ka_dialect::Wire::OpenaiChat,
+        Scripted::new(vec![]), // text-only turns
+    );
+    // one prompt cycle fires session_start + user_prompt_submit + stop
+    // + turn_end
+    settle(
+        &mut handle,
+        Command::Prompt {
+            text: "hi".into(),
+            schema: None,
+            images: vec![],
+            allowed_tools: None,
+            model: None,
+        },
+        on_idle,
+    )
+    .await;
+    for name in ["start", "prompt", "stop", "turnend"] {
+        assert!(
+            dir.join(format!("{name}.txt")).exists(),
+            "{name} hook must fire over the engine loop"
+        );
+    }
+    // a compact fires pre_compact before the digest runs
+    settle(&mut handle, Command::Compact { focus: None }, on_idle).await;
+    assert!(
+        dir.join("compact.txt").exists(),
+        "pre_compact hook must fire"
+    );
+    // dropping the command channel ends the session → session_end
+    // (keep draining events so the engine's final sends never block)
+    let ka_engine::EngineHandle { commands, events } = handle;
+    drop(commands);
+    let mut events = events;
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while !dir.join("end.txt").exists() && std::time::Instant::now() < deadline {
+        let _ = tokio::time::timeout(Duration::from_millis(100), events.recv()).await;
+    }
+    assert!(
+        dir.join("end.txt").exists(),
+        "session_end hook must fire at shutdown"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `Command::Prompt`'s per-turn scoping fields are real contract:
+/// `allowed_tools` restricts the turn's toolset (a call outside the
+/// list is refused with ok:false and no CallOutput), `model` overrides
+/// the session selector for that turn (reaching the wire request), an
+/// invalid override selector surfaces as a Note, and the scope clears
+/// when the turn ends.
+#[tokio::test]
+async fn prompt_scoping_allowed_tools_and_model_override() {
+    let dir = tmp_dir("prompt-scope");
+    std::fs::write(dir.join("s.txt"), "content\n").unwrap();
+    let cfg = ka_engine::Config {
+        cwd: Some(dir.to_string_lossy().into_owned()),
+        model: Some("test/m".into()),
+        ..Default::default()
+    };
+    let speaker = Scripted::new(vec![
+        ("read", serde_json::json!({"path": "s.txt"})),
+        ("bash", serde_json::json!({"command": "echo nope"})),
+    ]);
+    let mut handle = ka_engine::spawn_with_speaker(
+        cfg,
+        test_catalog(),
+        ka_engine::StrandChoice::New,
+        ka_dialect::Wire::OpenaiChat,
+        speaker.clone(),
+    );
+    let events = settle(
+        &mut handle,
+        Command::Prompt {
+            allowed_tools: Some(vec!["read".into()]),
+            model: Some("test/m@high".into()),
+            text: "scope this turn".into(),
+            schema: None,
+            images: Vec::new(),
+        },
+        on_idle,
+    )
+    .await;
+
+    // the read call executed (ok:true); the bash call was refused by
+    // the allowlist (ok:false, and no CallOutput ever for it)
+    let finished: Vec<(String, bool)> = events
+        .iter()
+        .filter_map(|e| match e {
+            Event::CallFinished { tool, ok, .. } => Some((tool.clone(), *ok)),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        finished.iter().any(|(t, ok)| t == "read" && *ok),
+        "read allowed: {finished:?}"
+    );
+    assert!(
+        finished.iter().any(|(t, ok)| t == "bash" && !*ok),
+        "bash refused: {finished:?}"
+    );
+    // the refusal rides the tool result back to the model (the loop
+    // gate's no-output shape does not apply to allowlist refusals)
+    assert!(
+        events.iter().any(
+            |e| matches!(e, Event::CallOutput { tool, excerpt, is_error: true, .. }
+            if tool == "bash" && excerpt.contains("allowed tools"))
+        ),
+        "{events:?}"
+    );
+    // the per-turn model override reached the wire request: the
+    // @high suffix is observable on the wire as the request's effort
+    // (the model id itself is the same as the session default, so
+    // asserting on it alone would be vacuous)
+    assert_eq!(
+        speaker.efforts.lock().first().cloned().flatten(),
+        Some("high".to_string()),
+        "the @high override must reach SpeakRequest.effort"
+    );
+    // the turn still completes cleanly
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            Event::TurnFinished {
+                stop: Stop::Done,
+                ..
+            }
+        )),
+        "{events:?}"
+    );
+
+    // the follow-up turn completes unscoped...
+    let events = settle(
+        &mut handle,
+        Command::Prompt {
+            allowed_tools: None,
+            model: None,
+            text: "next turn unscoped".into(),
+            schema: None,
+            images: Vec::new(),
+        },
+        on_idle,
+    )
+    .await;
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            Event::TurnFinished {
+                stop: Stop::Done,
+                ..
+            }
+        )),
+        "{events:?}"
+    );
+    // ...and the offered toolsets prove the scope cleared: the scoped
+    // turn's rounds saw exactly the allowlisted tool, the follow-up
+    // turn is offered the whole session toolset again
+    assert!(
+        speaker.efforts.lock().last().map_or(true, |e| e.is_none()),
+        "the override must not leak into the next turn"
+    );
+    let counts = speaker.tool_counts.lock().clone();
+    assert_eq!(
+        counts.first(),
+        Some(&1),
+        "scoped turn sees only [read]: {counts:?}"
+    );
+    assert!(
+        counts.last().is_some_and(|c| *c > 1),
+        "follow-up turn sees the full toolset: {counts:?}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A per-turn model override that is not a valid selector is refused
+/// with a visible note — never silently dropped.
+#[tokio::test]
+async fn prompt_model_override_rejects_invalid_selector() {
+    let dir = tmp_dir("prompt-bad-selector");
+    let cfg = ka_engine::Config {
+        cwd: Some(dir.to_string_lossy().into_owned()),
+        model: Some("test/m".into()),
+        ..Default::default()
+    };
+    let speaker = Scripted::new(vec![]);
+    let mut handle = ka_engine::spawn_with_speaker(
+        cfg,
+        test_catalog(),
+        ka_engine::StrandChoice::New,
+        ka_dialect::Wire::OpenaiChat,
+        speaker,
+    );
+    let events = settle(
+        &mut handle,
+        Command::Prompt {
+            allowed_tools: None,
+            model: Some("bogus-no-slash".into()),
+            text: "hello".into(),
+            schema: None,
+            images: Vec::new(),
+        },
+        on_idle,
+    )
+    .await;
+    assert!(
+        events.iter().any(
+            |e| matches!(e, Event::Note { message } if message.contains("not a valid selector"))
+        ),
+        "invalid override surfaces a note: {events:?}"
     );
     let _ = std::fs::remove_dir_all(&dir);
 }

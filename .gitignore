@@ -5,3 +5,11 @@ research/repos/
 
 # release signing private key (never commit)
 ka-release.key
+
+# harnesses — anchored to the repo root so fixture dirs named the
+# same never silently disappear
+/.pi/
+/.omp/
+/.zcode/
+/.codex/
+/.claude/

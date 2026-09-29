@@ -164,6 +164,14 @@ pub enum Command {
         /// Images attached to the prompt (base64 data + media type).
         #[serde(default)]
         images: Vec<ImagePart>,
+        /// Per-turn tool allowlist (custom-command frontmatter
+        /// `allowed-tools`); None = the session toolset. Additive.
+        #[serde(default)]
+        allowed_tools: Option<Vec<String>>,
+        /// Per-turn model selector override (custom-command frontmatter
+        /// `model`); None = the session model. Additive.
+        #[serde(default)]
+        model: Option<String>,
     },
     /// Re-run tools/list on every MCP server (watchdog-adjacent).
     RefreshMcp,
@@ -519,6 +527,16 @@ pub enum Event {
         /// Note text.
         message: String,
     },
+    /// Observer presence changed on a `ka serve` session (roadmap 9.6):
+    /// emitted to subscribers when an attach client arrives or leaves.
+    /// The writing surface never sees it (the engine does not emit it —
+    /// the server does); older consumers ignore it as an unknown type.
+    Presence {
+        /// A turn is in flight on the session.
+        busy: bool,
+        /// Live SSE observers right now (the writer is not counted).
+        attached: usize,
+    },
     /// Output of a user `!` shell passthrough (redacted, capped).
     ShellOutput {
         /// The command line that ran.
@@ -614,8 +632,32 @@ mod tests {
     }
 
     #[test]
+    fn prompt_decodes_from_legacy_wire_line() {
+        // allowed_tools/model are additive wire fields: an NDJSON line
+        // recorded before they existed must keep decoding to None —
+        // the None-on-absent contract recorded strands rely on
+        let line = r#"{"type":"prompt","text":"hi"}"#;
+        let cmd: Command = from_line(line).unwrap();
+        match cmd {
+            Command::Prompt {
+                allowed_tools,
+                model,
+                text,
+                ..
+            } => {
+                assert_eq!(allowed_tools, None);
+                assert_eq!(model, None);
+                assert_eq!(text, "hi");
+            }
+            other => panic!("expected prompt, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn commands_roundtrip() {
         roundtrip_command(Command::Prompt {
+            allowed_tools: None,
+            model: None,
             text: "hi".into(),
             schema: None,
             images: Vec::new(),

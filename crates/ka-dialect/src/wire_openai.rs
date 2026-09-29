@@ -195,10 +195,11 @@ async fn speak_openai(
     if dialect.max_output > 0 {
         body[max_field.as_str()] = json!(dialect.max_output);
     }
-    if let Some(effort) = req.effort.clone() {
-        if dialect.flags.reasoning_field.is_some() {
-            body["reasoning_effort"] = json!(effort);
-        }
+    if let Some(effort) = req.effort.as_deref()
+        && let Some(name) =
+            resolved_effort(dialect, effort, dialect.flags.reasoning_field.is_some())
+    {
+        body["reasoning_effort"] = json!(name);
     }
 
     let resp = post_sse(
@@ -349,5 +350,92 @@ fn ingest_tool_fragment(calls: &mut Vec<PendingCall>, frag: &Value) {
     }
     if let Some(args) = frag.pointer("/function/arguments").and_then(Value::as_str) {
         pending.args.push_str(args);
+    }
+}
+
+/// The reasoning-effort value the endpoint accepts, if any. The dialect
+/// must expose reasoning control (`controllable`: the chat wires key off
+/// `reasoning_field`, the Responses wire off a non-empty `efforts`
+/// list) AND publish its levels; `"off"` and empty names are omitted so
+/// the endpoint keeps its own default. An unlisted level downgrades to
+/// the HIGHEST supported tier (the `resolve_effort` precedent) instead
+/// of being silently dropped — an explicit user request deserves the
+/// closest behavior, not a quiet no-op.
+pub(crate) fn resolved_effort(
+    dialect: &crate::dialects::Dialect,
+    effort: &str,
+    controllable: bool,
+) -> Option<String> {
+    if !controllable || effort.is_empty() || effort == "off" {
+        return None;
+    }
+    if dialect.efforts.iter().any(|s| s == effort) {
+        return Some(effort.to_string());
+    }
+    const RANK: [(&str, u8); 4] = [("low", 1), ("medium", 2), ("high", 3), ("max", 4)];
+    let rank = |name: &str| RANK.iter().find(|(n, _)| *n == name).map(|(_, r)| *r);
+    match dialect
+        .efforts
+        .iter()
+        .filter_map(|s| rank(s).map(|r| (r, s)))
+        .max_by_key(|(r, _)| *r)
+    {
+        // no known tier published (e.g. a vendor-specific level list):
+        // the last published level is the vendor's own highest
+        Some((_, s)) => Some(s.to_string()),
+        None => dialect.efforts.last().map(|s| s.to_string()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+    use super::*;
+
+    fn dialect(toml: &str) -> crate::dialects::Dialect {
+        crate::dialects::Catalog::parse(toml)
+            .expect("fixture parses")
+            .dialects
+            .into_iter()
+            .next()
+            .map(|(_, v)| v)
+            .expect("one row")
+    }
+
+    #[test]
+    fn effort_sent_only_when_the_dialect_lists_the_level() {
+        let glm = dialect(
+            r#"[dialects."zai/glm-5.3"]
+wire = "openai_chat"
+efforts = ["low", "high", "max"]
+[dialects."zai/glm-5.3".flags]
+reasoning_field = "reasoning_effort"
+"#,
+        );
+        let controllable = true;
+        assert_eq!(
+            resolved_effort(&glm, "high", controllable),
+            Some("high".to_string())
+        );
+        assert_eq!(
+            resolved_effort(&glm, "max", controllable),
+            Some("max".to_string())
+        );
+        // glm-5.3 has no "medium": downgrade to its highest tier, not a
+        // silent drop
+        assert_eq!(
+            resolved_effort(&glm, "medium", controllable),
+            Some("max".to_string())
+        );
+        // Off never sends a level
+        assert_eq!(resolved_effort(&glm, "off", controllable), None);
+
+        let plain = dialect(
+            r#"[dialects."x/y"]
+wire = "openai_chat"
+"#,
+        );
+        // no published control: nothing is ever sent
+        assert_eq!(resolved_effort(&plain, "high", false), None);
     }
 }

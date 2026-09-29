@@ -319,6 +319,8 @@ async fn drive_turn(
     if engine
         .commands
         .send(Command::Prompt {
+            allowed_tools: None,
+            model: None,
             text: prompt,
             schema: None,
             images: Vec::new(),

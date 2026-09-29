@@ -40,18 +40,31 @@ impl HookPoint {
 const HOOK_TIMEOUT: Duration = Duration::from_secs(10);
 /// Cap on the stderr tail carried in veto/note messages.
 const TAIL_CHARS: usize = 400;
-/// Cap on steering note length (chars).
-const NOTE_CHARS: usize = 200;
+/// Cap on steering note length (chars). Also caps hook-controlled key
+/// lists surfaced in transcript notes elsewhere in the engine.
+pub(crate) const NOTE_CHARS: usize = 200;
 
 /// Minimal hook-stdout steering: a JSON object may switch the
-/// permission mode and/or surface a short note. Anything else —
-/// invalid JSON, unknown keys, non-objects — is ignored silently; hook
-/// output never fails a turn. This is deliberately the whole action
-/// language (no rule mutation, no directory adds).
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+/// permission mode, surface a short note, patch the upcoming tool
+/// arguments (`updated_input`, shallow-merged top-level keys), or
+/// pre-approve the call (`decision: "allow"` — matched
+/// case-insensitively). A pre-approve may only skip a permission ASK:
+/// hardstops, protected paths, and deny-class gate verdicts (deny
+/// rules, plan-mode writes outside .ka/plans/) still apply. Anything
+/// else — invalid JSON, unknown keys, non-objects — is ignored
+/// silently; hook output never fails a turn. This is deliberately the
+/// whole action language (no rule mutation, no directory adds).
+#[derive(Debug, Clone, Default, PartialEq)]
 pub(crate) struct Steering {
     pub mode: Option<ka_protocol::Mode>,
     pub note: Option<String>,
+    /// Tool-argument patch for the call being admitted (pre_tool_use
+    /// only): top-level keys shallow-merge over the call's arguments.
+    pub updated_input: Option<serde_json::Map<String, serde_json::Value>>,
+    /// Hook verdict: `decision: "allow"` (any ASCII case) pre-approves
+    /// the call — the permission ask is skipped; hardstops, protected
+    /// paths, and deny-class verdicts still refuse.
+    pub allow: bool,
 }
 
 /// Parse steering off a successful hook's trimmed stdout.
@@ -77,7 +90,23 @@ pub(crate) fn parse_steering(stdout: &str) -> Steering {
         .and_then(|n| n.as_str())
         .map(|s| s.chars().take(NOTE_CHARS).collect::<String>())
         .filter(|s| !s.is_empty());
-    Steering { mode, note }
+    let updated_input = v
+        .get("updated_input")
+        .and_then(|u| u.as_object())
+        .cloned()
+        .filter(|m| !m.is_empty());
+    // case-insensitive by design: hooks are shell scripts, and "ALLOW"
+    // carries the same intent as "allow"
+    let allow = v
+        .get("decision")
+        .and_then(|d| d.as_str())
+        .is_some_and(|d| d.eq_ignore_ascii_case("allow"));
+    Steering {
+        mode,
+        note,
+        updated_input,
+        allow,
+    }
 }
 
 impl Steering {
@@ -263,6 +292,44 @@ mod tests {
         let long = "x".repeat(500);
         let s = parse_steering(&format!(r#"{{"note":"{long}"}}"#));
         assert_eq!(s.note.as_deref().map(str::len), Some(200));
+    }
+
+    #[test]
+    fn steering_parses_updated_input_and_allow() {
+        // updated_input: object, shallow-merged top-level keys
+        let s = parse_steering(r#"{"updated_input":{"command":"echo patched"}}"#);
+        assert_eq!(
+            s.updated_input
+                .as_ref()
+                .and_then(|m| m.get("command"))
+                .and_then(|v| v.as_str()),
+            Some("echo patched")
+        );
+        // non-object / empty-object patches are ignored
+        assert!(
+            parse_steering(r#"{"updated_input":"echo x"}"#)
+                .updated_input
+                .is_none()
+        );
+        assert!(
+            parse_steering(r#"{"updated_input":{}}"#.trim())
+                .updated_input
+                .is_none()
+        );
+        // decision: "allow" pre-approves; anything else does not
+        assert!(parse_steering(r#"{"decision":"allow"}"#).allow);
+        assert!(parse_steering(r#"{"decision":"ALLOW"}"#).allow);
+        assert!(!parse_steering(r#"{"decision":"deny"}"#).allow);
+        let both = parse_steering(r#"{"decision":"allow","updated_input":{}}"#);
+        assert!(both.allow);
+        assert!(both.updated_input.is_none(), "empty patch ignored");
+        // the combined form parses both
+        let s = parse_steering(
+            r#"{"decision":"allow","updated_input":{"command":"echo ok"},"note":"auto"}"#,
+        );
+        assert!(s.allow);
+        assert!(s.updated_input.is_some());
+        assert_eq!(s.note.as_deref(), Some("auto"));
     }
 
     fn hook_dir(name: &str) -> PathBuf {

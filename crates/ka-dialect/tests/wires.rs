@@ -462,7 +462,13 @@ async fn responses_basic_text_and_usage() {
 #[tokio::test]
 async fn responses_reasoning_streams_and_tool_accumulates() {
     let (addr, captured) = serve_sse(RESPONSES_REASONING_AND_TOOL).await;
-    let dialect = dialect_for("openai_responses", addr, "");
+    // the Responses wire gates effort on the dialect publishing its
+    // levels (mirroring the o-series seed rows)
+    let dialect = dialect_for(
+        "openai_responses",
+        addr,
+        "efforts = [\"low\", \"medium\", \"high\"]\n",
+    );
     let mut req = request(dialect, "");
     req.effort = Some("medium".to_string());
     let events = collect(&OpenaiResponses::new(), req).await;

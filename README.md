@@ -25,7 +25,7 @@ ka run "summarize the build error"    # headless NDJSON
 ka run --review                       # read-only review of the working tree
 ```
 
-Keys: `Enter` send / interject mid-turn · `+text` defer until turn ends · `Esc`/`Ctrl-C` abort · `↑/↓`/`Ctrl+P/N` history (seeded with a resumed session's earlier prompts) · long drafts wrap like a textarea — the box grows to six rows, no horizontal scroll · `/model` without arguments opens a unified picker over the whole catalog: configured providers first, a `─ not configured ─` divider, then the rest (filter as you type, key/env status; Enter on a keyed-but-unset model asks for the API key, then applies the pick; Enter on an unmatched filter sets it as a custom `vendor/model` selector). Interjections and `+deferrals` post a visible ack line while a turn runs. `PgUp`/`PgDn` scroll the transcript (title shows `↑N above`; `Esc` re-pins to the tail). Mouse: capture by default — the strip buttons, tool cards and ▲▼ jump arrows respond to clicks, the wheel scrolls at line granularity, `↑/↓` recall history, and plain left-drag over the transcript selects those rows and copies them to the clipboard on release (OSC 52); ⇧drag still selects natively. `Ctrl+M` (or `[tui] mouse = "native"`) flips to **native**: plain drag selects and pastes with the terminal's own bindings, the wheel scrolls via alternate-scroll, and click-only affordances fall back to their keys (`Ctrl+O`, `Ctrl+↑/↓`); the choice persists. `Esc` closes popups and path completion before it ever aborts a turn, and small actions (mouse toggle, mode/model changes, `/copy`, key saves, image staging) ack as toasts over the transcript tail instead of transcript rows. Rendered rows are cached per entry — streaming redraws only the live region. `/session` (alias `/resume`) opens an in-app session picker with type-to-filter, and resumed sessions replay their tool calls, results, and thinking; `/new` starts a fresh session; `/settings` edits model/mode/effort (persist with `s`) and shows every provider's API-key env status. On exit the `ka --session <tag>` resume command is appended to `$HISTFILE` (zsh-aware format; new shells see it on ↑). The transcript renders markdown (headers, lists, `code`, fenced blocks with syntax coloring behind a quiet rail). Tool activity is one boxed card per call — `╭─ 🐚 bash ▸ · cmd ─╌╌ 1.2s ✓ ─╮`, state-tinted (violet while running, sage on success, coral on failure, a failed bash call's `⏎ exit N` on the border), with the thinking-block fold vocabulary: `▸` collapsed / `▾` expanded on any call that has output to reveal; consecutive calls group into one block, and clicking a row (capture mode) or `Ctrl+O` expands the call's full output in place (spill files pointed at `/spills`). Multi-line thinking collapses to its first line plus a count — click a block (capture mode) or `Alt+T` to expand/collapse; per-block clicks and the global toggle compose. Every turn closes with a single verdict row — `✓ done · 2.1s · 1.2k in · $0.0042` (`◐ aborted`, `◑ stopped at output limit`, `✗ failed … /retry`); model, mode, ctx gauge, and cost live in the status bar's right side. NO_COLOR is honored. The bottom strip carries popup buttons — `📋 todos` (Alt+O), `⚡ skills` (Ctrl+T), `💡 info` (Alt+I), all working mid-turn — with `cwd 🌿 branch` on the right; `/help` teaches the full key table.
+Keys: `Enter` send / interject mid-turn · `⇧Enter` newline (kitty-protocol terminals; `Ctrl+J` the universal fallback) · `+text` defer until turn ends · `Esc`/`Ctrl-C` abort · `↑/↓`/`Ctrl+P/N` history (seeded with a resumed session's earlier prompts) · long drafts wrap like a textarea — the box grows to six rows, no horizontal scroll · `/model` without arguments opens a unified picker over the whole catalog: configured providers first, a `─ not configured ─` divider, then the rest (filter as you type, key/env status, and each model's reasoning levels as a `🧠 low/med/high` segment (abbreviated to fit) where the dialect exposes them; Enter on a keyed-but-unset model asks for the API key, then applies the pick; Enter on an unmatched filter sets it as a custom `vendor/model` selector). Interjections and `+deferrals` post a visible ack line while a turn runs. `PgUp`/`PgDn` scroll the transcript (title shows `↑N above`; `Esc` re-pins to the tail), and the right edge carries a scrollbar rail — drag the thumb to scroll, click the track to page (capture mode). Mouse: capture by default — the strip buttons, tool cards and ▲▼ jump arrows respond to clicks, the wheel scrolls at line granularity, `↑/↓` recall history, and plain left-drag over the transcript selects those rows and copies them to the clipboard on release (OSC 52); ⇧drag still selects natively. `Ctrl+M` (or `[tui] mouse = "native"`) flips to **native**: plain drag selects and pastes with the terminal's own bindings, the wheel scrolls via alternate-scroll, and click-only affordances fall back to their keys (`Ctrl+O`, `Ctrl+↑/↓`); the choice persists. `Esc` closes popups and path completion before it ever aborts a turn, and small actions (mouse toggle, mode/model/thinking changes, `/copy`, key saves, image staging) ack as toasts over the transcript tail instead of transcript rows. Rendered rows are cached per entry — streaming redraws only the live region. `/session` (alias `/resume`) opens an in-app session picker with type-to-filter, and resumed sessions replay their tool calls, results, and thinking; `/new` starts a fresh session; `/settings` edits model/mode/effort (persist with `s`) and shows every provider's API-key env status; `/thinking` opens the reasoning-level picker (Enter applies and persists; `/thinking <level>` is session-scoped). On exit the `ka --session <tag>` resume command is appended to `$HISTFILE` (zsh-aware format; new shells see it on ↑) and written to `<data dir>/last-resume` — with `eval "$(ka shell-integration)"` in `.zshrc`/`.bashrc`, a tiny `ka()` wrapper feeds that command into the live shell's own history after every run, so exiting and pressing **↑ then Enter** reopens the exact session you left. The transcript renders markdown (headers, lists, `code`, fenced blocks with syntax coloring behind a quiet rail). Tool activity is one boxed card per call — `╭─ 🐚 bash ▸ · cmd ─╌╌ 1.2s ✓ ─╮`, state-tinted (violet while running, sage on success, coral on failure, a failed bash call's `⏎ exit N` on the border), with the thinking-block fold vocabulary: `▸` collapsed / `▾` expanded on any call that has output to reveal; consecutive calls group into one block separated by a quiet `╌` rule, and clicking a row (capture mode) or `Ctrl+O` expands the call's full output in place (spill files pointed at `/spills`). Thinking renders as a borderless pink band carrying a single `🧠` — a `Thinking ▾ · N lines` head plus at most three rows inside a quiet inner margin (the streaming tail while a turn runs, the first three once cached), folding to the full text on click/`Alt+T`; single-line thoughts carry no chevron so a foldable block is recognizable at a glance; `Alt+T` or a click (capture mode) toggles any block open/closed, and a blank spacer row keeps the box off the input. Every turn closes with a single verdict row — `✓ done · 2.1s · 1.2k in · $0.0042` (`◐ aborted`, `◑ stopped at output limit`, `✗ failed … /retry`); model, mode, thinking level, ctx gauge, and cost live in the status bar's right side (the `🧠 ○ off/…` segment shows whenever the model exposes reasoning control). NO_COLOR is honored. The bottom strip carries popup buttons — `📋 todos` (Alt+O), `⚡ skills` (Ctrl+T), `💡 info` (Alt+I), all working mid-turn — with `cwd 🌿 branch` on the right; `/help` teaches the full key table.
 
 ## Commands
 
@@ -37,13 +37,18 @@ Keys: `Enter` send / interject mid-turn · `+text` defer until turn ends · `Esc
 | `ka models [--no-discovery]` | catalog + local Ollama/LM Studio probes |
 | `ka rewind [N]` | drop the last N exchanges of the newest strand |
 | `ka export [-o out.md] [--html]` | strand as readable markdown, or a self-contained offline HTML page |
+| `ka -i "<prompt>"` | run one prompt, then open the TUI resumed on that strand (works with `-c`/`--session`) |
 | `ka skill install <git-url\|path> [--force]` / `ka skill list` / `ka skill remove <name>` | user-scope skill lifecycle (`~/.config/ka/skills`; SKILL.md directories; git URL or local path) |
+| `ka install <skill\|agent\|command\|rule> <git-url\|path> [--force]` · `ka install list [kind]` · `ka install remove <kind> <name>` | generalized user-scope customization lifecycle (`ka skill …` stays as the skill alias; no registry, no manifests — installing is the trust act) |
+| `ka import claude <settings.json> [--project\|--user] [--dry-run]` | one-shot conversion of Claude Code permission rules into ka `[[rules]]` (printed conversion + skips; strict-validated write; deny → ask → allow order preserves claude precedence) |
+| `ka attach [id] [--addr 127.0.0.1:8417] [--token T]` | observe a live `ka serve` session read-only (SSE; `busy · N attached` chips; no write path — prompting stays on the server API) |
+| `ka completions <bash\|zsh\|fish>` | shell completions, generated from the live CLI parser |
 | `ka init` | starter AGENTS.md at the project root, from repo shape |
 | `ka config {schema,print}` | resolved config / JSON schema |
 
-TUI slash commands: `/model <sel>` `/mode [tier]` (picker: guarded | accept edits | full access | plan) `/plan <task>` `/build` `/review [base]` `/tasks` `/debug` `/rewind [N]` `/compact [focus]` `/quit` plus custom `/name` from `.ka/commands/*.md` (`$ARGUMENTS` substituted) — they appear in the `/` popup and `/help` like builtins; full list in `/help`. `/tasks` opens a picker over background tasks/jobs/DAP sessions — ⏎ pages the selected task's full result; `/debug` shows live debug sessions (breakpoints + console tail). Double-Esc on an empty input opens the rewind menu — pick a past message to rewind to, or `e` to edit & resend it. `!cmd` runs a shell command directly (no turn, no gate); its output shows in the transcript and rides the next prompt as context.
+TUI slash commands: `/model <sel>` `/mode [tier]` (picker: guarded | accept edits | full access | plan) `/thinking [level]` (picker: off | low | medium | high | max — model-dependent; Enter persists, the named form is session-scoped) `/plan <task>` `/build` `/review [base]` `/tasks` `/debug` `/rewind [N]` `/compact [focus]` `/quit` plus custom `/name` from `.ka/commands/*.md` (`$ARGUMENTS` substituted) — they appear in the `/` popup and `/help` like builtins; full list in `/help`. Custom commands carry frontmatter: `description`, `argument-hint`, plus `allowed-tools: read, grep` (restricts that turn's toolset) and `model: <selector>` (runs the turn on that model once, never persisting the switch). `/tasks` opens a picker over background tasks/jobs/DAP sessions — ⏎ pages the selected task's full result; `/debug` shows live debug sessions (breakpoints + console tail). Double-Esc on an empty input opens the rewind menu — pick a past message to rewind to, or `e` to edit & resend it. `!cmd` runs a shell command directly (no turn, no gate); its output shows in the transcript and rides the next prompt as context.
 
-Mouse: the default is **capture** — SGR button reporting makes every click affordance work out of the box: tool rows expand in place — each call renders as a state-tinted card with a `▸`/`▾` fold marker (violet while running, sage on success, coral on failure, with a failed bash call's `⏎ exit N` on the border) — the ▲▼ title arrows and strip popups respond to clicks, the wheel scrolls at line granularity, and `↑/↓`/`Ctrl+P/N` recall history. Plain left-drag over the transcript is ka's own selection: it highlights the picked rows and copies them to your system clipboard on release (OSC 52; a toast confirms), so selecting never needs a modifier. Click outside a popup (or its ✕) closes it — except permission asks, which need an explicit key. ⇧drag still selects natively in your terminal. `Ctrl+M` (or `[tui] mouse = "native"`) switches to **native**: nothing is captured, so plain drag selects and pastes with the terminal's own bindings and the wheel scrolls via alternate-scroll (which translates it to ↑/↓) — click affordances are keyboard-only there (`Ctrl+O`, `Ctrl+↑/↓`); while a popup or modal is open tracking turns on by itself so its ✕/click-outside still work; the choice persists.
+Mouse: the default is **capture** — SGR button reporting makes every click affordance work out of the box: tool rows expand in place — each call renders as a state-tinted card with a `▸`/`▾` fold marker (violet while running, sage on success, coral on failure, with a failed bash call's `⏎ exit N` on the border) — the ▲▼ title arrows and strip popups respond to clicks, the wheel scrolls at line granularity, the scrollbar rail on the right edge drags (thumb) and pages (track), and `↑/↓`/`Ctrl+P/N` recall history; with the pointer resting on anything clickable — cards, foldable thinking bands, strip buttons, ▲▼ arrows, the ✕ chip, the rail thumb — a blue hover band / gold glow previews what a click would touch. Plain left-drag over the transcript is ka's own selection: it highlights the picked rows and copies them to your system clipboard on release (OSC 52; a toast confirms), so selecting never needs a modifier. Click outside a popup (or its ✕) closes it — except permission asks, which need an explicit key. ⇧drag still selects natively in your terminal. `Ctrl+M` (or `[tui] mouse = "native"`) switches to **native**: nothing is captured, so plain drag selects and pastes with the terminal's own bindings and the wheel scrolls via alternate-scroll (which translates it to ↑/↓) — click affordances are keyboard-only there (`Ctrl+O`, `Ctrl+↑/↓`); while a popup or modal is open tracking turns on by itself so its ✕/click-outside still work; the choice persists.
 
 ## Selectors & models
 
@@ -63,16 +68,39 @@ pattern = "cargo *"         # glob on the call's primary argument
 verdict = "allow"           # allow | ask | deny
 
 [[hooks]]                   # exit-2 block contract
-event = "pre_tool_use"      # or post_tool_use
-tool = "write"              # optional filter
-command = "guard.sh"        # {tool, arguments} JSON on stdin
+event = "pre_tool_use"      # or post_tool_use · stop · turn_end ·
+tool = "write"              # session_start · session_end ·
+command = "guard.sh"        # user_prompt_submit · pre_compact
+                            # ({tool, arguments, cwd} JSON on stdin;
+                            # lifecycle events carry their own payload)
+
+[guards]
+spend_usd = 2.0             # ask before the session crosses $2
+context_pct = 90            # ask when the context meter passes 90%
+auto_review = true          # fast-role reviewer pre-screens exec asks:
+                            # auto-allows only the unmistakably safe,
+                            # never denies, always leaves a note. Off by
+                            # default; inert in --safe-mode
+
+[[rules]]                   # the doom-loop rule domain: what happens
+tool = "loop"               # when a call repeats with identical args
+verdict = "ask"             # (allow = never trip · ask at 3 · deny at 3;
+                            # no rule = the shipped auto-error at 4)
 ```
 
 Hooks may also **steer**: on a clean exit, a JSON object on stdout —
 `{"mode":"plan","note":"why"}` — switches the permission mode
 (persisted to the strand, like `/mode`) and surfaces the note (≤200
-chars) as a transcript row. That is the whole action language; anything
-unparsable is ignored.
+chars) as a transcript row. A `pre_tool_use` hook can also patch the
+upcoming call — `{"updated_input":{"command":"…"}}` shallow-merges into
+the tool arguments (formatters, secret-scrubbers, redirectors) — and
+pre-approve it — `{"decision":"allow"}` skips the permission ask, though
+never for hardstops or protected paths; every pre-approve lands as a
+visible transcript row. That is the whole action language; anything
+unparsable is ignored. `turn_end` is the claude-compat spelling of
+`stop` (same point, same payload, its own event name); `session_start`
+/ `session_end` fire once per strand attach/close, `user_prompt_submit`
+before each turn, `pre_compact` before every digest.
 
 `ka --safe-mode` disables all customizations (AGENTS.md, MEMORY.md,
 skills, agents, commands, hooks, MCP, LSP) keeping built-ins, config,
@@ -82,7 +110,15 @@ rough per-Mtok cost estimate when the active model is priced.
 `ka serve` sessions can resume strands on disk: `POST /sessions` with
 `{"resume":"latest"}` or `{"resume":"<strand id/prefix>"}` replays the
 prior transcript over SSE; `ka acp` `session/load` accepts a strand id
-prefix the same way.
+prefix the same way. Any number of concurrent observers may stream a
+session (`GET /sessions/{id}/events`): each gets the full ring-buffered
+history then live events, `Last-Event-ID` reconnects mid-session, and
+presence changes broadcast as `{"type":"presence","busy":…,"attached":…}`
+events — `ka attach` renders exactly that (`busy · N attached` in the
+footer). `GET /sessions` lists every session with presence + title,
+`GET /sessions/{id}` returns one. The write path stays single-owner:
+observers have no prompt route; `POST /sessions/{id}/prompt` remains the
+only writer API.
 
 
 ## Sandbox & LSP
@@ -92,7 +128,20 @@ prefix the same way.
 mode = "fs"                # bash children: read everything, write only
                            # cwd, /tmp, XDG state/cache — enforced by
                            # bwrap, firejail, or in-kernel landlock
+allow_write = ["/opt/cache"]   # extra writable dirs; an "always"
+                           # expansion grant (below) appends here
+```
 
+**Sandbox expansion**: when a sandboxed command deterministically needs
+more than the policy allows — a redirection outside the write allowlist,
+a network-touching program under a network-denying backend, env
+assignments an env-clearing backend would strip — ka computes the exact
+missing grants *before* running and asks once: *allow* (this run),
+*always* (write paths persist to `[sandbox] allow_write`; network/env
+are session-scoped), or *deny* (the sandbox stays unchanged; the command
+fails on its own). Grants come from command analysis, never from failure
+output, and writes beneath broad dirs (`/`, `$HOME`, `/etc`…) are never
+offered — nothing expands without an explicit ask.
 [lsp]                      # opt-in diagnostics feedback
 enable = true
 write_through = true       # act through the server (below), not just read
@@ -188,7 +237,7 @@ cargo xtask unlink    # remove the kad symlink
 
 **File snapshots / undo**: `edit` and `write` park the target's current bytes under the data dir before every mutation (a failed snapshot refuses the change) and journal it per session — `/undo` (or `ka undo`) restores the most recent one, creation-undos delete. `/help` lists commands and keys; `ka --version` carries the git hash.
 
-**Live meters**: the engine emits a context meter per model step, so the footer's token/ctx gauge moves while a turn runs (not just at the end), and the reasoning effort shows once set. `ka run --session <id>` resumes headless by id. Input keying: `⏎` send · `⇧⏎` newline (Ctrl+J fallback) · bracketed paste pastes multi-line as one draft.
+**Live meters**: the engine emits a context meter per model step, so the footer's token/ctx gauge moves while a turn runs (not just at the end), and the reasoning effort always shows beside model/mode (for models that expose reasoning control). `ka run --session <id>` resumes headless by id. Input keying: `⏎` send · `⇧⏎` newline (Ctrl+J fallback) · bracketed paste pastes multi-line as one draft.
 
 **Pricing honesty**: curated dialect rows default to placeholder pricing flagged `priced = false` — surfaces (footer, `ka models`) never display costs from unverified rows; vendor-verified seed rows (e.g. `deepseek/deepseek-flash`) set `priced = true` with published prices. The generated models.dev overlay (`cargo xtask models-sync`) carries real published pricing, subscription plans included as unpriced `plan` rows.
 
@@ -204,4 +253,4 @@ Stable owns the name `ka`; dev is always `kad`. Isolate dev sessions with `KA_DA
 
 ## Footprint contract
 
-Single binary ≤ 10 MB (currently **6.48 MB** musl, gated in CI on the stripped musl artifact) · cold start ≤ 50 ms · idle RSS ≤ 15 MB · zero steady-state network. 636 tests (feature contracts included — CI fails if a documented behavior regresses), `clippy -D warnings` clean, musl CI build. Full-text session search ships behind the opt-in `index` cargo feature (`cargo install ka-agent --features index`).
+Single binary ≤ 10 MB (currently **6.31 MB** musl, gated in CI on the stripped musl artifact) · cold start ≤ 50 ms · idle RSS ≤ 15 MB · zero steady-state network. 713 tests (feature contracts included — CI fails if a documented behavior regresses), `clippy -D warnings` clean, musl CI build. Full-text session search ships behind the opt-in `index` cargo feature (`cargo install ka-agent --features index`).

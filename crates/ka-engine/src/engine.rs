@@ -355,6 +355,17 @@ fn replay_excerpt(s: &str) -> String {
     line.chars().take(120).collect()
 }
 
+/// Wire-level name of a protocol effort level.
+fn effort_name(level: ka_protocol::Effort) -> &'static str {
+    match level {
+        ka_protocol::Effort::Off => "off",
+        ka_protocol::Effort::Low => "low",
+        ka_protocol::Effort::Medium => "medium",
+        ka_protocol::Effort::High => "high",
+        ka_protocol::Effort::Max => "max",
+    }
+}
+
 /// Live engine settings, derived from the initial config and mutated by
 /// commands. Phase 3 persists these as strand `Change` records.
 struct EngineState {
@@ -485,6 +496,13 @@ async fn run(
     voice.set_context_promote(config.effective_context_promote());
     let sandbox_policy = ka_sandbox::policy_from_config(&config.sandbox.to_policy_config(), &cwd)?;
     voice.set_sandbox(sandbox_policy);
+    // [guards] auto_review: the fast-role reviewer pre-screens reviewable
+    // exec asks (opt-in; inert in safe mode — hooks-class customization)
+    let auto_review = config.guards.auto_review.unwrap_or(false);
+    voice.set_auto_review(
+        auto_review && !crate::conventions::bare_mode(),
+        roles.fast.clone(),
+    );
     // safe mode: [lsp] spawns user-configured executables — same risk
     // class as hooks/MCP, so the diagnostics tier is inert there too
     let lsp_cfg = effective_lsp_cfg(&config);
@@ -696,6 +714,17 @@ async fn run(
         .send(Event::Todos { items: Vec::new() })
         .await
         .ok();
+    // session_start hook (roadmap 9.2): strand attached, inventory out
+    ctx.voice
+        .lifecycle_hook(
+            crate::config::HookEvent::SessionStart,
+            serde_json::json!({
+                "event": "session_start",
+                "cwd": ctx.cwd.display().to_string(),
+            }),
+            &ctx.events,
+        )
+        .await;
     loop {
         tokio::select! {
             maybe = commands.recv() => {
@@ -715,6 +744,18 @@ async fn run(
     if let Some(path) = crate::hands::jobs::default_jobs_file() {
         ctx.voice.jobs().set_path(path);
     }
+    // session_end hook (roadmap 9.2): the command channel closed; the
+    // surface may already be gone, so steering surfaces best-effort
+    ctx.voice
+        .lifecycle_hook(
+            crate::config::HookEvent::SessionEnd,
+            serde_json::json!({
+                "event": "session_end",
+                "cwd": ctx.cwd.display().to_string(),
+            }),
+            &ctx.events,
+        )
+        .await;
     Ok(())
 }
 
@@ -787,6 +828,8 @@ async fn handle_command(
             text,
             schema,
             images,
+            allowed_tools,
+            model,
         } => {
             // a fresh user prompt earns a fresh verify-fix round
             ctx.state.verify_round_done = false;
@@ -798,6 +841,43 @@ async fn handle_command(
                 ctx.state.shell_context.clear();
                 format!("{block}\n\n{text}")
             };
+            // user_prompt_submit hook (roadmap 9.2): before the turn
+            // starts; steering (e.g. a mode switch) applies immediately
+            ctx.voice
+                .lifecycle_hook(
+                    crate::config::HookEvent::UserPromptSubmit,
+                    serde_json::json!({
+                        "event": "user_prompt_submit",
+                        "prompt": text,
+                    }),
+                    &ctx.events,
+                )
+                .await;
+            // per-turn scoping (roadmap 9.7, custom-command frontmatter):
+            // `allowed-tools` restricts this turn's toolset, `model`
+            // switches the model for this turn only (never persisted —
+            // no Change record, the session default is untouched)
+            if let Some(tools) = &allowed_tools {
+                ctx.voice.set_turn_tools(Some(tools.clone()));
+            }
+            let model_override = model.as_deref().and_then(|sel| {
+                if ka_dialect::parse_selector(sel).is_ok() {
+                    Some(sel.to_string())
+                } else {
+                    None
+                }
+            });
+            if model.is_some() && model_override.is_none() {
+                ctx.events
+                    .send(Event::Note {
+                        message: format!(
+                            "command model {:?} is not a valid selector — using the session model",
+                            model
+                        ),
+                    })
+                    .await
+                    .ok();
+            }
             dispatch_turn(
                 commands,
                 &ctx.events,
@@ -808,13 +888,16 @@ async fn handle_command(
                 images,
                 &mut ctx.strand,
                 &ctx.cwd,
+                model_override,
             )
             .await;
+            ctx.voice.set_turn_tools(None);
             settle_context(&mut ctx.voice, &mut ctx.state, &mut ctx.strand, &ctx.events).await;
             // auto-title once, right after the first completed turn of a
             // fresh strand (deferral follow-on turns are later turns)
             maybe_auto_title(&mut ctx.voice, &mut ctx.state, &mut ctx.strand, &ctx.events).await;
-            // Settling: drain deferrals as follow-on turns.
+            // Settling: drain deferrals as follow-on turns (scoped turns
+            // do not carry their restriction into deferred follow-ups).
             while let Some(deferred) = ctx.state.deferrals.pop_front() {
                 dispatch_turn(
                     commands,
@@ -826,6 +909,7 @@ async fn handle_command(
                     Vec::new(),
                     &mut ctx.strand,
                     &ctx.cwd,
+                    None,
                 )
                 .await;
                 settle_context(&mut ctx.voice, &mut ctx.state, &mut ctx.strand, &ctx.events).await;
@@ -897,6 +981,7 @@ async fn handle_command(
                         Vec::new(),
                         &mut ctx.strand,
                         &ctx.cwd,
+                        None,
                     )
                     .await;
                     settle_context(&mut ctx.voice, &mut ctx.state, &mut ctx.strand, &ctx.events)
@@ -926,6 +1011,14 @@ async fn handle_command(
                 mode: None,
             });
             ctx.events.send(Event::ModelChanged { selector }).await?;
+            // a model change re-announces the stored level so surfaces stay truthful
+            // (the level itself is not model-derived)
+            ctx.events
+                .send(Event::EffortChanged {
+                    level: ctx.state.effort.unwrap_or(ka_protocol::Effort::Off),
+                })
+                .await
+                .ok();
             ctx.events.send(Event::Idle).await.ok();
         }
         Command::SetMode { mode } => {
@@ -941,7 +1034,9 @@ async fn handle_command(
             ctx.events.send(Event::Idle).await.ok();
         }
         Command::SetEffort { level } => {
+            let name = effort_name(level);
             ctx.state.effort = Some(level);
+            ctx.voice.set_effort(Some(name.to_string()));
             let _ = ctx.strand.append(ka_strand::Record::Change {
                 id: ka_strand::new_record_id(),
                 model: None,
@@ -1565,6 +1660,7 @@ async fn attach_strand(
         voice.set_mode(state.mode);
     }
     voice.pathfinder_slot().write().model = state.model.clone();
+    voice.set_effort(state.effort.map(|e| effort_name(e).to_string()));
     let (history, ids, digest) = history_from_records(strand.records());
     voice.load_history(history, digest);
     state.record_ids = ids;
@@ -1608,6 +1704,14 @@ async fn attach_strand(
     // the true state instead of an assumed default
     events
         .send(Event::ModeChanged { mode: state.mode })
+        .await
+        .ok();
+    // same for the reasoning level: surfaces render the true state,
+    // not an assumed default (models without reasoning control get Off)
+    events
+        .send(Event::EffortChanged {
+            level: state.effort.unwrap_or(ka_protocol::Effort::Off),
+        })
         .await
         .ok();
     // one source of truth for titles: `ka_strand::title_of` over the
@@ -1802,6 +1906,18 @@ async fn run_digest(
     };
     let _ = model;
     let ratio = voice_ratio(voice);
+    // pre_compact hook (roadmap 9.2): advisory only — the digest runs
+    // regardless; clean stdout may steer or note
+    voice
+        .lifecycle_hook(
+            crate::config::HookEvent::PreCompact,
+            serde_json::json!({
+                "event": "pre_compact",
+                "focus": focus,
+            }),
+            events,
+        )
+        .await;
     // a ready speculative candidate with a matching watermark skips the
     // synchronous summarize entirely
     if focus.is_none() {
@@ -1877,6 +1993,7 @@ async fn dispatch_turn(
     images: Vec<ka_dialect::ImagePart>,
     strand: &mut ka_strand::StrandFile,
     cwd: &std::path::Path,
+    model_override: Option<String>,
 ) {
     match crate::fshooks::run(HookPoint::PreTurn, cwd, None).await {
         Ok(steer) => apply_steering(steer, events, state, voice, strand).await,
@@ -1885,7 +2002,8 @@ async fn dispatch_turn(
         }
     }
     let prompt_head = text.lines().next().unwrap_or("").to_string();
-    let usage = if let Some(model) = state.model.clone() {
+    let turn_model = model_override.or_else(|| state.model.clone());
+    let usage = if let Some(model) = turn_model {
         // stage auto-commit to run inside the voice just before its
         // terminal TurnFinished: ACP clients break on that event, so
         // the commit (and its notes) must land first
@@ -2051,6 +2169,7 @@ async fn dispatch_turn(
                             Vec::new(),
                             strand,
                             cwd,
+                            None,
                         ))
                         .await;
                     }
@@ -2578,6 +2697,8 @@ mod tests {
         handle
             .commands
             .send(Command::Prompt {
+                allowed_tools: None,
+                model: None,
                 text: "hi".into(),
                 schema: None,
                 images: Vec::new(),
@@ -2607,6 +2728,8 @@ mod tests {
         handle
             .commands
             .send(Command::Prompt {
+                allowed_tools: None,
+                model: None,
                 text: "slow".into(),
                 schema: None,
                 images: Vec::new(),
@@ -2669,6 +2792,8 @@ mod tests {
         handle
             .commands
             .send(Command::Prompt {
+                allowed_tools: None,
+                model: None,
                 text: "hello".into(),
                 schema: None,
                 images: Vec::new(),
@@ -2708,6 +2833,8 @@ mod tests {
         handle
             .commands
             .send(Command::Prompt {
+                allowed_tools: None,
+                model: None,
                 text: "hello".into(),
                 schema: None,
                 images: Vec::new(),
@@ -2734,6 +2861,8 @@ mod tests {
         handle
             .commands
             .send(Command::Prompt {
+                allowed_tools: None,
+                model: None,
                 text: "hello".into(),
                 schema: None,
                 images: Vec::new(),
@@ -2757,6 +2886,8 @@ mod tests {
         handle
             .commands
             .send(Command::Prompt {
+                allowed_tools: None,
+                model: None,
                 text: "one".into(),
                 schema: None,
                 images: Vec::new(),
@@ -2810,6 +2941,8 @@ mod tests {
         );
         h1.commands
             .send(Command::Prompt {
+                allowed_tools: None,
+                model: None,
                 text: "hello there".into(),
                 schema: None,
                 images: Vec::new(),
@@ -2846,6 +2979,8 @@ mod tests {
         let mut h2 = spawn_full(cfg, ka_dialect::Catalog::embedded(), StrandChoice::Latest);
         h2.commands
             .send(Command::Prompt {
+                allowed_tools: None,
+                model: None,
                 text: "second question".into(),
                 schema: None,
                 images: Vec::new(),
@@ -2902,6 +3037,8 @@ mod tests {
         );
         h.commands
             .send(Command::Prompt {
+                allowed_tools: None,
+                model: None,
                 text: "hi".into(),
                 schema: None,
                 images: Vec::new(),
@@ -3014,6 +3151,8 @@ mod tests {
         );
         h2.commands
             .send(Command::Prompt {
+                allowed_tools: None,
+                model: None,
                 text: "hello".into(),
                 schema: None,
                 images: Vec::new(),
@@ -3073,6 +3212,8 @@ mod tests {
         for prompt in ["first question", "second question"] {
             h.commands
                 .send(Command::Prompt {
+                    allowed_tools: None,
+                    model: None,
                     text: prompt.into(),
                     schema: None,
                     images: Vec::new(),
@@ -3129,6 +3270,8 @@ mod tests {
         handle
             .commands
             .send(Command::Prompt {
+                allowed_tools: None,
+                model: None,
                 text: "first session question".into(),
                 schema: None,
                 images: Vec::new(),
@@ -3224,6 +3367,7 @@ mod tests {
                 Event::SessionInfo { .. }
                 | Event::ModelChanged { .. }
                 | Event::ModeChanged { .. }
+                | Event::EffortChanged { .. }
                 | Event::Replay { .. }
                 | Event::Inventory { .. }
                 | Event::Todos { .. } => continue,
@@ -3259,6 +3403,8 @@ mod tests {
         handle
             .commands
             .send(Command::Prompt {
+                allowed_tools: None,
+                model: None,
                 text: text.to_string(),
                 schema: None,
                 images: Vec::new(),
@@ -3403,6 +3549,38 @@ mod tests {
                 Event::Note { message } if message.contains("agents available")
             )),
             "no agents-available note expected: {seen:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn bootstrap_emits_the_effort_level_beside_the_mode() {
+        // surfaces render the true level from launch, not an assumed
+        // default: the bootstrap cluster emits EffortChanged(Off)
+        // right after ModeChanged
+        let seen = drain_bootstrap("effort", Config::default()).await;
+        let mode_at = seen
+            .iter()
+            .position(|e| matches!(e, Event::ModeChanged { .. }))
+            .expect("bootstrap emits ModeChanged");
+        let effort_at = seen
+            .iter()
+            .position(|e| {
+                matches!(
+                    e,
+                    Event::EffortChanged {
+                        level: ka_protocol::Effort::Off
+                    }
+                )
+            })
+            .expect("bootstrap emits EffortChanged(Off)");
+        assert_eq!(effort_at, mode_at + 1, "effort follows the mode: {seen:?}");
+        // exactly one emission
+        assert_eq!(
+            seen.iter()
+                .filter(|e| matches!(e, Event::EffortChanged { .. }))
+                .count(),
+            1,
+            "{seen:?}"
         );
     }
 
@@ -3655,6 +3833,8 @@ mod tests {
         let mut h = spawn_full(cfg, live_catalog(addr, None), StrandChoice::New);
         h.commands
             .send(Command::Prompt {
+                allowed_tools: None,
+                model: None,
                 text: "please fix the parser in src/x.rs".into(),
                 schema: None,
                 images: Vec::new(),
@@ -3694,6 +3874,8 @@ mod tests {
         let mut h = spawn_full(cfg, live_catalog(addr, Some(dead_addr)), StrandChoice::New);
         h.commands
             .send(Command::Prompt {
+                allowed_tools: None,
+                model: None,
                 text: "please fix the parser in src/x.rs".into(),
                 schema: None,
                 images: Vec::new(),
@@ -3730,6 +3912,8 @@ mod tests {
         let mut h = spawn_full(cfg, live_catalog(addr, None), StrandChoice::New);
         h.commands
             .send(Command::Prompt {
+                allowed_tools: None,
+                model: None,
                 text: "please fix the parser in src/x.rs".into(),
                 schema: None,
                 images: Vec::new(),
@@ -3759,6 +3943,8 @@ mod tests {
         let mut h1 = spawn_full(cfg.clone(), live_catalog(addr_a, None), StrandChoice::New);
         h1.commands
             .send(Command::Prompt {
+                allowed_tools: None,
+                model: None,
                 text: "please fix the parser in src/x.rs".into(),
                 schema: None,
                 images: Vec::new(),
@@ -3791,6 +3977,8 @@ mod tests {
         );
         h2.commands
             .send(Command::Prompt {
+                allowed_tools: None,
+                model: None,
                 text: "second question".into(),
                 schema: None,
                 images: Vec::new(),

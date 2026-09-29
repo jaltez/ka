@@ -54,9 +54,20 @@ pub const TOOL_BAND_STYLE: Style = Style::new().fg(TOOL).bg(BG_TOOL);
 /// Running tool card fill (deep violet); ok/err cards tint sage/coral.
 pub const BG_OK_TINT: Color = Color::Rgb(17, 36, 40); // #112428 sage 12% over night
 pub const BG_ERR_TINT: Color = Color::Rgb(44, 21, 33); // #2C1521 coral 12% over night
+/// Thinking-box tint: warm rose stratum, one violet-family step beside
+/// the tool cards — boxes stay readable as a block when collapsed.
+pub const BG_THINK_TINT: Color = Color::Rgb(46, 30, 44); // #2E1E2C
+/// Thinking-box border + head text (6.02:1 on the tint).
+pub const THINK_BORDER: Color = Color::Rgb(208, 140, 176); // #D08CB0
 /// Drag-selection band: clearly lifted off the canvas (4.3× its
 /// luminance) yet dark enough that every text tier keeps its budget.
 pub const BG_SELECT: Color = Color::Rgb(40, 32, 60); // #28203C
+/// Hover band: a clear blue lift for the tinted block under the
+/// pointer — transient affordance on clickable/collapsible rows.
+/// Blue reads unmistakably against the warm canvas tints, yet stays
+/// dark enough that FAINT card text keeps its 4.2:1 budget (4.24
+/// measured).
+pub const BG_HOVER: Color = Color::Rgb(26, 38, 64); // #1A2640
 
 // ── text: dusk lavender-white ramp over the indigo ground ─────────
 pub const FG: Color = CREAM; // #EDE7F4 primary prose
@@ -145,6 +156,9 @@ mod tests {
             (BG_OK_TINT, (0x11, 0x24, 0x28), "ok tint"),
             (BG_ERR_TINT, (0x2C, 0x15, 0x21), "err tint"),
             (BG_SELECT, (0x28, 0x20, 0x3C), "drag-selection band"),
+            (BG_HOVER, (0x1A, 0x26, 0x40), "hover band"),
+            (BG_THINK_TINT, (0x2E, 0x1E, 0x2C), "think tint"),
+            (THINK_BORDER, (0xD0, 0x8C, 0xB0), "think border"),
             (FG_STRONG, (0xFF, 0xD9, 0x9A), "fg-strong follows gold-hi"),
         ] {
             assert_eq!(got, Color::Rgb(want.0, want.1, want.2), "{name}");
@@ -154,11 +168,13 @@ mod tests {
     /// WCAG 2.x relative-luminance contrast, computed with the same
     /// formula cited in the module doc. Measured ratios: GOLD_HI on
     /// BG_PANEL = 14.79; FAINT = 5.45 (BG), 5.59 (BG_PANEL), 4.52
-    /// (BG_OK_TINT), 4.78 (BG_ERR_TINT), 4.34 (BG_SELECT); FG = 15.99
-    /// (BG), 16.39 (BG_PANEL), 15.13 (BG_OUTPUT), 15.69 (BG_SURFACE),
-    /// 12.76 (BG_USER), 15.17 (BG_TOOL), 13.27 (BG_OK_TINT), 14.02
-    /// (BG_ERR_TINT), 12.73 (BG_SELECT). Every text tier must clear
-    /// 4.2:1 on the surface it actually sits on.
+    /// (BG_OK_TINT), 4.78 (BG_ERR_TINT), 4.42 (BG_THINK_TINT), 4.34
+    /// (BG_SELECT); FG = 15.99 (BG), 16.39 (BG_PANEL), 15.13
+    /// (BG_OUTPUT), 15.69 (BG_SURFACE), 12.76 (BG_USER), 15.17
+    /// (BG_TOOL), 13.27 (BG_OK_TINT), 14.02 (BG_ERR_TINT), 12.96
+    /// (BG_THINK_TINT), 12.73 (BG_SELECT); THINK_BORDER = 6.02
+    /// (BG_THINK_TINT). Every text tier must clear 4.2:1 on the
+    /// surface it actually sits on.
     fn contrast(fg: (u8, u8, u8), bg: (u8, u8, u8)) -> f64 {
         fn chan(v: u8) -> f64 {
             let x = f64::from(v) / 255.0;
@@ -188,11 +204,17 @@ mod tests {
         // Strong tier on the darkest surface it appears on.
         let gold_hi = rgb(GOLD_HI);
         assert!(contrast(gold_hi, rgb(BG_PANEL)) >= 4.2);
-        // Quiet tier across the canvas, panels, and the new tints.
+        // Quiet tier across the canvas, panels, and the tints.
         let faint = rgb(FAINT);
-        for bg in [BG, BG_PANEL, BG_OK_TINT, BG_ERR_TINT, BG_SELECT] {
+        for bg in [BG, BG_PANEL, BG_OK_TINT, BG_ERR_TINT, BG_SELECT, BG_HOVER] {
             assert!(contrast(faint, rgb(bg)) >= 4.2);
         }
+        // Thinking box: FAINT body on the pink tint keeps the
+        // BG_SELECT precedent (≥ 4.3), and the box border/head tier
+        // stays legible on its own surface.
+        let think_tint = rgb(BG_THINK_TINT);
+        assert!(contrast(faint, think_tint) >= 4.3);
+        assert!(contrast(rgb(THINK_BORDER), think_tint) >= 4.2);
         // Primary prose on every card surface.
         let fg = rgb(FG);
         for bg in [
@@ -205,8 +227,13 @@ mod tests {
             BG_OK_TINT,
             BG_ERR_TINT,
             BG_SELECT,
+            BG_HOVER,
         ] {
             assert!(contrast(fg, rgb(bg)) >= 4.2);
         }
+        assert!(
+            contrast(fg, think_tint) >= 12.0,
+            "FG keeps the strong tier on the think tint"
+        );
     }
 }

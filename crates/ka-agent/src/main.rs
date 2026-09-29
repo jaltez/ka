@@ -51,6 +51,10 @@ struct Cli {
     /// and auth
     #[arg(long)]
     safe_mode: bool,
+    /// Run one prompt before the TUI opens, landed in the session
+    /// (`ka -i "fix the tests"` — the TUI resumes on that strand)
+    #[arg(short = 'i', long = "interactive-prompt", value_name = "PROMPT")]
+    interactive_prompt: Option<String>,
 }
 
 #[derive(Subcommand, Clone)]
@@ -118,7 +122,7 @@ enum CliCommand {
         /// Bind address (loopback by default)
         #[arg(long, default_value = "127.0.0.1:8417")]
         addr: String,
-        /// Require this bearer token on every request
+        /// Require this bearer token on every request (or KA_SERVE_TOKEN)
         #[arg(long)]
         token: Option<String>,
     },
@@ -172,6 +176,47 @@ enum CliCommand {
         #[command(subcommand)]
         cmd: SkillCmd,
     },
+    /// Manage user-layer customizations (skills, agents, commands,
+    /// rules) — generalizes `ka skill`
+    Install {
+        #[command(subcommand)]
+        cmd: InstallCmd,
+    },
+    /// Import permission rules from another agent's config (one-shot:
+    /// printed conversion, strict-validated write)
+    Import {
+        /// Import format: claude (codex/gemini later)
+        format: String,
+        /// Path to the source config (claude: settings.json)
+        path: PathBuf,
+        /// Write to the project layer (.ka/ka.toml)
+        #[arg(long)]
+        project: bool,
+        /// Write to the user layer (~/.config/ka/ka.toml)
+        #[arg(long)]
+        user: bool,
+        /// Print the conversion without writing anything
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Observe a live `ka serve` session read-only (SSE; presence
+    /// chips, no write path — prompting stays on the server API)
+    Attach {
+        /// Session id prefix (omit: the server's newest session)
+        #[arg(value_name = "ID")]
+        session: Option<String>,
+        /// Server address
+        #[arg(long, default_value = "127.0.0.1:8417")]
+        addr: String,
+        /// Bearer token (or KA_SERVE_TOKEN)
+        #[arg(long)]
+        token: Option<String>,
+    },
+    /// Emit shell completions (bash | zsh | fish)
+    Completions {
+        /// Target shell
+        shell: String,
+    },
     /// List sessions for this directory (ids for `ka --session`)
     Sessions {
         /// Print a JSON array of session objects (id, ts, title, messages,
@@ -189,6 +234,9 @@ enum CliCommand {
     Providers,
     /// Generate a starter AGENTS.md from a quick repo scan
     Init,
+    /// Print a shell wrapper that puts the just-exited session's resume
+    /// command into the live shell's history (↑ + Enter restores it)
+    ShellIntegration,
     /// Inspect configuration
     Config {
         #[command(subcommand)]
@@ -200,7 +248,7 @@ enum CliCommand {
     #[cfg(target_os = "linux")]
     #[command(hide = true)]
     KaSandboxExec {
-        /// JSON array of writable roots.
+        /// Policy JSON object: {"writable":[…], "net":bool, "env":[…]} built by ka_sandbox::wrap_command.
         policy: String,
         /// The command to run (everything after `--`).
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
@@ -246,8 +294,39 @@ pub enum SkillCmd {
     },
 }
 
+/// `ka install ...`: the generalized customization lifecycle
+/// (roadmap 9.5). Same trust model as `ka skill`: user-scope install
+/// is the trust act; no registry, no manifests.
+#[derive(clap::Subcommand, Clone, Debug)]
+pub enum InstallCmd {
+    /// Install a customization from a git URL or local path
+    Install {
+        /// skill | agent | command | rule
+        kind: String,
+        /// Git URL (https://, git@) or local path (file or directory)
+        source: String,
+        /// Overwrite an installed item of the same name
+        #[arg(long)]
+        force: bool,
+    },
+    /// List installed user customizations (all kinds, or one)
+    List {
+        /// skill | agent | command | rule (omit = all)
+        kind: Option<String>,
+    },
+    /// Remove an installed customization
+    Remove {
+        /// skill | agent | command | rule
+        kind: String,
+        /// The installed item's bare name
+        name: String,
+    },
+}
+
 mod acp;
+mod attach;
 mod doctor;
+mod import;
 mod serve;
 mod skills;
 mod update;
@@ -393,6 +472,20 @@ async fn build_catalog(overlays: &[PathBuf], with_discovery: bool) -> Result<Cat
 }
 
 async fn dispatch(cli: Cli) -> Result<ExitCode, String> {
+    // -i is a TUI-only affordance: refuse the combination instead of
+    // silently dropping a user-typed prompt (and never spend a model
+    // turn the user cannot see without an interactive terminal)
+    if let Some(prompt) = cli.interactive_prompt.clone() {
+        if cli.command.is_some() {
+            return Err(format!(
+                "-i only applies to the interactive TUI (no subcommand); \
+                 pass the prompt to the subcommand instead — got {prompt:?}"
+            ));
+        }
+        if !std::io::IsTerminal::is_terminal(&std::io::stdout()) {
+            return Err("-i needs an interactive terminal; use `ka run` for headless".to_string());
+        }
+    }
     if cli.command.is_none() {
         return run_tui(cli).await;
     }
@@ -407,6 +500,7 @@ async fn dispatch(cli: Cli) -> Result<ExitCode, String> {
         no_discovery: cli.no_discovery,
         trust: cli.trust,
         safe_mode: cli.safe_mode,
+        interactive_prompt: cli.interactive_prompt,
     };
     match cli.command {
         Some(CliCommand::Run {
@@ -538,10 +632,41 @@ async fn dispatch(cli: Cli) -> Result<ExitCode, String> {
         Some(CliCommand::Agents) => run_agents(),
         Some(CliCommand::Providers) => run_providers(),
         Some(CliCommand::Init) => run_init(),
+        Some(CliCommand::ShellIntegration) => {
+            print!("{}", shell_integration_snippet());
+            Ok(ExitCode::SUCCESS)
+        }
         Some(CliCommand::Sessions { json }) => run_sessions(json),
         Some(CliCommand::Rewind { turns }) => run_rewind(turns).await,
         Some(CliCommand::Export { out, session, html }) => run_export(out, session, html),
         Some(CliCommand::Skill { cmd }) => skills::run_skill(cmd),
+        Some(CliCommand::Install { cmd }) => skills::run_install(cmd),
+        Some(CliCommand::Import {
+            format,
+            path,
+            project,
+            user,
+            dry_run,
+        }) => {
+            let layer = match (project, user) {
+                (true, false) => Some(import::Layer::Project),
+                (false, true) => Some(import::Layer::User),
+                (false, false) => None,
+                (true, true) => {
+                    return Err("--project and --user are mutually exclusive".to_string());
+                }
+            };
+            import::run(&format, &path, layer, dry_run)
+        }
+        Some(CliCommand::Attach {
+            session,
+            addr,
+            token,
+        }) => attach::run(session, &addr, token).await,
+        Some(CliCommand::Completions { shell }) => {
+            print!("{}", completions_script(&shell)?);
+            Ok(ExitCode::SUCCESS)
+        }
         Some(CliCommand::Config { cmd }) => match cmd {
             ConfigCommand::Schema => {
                 println!(
@@ -573,34 +698,67 @@ async fn dispatch(cli: Cli) -> Result<ExitCode, String> {
 /// Hidden `ka-sandbox-exec <policy-json> -- <argv…>`: apply the landlock
 /// ruleset to this process, then exec the real command (restrictions
 /// survive execve). Fails closed: any landlock error refuses to run.
+/// The policy JSON is `{"writable":[…], "net":bool, "env":[…]}` — the
+/// net/env fields carry sandbox-expansion grants.
 #[cfg(target_os = "linux")]
 fn run_sandbox_exec(policy: &str, argv: &[String]) -> Result<ExitCode, String> {
     use std::os::unix::process::CommandExt;
 
-    let writable: Vec<PathBuf> =
+    // parse the policy JSON by hand (serde_json::Value): ka-agent does
+    // not depend on serde derive directly, and this shape is tiny
+    let parsed: serde_json::Value =
         serde_json::from_str(policy).map_err(|e| format!("sandbox policy: {e}"))?;
+    let writable: Vec<PathBuf> = parsed
+        .get("writable")
+        .and_then(|v| v.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|x| x.as_str().map(PathBuf::from))
+                .collect()
+        })
+        .unwrap_or_default();
+    let allow_net = parsed.get("net").and_then(|v| v.as_bool()).unwrap_or(false);
+    let env_names: Vec<String> = parsed
+        .get("env")
+        .and_then(|v| v.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|x| x.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
     let (program, args) = argv
         .split_first()
         .ok_or_else(|| "sandbox-exec: no command after --".to_string())?;
-    apply_landlock(&writable)?;
+    apply_landlock(&writable, allow_net)?;
     // parity with bwrap --clearenv: the sandboxed command must not see
     // the parent's environment (provider API keys live there). PATH is
-    // re-set to the bare minimum so plain commands still resolve.
+    // re-set to the bare minimum so plain commands still resolve; env
+    // grants re-set their variables from this process's environment
+    // (the trampoline still sees the parent's values).
+    let passed: Vec<(String, String)> = env_names
+        .iter()
+        .filter_map(|name| std::env::var(name).ok().map(|value| (name.clone(), value)))
+        .collect();
     let mut cmd = std::process::Command::new(program);
     cmd.args(args);
     cmd.env_clear();
     cmd.env("PATH", "/usr/local/bin:/usr/bin:/bin");
+    for (name, value) in passed {
+        cmd.env(name, value);
+    }
     let err = cmd.exec();
     // exec() only returns on failure
     Err(format!("sandbox-exec: {program}: {err}"))
 }
 
 /// Landlock policy: read everything beneath `/`; write only beneath the
-/// allowlist; network (bind/connect) denied when the kernel ABI ≥ 4
-/// (older kernels degrade silently — filesystem enforcement stays).
-/// Mirrors what bwrap's `--unshare-all` gives the fs tier.
+/// allowlist; network (bind/connect) denied when the kernel ABI ≥ 4 and
+/// the policy does not grant it (older kernels degrade silently —
+/// filesystem enforcement stays). Mirrors what bwrap's `--unshare-all`
+/// gives the fs tier.
 #[cfg(target_os = "linux")]
-fn apply_landlock(writable: &[PathBuf]) -> Result<(), String> {
+fn apply_landlock(writable: &[PathBuf], allow_net: bool) -> Result<(), String> {
     use landlock::{
         ABI, Access, AccessFs, AccessNet, Compatible, LandlockStatus, Ruleset, RulesetAttr,
         RulesetCreatedAttr, path_beneath_rules,
@@ -614,13 +772,17 @@ fn apply_landlock(writable: &[PathBuf]) -> Result<(), String> {
         .handle_access(AccessFs::from_all(abi))
         .map_err(|e| format!("sandbox: ruleset: {e}"))?;
     // handled-but-ungranted network access = denied on ABI ≥ 4;
-    // BestEffort makes these no-ops where the kernel lacks it
-    let ruleset = ruleset
-        .handle_access(AccessNet::BindTcp)
-        .map_err(|e| format!("sandbox: ruleset (net bind): {e}"))?;
-    let ruleset = ruleset
-        .handle_access(AccessNet::ConnectTcp)
-        .map_err(|e| format!("sandbox: ruleset (net connect): {e}"))?;
+    // BestEffort makes these no-ops where the kernel lacks it. An
+    // expansion grant skips the handling entirely: unhandled = allowed.
+    let ruleset = if allow_net {
+        ruleset
+    } else {
+        ruleset
+            .handle_access(AccessNet::BindTcp)
+            .map_err(|e| format!("sandbox: ruleset (net bind): {e}"))?
+            .handle_access(AccessNet::ConnectTcp)
+            .map_err(|e| format!("sandbox: ruleset (net connect): {e}"))?
+    };
     let created = ruleset
         .create()
         .map_err(|e| format!("sandbox: ruleset create: {e}"))?
@@ -702,6 +864,8 @@ async fn run_headless(
     handle
         .commands
         .send(Command::Prompt {
+            allowed_tools: None,
+            model: None,
             text: prompt,
             schema,
             images,
@@ -1038,6 +1202,7 @@ async fn run_tui(cli: Cli) -> Result<ExitCode, String> {
             price_out: d.price.output_per_mtok,
             priced: d.priced,
             plan: id.split('/').next().is_some_and(|v| v.contains("plan")),
+            efforts: d.efforts.clone(),
         })
         .collect();
     // the picker inherits catalog order: official block first, then
@@ -1049,6 +1214,21 @@ async fn run_tui(cli: Cli) -> Result<ExitCode, String> {
     let fresh = matches!(choice, ka_engine::StrandChoice::New);
     let handle = ka_engine::spawn_full(cfg, catalog, choice);
     let ka_engine::EngineHandle { commands, events } = handle;
+    // `ka -i "<prompt>"`: one turn runs before the TUI opens — the
+    // engine's event channel buffers it, so the TUI streams the turn
+    // (and answers any permission ask) live from its first frame
+    if let Some(prompt) = cli.interactive_prompt.clone() {
+        commands
+            .send(Command::Prompt {
+                allowed_tools: None,
+                model: None,
+                text: prompt,
+                schema: None,
+                images: Vec::new(),
+            })
+            .await
+            .map_err(|_| "engine closed before prompt".to_string())?;
+    }
     let agents: Vec<(String, String)> = if ka_engine::conventions::bare_mode() {
         Vec::new()
     } else {
@@ -1098,6 +1278,74 @@ async fn run_tui(cli: Cli) -> Result<ExitCode, String> {
     .map_err(|e| format!("tui: {e}"))?;
     match exit {
         ka_term::tui::Exit::Quit | ka_term::tui::Exit::EngineEnded => Ok(ExitCode::SUCCESS),
+    }
+}
+
+/// `ka completions <shell>` (roadmap 9.7): emit a completion script.
+/// The word lists are derived from the live clap command at runtime —
+/// subcommands and flags can never drift from the parser (data over
+/// code; no hand-maintained tables, no clap_complete dependency).
+fn completions_script(shell: &str) -> Result<String, String> {
+    let command = Cli::command();
+    let mut subs: Vec<String> = command
+        .get_subcommands()
+        .filter(|c| !c.is_hide_set() && c.get_name() != "help")
+        .map(|c| c.get_name().to_string())
+        .collect();
+    subs.sort();
+    let mut opts: Vec<String> = Vec::new();
+    for arg in command.get_arguments() {
+        if let Some(long) = arg.get_long() {
+            opts.push(format!("--{long}"));
+        }
+        if let Some(short) = arg.get_short() {
+            opts.push(format!("-{short}"));
+        }
+    }
+    opts.sort();
+    opts.dedup();
+    let subs = subs.join(" ");
+    let opts = opts.join(" ");
+    match shell {
+        "bash" => Ok(format!(
+            "# ka shell completions (bash) — source me, or install to \\\n\
+             # $(brew --prefix 2>/dev/null)/etc/bash_completion.d/ka\n\
+             _ka_completions() {{\n\
+             \x20 local cur=\"${{COMP_WORDS[COMP_CWORD]}}\"\n\
+             \x20 local subs=\"{subs}\"\n\
+             \x20 local opts=\"{opts}\"\n\
+             \x20 if [[ ${{COMP_CWORD}} -eq 1 ]]; then\n\
+             \x20   COMPREPLY=( $(compgen -W \"$subs $opts\" -- \"$cur\") )\n\
+             \x20 else\n\
+             \x20   COMPREPLY=( $(compgen -W \"$opts\" -- \"$cur\") )\n\
+             \x20 fi\n\
+             }}\n\
+             complete -F _ka_completions ka\n"
+        )),
+        "zsh" => Ok(format!(
+            "#compdef ka\n\
+             # ka shell completions (zsh) — install to a fpath dir as _ka\n\
+             _ka() {{\n\
+             \x20 local -a subs opts\n\
+             \x20 subs=({subs})\n\
+             \x20 opts=({opts})\n\
+             \x20 _arguments -A \"-*\" \"1: :->sub\" \"*::arg:->args\"\n\
+             \x20 case $state in\n\
+             \x20   sub) _describe 'ka command' subs ;;\n\
+             \x20   args) _describe 'ka option' opts ;;\n\
+             \x20 esac\n\
+             }}\n\
+             compdef _ka ka\n"
+        )),
+        "fish" => Ok(format!(
+            "# ka shell completions (fish) — install to ~/.config/fish/completions/ka.fish\n\
+             complete -c ka -n '__fish_use_subcommand' -a \"{subs}\" -d 'ka subcommand'\n\
+             complete -c ka -n '__fish_use_subcommand' -a \"{opts}\"\n\
+             complete -c ka -n 'not __fish_use_subcommand' -a \"{opts}\"\n"
+        )),
+        other => Err(format!(
+            "unknown shell {other:?} (expected bash | zsh | fish)"
+        )),
     }
 }
 
@@ -1386,6 +1634,32 @@ fn warn_untrusted_conventions(cwd: &std::path::Path) {
 /// Deterministic starter AGENTS.md from repo shape (no model call).
 /// Generated at the root project — the nearest `.git` ancestor of the
 /// launch dir, else the launch dir — where ka and other agents read it.
+/// The `ka shell-integration` snippet: a `ka()` shell function that,
+/// after every run, reads `<data dir>/last-resume` (written by the TUI
+/// on exit) and registers the resume command in the LIVE shell's
+/// history — zsh `print -s`, bash `history -s`. Sourced with
+/// `eval "$(ka shell-integration)"` from .zshrc/.bashrc.
+fn shell_integration_snippet() -> String {
+    r#"# ka session resume: after each ka run, the resume command of the
+# session you just left enters THIS shell's history — press ↑ then
+# Enter to bring it back.
+ka() {
+  command ka "$@"
+  local rc=$?
+  local f="${KA_DATA_DIR:-${XDG_DATA_HOME:-$HOME/.local/share}/ka}/last-resume"
+  if [ -r "$f" ]; then
+    local cmd
+    cmd=$(cat "$f" 2>/dev/null)
+    if [ -n "$cmd" ]; then
+      if [ -n "${ZSH_VERSION:-}" ]; then print -s -- "$cmd"; else history -s -- "$cmd"; fi
+    fi
+  fi
+  return $rc
+}
+"#
+    .to_string()
+}
+
 fn run_init() -> Result<ExitCode, String> {
     let cwd = std::env::current_dir().map_err(|e| format!("cwd: {e}"))?;
     let root = ka_engine::project_root(&cwd);
@@ -1706,5 +1980,95 @@ mod print_tests {
                 kind: ka_protocol::DeltaKind::Text(_)
             }
         ));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::shell_integration_snippet;
+
+    #[test]
+    fn shell_integration_registers_history_in_the_live_shell() {
+        let snip = shell_integration_snippet();
+        // both shell dialects covered, reading the TUI's last-resume file
+        assert!(snip.contains("print -s"), "zsh: {snip}");
+        assert!(snip.contains("history -s"), "bash: {snip}");
+        assert!(snip.contains("last-resume"), "{snip}");
+        // the wrapper must read exactly where ka_strand::data_dir()
+        // writes (KA_DATA_DIR > XDG_DATA_HOME > ~/.local/share, +/ka)
+        assert!(
+            snip.contains("KA_DATA_DIR:-${XDG_DATA_HOME:-$HOME/.local/share}/ka"),
+            "{snip}"
+        );
+        assert!(snip.contains("command ka \"$@\""), "{snip}");
+        assert!(snip.contains("return $rc"), "exit code preserved: {snip}");
+    }
+}
+
+#[cfg(test)]
+mod completions_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+    use super::*;
+
+    /// `ka completions` (roadmap 9.7): every visible subcommand and the
+    /// load-bearing global flags appear in all three shells; hidden
+    /// subcommands never do.
+    #[test]
+    fn completions_cover_subcommands_and_flags_for_each_shell() {
+        for shell in ["bash", "zsh", "fish"] {
+            let script = completions_script(shell).unwrap();
+            for sub in [
+                "run",
+                "serve",
+                "attach",
+                "install",
+                "import",
+                "completions",
+                "sessions",
+                "export",
+                "undo",
+                "models",
+                "doctor",
+                "update",
+                "init",
+                "acp",
+                "skill",
+            ] {
+                assert!(script.contains(sub), "{shell} lost subcommand {sub}");
+            }
+            for flag in [
+                "--session",
+                "--model",
+                "--mode",
+                "--safe-mode",
+                "--interactive-prompt",
+            ] {
+                assert!(script.contains(flag), "{shell} lost flag {flag}");
+            }
+            assert!(
+                !script.contains("ka-sandbox-exec"),
+                "{shell} must not complete hidden subcommands"
+            );
+        }
+        assert!(completions_script("powershell").is_err());
+        assert!(completions_script("nushell").is_err());
+    }
+
+    /// `ka -i "<prompt>"` parses onto the global CLI.
+    #[test]
+    fn interactive_prompt_flag_parses() {
+        let cli = Cli::try_parse_from(["ka", "-i", "fix the tests"]).unwrap();
+        assert_eq!(cli.interactive_prompt.as_deref(), Some("fix the tests"));
+        assert!(cli.command.is_none());
+        let cli = Cli::try_parse_from([
+            "ka",
+            "--interactive-prompt",
+            "review this",
+            "--session",
+            "abc",
+        ])
+        .unwrap();
+        assert_eq!(cli.interactive_prompt.as_deref(), Some("review this"));
+        assert_eq!(cli.session.as_deref(), Some("abc"));
     }
 }

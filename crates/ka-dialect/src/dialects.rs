@@ -203,19 +203,17 @@ impl Catalog {
         toml::from_str(text)
     }
 
-    /// The embedded seed catalog. Panics only if the compiled-in table is
-    /// invalid, which is a build-time guarantee. The generated models.dev
-    /// overlay is merged in; its generator never emits a curated selector,
-    /// so curated rows keep their richer flags.
+    /// The embedded catalog: the generated models.dev table first, then
+    /// the curated `dialects.toml` rows overlaid on top — curated wins
+    /// per selector, so a hand-curated row can enrich a models.dev
+    /// entry (efforts, flags) without the generator clobbering it.
     pub fn embedded() -> Self {
-        let mut curated = match Self::parse(EMBEDDED) {
-            Ok(c) => c,
+        let mut catalog = Self::parse(MODELS_DEV).unwrap_or_else(|_| Self::default());
+        match Self::parse(EMBEDDED) {
+            Ok(curated) => catalog.overlay(curated),
             Err(e) => panic!("embedded dialect catalog is invalid: {e}"),
-        };
-        if let Ok(models_dev) = Self::parse(MODELS_DEV) {
-            curated.overlay(models_dev);
         }
-        curated
+        catalog
     }
 
     /// Overlay another catalog on top (user wins per key).
@@ -375,6 +373,46 @@ mod tests {
         assert_eq!(q.first_byte_timeout_ms, 0);
         assert!(q.flags.replay_reasoning);
         assert_eq!(q.flags.tool_choice, ToolChoice::PinOrAuto);
+    }
+
+    #[test]
+    fn embedded_vision_rows_claim_image() {
+        // the `input` claim is load-bearing: every wire hard-errors on
+        // image-bearing turns without it, and the models.dev overlay
+        // never backfills it (whole-row replacement). Pin the curated
+        // vision rows so a stray edit cannot silently disable images.
+        let c = Catalog::embedded();
+        for id in [
+            "anthropic/claude-sonnet-5",
+            "openai/gpt-5.1",
+            "openai/o3",
+            "openai/o4-mini",
+            "deepseek/deepseek-flash",
+        ] {
+            let d = c.get(id).unwrap_or_else(|| panic!("{id} missing"));
+            assert!(
+                d.input.iter().any(|m| matches!(m, Modality::Image)),
+                "{id} must claim image input"
+            );
+        }
+    }
+
+    #[test]
+    fn embedded_curated_rows_win_over_models_dev() {
+        // the zai rows exist in the generated models.dev table without
+        // efforts; the curated seed row must survive the overlay
+        let c = Catalog::embedded();
+        let glm = c.get("zai/glm-5.3-flash").expect("zai row present");
+        assert_eq!(
+            glm.efforts,
+            vec!["low".to_string(), "high".to_string(), "max".to_string()]
+        );
+        assert!(glm.flags.reasoning_field.is_some());
+        assert_eq!(glm.api_key_env.as_deref(), Some("ZHIPU_API_KEY"));
+        assert_eq!(
+            glm.base_url.as_deref(),
+            Some("https://api.z.ai/api/paas/v4")
+        );
     }
 
     #[test]

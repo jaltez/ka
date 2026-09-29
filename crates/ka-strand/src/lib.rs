@@ -1487,4 +1487,20 @@ mod tests {
         let s = list(&cwd).unwrap().remove(0);
         assert_eq!((s.cost, s.tokens), (0.0, 0));
     }
+
+    #[test]
+    fn html_export_escapes_and_marks_the_island() {
+        let page = render_html(
+            "t<title>",
+            "# Head\n\n<script>alert(1)</script>\n\n- item `code`",
+        );
+        assert!(!page.contains("__KA_TITLE__"), "title is filled");
+        assert!(page.contains("t&lt;title&gt;"), "title is html-escaped");
+        assert!(page.contains("&lt;script&gt;"), "markdown is inert");
+        assert!(
+            !page.contains("<script>alert"),
+            "raw script must not pass through"
+        );
+        assert!(page.contains("text/markdown"), "island present");
+    }
 }

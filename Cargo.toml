@@ -55,7 +55,7 @@ todo = "deny"
 unimplemented = "deny"
 
 [profile.release]
-opt-level = "s"
+opt-level = "z"
 lto = "fat"
 strip = true
 panic = "abort"

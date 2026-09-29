@@ -30,6 +30,55 @@ const READONLY: &[&str] = &[
     "ls", "cat", "pwd", "echo", "head", "tail", "wc", "which", "grep", "find", "stat", "du",
     "diff", "rg", "file", "whoami", "uname", "true", "false", "git", "sed",
 ];
+/// Programs whose normal use touches the network — the sandbox-expansion
+/// grant computation offers a network grant when one of these leads a
+/// segment under a network-denying backend. Conservative by design: an
+/// unlisted program simply never earns a network grant (stays denied).
+pub const NETWORK_TOOLS: &[&str] = &[
+    "curl",
+    "wget",
+    "ping",
+    "ssh",
+    "scp",
+    "sftp",
+    "rsync",
+    "git",
+    "gh",
+    "npm",
+    "npx",
+    "pnpm",
+    "yarn",
+    "bun",
+    "pip",
+    "pip3",
+    "uv",
+    "poetry",
+    "cargo",
+    "go",
+    "docker",
+    "kubectl",
+    "helm",
+    "terraform",
+    "ansible",
+    "mvn",
+    "gradle",
+    "composer",
+    "gem",
+    "brew",
+    "apt",
+    "apt-get",
+    "dnf",
+    "yum",
+    "pacman",
+    "nix",
+    "conda",
+    "aws",
+    "gcloud",
+    "az",
+    "dig",
+    "host",
+    "nc",
+];
 
 /// Split a command line into shell segments on `&& || ; | &`, honoring
 /// single/double quotes. (Not a full parser: `$()` and unspaced `a&&b` are
@@ -54,6 +103,12 @@ pub fn split_segments(line: &str) -> (Vec<String>, bool) {
                 current.push(c);
             }
             '&' | '|' | ';' => {
+                // `>|` is the clobber redirect, not a pipe: a '|'
+                // glued directly to a '>' stays in the current token
+                if c == '|' && current.ends_with('>') {
+                    current.push(c);
+                    continue;
+                }
                 if c != ';' && chars.peek() == Some(&c) {
                     chars.next(); // && or ||
                 }
@@ -140,13 +195,11 @@ pub fn analyze(line: &str) -> Analysis {
                 skip_next = false;
                 continue;
             }
-            let is_redirect = t.starts_with('>')
-                || t.starts_with('<')
-                || t.starts_with("2>")
-                || t.as_str() == "|";
+            let (op, rest) = redirect_op(t);
+            let is_redirect = op.is_some() || t.starts_with('<') || t.as_str() == "|";
             if is_redirect {
                 // bare operator: its target follows as the next token
-                skip_next = t.len() == 1 || t == "2>" || t == ">>";
+                skip_next = rest == Some("") || t == "<";
                 continue;
             }
             cleaned.push(t.clone());
@@ -167,8 +220,16 @@ pub fn analyze(line: &str) -> Analysis {
 
 /// Minimal shlex: whitespace split honoring quotes.
 fn shlex_split(s: &str) -> Vec<String> {
+    shlex_split_marked(s).into_iter().map(|(t, _)| t).collect()
+}
+
+/// Split honoring quotes, keeping whether each token came from inside
+/// quotes: a quoted token is DATA, never a shell operator — `cat '>'
+/// f` must not read as a redirection.
+fn shlex_split_marked(s: &str) -> Vec<(String, bool)> {
     let mut out = Vec::new();
     let mut cur = String::new();
+    let mut cur_quoted = false;
     let mut quote: Option<char> = None;
     for c in s.chars() {
         if let Some(q) = quote {
@@ -180,17 +241,21 @@ fn shlex_split(s: &str) -> Vec<String> {
             continue;
         }
         match c {
-            '\'' | '"' => quote = Some(c),
+            '\'' | '"' => {
+                quote = Some(c);
+                cur_quoted = true;
+            }
             c if c.is_whitespace() => {
                 if !cur.is_empty() {
-                    out.push(std::mem::take(&mut cur));
+                    out.push((std::mem::take(&mut cur), cur_quoted));
+                    cur_quoted = false;
                 }
             }
             _ => cur.push(c),
         }
     }
     if !cur.is_empty() {
-        out.push(cur);
+        out.push((cur, cur_quoted));
     }
     out
 }
@@ -333,6 +398,147 @@ pub fn hardstop(line: &str, analysis: &Analysis) -> Option<Hardstop> {
     None
 }
 
+/// Redirection targets of a command line (`> f`, `>> f`, `2> f`, `1> f`,
+/// `>| f`, `&> f`, attached forms included), raw and unresolved —
+/// sandbox-expansion grant computation turns the outside-allowlist ones
+/// into write grants. `2>&1`-style duplicates are skipped (they alias
+/// an existing fd). The unspaced `cmd>file` spelling is a deliberate
+/// miss: this is not a full shell parser, and a missed write stays
+/// denied by the sandbox (fail-closed) rather than mis-parsed.
+pub fn redirect_targets(line: &str) -> Vec<String> {
+    let (segments, _) = split_segments(line);
+    let mut targets = Vec::new();
+    for seg in &segments {
+        let tokens = shlex_split_marked(seg);
+        let mut skip_next = false;
+        for (token, quoted) in &tokens {
+            if skip_next {
+                skip_next = false;
+                if !token.starts_with('-') && !token.starts_with('&') {
+                    push_unique(&mut targets, token.clone());
+                }
+                continue;
+            }
+            // a quoted token is data: `cat '>' f` redirects nothing
+            if *quoted {
+                continue;
+            }
+            match redirect_op(token) {
+                // bare operator: the next token is the target
+                (Some(_), Some("")) => skip_next = true,
+                // attached form `>file` / `2>file` / `&>>file` (`2>&1`
+                // fd aliases start with `&` and are skipped)
+                (Some(_), Some(r)) if !r.starts_with('&') => {
+                    push_unique(&mut targets, r.to_string());
+                }
+                _ => {}
+            }
+        }
+    }
+    targets
+}
+
+/// Split a token into (redirection operator, remainder) when it starts
+/// one: `>`, `>>`, `>|`, `2>`, `2>>`, `2>|`, `1>`, `1>>`, `1>|`, `&>`,
+/// `&>>`. Longest forms come first so `2>>x` does not parse as `2>` +
+/// `>x`.
+fn redirect_op(token: &str) -> (Option<&str>, Option<&str>) {
+    for op in [
+        "&>>", "&>", "2>>", "2>|", "2>", "1>>", "1>|", "1>", ">>", ">|", ">",
+    ] {
+        if let Some(rest) = token.strip_prefix(op) {
+            return (Some(op), Some(rest));
+        }
+    }
+    (None, None)
+}
+
+fn push_unique(list: &mut Vec<String>, value: String) {
+    if !value.is_empty() && !list.contains(&value) {
+        list.push(value);
+    }
+}
+
+/// Env var NAMES assigned as command prefixes (`FOO=1 cmd …`) or via
+/// `env FOO=1 cmd` — what an env-clearing sandbox backend would strip.
+pub fn env_assignments(line: &str) -> Vec<String> {
+    let (segments, _) = split_segments(line);
+    let mut names = Vec::new();
+    for seg in &segments {
+        let tokens = shlex_split(seg);
+        let mut idx = 0;
+        // `env [-flags] NAME=value … cmd`
+        if tokens.first().map(String::as_str) == Some("env") {
+            idx = 1;
+            while let Some(t) = tokens.get(idx) {
+                if t.starts_with('-') {
+                    idx += 1;
+                    continue;
+                }
+                break;
+            }
+        }
+        while let Some(t) = tokens.get(idx) {
+            if let Some(name) = assignment_name(t) {
+                if !names.contains(&name) {
+                    names.push(name.clone());
+                }
+                idx += 1;
+            } else {
+                break;
+            }
+        }
+    }
+    names
+}
+
+/// `NAME=value` → `NAME` when NAME is a plausible env identifier.
+fn assignment_name(token: &str) -> Option<String> {
+    let (name, _rest) = token.split_once('=')?;
+    let valid = !name.is_empty()
+        && name
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+    valid.then(|| name.to_string())
+}
+
+/// Whether any segment leads with a known network-touching program.
+/// Matched by basename — mirroring [`hardstop`]'s normalization — so
+/// `/usr/bin/curl …` counts too.
+pub fn wants_network(analysis: &Analysis) -> bool {
+    analysis.segments.iter().any(|seg| {
+        seg.first()
+            .is_some_and(|p| NETWORK_TOOLS.contains(&basename(p).as_str()))
+    })
+}
+
+/// Host hints from URL-shaped arguments (`scheme://host/...`) of
+/// network-tool segments — display-only; the grant itself is
+/// command-scoped network egress (backends cannot narrow by host).
+pub fn network_hosts(analysis: &Analysis) -> Vec<String> {
+    let mut hosts = Vec::new();
+    for seg in &analysis.segments {
+        let Some(prog) = seg.first() else { continue };
+        if !NETWORK_TOOLS.contains(&basename(prog).as_str()) {
+            continue;
+        }
+        for arg in seg.iter().skip(1) {
+            if let Some(rest) = arg
+                .strip_prefix("https://")
+                .or_else(|| arg.strip_prefix("http://"))
+            {
+                let host = rest.split(['/', ':']).next().unwrap_or_default();
+                if !host.is_empty() && !hosts.contains(&host.to_string()) {
+                    hosts.push(host.to_string());
+                }
+            }
+        }
+    }
+    hosts
+}
+
 /// Whether every segment is a known read-only program with no redirection
 /// (auto-allowed in guarded mode).
 pub fn all_readonly(analysis: &Analysis) -> bool {
@@ -456,5 +662,121 @@ mod tests {
         if let Some(path) = resolve_program("ls") {
             assert!(path.contains('/'), "{path}");
         }
+    }
+
+    #[test]
+    fn redirect_targets_split_attached_and_bare() {
+        assert_eq!(
+            redirect_targets("echo hi > out.txt"),
+            vec!["out.txt".to_string()]
+        );
+        assert_eq!(
+            redirect_targets("cmd >>/var/log/app.log 2>&1"),
+            vec!["/var/log/app.log".to_string()],
+            "attached >> counts; 2>&1 is an fd alias, not a target"
+        );
+        assert_eq!(
+            redirect_targets("a > one.txt && b >> two.txt"),
+            vec!["one.txt".to_string(), "two.txt".to_string()]
+        );
+        assert!(
+            redirect_targets("echo 'a > b'").is_empty(),
+            "quoted, not a redirect"
+        );
+        assert!(redirect_targets("cat f").is_empty());
+    }
+
+    #[test]
+    fn env_assignments_from_prefixes_and_env() {
+        assert_eq!(
+            env_assignments("FOO=1 BAR= cargo build"),
+            vec!["FOO".to_string(), "BAR".to_string()]
+        );
+        assert_eq!(
+            env_assignments("env -i X=9 python -c t.py"),
+            vec!["X".to_string()]
+        );
+        assert!(
+            env_assignments("echo A=1").is_empty(),
+            "argument position, not prefix"
+        );
+        assert!(env_assignments("cargo build").is_empty());
+    }
+
+    #[test]
+    fn network_detection_and_host_hints() {
+        let a = analyze("cargo build && curl -fsSL https://example.com/a | tee out");
+        assert!(wants_network(&a));
+        assert_eq!(network_hosts(&a), vec!["example.com".to_string()]);
+        let quiet = analyze("ls -la && sed -n 1p f");
+        assert!(!wants_network(&quiet));
+        assert!(network_hosts(&quiet).is_empty());
+    }
+
+    #[test]
+    fn redirect_targets_cover_fd1_and_clobber_forms() {
+        assert_eq!(
+            redirect_targets("cmd 1> out.log"),
+            vec!["out.log".to_string()]
+        );
+        assert_eq!(
+            redirect_targets("cmd 1>>out.log"),
+            vec!["out.log".to_string()]
+        );
+        assert_eq!(
+            redirect_targets("cmd >| forced.txt"),
+            vec!["forced.txt".to_string()]
+        );
+        // the fd-1 forms are stripped from segments like every other
+        // redirect token
+        let a = analyze("echo hi 1> out.txt");
+        assert!(a.redirects);
+        assert_eq!(a.segments, vec![vec!["echo".to_string(), "hi".to_string()]]);
+        // unspaced `cmd>file` is a deliberate, documented miss: the
+        // write stays denied by the sandbox rather than mis-parsed
+        assert!(redirect_targets("echo hi>out.txt").is_empty());
+    }
+
+    #[test]
+    fn network_detection_resolves_absolute_program_paths() {
+        let a = analyze("/usr/bin/curl -fsSL https://example.com/a");
+        assert!(wants_network(&a), "basename must match: {a:?}");
+        assert_eq!(network_hosts(&a), vec!["example.com".to_string()]);
+    }
+
+    #[test]
+    fn adversarial_forms_earn_no_network_grant() {
+        // command substitution inside a redirect target: the raw text
+        // is a literal target token — the inner command is never
+        // analyzed, let alone granted network
+        let a = analyze("echo > $(cmd).log");
+        assert!(!wants_network(&a));
+        assert_eq!(
+            redirect_targets("echo > $(cmd).log"),
+            vec!["$(cmd).log".to_string()]
+        );
+        // quoted inner commands are opaque arguments, not segments
+        assert!(!wants_network(&analyze(
+            "bash -c \"curl https://example.com/x\""
+        )));
+        assert!(!wants_network(&analyze("sh -c 'FOO=1 cmd'")));
+        assert!(
+            env_assignments("sh -c 'FOO=1 cmd'").is_empty(),
+            "the quoted assignment is an argument, not a prefix"
+        );
+    }
+
+    #[test]
+    fn quoted_redirect_operator_is_data_not_an_operator() {
+        // `cat '>' /etc/passwd` passes a LITERAL > argument: no
+        // redirection happens, so no write target may be extracted
+        // (over-asking was the old failure — fail-closed, but noisy)
+        assert!(redirect_targets("cat '>' /etc/passwd").is_empty());
+        // an unquoted operator still extracts, and a quoted TARGET is
+        // legitimate data for the redirection
+        assert_eq!(
+            redirect_targets("echo hi > 'my file.txt'"),
+            vec!["my file.txt".to_string()]
+        );
     }
 }

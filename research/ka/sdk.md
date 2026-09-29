@@ -118,3 +118,43 @@ Editor integration → `ka acp`. Batch reporting/auditing → `ka sessions --jso
 All workspace crates carry one version (`0.2.5`), pinned through `workspace.dependencies`, and
 publish together in lockstep — a surface and its protocol change in the same release. Pre-1.0:
 shapes may change between minor versions.
+
+## 6. ka-passport (future crate) — the design stub, ratified 2026-09-29
+
+Subscription OAuth (Claude Pro/Max, ChatGPT plans, …) is the #1 onboarding
+moat every competitor ships and ka deliberately does not — **keys-only core
+is a locked decision** (roadmap Phase 1, re-ratified in Phase 8 and the
+2026-09-29 review). The seam a future `ka-passport` crate plugs into is
+fixed NOW so the core never grows provider-specific auth:
+
+```rust
+/// The one auth abstraction core ka-dialect would accept (design shape;
+/// NOT implemented yet). A passport crate implements this and hooks the
+/// auth ladder between the keyring and `!command` tiers.
+pub trait TokenSource: Send + Sync {
+    /// Bearer token for the vendor's API, refreshing when stale.
+    fn token(&self, vendor: &str) -> Result<String, AuthError>;
+    /// Which vendors this source can serve (e.g. ["anthropic-plan"]).
+    fn vendors(&self) -> &[String];
+}
+```
+
+Data shapes (catalog-side, so passports stay data-over-code):
+
+```toml
+# dialects.toml overlay — a plan vendor is just a vendor
+[dialects."claude-plan/claude-sonnet-5"]
+wire = "anthropic_messages"
+base_url = "https://api.anthropic.com"
+priced = false          # subscription: no per-token cost display
+auth = "passport"       # NEW optional key: token comes from a
+                        # registered TokenSource, never an env var
+```
+
+Rules fixed at ratification: core never links the passport crate (ka-agent
+opt-in via cargo feature), `auth = "passport"` rows without a registered
+source fail with an instructive error at engine bootstrap, tokens live in
+the OS keyring under service `ka-passport` (same class as keys today), and
+`--safe-mode` keeps passport auth available (it is auth, not a
+customization). Implementation order when it lands: one provider
+end-to-end (Claude Pro/Max), then the long tail.

@@ -59,8 +59,40 @@ pub enum HookEvent {
     PreToolUse,
     /// After a tool finished; exit 2 marks the result an error.
     PostToolUse,
-    /// After a turn finishes, any stop kind.
+    /// After a turn finishes, any stop kind (`{"event":"stop",
+    /// "stop":"done"|"aborted"|"error"}`).
     Stop,
+    /// After a turn finishes — same point as `stop`, claude-compat
+    /// spelling (`{"event":"turn_end","stop":…}`).
+    TurnEnd,
+    /// Once when a session (strand) attaches (`{"event":
+    /// "session_start","cwd":…}`).
+    SessionStart,
+    /// Once when the session ends — the engine's command channel closed
+    /// (`{"event":"session_end","cwd":…}`).
+    SessionEnd,
+    /// A user prompt was submitted, before the turn starts
+    /// (`{"event":"user_prompt_submit","prompt":…}`).
+    UserPromptSubmit,
+    /// Before a digest/compaction runs (`{"event":"pre_compact",
+    /// "focus":…}`). Only advisory steering; cannot stop the digest.
+    PreCompact,
+}
+
+impl HookEvent {
+    /// The `"event"` value hooks receive on stdin.
+    pub fn wire_name(self) -> &'static str {
+        match self {
+            HookEvent::PreToolUse => "pre_tool_use",
+            HookEvent::PostToolUse => "post_tool_use",
+            HookEvent::Stop => "stop",
+            HookEvent::TurnEnd => "turn_end",
+            HookEvent::SessionStart => "session_start",
+            HookEvent::SessionEnd => "session_end",
+            HookEvent::UserPromptSubmit => "user_prompt_submit",
+            HookEvent::PreCompact => "pre_compact",
+        }
+    }
 }
 
 /// Rule verdicts.
@@ -95,6 +127,12 @@ pub struct Guards {
     /// Context-window percentage (1–100) at which the engine asks to
     /// continue (None = disabled).
     pub context_pct: Option<u64>,
+    /// Opt-in auto-review of exec-tier permission asks (roadmap 9.4,
+    /// default false): the `fast`-role model reviews each ask and
+    /// auto-allows only unmistakably safe commands — it can never deny
+    /// (anything short of confident falls through to you) and every
+    /// auto-allow surfaces as a transcript note. Inert in --safe-mode.
+    pub auto_review: Option<bool>,
 }
 
 /// Git automation settings.
@@ -210,6 +248,11 @@ pub struct SearchProvider {
 pub struct Sandbox {
     /// `"off"` (default) or `"fs"`.
     pub mode: Option<String>,
+    /// Extra writable directories on top of the default allowlist
+    /// (cwd, /tmp, XDG state/cache). An "always" answer on a
+    /// sandbox-expansion ask appends the granted write paths here
+    /// (project layer).
+    pub allow_write: Vec<String>,
 }
 
 /// TUI appearance and notifications ([tui]).
@@ -240,6 +283,7 @@ impl Sandbox {
     pub fn to_policy_config(&self) -> ka_sandbox::SandboxConfig {
         ka_sandbox::SandboxConfig {
             mode: self.mode.clone(),
+            allow_write: self.allow_write.clone(),
         }
     }
 }
@@ -463,6 +507,12 @@ impl Config {
         if other.sandbox.mode.is_some() {
             self.sandbox.mode = other.sandbox.mode;
         }
+        if !other.sandbox.allow_write.is_empty() {
+            self.sandbox.allow_write = other.sandbox.allow_write;
+        }
+        if other.guards.auto_review.is_some() {
+            self.guards.auto_review = other.guards.auto_review;
+        }
         if other.tui.bell.is_some() {
             self.tui.bell = other.tui.bell;
         }
@@ -570,6 +620,18 @@ impl Config {
     }
 }
 
+/// The project layer as a writer needs it: `Some(default)` when the
+/// file does not exist yet, `None` when it exists but fails strict
+/// parse (a writer must never silently default from — and then
+/// overwrite — a file whose settings it could not read).
+fn read_project_layer(path: &std::path::Path) -> Option<Config> {
+    match std::fs::read_to_string(path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Some(Config::default()),
+        Err(_) => None,
+        Ok(text) => Config::parse_layer(&text, "project").ok(),
+    }
+}
+
 /// Append `tool` to `[permissions] allow` in the PROJECT config layer
 /// (`<project root>/.ka/ka.toml` — the nearest `.git` ancestor of
 /// `cwd`, else `cwd` itself), preserving all other keys. Already-listed
@@ -577,15 +639,43 @@ impl Config {
 /// return `None` rather than clobbering a file we could not read.
 pub fn save_project_permission(cwd: &std::path::Path, tool: &str) -> Option<std::path::PathBuf> {
     let path = crate::project_root(cwd).join(".ka/ka.toml");
-    let mut layer = std::fs::read_to_string(&path)
-        .ok()
-        .and_then(|text| Config::parse_layer(&text, "project").ok())
-        .unwrap_or_default();
+    let mut layer = read_project_layer(&path)?;
     if layer.permissions.allow.iter().any(|t| t == tool) {
         return None;
     }
     layer.permissions.allow.push(tool.to_string());
     let mut text = String::from("# ka project config — extended by an \"always\" permission\n\n");
+    text.push_str(&toml::to_string_pretty(&layer).ok()?);
+    std::fs::create_dir_all(path.parent()?).ok()?;
+    std::fs::write(&path, text).ok()?;
+    Some(path)
+}
+
+/// Append sandbox write grants to `[sandbox] allow_write` in the PROJECT
+/// config layer, preserving all other keys (the "always" answer on a
+/// sandbox-expansion ask). Already-listed paths are a no-op (`None`).
+/// Best-effort like [`save_project_permission`]: failures return `None`
+/// rather than clobbering a file we could not read — in particular an
+/// existing layer that fails strict parse is left untouched (defaulting
+/// from it would silently destroy the user's settings).
+pub fn save_project_sandbox_grants(
+    cwd: &std::path::Path,
+    write_paths: &[std::path::PathBuf],
+) -> Option<std::path::PathBuf> {
+    let path = crate::project_root(cwd).join(".ka/ka.toml");
+    let mut layer = read_project_layer(&path)?;
+    let mut added = false;
+    for p in write_paths {
+        let text = p.display().to_string();
+        if !layer.sandbox.allow_write.contains(&text) {
+            layer.sandbox.allow_write.push(text);
+            added = true;
+        }
+    }
+    if !added {
+        return None;
+    }
+    let mut text = String::from("# ka project config — extended by a sandbox \"always\" grant\n\n");
     text.push_str(&toml::to_string_pretty(&layer).ok()?);
     std::fs::create_dir_all(path.parent()?).ok()?;
     std::fs::write(&path, text).ok()?;
@@ -717,6 +807,30 @@ impl std::error::Error for ConfigError {}
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    #[test]
+    fn project_layer_parse_failure_is_never_overwritten() {
+        let dir = std::env::temp_dir().join(format!("ka-cfg-sbx-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join(".ka")).unwrap();
+        let path = dir.join(".ka/ka.toml");
+        let broken = "model = \"a/x\"\nunknown_key = true\n";
+        std::fs::write(&path, broken).unwrap();
+        // strict parse fails: both writers must refuse (None) and the
+        // user's file must survive byte-for-byte
+        assert!(
+            save_project_sandbox_grants(&dir, &[std::path::PathBuf::from("/opt/data")]).is_none()
+        );
+        assert!(save_project_permission(&dir, "bash").is_none());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), broken);
+        // a missing layer starts from defaults and saves fine
+        std::fs::remove_file(&path).unwrap();
+        let saved = save_project_sandbox_grants(&dir, &[std::path::PathBuf::from("/opt/data")]);
+        let path = saved.expect("missing layer saves");
+        let layer = Config::parse_layer(&std::fs::read_to_string(&path).unwrap(), "check").unwrap();
+        assert_eq!(layer.sandbox.allow_write, vec!["/opt/data".to_string()]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn save_settings_preserves_unrelated_keys() {

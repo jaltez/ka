@@ -14,7 +14,7 @@ use ka_dialect::speaker::{
 use ka_protocol::{AskId, AskQuestion, Command, ErrorClass, Event, Stop, Usage};
 use tokio::sync::{mpsc, oneshot};
 
-use crate::hands::bashp::{all_readonly, analyze, hardstop};
+use crate::hands::bashp::{all_readonly, analyze, hardstop, redirect_targets, wants_network};
 use crate::hands::{
     Clearance, Hand, HandContext, Ledger, Spill, ToolOutput, registry_with_pathfinder,
 };
@@ -28,6 +28,17 @@ pub struct VoiceState {
     pub ask_counter: u64,
     /// Identical tool+argument counts (loop guard).
     pub loop_counts: HashMap<String, u32>,
+    /// Loop-gate signatures the user allowed "always" (session scope).
+    pub loop_ok: HashSet<String>,
+    /// Sandbox-expansion grants remembered per command signature
+    /// ("always" answers; applied silently on identical repeats).
+    pub sandbox_granted: HashMap<String, ka_sandbox::Grants>,
+    /// Signatures already granted-asked once — never nag an identical
+    /// command twice in one session (fail-closed on repeat).
+    pub sandbox_asked: HashSet<String>,
+    /// Per-call expansion grants awaiting the executor (call id →
+    /// grants), set by a "this run" allow at admit time.
+    pub sandbox_pending: HashMap<String, ka_sandbox::Grants>,
 }
 
 /// Spend/context guard runtime state: thresholds from config, the
@@ -87,6 +98,15 @@ task and its current state, key decisions and their reasons, file paths \
 touched (read vs modified), open threads and next steps, and any \
 user-stated constraints. Be dense; skip pleasantries. Output only the \
 summary.";
+
+/// The `[guards] auto_review` reviewer's instructions: one word back,
+/// `allow` only when unmistakably safe — everything else is `ask` and
+/// falls through to the human.
+const REVIEW_SYSTEM: &str = "You review shell commands for a coding agent's permission \
+gate. Reply with exactly one word: `allow` when the command is unmistakably safe to run \
+(build, test, list, read-only inspection, routine project-scoped work), `ask` in every \
+other case (network mutation, credentials, system-wide changes, anything destructive or \
+unusual). When in doubt, `ask`.";
 
 /// Simple glob match: `*` spans anything, `?` one char, everything else
 /// literal. No path semantics — patterns match raw strings.
@@ -183,6 +203,9 @@ pub struct Voice {
     pub history: Vec<TurnMessage>,
     /// Active model selector (set per turn; needed by settle-time digests).
     model_selector: Option<String>,
+    /// Reasoning-effort level name from the engine's live settings
+    /// (`SetEffort`); a selector `@effort` suffix still wins per model.
+    effort: Option<String>,
     /// Chars-per-token ratio of the active model (estimates).
     ratio: f64,
     /// Active digest summary (prepended to requests, not part of history).
@@ -237,6 +260,15 @@ pub struct Voice {
     /// Files edited this turn (successful edit/write paths), for the
     /// [verify] test loop. Shared with the spawned tool tasks.
     edited: std::sync::Arc<parking_lot::Mutex<Vec<String>>>,
+    /// `[guards] auto_review`: the fast-role reviewer pre-screens
+    /// exec-tier permission asks (roadmap 9.4). Auto-allow only.
+    auto_review: bool,
+    /// Resolved fast-role model id for the reviewer (None = disabled).
+    reviewer_model: Option<String>,
+    /// Per-turn tool allowlist (custom-command frontmatter
+    /// `allowed-tools`); None = the session toolset. Set by the engine
+    /// around one turn, cleared after.
+    turn_tools: Option<Vec<String>>,
 }
 
 impl Voice {
@@ -274,6 +306,7 @@ impl Voice {
             mode,
             history: Vec::new(),
             model_selector: None,
+            effort: None,
             ratio: 4.0,
             digest: None,
             last_context: 0,
@@ -294,6 +327,9 @@ impl Voice {
             lsp: None,
             verify: crate::config::Verify::default(),
             edited: std::sync::Arc::new(parking_lot::Mutex::new(Vec::new())),
+            auto_review: false,
+            reviewer_model: None,
+            turn_tools: None,
         }
     }
 
@@ -380,6 +416,7 @@ impl Voice {
             allowed_tools: Vec::new(),
             history: Vec::new(),
             model_selector: None,
+            effort: None,
             ratio: 4.0,
             digest: None,
             last_context: 0,
@@ -396,6 +433,9 @@ impl Voice {
             lsp: None,
             verify: crate::config::Verify::default(),
             edited: std::sync::Arc::new(parking_lot::Mutex::new(Vec::new())),
+            auto_review: false,
+            reviewer_model: None,
+            turn_tools: None,
         }
     }
 
@@ -409,6 +449,13 @@ impl Voice {
         &self,
     ) -> std::sync::Arc<parking_lot::RwLock<crate::hands::pathfinder::PathfinderSource>> {
         self.pathfinder_slot.clone()
+    }
+
+    /// Set the reasoning-effort level name from the engine's live
+    /// settings (`None` clears it back to endpoint defaults). A
+    /// selector `@effort` suffix still overrides per model.
+    pub fn set_effort(&mut self, level: Option<String>) {
+        self.effort = level;
     }
 
     /// Set configured hooks (engine bootstrap).
@@ -585,6 +632,26 @@ impl Voice {
         self.verify = verify;
     }
 
+    /// Enable/disable `[guards] auto_review` and arm the reviewer model
+    /// (the resolved `fast` role). Engine bootstrap; inert when the
+    /// fast role is unresolvable (reviewer silently off).
+    pub fn set_auto_review(&mut self, enabled: bool, reviewer_model: Option<String>) {
+        self.auto_review = enabled;
+        self.reviewer_model = reviewer_model;
+    }
+
+    /// Set the per-turn tool allowlist (engine clears it after the
+    /// turn). Both filters the specs the model is offered and denies
+    /// any stragglers at admit time.
+    pub fn set_turn_tools(&mut self, tools: Option<Vec<String>>) {
+        self.turn_tools = tools;
+    }
+
+    /// Whether a per-turn tool allowlist is active (contract tests).
+    pub fn turn_tools_active(&self) -> bool {
+        self.turn_tools.is_some()
+    }
+
     /// Files edited this turn; also clears the list (read-once).
     pub fn take_edited(&self) -> Vec<String> {
         std::mem::take(&mut *self.edited.lock())
@@ -641,21 +708,58 @@ impl Voice {
         }
     }
 
-    /// Fire `stop` hooks at turn exit and record the stop kind.
-    /// Advisory only: failures surface as notes and never fail the turn.
+    /// Fire `stop` and `turn_end` hooks at turn exit and record the stop
+    /// kind. Advisory only: failures surface as notes and never fail the
+    /// turn; `turn_end` is the claude-compat spelling of `stop` and
+    /// receives the same payload under its own `"event"` name.
     pub(crate) async fn stop_hooks(&mut self, events: &mpsc::Sender<Event>, status: &str) {
         self.last_stop = match status {
             "aborted" => Stop::Aborted,
             "error" => Stop::Error,
             _ => Stop::Done,
         };
-        for reason in run_stop_scripts(&self.hooks_cfg, status, &self.hand_ctx.cwd).await {
+        for event in [
+            crate::config::HookEvent::Stop,
+            crate::config::HookEvent::TurnEnd,
+        ] {
+            let payload = serde_json::json!({"event": event.wire_name(), "stop": status});
+            let (failures, steer) =
+                run_event_scripts(&self.hooks_cfg, event, &payload, &self.hand_ctx.cwd).await;
+            for reason in failures {
+                events
+                    .send(Event::Note {
+                        message: format!("{} hook: {reason}", event.wire_name()),
+                    })
+                    .await
+                    .ok();
+            }
+            if let Some(s) = steer {
+                self.apply_steering(Some(s), events).await;
+            }
+        }
+    }
+
+    /// Fire one lifecycle hook event (session_start / session_end /
+    /// user_prompt_submit / pre_compact) from the engine. Failures
+    /// surface as notes; clean stdout may steer (mode/note).
+    pub(crate) async fn lifecycle_hook(
+        &mut self,
+        event: crate::config::HookEvent,
+        payload: serde_json::Value,
+        events: &mpsc::Sender<Event>,
+    ) {
+        let (failures, steer) =
+            run_event_scripts(&self.hooks_cfg, event, &payload, &self.hand_ctx.cwd).await;
+        for reason in failures {
             events
                 .send(Event::Note {
-                    message: format!("stop hook: {reason}"),
+                    message: format!("{} hook: {reason}", event.wire_name()),
                 })
                 .await
                 .ok();
+        }
+        if let Some(s) = steer {
+            self.apply_steering(Some(s), events).await;
         }
     }
 
@@ -1270,8 +1374,15 @@ impl Voice {
     }
 
     fn specs(&self) -> Vec<ToolSpec> {
+        // a per-turn allowlist (custom-command `allowed-tools`) filters
+        // what the model is offered for this turn
         self.hands
             .iter()
+            .filter(|h| {
+                self.turn_tools
+                    .as_ref()
+                    .is_none_or(|tools| tools.iter().any(|t| t == &h.def().name))
+            })
             .map(|h| {
                 let def = h.def();
                 ToolSpec {
@@ -1472,9 +1583,9 @@ attempt implementation — the user will review and switch to build mode.",
 
         'outer: loop {
             let req = SpeakRequest {
+                effort: parsed.effort.clone().or_else(|| self.effort.clone()),
                 model_id: model_id.clone(),
                 dialect: dialect.clone(),
-                effort: parsed.effort.clone(),
                 system: system.clone(),
                 messages: self.speak_messages(),
                 tools: self.specs(),
@@ -1815,11 +1926,17 @@ attempt implementation — the user will review and switch to build mode.",
             });
             let mut slots: Vec<Option<ToolOutput>> = vec![None; step_calls.len()];
             let mut approved: Vec<(usize, std::sync::Arc<dyn Hand>)> = Vec::new();
-            for (idx, call) in step_calls.iter().enumerate() {
+            for (idx, call) in step_calls.iter_mut().enumerate() {
                 match self.admit_call(call, commands, events).await {
                     Ok(hand) => approved.push((idx, hand)),
                     Err(output) => slots[idx] = Some(output),
                 }
+            }
+            // admit_call may patch step_calls in place (hook
+            // updated_input); refresh the just-pushed history row so
+            // the recorded arguments match the call that actually runs
+            if let Some(msg) = self.history.last_mut() {
+                msg.calls = step_calls.clone();
             }
             let mut aborted = false;
             if !approved.is_empty() {
@@ -1831,7 +1948,11 @@ attempt implementation — the user will review and switch to build mode.",
                 let hooks = std::sync::Arc::new(self.hooks_cfg.clone());
                 for (idx, hand) in approved {
                     let call = step_calls[idx].clone();
-                    let ctx = self.hand_ctx.clone();
+                    let mut ctx = self.hand_ctx.clone();
+                    // a "this run" sandbox grant rides exactly this call
+                    if let Some(grants) = self.state.sandbox_pending.remove(&call.id) {
+                        ctx.sandbox = ka_sandbox::apply_grants(&ctx.sandbox, &grants);
+                    }
                     let events = events.clone();
                     let hooks = hooks.clone();
                     let todo = self.todo.clone();
@@ -2106,37 +2227,24 @@ attempt implementation — the user will review and switch to build mode.",
         let diff = crate::hands::unified_diff(path, &old, &new, 24);
         (!diff.is_empty()).then_some(diff)
     }
-    /// Sequential gating phase for one call: loop guard, pre-tool hooks,
-    /// clearance verdict, and any permission ask (one at a time — the ask
-    /// UX stays exclusive). Returns the approved hand; Err carries the
-    /// decided result (already surfaced to events).
+    /// Sequential gating phase for one call: the loop gate, pre-tool
+    /// hooks (block / argument patch / pre-approve), clearance verdict,
+    /// the fast-role auto-reviewer, sandbox-expansion grants, and any
+    /// permission ask (one at a time — the ask UX stays exclusive).
+    /// Returns the approved hand; Err carries the decided result
+    /// (already surfaced to events). `call` is `&mut` because
+    /// `updated_input` hook steering patches the arguments in place.
     async fn admit_call(
         &mut self,
-        call: &ToolCall,
+        call: &mut ToolCall,
         commands: &mut mpsc::Receiver<Command>,
         events: &mpsc::Sender<Event>,
     ) -> Result<std::sync::Arc<dyn Hand>, ToolOutput> {
         let sig = format!("{}|{}", call.tool, call.arguments);
-        *self.state.loop_counts.entry(sig).or_insert(0) += 1;
-        if self.state.loop_counts.values().any(|c| *c >= 4) {
-            // loop-guard decisions surface as CallFinished only (existing
-            // contract); the result itself still feeds back to the model
-            events
-                .send(Event::CallFinished {
-                    tool: call.tool.clone(),
-                    id: call.id.clone(),
-                    ok: false,
-                })
-                .await
-                .ok();
-            return Err(ToolOutput {
-                content: "loop guard: this tool was called with identical arguments 4+ \
-                          times; stop repeating and reconsider"
-                    .to_string(),
-                is_error: true,
-                images: Vec::new(),
-                spill: None,
-            });
+        *self.state.loop_counts.entry(sig.clone()).or_insert(0) += 1;
+        let count = self.state.loop_counts.get(&sig).copied().unwrap_or(0);
+        if let Some(output) = self.loop_gate(call, &sig, count, commands, events).await {
+            return Err(output);
         }
         let Some(hand) = self
             .hands
@@ -2148,8 +2256,24 @@ attempt implementation — the user will review and switch to build mode.",
             self.surface_decided(call, &output, events).await;
             return Err(output);
         };
-        // pre_tool_use hooks: exit 2 blocks before any gate; stdout may
-        // steer (mode/note)
+        // per-turn allowlist (custom-command `allowed-tools`): the spec
+        // filter already hides these from the model; this guard catches
+        // strays (a stale step, a racing call)
+        if let Some(tools) = &self.turn_tools {
+            if !tools.iter().any(|t| t == &call.tool) {
+                let output = ToolOutput::err(format!(
+                    "{} is not in this command's allowed tools ({})",
+                    call.tool,
+                    tools.join(", ")
+                ));
+                self.surface_decided(call, &output, events).await;
+                return Err(output);
+            }
+        }
+        // pre_tool_use hooks: exit 2 blocks before any gate; clean stdout
+        // may steer (mode/note), patch the call's arguments
+        // (updated_input), or pre-approve the call (decision: "allow")
+        let mut hook_allowed = false;
         match self
             .run_hooks(
                 crate::config::HookEvent::PreToolUse,
@@ -2163,89 +2287,238 @@ attempt implementation — the user will review and switch to build mode.",
                 self.surface_decided(call, &output, events).await;
                 return Err(output);
             }
-            Ok(steer) => self.apply_steering(steer, events).await,
+            Ok(steer) => {
+                if let Some(s) = steer {
+                    if let Some(patch) = s.updated_input {
+                        let keys = apply_input_patch(call, patch);
+                        events
+                            .send(Event::Note {
+                                message: format!(
+                                    "hook patched {} arguments ({})",
+                                    call.tool,
+                                    keys.chars()
+                                        .take(crate::fshooks::NOTE_CHARS)
+                                        .collect::<String>()
+                                ),
+                            })
+                            .await
+                            .ok();
+                    }
+                    hook_allowed = s.allow;
+                    self.apply_steering(
+                        Some(crate::fshooks::Steering {
+                            mode: s.mode,
+                            note: s.note,
+                            updated_input: None,
+                            allow: false,
+                        }),
+                        events,
+                    )
+                    .await;
+                }
+            }
         }
-        let verdict = self.gate(hand.clearance_for(&call.arguments), call);
-        match verdict {
-            Gate::Allow => {}
+        // a hook pre-approve skips the permission ask — but it may
+        // only downgrade an ask. Deny-class verdicts (deny rules,
+        // plan-mode writes outside .ka/plans/) and the hardstop /
+        // protected classes outrank every hook and stand.
+        let clearance = hand.clearance_for(&call.arguments);
+        let mut gate = if hook_allowed {
+            let normal = self.gate(clearance, call);
+            let refused = match &normal {
+                Gate::Deny { reason } => Some(reason.clone()),
+                _ => self.unbypassable_reason(call, clearance),
+            };
+            match refused {
+                Some(reason) => {
+                    events
+                        .send(Event::Note {
+                            message: format!(
+                                "hook pre-approve ignored for {}: {}",
+                                call.tool, reason
+                            ),
+                        })
+                        .await
+                        .ok();
+                    normal
+                }
+                None => {
+                    events
+                        .send(Event::Note {
+                            message: format!("hook pre-approved `{}`", call.tool),
+                        })
+                        .await
+                        .ok();
+                    Gate::Allow
+                }
+            }
+        } else {
+            self.gate(clearance, call)
+        };
+        // auto_review (roadmap 9.4): the fast-role reviewer pre-screens
+        // reviewable exec asks — auto-allow only, never deny, always
+        // visible as a note; unavailable reviewer fails toward the human
+        if self.auto_review
+            && !crate::conventions::bare_mode()
+            && matches!(
+                gate,
+                Gate::Ask {
+                    reviewable: true,
+                    ..
+                }
+            )
+        {
+            if let Some(model) = self.reviewer_model.clone() {
+                let command = command_of(call);
+                let prompt = format!("Command:\n{command}\n\nReply with exactly `allow` or `ask`.");
+                match self
+                    .role_complete(&model, REVIEW_SYSTEM, &prompt, Duration::from_secs(10))
+                    .await
+                {
+                    Some(reply) if reply.trim().eq_ignore_ascii_case("allow") => {
+                        events
+                            .send(Event::Note {
+                                message: format!("auto_review: allowed `{command}` (fast role)"),
+                            })
+                            .await
+                            .ok();
+                        gate = Gate::Allow;
+                    }
+                    Some(_) => {
+                        events
+                            .send(Event::Note {
+                                message: format!(
+                                    "auto_review: not confident about `{command}` — asking you"
+                                ),
+                            })
+                            .await
+                            .ok();
+                    }
+                    None => {}
+                }
+            }
+        }
+        // sandbox expansion (roadmap 9.1): compute the exact grants the
+        // command needs beyond the policy — deterministic, pre-flight,
+        // never inferred from failure output
+        let mut grants = self.sandbox_grants_for(call).filter(|g| !g.is_empty());
+        // grants earned below ride exactly this call; they stay local
+        // until the final Ok so no veto/abort path between here and
+        // execution can leak a stale sandbox_pending entry under this
+        // call id
+        let mut pending: Option<ka_sandbox::Grants> = None;
+        // session-remembered grants ("always") apply silently
+        if let Some(wanted) = grants.clone() {
+            if let Some(have) = self.state.sandbox_granted.get(&sig) {
+                if have.covers(&wanted) {
+                    pending = Some(wanted);
+                    grants = None;
+                }
+            }
+        }
+        match gate {
+            Gate::Allow => {
+                // grant-only ask: the permission gate passed, but the
+                // sandbox would deny the command's computable needs
+                if let Some(g) = grants {
+                    if !self.state.sandbox_asked.contains(&sig) {
+                        self.state.sandbox_asked.insert(sig.clone());
+                        let command = command_of(call);
+                        let question = format!(
+                            "sandbox grant for `{command}`: {} — allow? (deny keeps the \
+                             sandbox unchanged; the command will likely fail)",
+                            g.summary()
+                        );
+                        match self.pose_ask(question, None, commands, events).await {
+                            AskOutcome::Choice(0) => {
+                                pending = Some(g);
+                            }
+                            AskOutcome::Choice(1) => {
+                                self.expand_live_sandbox(&g);
+                                pending = Some(g.clone());
+                                self.state.sandbox_granted.insert(sig.clone(), g.clone());
+                                self.note_sandbox_save(&g, events).await;
+                            }
+                            AskOutcome::Choice(_) => {}
+                            AskOutcome::Abort => {
+                                let output = ToolOutput::err("aborted");
+                                self.surface_decided(call, &output, events).await;
+                                return Err(output);
+                            }
+                            AskOutcome::Closed => {
+                                let output = ToolOutput::err("surface closed during ask");
+                                self.surface_decided(call, &output, events).await;
+                                return Err(output);
+                            }
+                        }
+                    }
+                }
+            }
             Gate::Deny { reason } => {
                 let output = ToolOutput::err(reason);
                 self.surface_decided(call, &output, events).await;
                 return Err(output);
             }
-            Gate::Ask { question } => {
-                self.state.ask_counter += 1;
-                let ask_id = AskId(format!("ask-{}", self.state.ask_counter));
-                let detail = self.ask_detail(call);
-                let options = vec![
-                    "allow".to_string(),
-                    "always".to_string(),
-                    "deny".to_string(),
-                ];
-                let ask = Event::Ask {
-                    id: ask_id.clone(),
-                    questions: vec![AskQuestion {
-                        text: question,
-                        options,
-                        detail,
-                    }],
+            Gate::Ask { question, .. } => {
+                // fold the grant summary into the permission ask so one
+                // answer covers both (guarded mode asks once, not twice)
+                let question = if let Some(g) = &grants {
+                    if self.state.sandbox_asked.contains(&sig) {
+                        question
+                    } else {
+                        self.state.sandbox_asked.insert(sig.clone());
+                        format!("{question}\nsandbox grant: {}", g.summary())
+                    }
+                } else {
+                    question
                 };
-                if events.send(ask).await.is_err() {
-                    let output = ToolOutput::err("permission ask failed: surface closed");
-                    self.surface_decided(call, &output, events).await;
-                    return Err(output);
-                }
-                // wait for the answer (or abort); the ask stays sequential
-                loop {
-                    tokio::select! {
-                        maybe = commands.recv() => {
-                            match maybe {
-                                Some(Command::Answer { question: q, choice }) if q == ask_id => {
-                                    match choice {
-                                        1 => {
-                                            self.state.rules.insert(format!("tool:{}", call.tool));
-                                            // persist the allowlist entry to the
-                                            // project layer (best-effort, silent)
-                                            if let Some(path) = crate::config::save_project_permission(
-                                                &self.hand_ctx.cwd,
-                                                &call.tool,
-                                            ) {
-                                                events
-                                                    .send(Event::Note {
-                                                        message: format!(
-                                                            "always-allow for {} saved to {}",
-                                                            call.tool,
-                                                            path.display()
-                                                        ),
-                                                    })
-                                                    .await
-                                                    .ok();
-                                            }
-                                            break;
-                                        }
-                                        2 => {
-                                            let output = ToolOutput::err(format!(
-                                                "permission denied by user for {}",
-                                                call.tool
-                                            ));
-                                            self.surface_decided(call, &output, events).await;
-                                            return Err(output);
-                                        }
-                                        _ => break,
-                                    }
-                                }
-                                Some(Command::Abort) => {
-                                    let output = ToolOutput::err("aborted");
-                                    self.surface_decided(call, &output, events).await;
-                                    return Err(output);
-                                }
-                                Some(_) => {}
-                                None => {
-                                    let output = ToolOutput::err("surface closed during ask");
-                                    self.surface_decided(call, &output, events).await;
-                                    return Err(output);
-                                }
-                            }
+                let detail = self.ask_detail(call);
+                match self.pose_ask(question, detail, commands, events).await {
+                    AskOutcome::Choice(1) => {
+                        self.state.rules.insert(format!("tool:{}", call.tool));
+                        // persist the allowlist entry to the project
+                        // layer (best-effort, silent)
+                        if let Some(path) =
+                            crate::config::save_project_permission(&self.hand_ctx.cwd, &call.tool)
+                        {
+                            events
+                                .send(Event::Note {
+                                    message: format!(
+                                        "always-allow for {} saved to {}",
+                                        call.tool,
+                                        path.display()
+                                    ),
+                                })
+                                .await
+                                .ok();
+                        }
+                        if let Some(g) = grants.take() {
+                            self.expand_live_sandbox(&g);
+                            pending = Some(g.clone());
+                            self.state.sandbox_granted.insert(sig.clone(), g.clone());
+                            self.note_sandbox_save(&g, events).await;
+                        }
+                    }
+                    AskOutcome::Choice(2) => {
+                        let output =
+                            ToolOutput::err(format!("permission denied by user for {}", call.tool));
+                        self.surface_decided(call, &output, events).await;
+                        return Err(output);
+                    }
+                    AskOutcome::Abort => {
+                        let output = ToolOutput::err("aborted");
+                        self.surface_decided(call, &output, events).await;
+                        return Err(output);
+                    }
+                    AskOutcome::Closed => {
+                        let output = ToolOutput::err("surface closed during ask");
+                        self.surface_decided(call, &output, events).await;
+                        return Err(output);
+                    }
+                    AskOutcome::Choice(_) => {
+                        // allow (this run): grants apply to this call only
+                        if let Some(g) = grants.take() {
+                            pending = Some(g);
                         }
                     }
                 }
@@ -2274,7 +2547,216 @@ attempt implementation — the user will review and switch to build mode.",
             }
             Ok(steer) => self.apply_steering(steer, events).await,
         }
+        // the call survived every veto: only now does the grant attach
+        if let Some(g) = pending {
+            self.state.sandbox_pending.insert(call.id.clone(), g);
+        }
         Ok(hand)
+    }
+
+    /// Pose one allow/always/deny ask and await the answer. `Abort` and
+    /// a closed surface are distinct outcomes so callers keep their
+    /// existing error strings. Other commands arriving mid-ask are
+    /// dropped (the ask stays exclusive).
+    async fn pose_ask(
+        &mut self,
+        question: String,
+        detail: Option<String>,
+        commands: &mut mpsc::Receiver<Command>,
+        events: &mpsc::Sender<Event>,
+    ) -> AskOutcome {
+        self.state.ask_counter += 1;
+        let ask_id = AskId(format!("ask-{}", self.state.ask_counter));
+        let ask = Event::Ask {
+            id: ask_id.clone(),
+            questions: vec![AskQuestion {
+                text: question,
+                options: vec![
+                    "allow".to_string(),
+                    "always".to_string(),
+                    "deny".to_string(),
+                ],
+                detail,
+            }],
+        };
+        if events.send(ask).await.is_err() {
+            return AskOutcome::Closed;
+        }
+        loop {
+            match commands.recv().await {
+                Some(Command::Answer {
+                    question: q,
+                    choice,
+                }) if q == ask_id => {
+                    return AskOutcome::Choice(choice);
+                }
+                Some(Command::Abort) => return AskOutcome::Abort,
+                Some(_) => {}
+                None => return AskOutcome::Closed,
+            }
+        }
+    }
+
+    /// The loop gate (`[[rules]] tool = "loop"`, roadmap 9.4).
+    /// `Some(output)` = the call is refused. Without a loop rule the
+    /// guard keeps its shipped shape: identical calls error at 4+.
+    async fn loop_gate(
+        &mut self,
+        call: &ToolCall,
+        sig: &str,
+        count: u32,
+        commands: &mut mpsc::Receiver<Command>,
+        events: &mpsc::Sender<Event>,
+    ) -> Option<ToolOutput> {
+        let rule = self
+            .rules_cfg
+            .iter()
+            .find(|r| r.tool == "loop")
+            .map(|r| r.verdict);
+        if self.state.loop_ok.contains(sig) || rule == Some(crate::config::Verdict::Allow) {
+            return None;
+        }
+        if count >= 3 && rule.is_some() {
+            match rule {
+                Some(crate::config::Verdict::Deny) => {
+                    return Some(
+                        loop_refused(
+                            call,
+                            format!(
+                                "denied by loop rule: `{}` repeated {count}× with identical \
+                                 arguments",
+                                call.tool
+                            ),
+                            events,
+                        )
+                        .await,
+                    );
+                }
+                Some(crate::config::Verdict::Ask) => {
+                    let question = format!(
+                        "loop detected: `{}` called {count}× with identical arguments — \
+                         continue?",
+                        call.tool
+                    );
+                    match self.pose_ask(question, None, commands, events).await {
+                        AskOutcome::Choice(1) => {
+                            self.state.loop_ok.insert(sig.to_string());
+                        }
+                        AskOutcome::Choice(2) => {
+                            return Some(
+                                loop_refused(
+                                    call,
+                                    "denied by user at the loop gate".to_string(),
+                                    events,
+                                )
+                                .await,
+                            );
+                        }
+                        AskOutcome::Abort => {
+                            return Some(loop_refused(call, "aborted".to_string(), events).await);
+                        }
+                        AskOutcome::Closed => {
+                            return Some(
+                                loop_refused(call, "surface closed during ask".to_string(), events)
+                                    .await,
+                            );
+                        }
+                        AskOutcome::Choice(_) => {} // allow once; re-asks on repeat
+                    }
+                }
+                _ => {}
+            }
+        }
+        // default trip (no rule): unchanged at 4+ — an Ask rule owns the
+        // threshold from 3 upward and never falls through to this
+        if count >= 4 && rule.is_none() {
+            return Some(
+                loop_refused(
+                    call,
+                    "loop guard: this tool was called with identical arguments 4+ times; stop \
+                     repeating and reconsider"
+                        .to_string(),
+                    events,
+                )
+                .await,
+            );
+        }
+        None
+    }
+
+    /// Deterministic pre-flight sandbox-expansion grants for a call
+    /// (None unless the call is a sandboxed bash command).
+    fn sandbox_grants_for(&self, call: &ToolCall) -> Option<ka_sandbox::Grants> {
+        if call.tool != "bash" {
+            return None;
+        }
+        if !matches!(self.hand_ctx.sandbox, ka_sandbox::Policy::Fs { .. }) {
+            return None;
+        }
+        let command = command_of(call);
+        if command.is_empty() {
+            return None;
+        }
+        let analysis = analyze(&command);
+        let targets = redirect_targets(&command);
+        let envs = crate::hands::bashp::env_assignments(&command);
+        Some(ka_sandbox::missing_grants(
+            &self.hand_ctx.sandbox,
+            &self.hand_ctx.cwd,
+            &targets,
+            &envs,
+            // readonly commands never earn a network grant: `git`
+            // sits in NETWORK_TOOLS, so `git status`/`git diff` would
+            // otherwise pose a dishonest network-expansion ask
+            wants_network(&analysis) && !all_readonly(&analysis),
+        ))
+    }
+
+    /// Fold granted write paths into the live base policy so later
+    /// identical commands compute an empty grant set.
+    fn expand_live_sandbox(&mut self, grants: &ka_sandbox::Grants) {
+        self.hand_ctx.sandbox = ka_sandbox::apply_grants(&self.hand_ctx.sandbox, grants);
+    }
+
+    /// Note where an "always" grant's write paths were persisted.
+    async fn note_sandbox_save(&self, grants: &ka_sandbox::Grants, events: &mpsc::Sender<Event>) {
+        if grants.write_paths.is_empty() {
+            return;
+        }
+        if let Some(path) =
+            crate::config::save_project_sandbox_grants(&self.hand_ctx.cwd, &grants.write_paths)
+        {
+            events
+                .send(Event::Note {
+                    message: format!(
+                        "sandbox write grant ({}) saved to {}",
+                        grants.summary(),
+                        path.display()
+                    ),
+                })
+                .await
+                .ok();
+        }
+    }
+
+    /// The unbypassable reason a hook pre-approve must NOT skip:
+    /// hardstops for exec calls, protected paths for writes.
+    /// (Deny-class gate verdicts — deny rules, plan-mode writes
+    /// outside .ka/plans/ — are caught at the call site by running
+    /// the normal gate first; see admit_call.)
+    fn unbypassable_reason(&self, call: &ToolCall, clearance: Clearance) -> Option<String> {
+        match clearance {
+            Clearance::Exec => {
+                let command = command_of(call);
+                let analysis = analyze(&command);
+                hardstop(&command, &analysis).map(|s| s.reason)
+            }
+            Clearance::Write if self.mode != ka_protocol::Mode::Plan => {
+                crate::hands::protected::reason(&self.hand_ctx.cwd, &call.primary_arg())
+                    .map(str::to_string)
+            }
+            _ => None,
+        }
     }
 
     /// Surface a gate-phase decision (CallOutput + CallFinished) without
@@ -2320,6 +2802,7 @@ attempt implementation — the user will review and switch to build mode.",
                         "PROTECTED — {reason}: `{}`. Proceed anyway?",
                         call.primary_arg()
                     ),
+                    reviewable: false,
                 };
             }
         }
@@ -2333,6 +2816,7 @@ attempt implementation — the user will review and switch to build mode.",
                         call.tool,
                         call.primary_arg()
                     ),
+                    reviewable: false,
                 },
                 crate::config::Verdict::Deny => Gate::Deny {
                     reason: format!("denied by rule for {}", call.tool),
@@ -2348,6 +2832,7 @@ attempt implementation — the user will review and switch to build mode.",
                 ka_protocol::Mode::Free | ka_protocol::Mode::AcceptEdits => Gate::Allow,
                 ka_protocol::Mode::Guarded => Gate::Ask {
                     question: format!("allow {} to modify files?", call.tool),
+                    reviewable: false,
                 },
                 ka_protocol::Mode::Plan => {
                     // research mode: only the project root's plans
@@ -2385,6 +2870,7 @@ use /build to switch to implementation",
                             command,
                             self.cost_suffix()
                         ),
+                        reviewable: false,
                     };
                 }
                 if self.state.rules.contains(&format!(
@@ -2408,9 +2894,11 @@ use /build to switch to implementation",
                             "plan mode: run `{command}`? (build with /build){}",
                             self.cost_suffix()
                         ),
+                        reviewable: false,
                     },
                     ka_protocol::Mode::AcceptEdits | ka_protocol::Mode::Guarded => Gate::Ask {
                         question: format!("run `{command}`?{}", self.cost_suffix()),
+                        reviewable: true,
                     },
                 }
             }
@@ -2666,7 +3154,11 @@ async fn run_hook_scripts(
                 continue;
             }
         }
-        let payload = serde_json::json!({"tool": tool, "arguments": args});
+        let payload = serde_json::json!({
+            "tool": tool,
+            "arguments": args,
+            "cwd": cwd.display().to_string(),
+        });
         let mut child = match tokio::process::Command::new("sh")
             .arg("-c")
             .arg(&hook.command)
@@ -2717,21 +3209,25 @@ async fn run_hook_scripts(
     Ok(steering)
 }
 
-/// Run configured `stop` hooks once at turn exit (`status` is `done`,
-/// `aborted`, or `error`). Exit codes are advisory: failures are
-/// collected for the caller to surface as notes, never to fail the turn.
-async fn run_stop_scripts(
+/// Run configured hooks for a lifecycle `event` (stop / turn_end /
+/// session_start / session_end / user_prompt_submit / pre_compact).
+/// Exit codes are advisory: failures are collected for the caller to
+/// surface as notes, never to fail the turn. Clean stdout may steer
+/// (mode/note only — argument patches and pre-approval are pre_tool_use
+/// powers and are ignored here). Tool-filtered hooks never fire.
+async fn run_event_scripts(
     hooks: &[crate::config::Hook],
-    status: &str,
+    event: crate::config::HookEvent,
+    payload: &serde_json::Value,
     cwd: &std::path::Path,
-) -> Vec<String> {
+) -> (Vec<String>, Option<crate::fshooks::Steering>) {
     use tokio::io::AsyncWriteExt;
     let mut failures = Vec::new();
+    let mut steering = None;
     for hook in hooks {
-        if hook.event != crate::config::HookEvent::Stop || hook.tool.is_some() {
+        if hook.event != event || hook.tool.is_some() {
             continue;
         }
-        let payload = serde_json::json!({"event": "stop", "stop": status});
         let outcome = async {
             let mut child = tokio::process::Command::new("sh")
                 .arg("-c")
@@ -2758,14 +3254,24 @@ async fn run_stop_scripts(
                     err
                 });
             }
-            Ok(())
+            Ok(String::from_utf8_lossy(&output.stdout).to_string())
         }
         .await;
-        if let Err(reason) = outcome {
-            failures.push(reason);
+        match outcome {
+            Err(reason) => failures.push(reason),
+            Ok(stdout) => {
+                if let Some(s) = crate::fshooks::parse_steering(&stdout).into_nonempty() {
+                    steering = Some(crate::fshooks::Steering {
+                        mode: s.mode,
+                        note: s.note,
+                        updated_input: None,
+                        allow: false,
+                    });
+                }
+            }
         }
     }
-    failures
+    (failures, steering)
 }
 
 /// Automatic retry backoff for retryable turn failures: 5s, 20s, 60s
@@ -2793,8 +3299,76 @@ fn retry_delays() -> Vec<Duration> {
 #[derive(Debug)]
 enum Gate {
     Allow,
-    Ask { question: String },
-    Deny { reason: String },
+    /// `reviewable` marks the plain exec-tier mode asks (the only ones
+    /// the `[guards] auto_review` fast-role reviewer may pre-screen).
+    Ask {
+        question: String,
+        reviewable: bool,
+    },
+    Deny {
+        reason: String,
+    },
+}
+
+/// Outcome of a posed allow/always/deny ask.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AskOutcome {
+    /// The chosen option index (0 allow · 1 always · 2 deny).
+    Choice(usize),
+    /// The surface aborted the turn mid-ask.
+    Abort,
+    /// The surface channel closed mid-ask.
+    Closed,
+}
+
+/// The bash `command` string of a call ("" for anything else).
+fn command_of(call: &ToolCall) -> String {
+    call.arguments
+        .get("command")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .to_string()
+}
+
+/// Shallow-merge an `updated_input` patch into a call's arguments;
+/// returns the patched key names for the transcript note. A call whose
+/// arguments are not an object is left untouched (nothing to merge).
+fn apply_input_patch(
+    call: &mut ToolCall,
+    patch: serde_json::Map<String, serde_json::Value>,
+) -> String {
+    let keys = patch.keys().cloned().collect::<Vec<_>>().join(", ");
+    if let Some(map) = call.arguments.as_object_mut() {
+        for (k, v) in patch {
+            map.insert(k, v);
+        }
+    }
+    keys
+}
+
+/// Loop-gate refusal: surfaces as CallFinished ONLY — deliberately a
+/// different shape than surface_decided (CallOutput + CallFinished),
+/// because the refusal reason rides the tool result back to the model
+/// instead of the event stream.
+async fn loop_refused(
+    call: &ToolCall,
+    message: String,
+    events: &mpsc::Sender<Event>,
+) -> ToolOutput {
+    events
+        .send(Event::CallFinished {
+            tool: call.tool.clone(),
+            id: call.id.clone(),
+            ok: false,
+        })
+        .await
+        .ok();
+    ToolOutput {
+        content: message,
+        is_error: true,
+        images: Vec::new(),
+        spill: None,
+    }
 }
 
 /// Wait `delay` before a retry, draining side-effect commands while
@@ -3984,7 +4558,7 @@ mod tests {
         let voice =
             crate::voice::Voice::new(catalog, std::env::temp_dir(), ka_protocol::Mode::Guarded, 5);
         match voice.gate(crate::hands::Clearance::Write, &call) {
-            Gate::Ask { question } => assert_eq!(question, "allow write to modify files?"),
+            Gate::Ask { question, .. } => assert_eq!(question, "allow write to modify files?"),
             Gate::Allow | Gate::Deny { .. } => {
                 panic!("guarded write must ask")
             }
@@ -4023,7 +4597,7 @@ mod tests {
             let gate = voice.gate(crate::hands::Clearance::Exec, &call);
             match (gate, expected) {
                 (Gate::Allow, None) => {}
-                (Gate::Ask { question }, Some(want)) => assert_eq!(question, want),
+                (Gate::Ask { question, .. }, Some(want)) => assert_eq!(question, want),
                 (other, want) => panic!("exec gate in {mode:?}: got {other:?}, want {want:?}"),
             }
         }
@@ -4201,6 +4775,58 @@ mod tests {
                 .count(),
             1,
             "user record must not be duplicated by retries"
+        );
+    }
+
+    #[tokio::test]
+    async fn set_effort_reaches_the_speak_request() {
+        let seen = std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let mut voice = Voice::new(
+            flaky_catalog(),
+            std::env::temp_dir(),
+            ka_protocol::Mode::Free,
+            5,
+        )
+        .with_speaker(
+            Wire::OpenaiChat,
+            std::sync::Arc::new(TitleSpeaker { seen: seen.clone() }),
+        );
+        let mut guards = GuardRuntime::default();
+
+        // the engine-level level rides every request
+        voice.set_effort(Some("high".into()));
+        drive_turn(&mut voice, &mut guards, "prompt one", None).await;
+        assert_eq!(
+            seen.lock()[0].effort.as_deref(),
+            Some("high"),
+            "set_effort must reach SpeakRequest.effort"
+        );
+
+        // a selector @effort suffix still wins per model
+        voice.set_effort(Some("low".into()));
+        let (_evt_tx, evt_rx) = tokio::sync::mpsc::channel::<Event>(256);
+        let (_cmd_tx, mut cmd_rx) = tokio::sync::mpsc::channel(16);
+        let mut interjections = Vec::new();
+        let mut deferrals = std::collections::VecDeque::new();
+        voice
+            .turn(
+                "test/m@medium",
+                "prompt two".into(),
+                &mut cmd_rx,
+                &_evt_tx,
+                &mut interjections,
+                &mut deferrals,
+                &mut guards,
+                None,
+                Vec::new(),
+            )
+            .await;
+        drop(cmd_rx);
+        drop(evt_rx);
+        assert_eq!(
+            seen.lock()[1].effort.as_deref(),
+            Some("medium"),
+            "the selector suffix outranks the engine level"
         );
     }
 

@@ -183,8 +183,13 @@ async fn speak_responses(
             "format": { "type": "json_schema", "name": "output", "strict": true, "schema": schema }
         });
     }
-    if let Some(effort) = req.effort.clone() {
-        body["reasoning"] = json!({"effort": effort});
+    // same policy as the chat wire: only published levels, "off" keeps
+    // the endpoint default, unlisted levels downgrade to the highest
+    if let Some(effort) = req.effort.as_deref()
+        && let Some(name) =
+            crate::wire_openai::resolved_effort(dialect, effort, !dialect.efforts.is_empty())
+    {
+        body["reasoning"] = json!({"effort": name});
     }
 
     let resp = post_sse(

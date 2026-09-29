@@ -165,6 +165,16 @@ fn outputs_of<'a>(events: &'a [Event], tool: &str) -> Vec<&'a str> {
         .collect()
 }
 
+/// Gate-phase refusals (loop guard, loop rule) surface as CallFinished
+/// ok:false with NO CallOutput — the message rides the tool result back
+/// to the model, not the event stream.
+fn refused_calls(events: &[Event], tool: &str) -> usize {
+    events
+        .iter()
+        .filter(|e| matches!(e, Event::CallFinished { tool: t, ok: false, .. } if t == tool))
+        .count()
+}
+
 fn errored_outputs<'a>(events: &'a [Event], tool: &str) -> Vec<&'a str> {
     events
         .iter()
@@ -526,10 +536,29 @@ fn config_schema_carries_every_documented_key() {
         "roles",
         "default",
         "fast",
+        // Phase 9 (2026-09-29): sandbox expansion, auto-review, loop rule
+        "allow_write",
+        "auto_review",
     ] {
         assert!(
             schema.contains(&format!("\"{key}\"")),
             "config schema lost documented key {key:?}"
+        );
+    }
+    // the schema's hook-event enum carries every documented event
+    for event in [
+        "pre_tool_use",
+        "post_tool_use",
+        "stop",
+        "turn_end",
+        "session_start",
+        "session_end",
+        "user_prompt_submit",
+        "pre_compact",
+    ] {
+        assert!(
+            schema.contains(&format!("\"{event}\"")),
+            "config schema lost documented hook event {event:?}"
         );
     }
 }
@@ -1212,6 +1241,528 @@ async fn snapshot_undo_contract() {
         std::fs::read_to_string(dir.join("existing.txt")).unwrap(),
         "original",
         "edit-undo must restore the pre-mutation bytes"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ------------------------------------------------------------ Phase 9 (2026-09-29)
+
+use ka_engine::config::{Hook, HookEvent as CfgHookEvent, Rule, Verdict};
+
+/// Sandbox expansion (roadmap 9.1): a sandboxed bash command whose
+/// redirect target sits outside the write allowlist earns exactly one
+/// "sandbox grant" ask — allow runs it with the expanded per-call
+/// policy, deny keeps the sandbox unchanged (the write fails), always
+/// persists the granted write paths to the project `[sandbox]
+/// allow_write` layer.
+#[tokio::test]
+async fn sandbox_expansion_grant_ask_allow_deny_always() {
+    let dir = tmp_dir("sb-expand");
+    let inside = dir.join("inside");
+    let outside = dir.join("outside");
+    std::fs::create_dir_all(&inside).unwrap();
+    std::fs::create_dir_all(&outside).unwrap();
+    let target = outside.join("out.txt");
+    let command = format!("echo granted > {}", target.display());
+
+    // allow (this run): one grant-only ask, then execution with the
+    // grant riding exactly this call
+    let mut voice = Voice::new(test_catalog(), inside.clone(), ka_protocol::Mode::Free, 5)
+        .with_speaker(
+            ka_dialect::Wire::OpenaiChat,
+            Scripted::calls(vec![("bash", serde_json::json!({"command": command}))]),
+        );
+    voice.set_sandbox(ka_sandbox::Policy::fs(vec![inside.clone()]));
+    let events = run_turn(&mut voice, "go", Some(0)).await;
+    let asks = asks_of(&events);
+    assert_eq!(asks.len(), 1, "grant-only ask fires once in free mode");
+    assert!(asks[0].text.contains("sandbox grant"), "{:?}", asks[0].text);
+    assert!(
+        asks[0].text.contains(&outside.display().to_string()),
+        "the ask names the granted write path: {:?}",
+        asks[0].text
+    );
+    // the grant really rides the call on hosts with an fs backend that
+    // can execute it (landlock's trampoline points at this test binary,
+    // so its execution proof is the sandbox crate's argv contracts)
+    if matches!(
+        ka_sandbox::detect_tool(),
+        Some(ka_sandbox::Tool::Bubblewrap) | Some(ka_sandbox::Tool::Firejail)
+    ) {
+        let text = std::fs::read_to_string(&target).unwrap_or_default();
+        assert!(text.contains("granted"), "allow must run the granted write");
+    }
+    // a command inside the allowlist never asks
+    let mut voice = Voice::new(test_catalog(), inside.clone(), ka_protocol::Mode::Free, 5)
+        .with_speaker(
+            ka_dialect::Wire::OpenaiChat,
+            Scripted::calls(vec![(
+                "bash",
+                serde_json::json!({"command": format!("echo ok > {}", inside.join("in.txt").display())}),
+            )]),
+        );
+    voice.set_sandbox(ka_sandbox::Policy::fs(vec![inside.clone()]));
+    let events = run_turn(&mut voice, "go", Some(0)).await;
+    assert!(
+        asks_of(&events).is_empty(),
+        "no grant ask for in-allowlist writes"
+    );
+
+    // deny: the sandbox stays unchanged — the write cannot land
+    let mut voice = Voice::new(test_catalog(), inside.clone(), ka_protocol::Mode::Free, 5)
+        .with_speaker(
+            ka_dialect::Wire::OpenaiChat,
+            Scripted::calls(vec![("bash", serde_json::json!({"command": command}))]),
+        );
+    voice.set_sandbox(ka_sandbox::Policy::fs(vec![inside.clone()]));
+    let events = run_turn(&mut voice, "go", Some(2)).await;
+    assert_eq!(asks_of(&events).len(), 1);
+    assert!(
+        !target.exists(),
+        "deny keeps the sandbox unchanged — the write must not land"
+    );
+
+    // always: the write paths persist to the project layer
+    let mut voice = Voice::new(test_catalog(), inside.clone(), ka_protocol::Mode::Free, 5)
+        .with_speaker(
+            ka_dialect::Wire::OpenaiChat,
+            Scripted::calls(vec![("bash", serde_json::json!({"command": command}))]),
+        );
+    voice.set_sandbox(ka_sandbox::Policy::fs(vec![inside.clone()]));
+    let events = run_turn(&mut voice, "go", Some(1)).await;
+    assert_eq!(asks_of(&events).len(), 1);
+    let saved = std::fs::read_to_string(inside.join(".ka/ka.toml")).unwrap_or_default();
+    assert!(
+        saved.contains(&outside.display().to_string()),
+        "always persists the granted write path to [sandbox] allow_write: {saved}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Hook powers (roadmap 9.2): `updated_input` patches the upcoming
+/// call's arguments before execution.
+#[tokio::test]
+async fn hook_updated_input_patches_arguments() {
+    let dir = tmp_dir("hook-patch");
+    let mut voice = Voice::new(test_catalog(), dir.clone(), ka_protocol::Mode::Free, 5)
+        .with_speaker(
+            ka_dialect::Wire::OpenaiChat,
+            Scripted::calls(vec![(
+                "bash",
+                serde_json::json!({"command": "echo original"}),
+            )]),
+        );
+    voice.set_hooks(vec![Hook {
+        event: CfgHookEvent::PreToolUse,
+        tool: Some("bash".into()),
+        command: r#"echo '{"updated_input":{"command":"echo patched-by-hook"}}'"#.to_string(),
+    }]);
+    let events = run_turn(&mut voice, "go", None).await;
+    assert!(
+        events.iter().any(|e| matches!(e, Event::Note { message } if message.contains("hook patched bash arguments (command)"))),
+        "the patch surfaces as a note: {events:?}"
+    );
+    let outs = outputs_of(&events, "bash");
+    assert!(
+        outs.first().is_some_and(|o| o.contains("patched-by-hook")),
+        "the patched command is what ran: {outs:?}"
+    );
+    assert!(
+        outs.first().is_some_and(|o| !o.contains("original")),
+        "the original command must not run: {outs:?}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A speaker whose call queue the test can extend between turns (one
+/// scripted call per model round).
+struct QueueSpeaker {
+    calls: parking_lot::Mutex<VecDeque<(&'static str, serde_json::Value)>>,
+}
+
+impl Speaker for QueueSpeaker {
+    fn speak<'a>(
+        &'a self,
+        _req: SpeakRequest,
+        out: tokio::sync::mpsc::Sender<StreamEvent>,
+    ) -> SpeakFuture<'a> {
+        Box::pin(async move {
+            let next = self.calls.lock().pop_front();
+            if let Some((tool, args)) = next {
+                out.send(StreamEvent::Call(ToolCall {
+                    id: "c1".into(),
+                    tool: tool.into(),
+                    arguments: args,
+                }))
+                .await
+                .ok();
+            } else {
+                out.send(StreamEvent::Text("done".into())).await.ok();
+            }
+            out.send(StreamEvent::Finished {
+                stop: ka_protocol::Stop::Done,
+                usage: ka_protocol::Usage {
+                    input: 1,
+                    output: 1,
+                    ..Default::default()
+                },
+            })
+            .await
+            .ok();
+        })
+    }
+}
+
+/// Hook powers (roadmap 9.2): `decision: "allow"` pre-approves the call
+/// (no ask in guarded mode) — but hardstops outrank every hook.
+#[tokio::test]
+async fn hook_pre_approve_skips_the_ask_but_not_hardstops() {
+    let dir = tmp_dir("hook-allow");
+    let marker = dir.join("pre.txt");
+    let queue = std::sync::Arc::new(QueueSpeaker {
+        calls: parking_lot::Mutex::new(VecDeque::from([(
+            "bash",
+            serde_json::json!({"command": format!("touch {}", marker.display())}),
+        )])),
+    });
+    let mut voice = Voice::new(test_catalog(), dir.clone(), ka_protocol::Mode::Guarded, 5)
+        .with_speaker(ka_dialect::Wire::OpenaiChat, queue.clone());
+    voice.set_hooks(vec![Hook {
+        event: CfgHookEvent::PreToolUse,
+        tool: Some("bash".into()),
+        command: r#"echo '{"decision":"allow"}'"#.to_string(),
+    }]);
+    let events = run_turn(&mut voice, "one", Some(2)).await;
+    assert!(
+        asks_of(&events).is_empty(),
+        "pre-approve must skip the permission ask: {events:?}"
+    );
+    assert!(marker.exists(), "the pre-approved command ran");
+    assert!(
+        events.iter().any(
+            |e| matches!(e, Event::Note { message } if message.contains("hook pre-approved `bash`"))
+        ),
+        "every pre-approve is a visible transcript record: {events:?}"
+    );
+    // the second turn brings a hardstop-class command: the pre-approve
+    // must be overruled and the ask must still reach the human
+    queue
+        .calls
+        .lock()
+        .push_back(("bash", serde_json::json!({"command": ":(){ :|:& };:"})));
+    let events = run_turn(&mut voice, "two", Some(2)).await;
+    let asks = asks_of(&events);
+    assert!(
+        asks.first().is_some_and(|q| q.text.contains("HARDSTOP")),
+        "hardstops still ask despite the pre-approve: {asks:?}"
+    );
+    assert!(
+        events.iter().any(
+            |e| matches!(e, Event::Note { message } if message.contains("hook pre-approve ignored"))
+        ),
+        "the overruled pre-approve surfaces too: {events:?}"
+    );
+    assert!(!errored_outputs(&events, "bash").is_empty());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Hook powers (roadmap 9.2, hardening): `decision: "allow"` may only
+/// downgrade an ask. Deny-class gate verdicts — a config deny rule, a
+/// plan-mode write outside .ka/plans/ — refuse despite the pre-approve.
+#[tokio::test]
+async fn hook_pre_approve_cannot_override_deny_verdicts() {
+    // deny rule: the refusal stands, no ask, nothing runs
+    let dir = tmp_dir("hook-allow-deny");
+    let mut voice = Voice::new(test_catalog(), dir.clone(), ka_protocol::Mode::Guarded, 5)
+        .with_speaker(
+            ka_dialect::Wire::OpenaiChat,
+            Scripted::calls(vec![("bash", serde_json::json!({"command": "git status"}))]),
+        );
+    voice.set_rules(vec![ka_engine::config::Rule {
+        tool: "bash".into(),
+        pattern: Some("git *".into()),
+        verdict: ka_engine::config::Verdict::Deny,
+    }]);
+    voice.set_hooks(vec![Hook {
+        event: CfgHookEvent::PreToolUse,
+        tool: Some("bash".into()),
+        command: r#"echo '{"decision":"allow"}'"#.to_string(),
+    }]);
+    let events = run_turn(&mut voice, "check git", None).await;
+    assert!(
+        asks_of(&events).is_empty(),
+        "the hook pre-approve must not turn a deny into an ask: {events:?}"
+    );
+    assert!(
+        errored_outputs(&events, "bash")
+            .iter()
+            .any(|e| e.contains("denied by rule")),
+        "the deny rule must outrank the hook pre-approve: {events:?}"
+    );
+    drop(voice);
+
+    // plan mode: a write outside .ka/plans/ stays denied
+    let mut voice = Voice::new(test_catalog(), dir.clone(), ka_protocol::Mode::Plan, 5)
+        .with_speaker(
+            ka_dialect::Wire::OpenaiChat,
+            Scripted::calls(vec![(
+                "write",
+                serde_json::json!({"path": "src/main.rs", "content": "x"}),
+            )]),
+        );
+    voice.set_hooks(vec![Hook {
+        event: CfgHookEvent::PreToolUse,
+        tool: Some("write".into()),
+        command: r#"echo '{"decision":"allow"}'"#.to_string(),
+    }]);
+    let events = run_turn(&mut voice, "implement", None).await;
+    assert!(
+        asks_of(&events).is_empty(),
+        "the hook pre-approve must not turn the plan denial into an ask: {events:?}"
+    );
+    assert!(
+        errored_outputs(&events, "write")
+            .iter()
+            .any(|e| e.contains("plan mode is read-only")),
+        "the plan-mode write denial must outrank the hook pre-approve: {events:?}"
+    );
+    assert!(
+        !dir.join("src/main.rs").exists(),
+        "the denied write must not execute"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The loop-gate rule domain (`[[rules]] tool = "loop"`, roadmap 9.4):
+/// `ask` poses a question instead of silently erroring, `deny` refuses
+/// outright, `allow` disables the guard, and with no rule the shipped
+/// 4-identical-calls trip is unchanged.
+#[tokio::test]
+async fn loop_rule_ask_deny_allow_and_default_trip() {
+    let dir = tmp_dir("loop-rule");
+    std::fs::write(dir.join("f.txt"), "content").unwrap();
+    let reads = |n: usize| {
+        (0..n)
+            .map(|_| {
+                (
+                    "read",
+                    serde_json::json!({"path": dir.join("f.txt").display().to_string()}),
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+
+    // ask: the 3rd identical call poses the loop question
+    let mut voice = Voice::new(test_catalog(), dir.clone(), ka_protocol::Mode::Free, 10)
+        .with_speaker(ka_dialect::Wire::OpenaiChat, Scripted::calls(reads(3)));
+    voice.set_rules(vec![Rule {
+        tool: "loop".into(),
+        pattern: None,
+        verdict: Verdict::Ask,
+    }]);
+    let events = run_turn(&mut voice, "go", Some(0)).await;
+    let asks = asks_of(&events);
+    assert_eq!(asks.len(), 1, "{events:?}");
+    assert!(asks[0].text.contains("loop detected"), "{:?}", asks[0].text);
+    assert!(
+        errored_outputs(&events, "read").is_empty(),
+        "allow-once lets the call proceed"
+    );
+    // ask + deny answer refuses the call
+    let mut voice = Voice::new(test_catalog(), dir.clone(), ka_protocol::Mode::Free, 10)
+        .with_speaker(ka_dialect::Wire::OpenaiChat, Scripted::calls(reads(3)));
+    voice.set_rules(vec![Rule {
+        tool: "loop".into(),
+        pattern: None,
+        verdict: Verdict::Ask,
+    }]);
+    let events = run_turn(&mut voice, "go", Some(2)).await;
+    assert_eq!(refused_calls(&events, "read"), 1, "{events:?}");
+    assert_eq!(
+        events
+            .iter()
+            .filter(|e| matches!(e, Event::CallOutput { tool, .. } if tool == "read"))
+            .count(),
+        2,
+        "only the first two identical reads ran: {events:?}"
+    );
+
+    // deny: refused outright at the threshold, no ask
+    let mut voice = Voice::new(test_catalog(), dir.clone(), ka_protocol::Mode::Free, 10)
+        .with_speaker(ka_dialect::Wire::OpenaiChat, Scripted::calls(reads(3)));
+    voice.set_rules(vec![Rule {
+        tool: "loop".into(),
+        pattern: None,
+        verdict: Verdict::Deny,
+    }]);
+    let events = run_turn(&mut voice, "go", None).await;
+    assert!(asks_of(&events).is_empty(), "deny never asks: {events:?}");
+    assert_eq!(refused_calls(&events, "read"), 1, "{events:?}");
+    assert_eq!(
+        events
+            .iter()
+            .filter(|e| matches!(e, Event::CallOutput { tool, .. } if tool == "read"))
+            .count(),
+        2,
+        "the loop rule denies at the 3rd identical call: {events:?}"
+    );
+
+    // allow: the guard is off — identical calls stream through
+    let mut voice = Voice::new(test_catalog(), dir.clone(), ka_protocol::Mode::Free, 10)
+        .with_speaker(ka_dialect::Wire::OpenaiChat, Scripted::calls(reads(4)));
+    voice.set_rules(vec![Rule {
+        tool: "loop".into(),
+        pattern: None,
+        verdict: Verdict::Allow,
+    }]);
+    let events = run_turn(&mut voice, "go", None).await;
+    assert!(
+        errored_outputs(&events, "read").is_empty(),
+        "loop allow never trips: {events:?}"
+    );
+
+    // no rule: the shipped trip at 4 identical calls is unchanged
+    let mut voice = Voice::new(test_catalog(), dir.clone(), ka_protocol::Mode::Free, 10)
+        .with_speaker(ka_dialect::Wire::OpenaiChat, Scripted::calls(reads(4)));
+    let events = run_turn(&mut voice, "go", None).await;
+    assert_eq!(
+        refused_calls(&events, "read"),
+        1,
+        "the shipped 4-identical-calls trip still fires: {events:?}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Speaker for the auto_review contract: tool-bearing requests pop the
+/// scripted call queue; tool-less requests are reviewer probes answered
+/// from `verdict`.
+struct ReviewSpeaker {
+    calls: parking_lot::Mutex<VecDeque<(&'static str, serde_json::Value)>>,
+    verdict: &'static str,
+}
+
+impl Speaker for ReviewSpeaker {
+    fn speak<'a>(
+        &'a self,
+        req: SpeakRequest,
+        out: tokio::sync::mpsc::Sender<StreamEvent>,
+    ) -> SpeakFuture<'a> {
+        Box::pin(async move {
+            if req.tools.is_empty() {
+                out.send(StreamEvent::Text(self.verdict.into())).await.ok();
+            } else {
+                let next = self.calls.lock().pop_front();
+                if let Some((tool, args)) = next {
+                    out.send(StreamEvent::Call(ToolCall {
+                        id: "c1".into(),
+                        tool: tool.into(),
+                        arguments: args,
+                    }))
+                    .await
+                    .ok();
+                } else {
+                    out.send(StreamEvent::Text("done".into())).await.ok();
+                }
+            }
+            out.send(StreamEvent::Finished {
+                stop: ka_protocol::Stop::Done,
+                usage: ka_protocol::Usage {
+                    input: 1,
+                    output: 1,
+                    ..Default::default()
+                },
+            })
+            .await
+            .ok();
+        })
+    }
+}
+
+/// `[guards] auto_review` (roadmap 9.4): a confident reviewer allows
+/// the obvious command without asking (and says so in a note); an
+/// unconfident one falls through to the human — it can never deny.
+#[tokio::test]
+async fn auto_review_allows_confident_and_defers_everything_else() {
+    let dir = tmp_dir("auto-review");
+    // confident: no ask, the command ran, the auto-allow is visible
+    let marker = dir.join("reviewed.txt");
+    let mut voice = Voice::new(test_catalog(), dir.clone(), ka_protocol::Mode::Guarded, 5)
+        .with_speaker(
+            ka_dialect::Wire::OpenaiChat,
+            std::sync::Arc::new(ReviewSpeaker {
+                calls: parking_lot::Mutex::new(VecDeque::from([(
+                    "bash",
+                    serde_json::json!({"command": format!("touch {}", marker.display())}),
+                )])),
+                verdict: "allow",
+            }),
+        );
+    voice.set_auto_review(true, Some("test/m".to_string()));
+    let events = run_turn(&mut voice, "go", Some(0)).await;
+    assert!(
+        asks_of(&events).is_empty(),
+        "a confident review skips the ask: {events:?}"
+    );
+    assert!(marker.exists(), "the reviewed command ran");
+    assert!(
+        events.iter().any(|e| matches!(e, Event::Note { message } if message.contains("auto_review: allowed `touch"))),
+        "every auto-allow is a visible record: {events:?}"
+    );
+
+    // unconfident: the ask still reaches the human (never auto-denied)
+    let marker = dir.join("deferred.txt");
+    let mut voice = Voice::new(test_catalog(), dir.clone(), ka_protocol::Mode::Guarded, 5)
+        .with_speaker(
+            ka_dialect::Wire::OpenaiChat,
+            std::sync::Arc::new(ReviewSpeaker {
+                calls: parking_lot::Mutex::new(VecDeque::from([(
+                    "bash",
+                    serde_json::json!({"command": format!("touch {}", marker.display())}),
+                )])),
+                verdict: "ask",
+            }),
+        );
+    voice.set_auto_review(true, Some("test/m".to_string()));
+    let events = run_turn(&mut voice, "go", Some(0)).await;
+    assert_eq!(
+        asks_of(&events).len(),
+        1,
+        "an unconfident review defers to the human: {events:?}"
+    );
+    assert!(marker.exists(), "the human's allow runs the command");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Custom-command turn scoping (roadmap 9.7): `allowed-tools`
+/// frontmatter rides the Prompt; tools outside the list are denied at
+/// admit time even when the model calls them anyway.
+#[tokio::test]
+async fn turn_scoped_allowed_tools_restrict_the_turn() {
+    let dir = tmp_dir("turn-scope");
+    let mut voice = Voice::new(test_catalog(), dir.clone(), ka_protocol::Mode::Free, 5)
+        .with_speaker(
+            ka_dialect::Wire::OpenaiChat,
+            // the model tries a bash call the command did not allow
+            Scripted::calls(vec![("bash", serde_json::json!({"command": "echo nope"}))]),
+        );
+    voice.set_turn_tools(Some(vec!["read".to_string()]));
+    let events = run_turn(&mut voice, "go", None).await;
+    let outs = errored_outputs(&events, "bash");
+    assert!(
+        outs.first()
+            .is_some_and(|o| o.contains("not in this command's allowed tools")),
+        "{events:?}"
+    );
+    // clearing restores the session toolset: the previously-refused
+    // tool now runs (the engine clears the scope right after a scoped
+    // turn; the engine-level end-to-end pin lives in engine_e2e's
+    // prompt_scoping_allowed_tools_and_model_override)
+    voice.set_turn_tools(None);
+    let events = run_turn(&mut voice, "go again", None).await;
+    let outs = errored_outputs(&events, "bash");
+    assert!(
+        outs.is_empty(),
+        "scope must not leak into the next turn: {events:?}"
     );
     let _ = std::fs::remove_dir_all(&dir);
 }

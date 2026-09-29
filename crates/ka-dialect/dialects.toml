@@ -94,3 +94,91 @@ priced = true
 [dialects."deepseek/deepseek-flash".price]
 input_per_mtok = 0.30
 output_per_mtok = 1.20
+
+# z.ai GLM-5.3 family: thinking is always on (thinking.type accepts only
+# "enabled"); depth is controlled by reasoning_effort (low/high/max,
+# default max). Curated rows carry the efforts list + the reasoning flag
+# over the generated models.dev entries.
+[dialects."zai/glm-5.3"]
+wire = "openai_chat"
+base_url = "https://api.z.ai/api/paas/v4"
+api_key_env = "ZHIPU_API_KEY"
+doc_url = "https://docs.z.ai/guides/overview/pricing"
+context = 1000000
+max_output = 131072
+efforts = ["low", "high", "max"]
+priced = true
+[dialects."zai/glm-5.3".price]
+input_per_mtok = 1.4
+output_per_mtok = 4.4
+[dialects."zai/glm-5.3".flags]
+reasoning_field = "reasoning_effort"
+
+[dialects."zai/glm-5.3-flash"]
+wire = "openai_chat"
+base_url = "https://api.z.ai/api/paas/v4"
+api_key_env = "ZHIPU_API_KEY"
+doc_url = "https://docs.z.ai/guides/overview/pricing"
+context = 1000000
+max_output = 131072
+efforts = ["low", "high", "max"]
+priced = true
+[dialects."zai/glm-5.3-flash".price]
+input_per_mtok = 0.075
+output_per_mtok = 0.25
+[dialects."zai/glm-5.3-flash".flags]
+reasoning_field = "reasoning_effort"
+
+[dialects."zai-coding-plan/glm-5.3"]
+wire = "openai_chat"
+base_url = "https://api.z.ai/api/coding/paas/v4"
+api_key_env = "ZHIPU_API_KEY"
+doc_url = "https://docs.z.ai/devpack/overview"
+context = 1000000
+max_output = 131072
+efforts = ["low", "high", "max"]
+priced = false
+[dialects."zai-coding-plan/glm-5.3".flags]
+reasoning_field = "reasoning_effort"
+
+[dialects."zai-coding-plan/glm-5.3-flash"]
+wire = "openai_chat"
+base_url = "https://api.z.ai/api/coding/paas/v4"
+api_key_env = "ZHIPU_API_KEY"
+doc_url = "https://docs.z.ai/devpack/overview"
+context = 1000000
+max_output = 131072
+efforts = ["low", "high", "max"]
+priced = false
+[dialects."zai-coding-plan/glm-5.3-flash".flags]
+reasoning_field = "reasoning_effort"
+
+[dialects."openrouter/z-ai/glm-5.3"]
+wire = "openai_chat"
+base_url = "https://openrouter.ai/api/v1"
+api_key_env = "OPENROUTER_API_KEY"
+doc_url = "https://openrouter.ai/models"
+context = 1310720
+max_output = 131072
+efforts = ["low", "high", "max"]
+priced = true
+[dialects."openrouter/z-ai/glm-5.3".price]
+input_per_mtok = 1.4
+output_per_mtok = 4.4
+[dialects."openrouter/z-ai/glm-5.3".flags]
+reasoning_field = "reasoning_effort"
+
+[dialects."openrouter/z-ai/glm-5.3-flash"]
+wire = "openai_chat"
+base_url = "https://openrouter.ai/api/v1"
+api_key_env = "OPENROUTER_API_KEY"
+doc_url = "https://openrouter.ai/models"
+context = 1310720
+max_output = 131072
+efforts = ["low", "high", "max"]
+priced = true
+[dialects."openrouter/z-ai/glm-5.3-flash".price]
+input_per_mtok = 0.075
+output_per_mtok = 0.25
+[dialects."openrouter/z-ai/glm-5.3-flash".flags]
+reasoning_field = "reasoning_effort"

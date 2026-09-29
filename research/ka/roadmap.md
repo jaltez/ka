@@ -144,10 +144,65 @@ Order: 8.1 → 8.2 → 8.3 → 8.4. 8.4 items are filler and never block.
 
 **Exit:** heavy interactive coding on ka — refactor-through-server, attach-a-debugger, fan-out with contracts and merge-back — without reaching for another harness, at ≤10 MB musl.
 
+## Phase 9 — Approval & Extensibility (ratified 2026-09-29, shipped 2026-09-29)
+
+Grounded in `feature-research-2026-09.md` (fresh 10-harness sweep + interview; the 2026-08-23 corpus and `daily-driver-study.md` remain the per-tool references). Locked decisions: **sandbox denials return structured missing-grant data and convert to one-shot asks — fail-closed preserved, no model in the safety path · the hook protocol is extended, not replaced (same JSON envelope, same exit codes) · rule import is one-shot and explicit, no live-read compat surface · `auto_review` is opt-in, auto-allow-only, never auto-denies, always transcript-logged · install generalizes with no registry and no manifests · multi-client is observe-only v1 — single writer, server-enforced · ka-passport remains a documented stub (trait + data shapes, no crate, no providers).**
+
+Order: 9.1 → 9.6 in sequence; 9.7 is filler and never blocks.
+
+### 9.1 Sandbox-expansion modal (flagship) — shipped 2026-09
+- **[M]** `ka-sandbox` denials carry structured missing-grant records (write paths, network hosts, env vars) instead of a flat refusal — grant data, not prose — **shipped 2026-09** as *pre-flight* grant computation (deterministic, from command analysis — redirect targets, network-tool table, env assignments — never from failure output; a post-mortem channel would have been heuristics)
+- **[M]** Engine converts a grant-bearing denial into a one-shot ask with the existing ask-modal verbs: this run / always (session → project layer) / deny — **shipped**: grants ride exactly the approved call (`sandbox_pending`); "always" persists write paths to `[sandbox] allow_write` (project layer) + live policy + session memory; network/env grants are session/run-scoped by design; one ask per command signature; guarded mode folds the grant summary into the single permission ask. Note: writes beneath broad dirs (`/`, `$HOME`, `/etc`…) are never offered — fail-closed stays
+- **[M]** Fail-closed preserved: hardstops, protected paths, and non-grant-computable denials never expand — the ask is always shown, nothing pre-granted
+- Tests: sandbox denial fixture → exact grant diff; "always" persists the expected rule; README + feature contract together — **shipped** (`sandbox_expansion_grant_ask_allow_deny_always`; landlock's execution proof rides the sandbox crate's argv contracts because the trampoline points at `current_exe`, i.e. the test binary)
+- Declined: LLM in this loop (see 9.4 — the reviewer trails, never leads)
+
+### 9.2 Hook powers — shipped 2026-09
+- **[M]** Lifecycle events: `session_start`, `session_end`, `turn_end`, `user_prompt_submit`, `pre_compact` — same stdin JSON envelope, same exit-code contract (exit 2 = block where blockable)
+- **[M]** `pre_tool_use` stdout steering extended with `updated_input`: shallow-merge patch of tool arguments (crush/claude shape)
+- **[M]** Hook `allow` verdict pre-approves and skips the permission prompt; every pre-approve lands as a visible transcript record
+- **[M]** Unchanged rails: inert in `--safe-mode`, hooks never bypass hardstops
+- Tests: hook fixture matrix — block / patch / pre-approve / no-verdict × each new event + safe-mode inertness contract — **shipped** (`hook_updated_input_patches_arguments`, `hook_pre_approve_skips_the_ask_but_not_hardstops`, `lifecycle_hooks_fire_across_the_engine_loop`; the tool-hook envelope gained `cwd`, additive)
+- Declined: file-watch hooks (overlaps the watch-mode non-goal)
+
+### 9.3 `ka import claude` — shipped 2026-09
+- **[M]** One-shot parse of Claude Code `settings.json` permissions (allow/ask/deny arrays; `Bash(...)`/`Edit(...)`/`Read(...)` pattern forms) → ka `[[rules]]`
+- **[M]** Printed diff before writing; target layer choice (project `.ka/ka.toml` vs user config); nothing written unconfirmed
+- **[O]** codex `config.toml` and gemini `settings.json` formats later
+- Tests: fixture `settings.json` → expected rules TOML; untranslatable patterns reported, never dropped silently — **shipped** (claude `prefix:*` → ka `prefix*`, `WebFetch(domain:x)` → web_fetch domain pattern, `mcp__s__t` → `s.t`; deny→ask→allow emission order preserves claude's deny-wins semantics under ka's first-match)
+
+### 9.4 Safety trail — shipped 2026-09
+- **[M]** `[guards] auto_review` opt-in: the `fast`-role model reviews exec-tier asks; high-confidence obvious ones are auto-allowed, everything else falls through to the human; never auto-denies; every auto-allow is a transcript audit record; inert in `--safe-mode`
+- **[M]** `doom_loop` rule domain: the existing loop-signature guard surfaced as configurable ask/deny over repeated identical calls
+- Tests: reviewer fixture (confident → allow + audit record, non-confident → human ask); precedence vs hardstops; loop (doom_loop) ask on repeated signature
+
+### 9.5 `ka install` — shipped 2026-09
+- **[M]** `skill install` generalized: skills, agents, commands, rules from git URL or path; same trust gate; no registry, no manifests, no version machinery
+- **[M]** `ka skill install` stays as alias; `ka install list|remove` manage all kinds
+- Tests: install matrix per resource kind + trust-gate contract (untrusted project dir refuses)
+
+### 9.6 Observe-only multi-client v1 — shipped 2026-09
+- **[M]** `ka attach <id-prefix>`: read-only SSE client of a live `ka serve` session (reuses `GET /sessions/{id}/events` + `Last-Event-ID` reconnect); renders the live transcript with normal TUI chrome
+- **[M]** Presence: serve tracks per-session SSE subscribers; attach footer shows `busy · N attached` — **shipped** via a per-session ring buffer (512 events, so late subscribers get full history incl. the startup Replay) + `tokio::sync::broadcast` fan-out + a synthetic `Event::Presence` (additive on the wire); the writer's-TUI chip is deferred to shared-write work — an in-process writer TUI never sees serve-side presence by construction. Single-writer is server-enforced trivially: observers have no write route (prompting stays `POST /sessions/{id}/prompt`); disconnect detection watches the socket's read half so presence drops immediately, not at the next keepalive
+- **[M]** Single writer, server-enforced: attach has no input path to the turn machine; prompt attempts are refused
+- Tests: two-client SSE fixture (identical replay), presence counter, attach write-attempt rejection — **shipped** (`concurrent_observers_presence_and_listings`; `GET /sessions` + `GET /sessions/{id}` carry presence/title; attach resolves id-prefix → title-substring → newest)
+- Declined for now: shared write access, permission-queue fan-out, engine relocation into serve (crush-parity workspace)
+- Re-ratification: the 8.4 decline of "live collab/share relay" covered write-sharing; observe-only attach is read-side only and in scope (same pattern as the 2026-09-13 git-mutation re-ratification)
+
+### 9.7 Convenience set (filler) — shipped 2026-09
+- **[M]** Command frontmatter: `argument-hint`, `allowed-tools`, `model` on `.ka/commands/*.md` (claude parity), surfaced in the `/` popup
+- **[M]** `ka -i "<prompt>"`: one headless prompt, then the TUI opens resumed on that strand (gemini parity)
+- **[O]** `ka completions <shell>` (bash/zsh/fish) — size-checked via `xtask size`; hand-rolled tables preferred over clap_complete if the dep breaks the budget
+- **[O]** ka-passport design stub: `TokenSource` trait + auth-ladder plug point + data shapes documented in `sdk.md`/architecture — no crate, no providers — **shipped** (`sdk.md` §6: trait sketch, `auth = "passport"` catalog key, keyring service, one-provider-first order). `-i` parses onto the global CLI and sends its Prompt before the TUI opens (the engine's event channel buffers the turn); completions are generated from the live clap parser at runtime — subcommands and flags can never drift (data over code, no clap_complete dep)
+
+**Exit:** approval fatigue measurably reduced on trusted repos — sandbox denials become one-shot grant asks, exec asks are pre-reviewed when opted in, hooks lint/patch/pre-approve, Claude Code switchers import in one command — and a second terminal can watch a session live, at ≤ 10 MB musl with zero new dependencies. **Met 2026-09-29: zero new workspace dependencies; `cargo xtask ci` green (fmt, clippy -D warnings incl. unwrap/expect denies, all contract suites).**
+
 ## Non-goals (explicit, permanent)
 No in-process plugin runtime · no vector DB / semantic indexing · no browser or computer control · no image gen / TTS / voice · no enterprise/MDM/team/cloud tier · no telemetry beyond optional local logs · no eval kernels · **no subscription OAuth in core** (`ka-passport` crate may add it later).
 
 Re-ratified 2026-09-13: **git mutation is no longer a non-goal** — `[git] auto_commit`, checkpoint/restore, and worktree-isolated delegates ship destructive-capable git paths behind explicit config/opt-in, while read-only awareness remains the default posture. The original "no git mutation" line was overtaken by shipped, gated features.
+
+Re-reviewed 2026-09-29 (`feature-research-2026-09.md`): MCP OAuth, watch mode, recipes/schedules, package manifests, and shared-write multi-client workspaces were re-examined and **remain out**. Observe-only attach (`ka attach`, Phase 9.6) is re-ratified **in** — the prior "live collab/share relay" decline (8.4) covered write-sharing, which stays out.
 
 ## Footprint budget (enforced from Phase 0)
 Single static binary ≤ 10MB (musl, stripped) · cold start ≤ 50ms · idle RSS ≤ 15MB · zero network at steady state · children only: user shell, stdio MCP (optional), git (optional).
