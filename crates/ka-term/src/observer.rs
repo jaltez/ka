@@ -218,9 +218,7 @@ fn scroll(scrollback: Option<usize>, rows: usize, height: usize, up: bool) -> Op
         let next = scrollback.unwrap_or(bottom).saturating_sub(content);
         Some(next.min(bottom))
     } else {
-        let Some(top) = scrollback else {
-            return None;
-        };
+        let top = scrollback?;
         let next = top.saturating_add(content);
         (next < bottom).then_some(next)
     }

@@ -1010,7 +1010,7 @@ async fn prompt_scoping_allowed_tools_and_model_override() {
     // turn's rounds saw exactly the allowlisted tool, the follow-up
     // turn is offered the whole session toolset again
     assert!(
-        speaker.efforts.lock().last().map_or(true, |e| e.is_none()),
+        speaker.efforts.lock().last().is_none_or(|e| e.is_none()),
         "the override must not leak into the next turn"
     );
     let counts = speaker.tool_counts.lock().clone();
