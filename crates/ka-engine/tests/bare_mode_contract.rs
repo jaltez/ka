@@ -7,8 +7,13 @@
 use ka_engine::conventions;
 use ka_engine::trust;
 
+/// The bare-mode flag is a process-global and this binary's tests all
+/// flip it — they run serialized.
+static FLAG_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+
 #[test]
 fn safe_mode_disables_every_customization_tier() {
+    let _guard = FLAG_LOCK.lock();
     let dir = std::env::temp_dir().join(format!("ka-bare-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     // a fully-loaded project: instructions, memory, skills, rules
@@ -115,5 +120,67 @@ fn safe_mode_disables_every_customization_tier() {
         "bare mode never spawns debug adapters"
     );
 
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Feature toggles can never WIDEN a safe-mode session: `SetFeature
+/// enabled=true` and `SetSandbox fs` are refused with a note, and no
+/// FeaturesChanged announcement is made.
+///
+/// The guard is held across awaits on purpose — it serializes this
+/// test against the sync one over the process-global flag — and cannot
+/// deadlock: the other holder blocks on plain lock acquisition, not on
+/// this task making progress.
+#[allow(clippy::await_holding_lock)]
+#[tokio::test]
+async fn safe_mode_pins_feature_toggles_off() {
+    let _guard = FLAG_LOCK.lock();
+    use ka_protocol::{Command, Event};
+    let dir = std::env::temp_dir().join(format!("ka-bare-tgl-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let cfg = ka_engine::Config {
+        cwd: Some(dir.to_string_lossy().into_owned()),
+        ..Default::default()
+    };
+    let catalog = ka_dialect::Catalog::parse(
+        "[dialects.\"test/m\"]\nwire = \"openai_chat\"\nbase_url = \"http://127.0.0.1:1\"\ncontext = 1000000\n",
+    )
+    .unwrap();
+    conventions::set_bare_mode(true);
+    let mut handle = ka_engine::spawn_with(cfg, catalog);
+    for cmd in [
+        Command::SetFeature {
+            spec: "agents".parse().unwrap(),
+            enabled: true,
+        },
+        Command::SetSandbox {
+            mode: "fs".to_string(),
+        },
+    ] {
+        handle.commands.send(cmd).await.expect("engine alive");
+    }
+    let mut refused = 0usize;
+    loop {
+        match tokio::time::timeout(std::time::Duration::from_secs(5), handle.events.recv()).await {
+            Ok(Some(e)) => {
+                assert!(
+                    !matches!(e, Event::FeaturesChanged { .. }),
+                    "bare mode never announces a widening toggle: {e:?}"
+                );
+                if matches!(
+                    &e,
+                    Event::Note { message, .. } if message.contains("safe mode pins")
+                ) {
+                    refused += 1;
+                }
+                if refused == 2 {
+                    break;
+                }
+            }
+            _ => panic!("expected two refusals, saw {refused}"),
+        }
+    }
+    conventions::set_bare_mode(false);
     let _ = std::fs::remove_dir_all(&dir);
 }

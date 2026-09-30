@@ -96,7 +96,7 @@ pub enum Record {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         thinking: Option<String>,
     },
-    /// A settings change (model / effort / mode).
+    /// A settings change (model / effort / mode / feature toggles).
     Change {
         /// Record identifier.
         id: RecordId,
@@ -106,6 +106,15 @@ pub enum Record {
         effort: Option<Effort>,
         /// New permission mode, if changed.
         mode: Option<Mode>,
+        /// Feature-toggle snapshot, if changed: the full disabled-spec
+        /// list in the shared grammar (`agents`, `mcp:github`, …).
+        /// Presence replaces the whole set; absent leaves it alone.
+        /// Additive.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        features: Option<Vec<String>>,
+        /// New sandbox mode, if changed (`"off"` | `"fs"`). Additive.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        sandbox: Option<String>,
     },
     /// A digest (compaction) boundary.
     Digest {
@@ -359,8 +368,48 @@ pub struct Settings {
     pub effort: Option<Effort>,
     /// Last-set permission mode.
     pub mode: Option<Mode>,
+    /// Last feature-toggle snapshot: the full disabled-spec list. None
+    /// until the session records one (presence matters — an empty
+    /// snapshot is a real "everything on").
+    pub features: Option<Vec<String>>,
+    /// Last-set sandbox mode (`"off"` | `"fs"`).
+    pub sandbox: Option<String>,
     /// True when the file ended on a dangling (user-tail) turn.
     pub dangling: bool,
+}
+
+impl Settings {
+    /// Fold one `Record::Change` into the settings (shared by open-time
+    /// replay and live append). Feature/sandbox fields are snapshots:
+    /// presence replaces, absence leaves the accumulated value alone.
+    fn apply(&mut self, change: &Record) {
+        let Record::Change {
+            model,
+            effort,
+            mode,
+            features,
+            sandbox,
+            ..
+        } = change
+        else {
+            return;
+        };
+        if let Some(m) = model {
+            self.model = Some(m.clone());
+        }
+        if let Some(e) = effort {
+            self.effort = Some(*e);
+        }
+        if let Some(m) = mode {
+            self.mode = Some(*m);
+        }
+        if let Some(list) = features {
+            self.features = Some(list.clone());
+        }
+        if let Some(s) = sandbox {
+            self.sandbox = Some(s.clone());
+        }
+    }
 }
 
 impl StrandFile {
@@ -431,23 +480,7 @@ impl StrandFile {
         }
         let mut settings = Settings::default();
         for record in &records {
-            if let Record::Change {
-                model,
-                effort,
-                mode,
-                ..
-            } = record
-            {
-                if model.is_some() {
-                    settings.model = model.clone();
-                }
-                if effort.is_some() {
-                    settings.effort = *effort;
-                }
-                if mode.is_some() {
-                    settings.mode = *mode;
-                }
-            }
+            settings.apply(record);
         }
         settings.dangling = matches!(
             records.last(),
@@ -484,23 +517,7 @@ impl StrandFile {
 
     /// Append a record (writes through to disk).
     pub fn append(&mut self, record: Record) -> std::io::Result<()> {
-        if let Record::Change {
-            model,
-            effort,
-            mode,
-            ..
-        } = &record
-        {
-            if model.is_some() {
-                self.settings.model = model.clone();
-            }
-            if effort.is_some() {
-                self.settings.effort = *effort;
-            }
-            if mode.is_some() {
-                self.settings.mode = *mode;
-            }
-        }
+        self.settings.apply(&record);
         if matches!(
             record,
             Record::Message {
@@ -1066,6 +1083,8 @@ mod tests {
                 model: Some("openai/gpt-5.1@high".into()),
                 effort: Some(Effort::High),
                 mode: Some(Mode::Free),
+                features: None,
+                sandbox: None,
             })
             .unwrap();
 
@@ -1075,6 +1094,76 @@ mod tests {
         assert_eq!(settings.model.as_deref(), Some("openai/gpt-5.1@high"));
         assert_eq!(settings.mode, Some(Mode::Free));
         assert!(!settings.dangling);
+        let _ = std::fs::remove_dir_all(&data);
+    }
+
+    #[test]
+    fn feature_toggles_replay_as_snapshots() {
+        let data = temp_data("features");
+        let mut strand = StrandFile::create(&PathBuf::from("/tmp/proj"), None).unwrap();
+        // first snapshot disables two specs
+        strand
+            .append(Record::Change {
+                id: new_record_id(),
+                model: None,
+                effort: None,
+                mode: None,
+                features: Some(vec!["agents".into(), "mcp:github".into()]),
+                sandbox: Some("fs".into()),
+            })
+            .unwrap();
+        // a model change in between must not touch the toggle set
+        strand
+            .append(Record::Change {
+                id: new_record_id(),
+                model: Some("zai/glm-5.3".into()),
+                effort: None,
+                mode: None,
+                features: None,
+                sandbox: None,
+            })
+            .unwrap();
+        // second snapshot replaces the whole set
+        strand
+            .append(Record::Change {
+                id: new_record_id(),
+                model: None,
+                effort: None,
+                mode: None,
+                features: Some(vec!["tool:bash".into()]),
+                sandbox: None,
+            })
+            .unwrap();
+        let settings = StrandFile::open(strand.path().unwrap())
+            .unwrap()
+            .into_settings();
+        assert_eq!(settings.features, Some(vec!["tool:bash".to_string()]));
+        assert_eq!(settings.sandbox.as_deref(), Some("fs"));
+        let _ = std::fs::remove_dir_all(&data);
+    }
+
+    #[test]
+    fn legacy_change_lines_still_decode() {
+        // strands recorded before the additive fields existed
+        let data = temp_data("legacy-change");
+        let dir = store_path(&strand_dir(&PathBuf::from("/tmp/legacy")));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("20260101T000000_s.jsonl");
+        std::fs::write(
+            &path,
+            concat!(
+                r#"{"record":"header","id":"s","ts":"2026-01-01T00:00:00Z","cwd":"/tmp","#,
+                r#""version":1}"#,
+                "\n",
+                r#"{"record":"change","id":"r1","model":"m","effort":"high","mode":"free"}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+        let settings = StrandFile::open(&path).unwrap().into_settings();
+        assert_eq!(settings.model.as_deref(), Some("m"));
+        assert_eq!(settings.features, None);
+        assert_eq!(settings.sandbox, None);
         let _ = std::fs::remove_dir_all(&data);
     }
 

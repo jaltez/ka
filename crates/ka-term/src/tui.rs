@@ -2027,6 +2027,9 @@ pub struct Meters {
     pub cache_hit: Option<f32>,
     /// Finished turns this session.
     pub turns: u64,
+    /// Feature specs currently disabled (`⊘ n` in the status bar; 0
+    /// hides the segment).
+    pub toggles: usize,
     /// Cumulative input tokens seen (incl. cache reads/writes).
     pub tokens_in: u64,
     /// Cumulative output tokens.
@@ -2041,7 +2044,7 @@ pub struct Meters {
 /// kept beside the transcript card it also renders).
 #[derive(Debug, Clone, Default)]
 pub struct Inventory {
-    /// Built-in + MCP tool names.
+    /// Visible tool names (feature toggles hide the rest).
     pub tools: Vec<String>,
     /// Per configured MCP server: name, connect ok, tool count.
     pub mcp: Vec<ka_protocol::McpSummary>,
@@ -2051,6 +2054,8 @@ pub struct Inventory {
     pub skills: Vec<String>,
     /// Advertised MCP prompts (`server/name (args)`).
     pub prompts: Vec<String>,
+    /// Specs currently disabled by feature toggles (shared grammar).
+    pub disabled: Vec<String>,
 }
 
 /// Data behind the bottom-strip popups. Session figures come from the
@@ -2059,6 +2064,11 @@ pub struct Inventory {
 pub struct SidebarState {
     /// Bootstrap inventory.
     pub inventory: Inventory,
+    /// Superset of tool names ever offered (toggled-off tools vanish
+    /// from the inventory but must stay re-enableable from /features).
+    pub known_tools: Vec<String>,
+    /// Live sandbox-mode override (None = follows config).
+    pub sandbox: Option<String>,
     /// Live todo list ([`Event::Todos`]; whole-list replacement).
     pub todos: Vec<ka_protocol::TodoItem>,
     /// Working directory, display-shortened.
@@ -2291,6 +2301,91 @@ fn inventory_rows(sidebar: &SidebarState, width: usize) -> Vec<ratatui::text::Li
                 crate::palette::META,
             ),
         );
+    }
+    out
+}
+
+/// One row of the /features panel. Header rows organize; every other
+/// row maps to one `SetFeature`/`SetSandbox` command.
+#[derive(Debug, Clone)]
+pub struct FeatureRow {
+    /// The spec string (`agents`, `mcp:github`, `tool:bash`, …) — or
+    /// `"sandbox"` for the sandbox-mode row.
+    pub spec: String,
+    /// Display label beside the state glyph.
+    pub label: String,
+    /// Section header row (not selectable).
+    pub header: bool,
+    /// Current state: on = enabled.
+    pub on: bool,
+}
+
+/// The /features panel rows: the seven feature words, the sandbox mode,
+/// every base tool, then per-item sections (MCP servers, skills,
+/// agents). State comes from the live inventory's disabled set.
+fn feature_rows(sidebar: &SidebarState) -> Vec<FeatureRow> {
+    let mut out = Vec::new();
+    let header = |out: &mut Vec<FeatureRow>, label: &str| {
+        out.push(FeatureRow {
+            spec: String::new(),
+            label: label.to_string(),
+            header: true,
+            on: true,
+        });
+    };
+    let on = |out: &mut Vec<FeatureRow>, spec: &str, label: String| {
+        let disabled = sidebar.inventory.disabled.iter().any(|d| d == spec);
+        out.push(FeatureRow {
+            spec: spec.to_string(),
+            label,
+            header: false,
+            on: !disabled,
+        });
+    };
+    header(&mut out, "features");
+    on(&mut out, "agents", "subagents (delegate + tasks)".into());
+    on(
+        &mut out,
+        "skills",
+        "skills block in the system prompt".into(),
+    );
+    on(&mut out, "mcp", "every MCP server".into());
+    on(&mut out, "hooks", "config + .ka/hooks hooks".into());
+    on(&mut out, "web", "web search + fetch".into());
+    on(&mut out, "lsp", "LSP navigation tier".into());
+    on(&mut out, "debug", "debug (DAP) probe".into());
+    header(&mut out, "sandbox");
+    let mode = sidebar.sandbox.clone().unwrap_or_else(|| "off".into());
+    out.push(FeatureRow {
+        spec: "sandbox".to_string(),
+        label: format!("bash sandbox (now {mode}; ⏎ cycles off↔fs)"),
+        header: false,
+        on: mode == "fs",
+    });
+    header(&mut out, "tools");
+    for t in &sidebar.known_tools {
+        on(&mut out, &format!("tool:{t}"), t.clone());
+    }
+    header(&mut out, "mcp servers");
+    for m in &sidebar.inventory.mcp {
+        let count = if m.ok {
+            format!(" ({} tools)", m.tools)
+        } else {
+            String::new()
+        };
+        on(
+            &mut out,
+            &format!("mcp:{}", m.name),
+            format!("{}{count}", m.name),
+        );
+    }
+    header(&mut out, "skills");
+    for s in &sidebar.inventory.skills {
+        on(&mut out, &format!("skill:{s}"), s.clone());
+    }
+    header(&mut out, "agents");
+    for a in &sidebar.inventory.agents {
+        on(&mut out, &format!("agent:{a}"), a.clone());
     }
     out
 }
@@ -3077,6 +3172,14 @@ pub enum Modal {
     Session(SessionPicker),
     /// Settings panel.
     Settings(SettingsPanel),
+    /// Feature-toggle panel (/features, ctrl+T): every toggleable
+    /// capability with a live on/off state; ⏎ flips the selection.
+    Features {
+        /// Panel rows (section headers + toggleable specs).
+        entries: Vec<FeatureRow>,
+        /// Selected row index (always a toggleable row).
+        selected: usize,
+    },
     /// Model picker.
     Model(ModelPicker),
     /// Provider picker (`/provider`).
@@ -3780,6 +3883,7 @@ async fn app(
                                             effort: None,
                                             mode: Some(mode),
                                             mouse: None,
+                                        features: None,
                                         })
                                         .await;
                                 }
@@ -3811,6 +3915,7 @@ async fn app(
                                             effort: Some(level),
                                             mode: None,
                                             mouse: None,
+                                        features: None,
                                         })
                                         .await;
                                     pop_toast(&mut toast, format!("🧠 {}", effort_label(level)));
@@ -3892,6 +3997,7 @@ async fn app(
                                                 effort: None,
                                                 mode: None,
                                                 mouse: None,
+                                            features: None,
                                             })
                                             .await;
                                         modal = None;
@@ -4033,6 +4139,7 @@ async fn app(
                                                 effort: None,
                                                 mode: None,
                                                 mouse: None,
+                                            features: None,
                                             })
                                             .await;
                                     }
@@ -4117,6 +4224,7 @@ async fn app(
                                                 effort: panel.effort,
                                                 mode: Some(panel.mode),
                                                 mouse: None,
+                                            features: None,
                                             })
                                             .await;
                                     }
@@ -4209,6 +4317,73 @@ async fn app(
                             Modal::Context { .. } => {
                                 modal = None;
                             }
+                            Modal::Features { entries, selected } => match key.code {
+                                KeyCode::Esc => modal = None,
+                                KeyCode::Up => {
+                                    while *selected > 0 {
+                                        *selected -= 1;
+                                        if !entries[*selected].header {
+                                            break;
+                                        }
+                                    }
+                                }
+                                KeyCode::Down => {
+                                    while *selected + 1 < entries.len() {
+                                        *selected += 1;
+                                        if !entries[*selected].header {
+                                            break;
+                                        }
+                                    }
+                                }
+                                // ⏎ (or space) flips the selected row; the
+                                // optimistic flip lands instantly and the
+                                // engine's FeaturesChanged keeps the state
+                                // truthful even if the command raced
+                                KeyCode::Enter | KeyCode::Char(' ') => {
+                                    if let Some(row) = entries.get(*selected).cloned() {
+                                        if row.spec == "sandbox" {
+                                            let mode =
+                                                if row.on { "off" } else { "fs" }.to_string();
+                                            let _ = commands
+                                                .send(Command::SetSandbox { mode })
+                                                .await;
+                                            if let Some(r) = entries.get_mut(*selected) {
+                                                r.on = !row.on;
+                                            }
+                                        } else if let Ok(spec) =
+                                            row.spec.parse::<ka_protocol::FeatureSpec>()
+                                        {
+                                            let _ = commands
+                                                .send(Command::SetFeature {
+                                                    spec,
+                                                    enabled: !row.on,
+                                                })
+                                                .await;
+                                            if let Some(r) = entries.get_mut(*selected) {
+                                                r.on = !row.on;
+                                            }
+                                        }
+                                    }
+                                }
+                                // `s` persists the current disabled set as
+                                // the user-layer default ([features] disable)
+                                KeyCode::Char('s') => {
+                                    let disabled = sidebar.inventory.disabled.clone();
+                                    let _ = commands
+                                        .send(Command::SaveSettings {
+                                            model: None,
+                                            effort: None,
+                                            mode: None,
+                                            mouse: None,
+                                            features: Some(disabled),
+                                        })
+                                        .await;
+                                    transcript.push_separated(Line::Info(
+                                        "saved feature toggles as the default (user ka.toml)".into(),
+                                    ));
+                                }
+                                _ => {}
+                            },
                             Modal::Tree {
                                 items,
                                 targets,
@@ -4557,6 +4732,7 @@ async fn app(
                                     effort: None,
                                     mode: None,
                                     mouse: mouse_setting(mouse_captured),
+                                features: None,
                                 })
                                 .await;
                             pop_toast(&mut toast, mouse_mode_text(mouse_captured));
@@ -4672,6 +4848,100 @@ async fn app(
                                         // resume past the searched-from row so a
                                         // later /find re-scans only fresh rows
                                         find_last = Some((q, from));
+                                    }
+                                }
+                                continue;
+                            }
+                            if text.trim() == "/features" || text.trim().starts_with("/features ") {
+                                // feature toggles: the panel, or direct
+                                // `/features on|off spec[,spec…]`. Local (like
+                                // /find): the engine command is assembled
+                                // here, one SetFeature per spec.
+                                let args = text.trim().strip_prefix("/features").map(str::trim).unwrap_or("");
+                                if args.is_empty() {
+                                    modal = Some(Modal::Features {
+                                        entries: feature_rows(&sidebar),
+                                        selected: 0,
+                                    });
+                                } else {
+                                    let mut parts = args.split_whitespace();
+                                    match (parts.next(), parts.next()) {
+                                        (Some(action), Some(list))
+                                            if action == "on" || action == "off" =>
+                                        {
+                                            let enabled = action == "on";
+                                            if busy {
+                                                transcript.push_separated(Line::Info(
+                                                    "⏳ turn running — toggles apply when it settles".into(),
+                                                ));
+                                            }
+                                            let mut sent = Vec::new();
+                                            let mut bad = Vec::new();
+                                            for spec in list.split(',').map(str::trim) {
+                                                match spec
+                                                    .parse::<ka_protocol::FeatureSpec>()
+                                                {
+                                                    Ok(spec) => {
+                                                        let _ = commands
+                                                            .send(Command::SetFeature {
+                                                                spec: spec.clone(),
+                                                                enabled,
+                                                            })
+                                                            .await;
+                                                        sent.push(spec.to_string());
+                                                    }
+                                                    Err(_) => bad.push(spec.to_string()),
+                                                }
+                                            }
+                                            if !sent.is_empty() {
+                                                transcript.push_separated(Line::Info(format!(
+                                                    "{} {}",
+                                                    if enabled { "⊘ off:" } else { "⊙ on:" },
+                                                    sent.join(", ")
+                                                )));
+                                            }
+                                            if !bad.is_empty() {
+                                                transcript.push_separated(Line::Warn(format!(
+                                                    "unknown feature spec(s): {} — try /features for the panel",
+                                                    bad.join(", ")
+                                                )));
+                                            }
+                                        }
+                                        _ => {
+                                            transcript.push_separated(Line::Info(
+                                                "usage: /features [on|off spec[,spec…]] — bare /features opens the panel"
+                                                    .into(),
+                                            ));
+                                        }
+                                    }
+                                }
+                                continue;
+                            }
+                            if text.trim() == "/sandbox" || text.trim().starts_with("/sandbox ") {
+                                let arg = text
+                                    .trim()
+                                    .strip_prefix("/sandbox")
+                                    .map(str::trim)
+                                    .unwrap_or("");
+                                match arg {
+                                    "off" | "fs" => {
+                                        if busy {
+                                            transcript.push_separated(Line::Info(
+                                                "⏳ turn running — the sandbox swap applies when it settles"
+                                                    .into(),
+                                            ));
+                                        }
+                                        let _ = commands
+                                            .send(Command::SetSandbox { mode: arg.to_string() })
+                                            .await;
+                                        transcript.push_separated(Line::Info(format!(
+                                            "sandbox {arg}"
+                                        )));
+                                    }
+                                    _ => {
+                                        transcript.push_separated(Line::Info(
+                                            "usage: /sandbox off|fs".into(),
+                                        ));
                                     }
                                 }
                                 continue;
@@ -5389,6 +5659,7 @@ async fn app(
                             Modal::Memory { .. } => {}
                             Modal::Rewind { .. } => {}
                             Modal::Tree { .. } => {}
+                            Modal::Features { .. } => {}
                             Modal::Session(picker) => {
                                 picker.filter.extend(text.chars().filter(|c| !c.is_whitespace()));
                             }
@@ -6413,10 +6684,23 @@ fn apply_event(
             agents,
             skills,
             prompts,
+            disabled,
         } => {
-            let card = inventory_card(mcp, agents);
-            if !card.is_empty() {
-                transcript.push_separated(Line::Info(card));
+            // the bootstrap card is transcript noise on re-emits (every
+            // toggle change re-emits the inventory) — only the first one
+            // introduces itself
+            if sidebar.inventory.tools.is_empty() {
+                let card = inventory_card(mcp, agents);
+                if !card.is_empty() {
+                    transcript.push_separated(Line::Info(card));
+                }
+            }
+            // tools are the *visible* set; keep a superset so a hidden
+            // tool can be re-enabled from the /features panel
+            for t in tools {
+                if !sidebar.known_tools.contains(t) {
+                    sidebar.known_tools.push(t.clone());
+                }
             }
             sidebar.inventory = Inventory {
                 tools: tools.clone(),
@@ -6424,7 +6708,14 @@ fn apply_event(
                 agents: agents.clone(),
                 skills: skills.clone(),
                 prompts: prompts.clone(),
+                disabled: disabled.clone(),
             };
+            meters.toggles = disabled.len();
+        }
+        Event::FeaturesChanged { disabled, sandbox } => {
+            sidebar.inventory.disabled = disabled.clone();
+            sidebar.sandbox = sandbox.clone();
+            meters.toggles = disabled.len();
         }
         Event::Title { title } => {
             if !title.is_empty() {
@@ -6838,6 +7129,14 @@ fn builtin_slash_commands() -> Vec<(String, String)> {
             "connect a provider (api key)".to_string(),
         ),
         ("/mode".to_string(), "pick a permission mode".to_string()),
+        (
+            "/features".to_string(),
+            "toggle features, tools, skills, MCP (on|off spec)".to_string(),
+        ),
+        (
+            "/sandbox".to_string(),
+            "switch the bash sandbox (off|fs)".to_string(),
+        ),
         (
             "/thinking".to_string(),
             "pick the reasoning level".to_string(),
@@ -8156,6 +8455,11 @@ fn status_right(meters: &Meters) -> Vec<ratatui::text::Span<'static>> {
     if !meters.mode.is_empty() {
         push(mode_segment(meters), &mut segs);
     }
+    if meters.toggles > 0 {
+        // feature toggles active: a count keeps the status bar honest
+        // about what the model can no longer see
+        push(format!("\u{2298}{}", meters.toggles), &mut segs);
+    }
     if meters.effort_supported {
         // the engine always emits the level now; defensive: a stale
         // empty string reads as off
@@ -8778,6 +9082,12 @@ fn render(
             Modal::Todos { .. } | Modal::Skills { .. } | Modal::Info { .. } => {
                 hint_spans(&[(" any", "close")])
             }
+            Modal::Features { .. } => hint_spans(&[
+                (" ↑↓", "choose"),
+                (" ⏎", "toggle"),
+                (" s", "save as default"),
+                (" esc", "close"),
+            ]),
             Modal::Context { .. } => hint_spans(&[(" esc", "close")]),
             Modal::Tasks { .. } => {
                 hint_spans(&[(" ↑↓", "choose"), (" ⏎", "page result"), (" esc", "close")])
@@ -9515,6 +9825,51 @@ fn render(
                     .wrap(Wrap { trim: false });
                 frame.render_widget(widget, rect);
             }
+            Modal::Features { entries, selected } => {
+                let height = (entries.len() as u16 + 4).clamp(6, 24);
+                let width = 76.min(frame.area().width);
+                let rect = centered(width, height, modal_area);
+                modal_zone.set(Some(rect));
+                frame.render_widget(ratatui::widgets::Clear, rect);
+                let inner_w = width.saturating_sub(4) as usize;
+                let cap = (height as usize).saturating_sub(4);
+                // keep the selection inside the window
+                let start = (*selected + 1).saturating_sub(cap);
+                let mut text = Vec::new();
+                for (i, row) in entries.iter().enumerate().skip(start).take(cap) {
+                    if row.header {
+                        text.push(TuiLine::styled(
+                            pad_to_width(row.label.clone(), inner_w),
+                            crate::palette::META,
+                        ));
+                        continue;
+                    }
+                    let glyph = if row.on { "\u{25cf}" } else { "\u{25cb}" };
+                    let shown = if row.spec == row.label || row.spec == "sandbox" {
+                        format!("{glyph} {}", row.label)
+                    } else {
+                        format!("{glyph} {} ({})", row.label, row.spec)
+                    };
+                    let style = if i == *selected {
+                        selection_style()
+                    } else {
+                        ratatui::style::Style::new()
+                    };
+                    text.push(TuiLine::styled(pad_to_width(shown, inner_w), style));
+                }
+                let more = entries.len().saturating_sub(start + cap);
+                if more > 0 {
+                    text.push(TuiLine::styled(
+                        format!("… +{more} more"),
+                        crate::palette::META,
+                    ));
+                }
+                let widget = Paragraph::new(text)
+                    .block(modal_frame(modal_title("features")))
+                    .style(ratatui::style::Style::new().bg(crate::palette::BG_SURFACE))
+                    .wrap(Wrap { trim: false });
+                frame.render_widget(widget, rect);
+            }
             Modal::Todos { rows } | Modal::Skills { rows } | Modal::Info { rows } => {
                 let (title, rows) = match open {
                     Modal::Todos { rows } => ("todos", rows),
@@ -10111,6 +10466,11 @@ fn help_modal_rows() -> Vec<ratatui::text::Line<'static>> {
             ("/model", "pick a model"),
             ("/mode", "pick a permission mode"),
             ("/thinking", "pick the reasoning level"),
+            (
+                "/features",
+                "toggle features/tools/skills/MCP (bare = panel)",
+            ),
+            ("/sandbox", "switch the bash sandbox (off|fs)"),
             ("/key", "set an api key for the current model"),
             ("/provider", "connect a provider (api key)"),
             ("/settings", "settings & provider status"),
@@ -13912,11 +14272,60 @@ mod tests {
                 agents: Vec::new(),
                 skills: vec!["rust-docs".into()],
                 prompts: Vec::new(),
+                disabled: Vec::new(),
             },
         );
         // tools and skills live in the sidebar now: nothing in the chat
         assert!(lines.entries().is_empty(), "{:?}", lines.entries());
         assert_eq!(lines.total_rows(), 0);
+    }
+
+    #[test]
+    fn feature_panel_rows_reflect_the_disabled_set() {
+        let sidebar = SidebarState {
+            known_tools: vec!["read".into(), "bash".into()],
+            sandbox: Some("fs".into()),
+            inventory: Inventory {
+                mcp: vec![ka_protocol::McpSummary {
+                    name: "github".into(),
+                    ok: true,
+                    tools: 4,
+                }],
+                skills: vec!["pdf".into()],
+                agents: vec!["reviewer".into()],
+                disabled: vec!["agents".into(), "mcp:github".into()],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let rows = feature_rows(&sidebar);
+        let on = |rows: &[FeatureRow], spec: &str| {
+            rows.iter()
+                .find(|r| r.spec == spec)
+                .map(|r| r.on)
+                .unwrap_or_else(|| panic!("row {spec} missing"))
+        };
+        assert!(!on(&rows, "agents"), "disabled spec reads off");
+        assert!(on(&rows, "skills"));
+        assert!(!on(&rows, "mcp:github"));
+        assert!(on(&rows, "tool:bash"), "tools section covers base hands");
+        assert!(on(&rows, "sandbox"), "fs override reads on");
+        assert!(
+            rows.first().is_some_and(|r| r.header),
+            "panel starts with a section header"
+        );
+        // the status badge counts the disabled set
+        let meters = Meters {
+            toggles: sidebar.inventory.disabled.len(),
+            ..Default::default()
+        };
+        let right = status_right(&meters);
+        let joined: String = right
+            .iter()
+            .map(|s| s.content.clone())
+            .collect::<Vec<_>>()
+            .join("");
+        assert!(joined.contains("\u{2298}2"), "badge shows ⊘2: {joined}");
     }
 
     #[test]
@@ -13941,6 +14350,7 @@ mod tests {
                 agents: Vec::new(),
                 skills: Vec::new(),
                 prompts: Vec::new(),
+                disabled: Vec::new(),
             },
         );
         let entries = lines.entries();
@@ -13965,6 +14375,7 @@ mod tests {
                 agents,
                 skills: vec!["rust-docs".into()],
                 prompts: Vec::new(),
+                disabled: Vec::new(),
             },
         );
         let entries = lines.entries();
@@ -14820,6 +15231,7 @@ mod tests {
                 agents: vec!["coder".into()],
                 skills: vec!["rust-docs".into()],
                 prompts: Vec::new(),
+                disabled: Vec::new(),
             },
             &mut lines,
             &mut busy,

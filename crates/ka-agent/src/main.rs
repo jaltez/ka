@@ -33,6 +33,17 @@ struct Cli {
     /// Permission mode override (guarded|free)
     #[arg(long)]
     mode: Option<String>,
+    /// Disable features at startup, comma-separated or repeatable:
+    /// agents|skills|mcp|hooks|web|lsp|debug, or one item as
+    /// mcp:<server>, skill:<name>, tool:<name>, agent:<name>
+    #[arg(long, value_delimiter = ',')]
+    disable: Vec<ka_protocol::FeatureSpec>,
+    /// Re-enable over a `[features]` disable (same grammar)
+    #[arg(long, value_delimiter = ',')]
+    enable: Vec<ka_protocol::FeatureSpec>,
+    /// Sandbox mode override (off|fs)
+    #[arg(long, value_parser = ["off", "fs"])]
+    sandbox: Option<String>,
     /// Extra strict-TOML config layer (repeatable)
     #[arg(long = "config")]
     configs: Vec<std::path::PathBuf>,
@@ -69,6 +80,17 @@ enum CliCommand {
         /// Permission mode override (guarded|free)
         #[arg(long)]
         mode: Option<String>,
+        /// Disable features for this run, comma-separated or repeatable
+        /// (agents|skills|mcp|hooks|web|lsp|debug, mcp:<server>,
+        /// skill:<name>, tool:<name>, agent:<name>)
+        #[arg(long, value_delimiter = ',')]
+        disable: Vec<ka_protocol::FeatureSpec>,
+        /// Re-enable over a `[features]` disable (same grammar)
+        #[arg(long, value_delimiter = ',')]
+        enable: Vec<ka_protocol::FeatureSpec>,
+        /// Sandbox mode override (off|fs)
+        #[arg(long, value_parser = ["off", "fs"])]
+        sandbox: Option<String>,
         /// Extra strict-TOML config layer (repeatable, highest file wins)
         #[arg(long = "config")]
         configs: Vec<PathBuf>,
@@ -361,12 +383,45 @@ fn main() -> ExitCode {
     }
 }
 
+/// Startup feature-toggle flags (`--disable`/`--enable`/`--sandbox`) —
+/// the CLI layer of the one spec grammar shared with `[features]` and
+/// `/features`. `--enable` re-enables over a config-disabled spec.
+#[derive(Debug, Clone, Default)]
+struct FeatureFlags {
+    disable: Vec<ka_protocol::FeatureSpec>,
+    enable: Vec<ka_protocol::FeatureSpec>,
+    sandbox: Option<String>,
+}
+
+impl FeatureFlags {
+    /// Apply onto the merged config: disable-union minus enable, plus
+    /// the sandbox-mode override.
+    fn apply(&self, cfg: &mut Config) {
+        if !self.disable.is_empty() || !self.enable.is_empty() {
+            let mut list = cfg.features.disable.clone();
+            for spec in &self.disable {
+                let s = spec.to_string();
+                if !list.contains(&s) {
+                    list.push(s);
+                }
+            }
+            let enabled: Vec<String> = self.enable.iter().map(|s| s.to_string()).collect();
+            list.retain(|s| !enabled.contains(s));
+            cfg.features.disable = list;
+        }
+        if let Some(mode) = &self.sandbox {
+            cfg.sandbox.mode = Some(mode.clone());
+        }
+    }
+}
+
 /// Defaults < user < project (if trusted) < extra files < env < flags.
 fn load_config(
     configs: &[PathBuf],
     flag_model: Option<String>,
     flag_mode: Option<String>,
     trust_project: bool,
+    features: &FeatureFlags,
 ) -> Result<Config, String> {
     let mut cfg = Config::default();
 
@@ -408,6 +463,9 @@ fn load_config(
     if let Some(mode) = flag_mode {
         cfg.mode = Some(parse_mode(&mode)?);
     }
+    // flags are the final baseline layer — a resumed strand's recorded
+    // toggle snapshot still wins at attach, exactly like --model
+    features.apply(&mut cfg);
     Ok(cfg)
 }
 
@@ -501,12 +559,18 @@ async fn dispatch(cli: Cli) -> Result<ExitCode, String> {
         trust: cli.trust,
         safe_mode: cli.safe_mode,
         interactive_prompt: cli.interactive_prompt,
+        disable: cli.disable,
+        enable: cli.enable,
+        sandbox: cli.sandbox,
     };
     match cli.command {
         Some(CliCommand::Run {
             prompt,
             model,
             mode,
+            disable,
+            enable,
+            sandbox,
             configs,
             dialects,
             no_discovery,
@@ -539,6 +603,11 @@ async fn dispatch(cli: Cli) -> Result<ExitCode, String> {
                 }
                 None => None,
             };
+            let features = FeatureFlags {
+                disable,
+                enable,
+                sandbox,
+            };
             run_headless(
                 prompt,
                 model,
@@ -552,6 +621,7 @@ async fn dispatch(cli: Cli) -> Result<ExitCode, String> {
                 schema_value,
                 Vec::new(),
                 print,
+                features,
             )
             .await
         }
@@ -588,7 +658,7 @@ async fn dispatch(cli: Cli) -> Result<ExitCode, String> {
         Some(CliCommand::Doctor { net, json }) => doctor::run(net, json).await,
         Some(CliCommand::Update { channel, check }) => {
             let trust = trust_for_cwd(false);
-            let cfg = load_config(&[], None, None, trust)?;
+            let cfg = load_config(&[], None, None, trust, &FeatureFlags::default())?;
             let repo = cfg
                 .update
                 .repo
@@ -677,7 +747,7 @@ async fn dispatch(cli: Cli) -> Result<ExitCode, String> {
             }
             ConfigCommand::Print { configs } => {
                 let trust = trust_for_cwd(false);
-                let cfg = load_config(&configs, None, None, trust)?;
+                let cfg = load_config(&configs, None, None, trust, &FeatureFlags::default())?;
                 let text =
                     toml::to_string_pretty(&cfg).map_err(|e| format!("serialize config: {e}"))?;
                 print!("{text}");
@@ -832,10 +902,11 @@ async fn run_headless(
     schema: Option<serde_json::Value>,
     images: Vec<ka_protocol::ImagePart>,
     print: String,
+    features: FeatureFlags,
 ) -> Result<ExitCode, String> {
     let trust = trust_for_cwd(force_trust);
     warn_untrusted_conventions(&std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
-    let cfg = load_config(configs, model, mode, trust)?;
+    let cfg = load_config(configs, model, mode, trust, &features)?;
     let prompt = match prompt {
         Some(p) => p,
         None => read_stdin()?,
@@ -1140,7 +1211,18 @@ async fn run_tui(cli: Cli) -> Result<ExitCode, String> {
 
     let trust = trust_for_cwd(cli.trust);
     warn_untrusted_conventions(&cwd);
-    let cfg = load_config(&cli.configs, cli.model.clone(), cli.mode.clone(), trust)?;
+    let features = FeatureFlags {
+        disable: cli.disable.clone(),
+        enable: cli.enable.clone(),
+        sandbox: cli.sandbox.clone(),
+    };
+    let cfg = load_config(
+        &cli.configs,
+        cli.model.clone(),
+        cli.mode.clone(),
+        trust,
+        &features,
+    )?;
     // the engine resolves its cwd as config cwd else process cwd; the
     // TUI must see the same value or plan-file paths, memory roots, and
     // custom-command roots drift from what the engine anchors to
@@ -1239,27 +1321,33 @@ async fn run_tui(cli: Cli) -> Result<ExitCode, String> {
     };
     let (cfg_tui_header_glyph, tui_notify, tui_mouse_capture) = {
         let trust = trust_for_cwd(false);
-        load_config(&cli.configs, cli.model.clone(), cli.mode.clone(), trust)
-            .map(|c| {
-                (
-                    c.effective_header_glyph(),
-                    ka_term::tui::NotifySettings {
-                        bell: c.effective_bell(),
-                        command: c.tui.notify.clone(),
-                    },
-                    c.effective_mouse_capture(),
-                )
-            })
-            .unwrap_or_else(|_| {
-                (
-                    "\u{25c6}".to_string(),
-                    ka_term::tui::NotifySettings {
-                        bell: true,
-                        command: None,
-                    },
-                    true,
-                )
-            })
+        load_config(
+            &cli.configs,
+            cli.model.clone(),
+            cli.mode.clone(),
+            trust,
+            &features,
+        )
+        .map(|c| {
+            (
+                c.effective_header_glyph(),
+                ka_term::tui::NotifySettings {
+                    bell: c.effective_bell(),
+                    command: c.tui.notify.clone(),
+                },
+                c.effective_mouse_capture(),
+            )
+        })
+        .unwrap_or_else(|_| {
+            (
+                "\u{25c6}".to_string(),
+                ka_term::tui::NotifySettings {
+                    bell: true,
+                    command: None,
+                },
+                true,
+            )
+        })
     };
     let exit = ka_term::tui::run(
         commands,
@@ -1461,7 +1549,7 @@ fn run_agents() -> Result<ExitCode, String> {
 
 async fn run_mcp() -> Result<ExitCode, String> {
     let trust = trust_for_cwd(false);
-    let cfg = load_config(&[], None, None, trust)?;
+    let cfg = load_config(&[], None, None, trust, &FeatureFlags::default())?;
     if cfg.mcp.is_empty() {
         println!("no [[mcp]] servers configured (~/.config/ka/ka.toml or .ka/ka.toml)");
         return Ok(ExitCode::SUCCESS);
@@ -1726,7 +1814,7 @@ async fn run_rewind(turns: u32) -> Result<ExitCode, String> {
     };
     // rewind only reads strand files — it must not silently approve the
     // project's .ka layer (trust is a side effect no reader should trip)
-    let cfg = load_config(&[], None, None, false)?;
+    let cfg = load_config(&[], None, None, false, &FeatureFlags::default())?;
     let catalog = build_catalog(&[], true).await?;
     let mut handle = ka_engine::spawn_full(cfg, catalog, choice);
     handle
@@ -1808,6 +1896,72 @@ fn read_stdin() -> Result<String, String> {
         .read_to_string(&mut buf)
         .map_err(|e| format!("stdin: {e}"))?;
     Ok(buf)
+}
+
+#[cfg(test)]
+mod feature_flag_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use super::*;
+
+    fn spec(s: &str) -> ka_protocol::FeatureSpec {
+        s.parse().unwrap()
+    }
+
+    #[test]
+    fn disable_flags_union_and_enable_removes() {
+        // config disabled skills; flags add agents and re-enable skills
+        let mut cfg = Config::parse_layer("[features]\ndisable = [\"skills\"]\n", "user").unwrap();
+        let flags = FeatureFlags {
+            disable: vec![spec("agents"), spec("mcp:github")],
+            enable: vec![spec("skills")],
+            sandbox: Some("fs".to_string()),
+        };
+        flags.apply(&mut cfg);
+        assert_eq!(
+            cfg.features.disable,
+            vec!["agents".to_string(), "mcp:github".to_string()],
+            "union minus enable"
+        );
+        assert_eq!(cfg.sandbox.mode.as_deref(), Some("fs"));
+    }
+
+    #[test]
+    fn enable_over_nothing_is_a_noop() {
+        let mut cfg = Config::default();
+        FeatureFlags {
+            disable: Vec::new(),
+            enable: vec![spec("web")],
+            sandbox: None,
+        }
+        .apply(&mut cfg);
+        assert!(cfg.features.disable.is_empty());
+    }
+
+    #[test]
+    fn cli_parses_comma_separated_specs_and_rejects_unknown() {
+        use clap::Parser;
+        let cli = Cli::try_parse_from(["ka", "--disable", "agents,mcp:github", "--sandbox", "fs"])
+            .unwrap();
+        assert_eq!(cli.disable, vec![spec("agents"), spec("mcp:github")]);
+        assert_eq!(cli.sandbox.as_deref(), Some("fs"));
+        assert!(
+            Cli::try_parse_from(["ka", "--disable", "bogus"]).is_err(),
+            "unknown specs fail at flag parse"
+        );
+        assert!(
+            Cli::try_parse_from(["ka", "--sandbox", "jail"]).is_err(),
+            "unknown sandbox modes fail at flag parse"
+        );
+        // the run subcommand carries the same grammar
+        let cli = Cli::try_parse_from(["ka", "run", "--disable", "skills", "do it"]).unwrap();
+        match cli.command {
+            Some(CliCommand::Run { disable, .. }) => {
+                assert_eq!(disable, vec![spec("skills")])
+            }
+            _ => panic!("expected run subcommand"),
+        }
+    }
 }
 
 #[cfg(test)]

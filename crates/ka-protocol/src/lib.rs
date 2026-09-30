@@ -50,6 +50,115 @@ pub enum Mode {
     Plan,
 }
 
+/// A feature-toggle selector — the one grammar shared by the
+/// `--disable`/`--enable` CLI flags, the `[features]` config table, the
+/// `/features` command, and the strand's change records. Bare words flip
+/// whole tiers; prefixed forms target one item (`mcp:<server>`,
+/// `skill:<name>`, `tool:<hand>`, `agent:<name>`). Serializes as the
+/// plain string form on the wire.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum FeatureSpec {
+    /// Subagents: the `delegate` + `tasks` hands.
+    Agents,
+    /// Skills: the skills block of the system prompt.
+    Skills,
+    /// Every MCP server (tools + prompts).
+    Mcp,
+    /// Config `[[hooks]]` + `.ka/hooks` file hooks.
+    Hooks,
+    /// The `web_search` + `web_fetch` hands.
+    Web,
+    /// The LSP hands tier.
+    Lsp,
+    /// The debug (DAP) hand.
+    Debug,
+    /// One MCP server by configured name.
+    McpServer(String),
+    /// One skill by name.
+    Skill(String),
+    /// One tool by hand name (`tool:bash`).
+    Tool(String),
+    /// One markdown subagent by name.
+    Agent(String),
+}
+
+impl std::fmt::Display for FeatureSpec {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            FeatureSpec::Agents => f.write_str("agents"),
+            FeatureSpec::Skills => f.write_str("skills"),
+            FeatureSpec::Mcp => f.write_str("mcp"),
+            FeatureSpec::Hooks => f.write_str("hooks"),
+            FeatureSpec::Web => f.write_str("web"),
+            FeatureSpec::Lsp => f.write_str("lsp"),
+            FeatureSpec::Debug => f.write_str("debug"),
+            FeatureSpec::McpServer(name) => write!(f, "mcp:{name}"),
+            FeatureSpec::Skill(name) => write!(f, "skill:{name}"),
+            FeatureSpec::Tool(name) => write!(f, "tool:{name}"),
+            FeatureSpec::Agent(name) => write!(f, "agent:{name}"),
+        }
+    }
+}
+
+impl std::str::FromStr for FeatureSpec {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let item = |prefix: &str| s.strip_prefix(prefix).map(str::to_string);
+        match s {
+            "agents" => Ok(FeatureSpec::Agents),
+            "skills" => Ok(FeatureSpec::Skills),
+            "mcp" => Ok(FeatureSpec::Mcp),
+            "hooks" => Ok(FeatureSpec::Hooks),
+            "web" => Ok(FeatureSpec::Web),
+            "lsp" => Ok(FeatureSpec::Lsp),
+            "debug" => Ok(FeatureSpec::Debug),
+            _ => {
+                let prefixed = [
+                    ("mcp:", FeatureSpec::McpServer as fn(String) -> FeatureSpec),
+                    ("skill:", FeatureSpec::Skill),
+                    ("tool:", FeatureSpec::Tool),
+                    ("agent:", FeatureSpec::Agent),
+                ]
+                .into_iter()
+                .find_map(|(prefix, mk)| item(prefix).filter(|n| !n.is_empty()).map(mk));
+                prefixed.ok_or_else(|| {
+                    format!(
+                        "unknown feature spec `{s}`: expected agents|skills|mcp|hooks|web|lsp|debug \
+                         or mcp:<server>|skill:<name>|tool:<name>|agent:<name>"
+                    )
+                })
+            }
+        }
+    }
+}
+
+impl Serialize for FeatureSpec {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&self.to_string())
+    }
+}
+
+impl<'de> Deserialize<'de> for FeatureSpec {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let raw = String::deserialize(deserializer)?;
+        raw.parse().map_err(serde::de::Error::custom)
+    }
+}
+
+impl schemars::JsonSchema for FeatureSpec {
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "FeatureSpec".into()
+    }
+
+    fn json_schema(_gen: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        schemars::json_schema!({
+            "type": "string",
+            "description": "Feature toggle: agents|skills|mcp|hooks|web|lsp|debug, or one item as mcp:<server>, skill:<name>, tool:<name>, agent:<name>."
+        })
+    }
+}
+
 /// Why a turn finished.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
@@ -234,6 +343,31 @@ pub enum Command {
         /// New mode.
         mode: Mode,
     },
+    /// Toggle a feature or capability for the rest of the session and the
+    /// strand (restored on resume). Disabling hides the capability from
+    /// the model's tool list and rejects stray calls; enabling may spawn
+    /// MCP servers / the LSP or debug tier on the spot. Never honored
+    /// under `--safe-mode` (bare mode pins everything off).
+    ///
+    /// TRUST INVARIANT: only the local surface may send this, like
+    /// [`Command::Shell`]. Remote surfaces (serve, ACP) must never
+    /// forward it — a forwarded enable/disable is configuration control
+    /// for whoever can reach the transport.
+    SetFeature {
+        /// What to toggle.
+        spec: FeatureSpec,
+        /// New state.
+        enabled: bool,
+    },
+    /// Switch the bash sandbox mode (`"off"` | `"fs"`). The `fs` policy is
+    /// recomputed from the config `[sandbox]` allowlist — unpersisted
+    /// session grants drop on `off`→`fs` (fresh-policy semantics).
+    ///
+    /// TRUST INVARIANT: local surface only, like [`Command::Shell`].
+    SetSandbox {
+        /// New mode, `"off"` or `"fs"`.
+        mode: String,
+    },
     /// Trigger a digest (manual compaction).
     Compact {
         /// Optional focus instructions for the summary.
@@ -298,6 +432,11 @@ pub enum Command {
         /// the stored value alone.
         #[serde(default)]
         mouse: Option<String>,
+        /// Default feature toggles to persist as `[features] disable` in
+        /// the user layer — the disabled specs, in the shared grammar.
+        /// None leaves the stored value alone. Additive.
+        #[serde(default)]
+        features: Option<Vec<String>>,
     },
     /// Ask for a context-usage breakdown (see [`Event::ContextBreakdown`]).
     ContextBreakdown,
@@ -494,6 +633,16 @@ pub enum Event {
         /// New mode.
         mode: Mode,
     },
+    /// Feature toggles changed (also emitted at attach when the strand
+    /// restores a non-default set). `disabled` is the full snapshot in
+    /// the shared spec grammar; `sandbox` is the live sandbox-mode
+    /// override for this session (None = follows config).
+    FeaturesChanged {
+        /// Disabled specs (full snapshot).
+        disabled: Vec<String>,
+        /// Live sandbox mode override, if any.
+        sandbox: Option<String>,
+    },
     /// Active model changed.
     ModelChanged {
         /// Selector that was applied.
@@ -515,6 +664,10 @@ pub enum Event {
         /// Advertised MCP prompts as `server/name (args)` (additive).
         #[serde(default)]
         prompts: Vec<String>,
+        /// Specs currently disabled by feature toggles, in the shared
+        /// grammar (additive: absent deserializes empty).
+        #[serde(default)]
+        disabled: Vec<String>,
     },
     /// The model's live todo list (the `todo` hand). Whole-list
     /// replacement: each event supersedes the previous one.
@@ -804,13 +957,21 @@ mod tests {
             effort: None,
             mode: None,
             mouse: Some("capture".into()),
+            features: None,
         });
         // older surfaces predating the mouse field still parse (additive)
         let legacy: Command =
             from_line(r#"{"type":"save_settings","model":null,"effort":null,"mode":null}"#)
                 .unwrap();
         assert!(
-            matches!(legacy, Command::SaveSettings { mouse: None, .. }),
+            matches!(
+                legacy,
+                Command::SaveSettings {
+                    mouse: None,
+                    features: None,
+                    ..
+                }
+            ),
             "{legacy:?}"
         );
         roundtrip_event(Event::Title {
@@ -870,6 +1031,7 @@ mod tests {
             agents: vec!["coder".into()],
             skills: vec!["rust-docs".into()],
             prompts: Vec::new(),
+            disabled: vec!["mcp:jira".into()],
         });
         roundtrip_event(Event::Todos {
             items: vec![
@@ -890,6 +1052,7 @@ mod tests {
             agents: Vec::new(),
             skills: Vec::new(),
             prompts: Vec::new(),
+            disabled: Vec::new(),
         });
     }
 
@@ -981,6 +1144,7 @@ mod tests {
                 agents,
                 skills,
                 prompts: _,
+                disabled,
             } => {
                 assert_eq!(
                     tools,
@@ -1000,6 +1164,10 @@ mod tests {
                 );
                 assert!(agents.is_empty());
                 assert_eq!(skills, vec!["demo".to_string()]);
+                assert!(
+                    disabled.is_empty(),
+                    "pre-toggle inventory lines must decode with no disabled specs"
+                );
             }
             other => panic!("expected inventory, got {other:?}"),
         }
@@ -1013,6 +1181,7 @@ mod tests {
             agents: Vec::new(),
             skills: Vec::new(),
             prompts: Vec::new(),
+            disabled: Vec::new(),
         })
         .unwrap();
         assert!(line.contains("\"type\":\"inventory\""), "got: {line}");
@@ -1027,5 +1196,95 @@ mod tests {
         })
         .unwrap();
         assert!(line.contains("\"type\":\"turn_started\""), "got: {line}");
+    }
+
+    #[test]
+    fn feature_spec_grammar_roundtrips() {
+        use std::str::FromStr;
+        for s in [
+            "agents",
+            "skills",
+            "mcp",
+            "hooks",
+            "web",
+            "lsp",
+            "debug",
+            "mcp:github",
+            "skill:pdf",
+            "tool:bash",
+            "agent:reviewer",
+        ] {
+            let spec = FeatureSpec::from_str(s).unwrap_or_else(|e| panic!("{s}: {e}"));
+            assert_eq!(spec.to_string(), s, "display/parse must be inverse");
+        }
+        for bad in ["", "agent:", "mcp:", "bogus", "tools:bash", "AGENTS"] {
+            assert!(
+                FeatureSpec::from_str(bad).is_err(),
+                "`{bad}` must not parse as a spec"
+            );
+        }
+    }
+
+    #[test]
+    fn set_feature_serializes_spec_as_bare_string() {
+        let line = to_line(&Command::SetFeature {
+            spec: FeatureSpec::McpServer("github".into()),
+            enabled: false,
+        })
+        .unwrap();
+        assert!(
+            line.contains("\"spec\":\"mcp:github\"") && line.contains("\"enabled\":false"),
+            "got: {line}"
+        );
+        let back: Command = from_line(&line).unwrap();
+        assert!(matches!(
+            back,
+            Command::SetFeature {
+                spec: FeatureSpec::McpServer(ref n),
+                enabled: false,
+            } if n == "github"
+        ));
+        // an unknown spec must fail decode, not silently pass through
+        assert!(
+            from_line::<Command>(r#"{"type":"set_feature","spec":"nope","enabled":true}"#).is_err()
+        );
+    }
+
+    #[test]
+    fn set_feature_and_set_sandbox_roundtrip() {
+        roundtrip_command(Command::SetFeature {
+            spec: FeatureSpec::Agents,
+            enabled: false,
+        });
+        roundtrip_command(Command::SetFeature {
+            spec: FeatureSpec::Tool("bash".into()),
+            enabled: true,
+        });
+        roundtrip_command(Command::SetSandbox { mode: "fs".into() });
+        roundtrip_command(Command::SetSandbox { mode: "off".into() });
+    }
+
+    #[test]
+    fn features_changed_wire_shape() {
+        let line = to_line(&Event::FeaturesChanged {
+            disabled: vec!["agents".into(), "mcp:github".into()],
+            sandbox: Some("fs".into()),
+        })
+        .unwrap();
+        assert!(
+            line.contains("\"type\":\"features_changed\""),
+            "got: {line}"
+        );
+        let back: Event = from_line(&line).unwrap();
+        match back {
+            Event::FeaturesChanged { disabled, sandbox } => {
+                assert_eq!(
+                    disabled,
+                    vec!["agents".to_string(), "mcp:github".to_string()]
+                );
+                assert_eq!(sandbox.as_deref(), Some("fs"));
+            }
+            other => panic!("expected features_changed, got {other:?}"),
+        }
     }
 }

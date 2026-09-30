@@ -18,6 +18,9 @@ use crate::voice::{GuardRuntime, Voice};
 /// The delegate tool: one hand over every discovered agent.
 pub struct DelegateHand {
     agents: Vec<AgentDef>,
+    /// Shared feature toggles: `agent:<name>` drops an agent from the
+    /// roster (def + execute) without touching the others.
+    features: crate::features::FeatureSlot,
     /// Shared catalog/model bootstrap (the engine-owned pathfinder slot —
     /// the single source of truth for the nested voices' speaker).
     source: Arc<parking_lot::RwLock<super::pathfinder::PathfinderSource>>,
@@ -37,14 +40,25 @@ impl DelegateHand {
         parent_mode: ka_protocol::Mode,
         tasks: Arc<super::tasks::AgentTaskTable>,
         events: mpsc::Sender<ka_protocol::Event>,
+        features: crate::features::FeatureSlot,
     ) -> Self {
         Self {
             agents,
+            features,
             source,
             parent_mode,
             tasks,
             events,
         }
+    }
+
+    /// Agents visible to the model right now (`agent:<name>` toggles).
+    fn visible(&self) -> Vec<&AgentDef> {
+        let features = self.features.read();
+        self.agents
+            .iter()
+            .filter(|a| features.agent_enabled(&a.name))
+            .collect()
     }
 
     fn find(&self, name: &str) -> Option<&AgentDef> {
@@ -54,10 +68,13 @@ impl DelegateHand {
 
 impl Hand for DelegateHand {
     fn def(&self) -> HandDef {
+        // the roster reflects live `agent:<name>` toggles: disabled
+        // agents vanish from the listing and the enums alike
+        let agents = self.visible();
         let mut listing = String::from(
             "Delegate a self-contained subtask to a named subagent. Available agents:\n",
         );
-        for a in &self.agents {
+        for a in &agents {
             let desc = if a.description.is_empty() {
                 "(no description)"
             } else {
@@ -85,7 +102,7 @@ track it with the tasks tool.",
                 "properties": {
                     "agent": {
                         "type": "string",
-                        "enum": self.agents.iter().map(|a| a.name.clone()).collect::<Vec<_>>(),
+                        "enum": agents.iter().map(|a| a.name.clone()).collect::<Vec<_>>(),
                         "description": "Which agent to run (required unless `tasks` is given)"
                     },
                     "task": {
@@ -103,7 +120,7 @@ track it with the tasks tool.",
                             "properties": {
                                 "agent": {
                                     "type": "string",
-                                    "enum": self.agents.iter().map(|a| a.name.clone()).collect::<Vec<_>>(),
+                                    "enum": agents.iter().map(|a| a.name.clone()).collect::<Vec<_>>(),
                                     "description": "Which agent to run"
                                 },
                                 "task": {
@@ -147,12 +164,19 @@ track it with the tasks tool.",
                 return ToolOutput::err("delegate: missing required 'task'");
             };
             let Some(def) = self.find(agent_name) else {
-                let known: Vec<String> = self.agents.iter().map(|a| a.name.clone()).collect();
+                let known: Vec<String> =
+                    self.visible().into_iter().map(|a| a.name.clone()).collect();
                 return ToolOutput::err(format!(
                     "delegate: unknown agent '{agent_name}' (known: {})",
                     known.join(", ")
                 ));
             };
+            if !self.features.read().agent_enabled(agent_name) {
+                return ToolOutput::err(format!(
+                    "delegate: agent '{agent_name}' is disabled by a session feature toggle \
+                     (`agent:{agent_name}`); it is unavailable until the user re-enables it"
+                ));
+            }
             // background: register, spawn, return immediately — the
             // model tracks it via the tasks hand (single tasks only)
             if args.get("background").and_then(Value::as_bool) == Some(true) {
@@ -253,13 +277,18 @@ impl DelegateHand {
                 return ToolOutput::err(format!("delegate: tasks[{i}] needs a 'task'"));
             };
             match self.find(name) {
-                Some(def) => picked.push(Ok(FanoutJob {
-                    def: def.clone(),
-                    task: task.to_string(),
-                    cwd: ctx.cwd.clone(),
-                    source: self.source.read().clone(),
-                    parent_mode: self.parent_mode,
-                })),
+                Some(def) if self.features.read().agent_enabled(name) => {
+                    picked.push(Ok(FanoutJob {
+                        def: def.clone(),
+                        task: task.to_string(),
+                        cwd: ctx.cwd.clone(),
+                        source: self.source.read().clone(),
+                        parent_mode: self.parent_mode,
+                    }))
+                }
+                Some(_) => picked.push(Err(format!(
+                    "agent '{name}' is disabled by a session feature toggle"
+                ))),
                 None => picked.push(Err(format!("unknown agent '{name}'"))),
             }
         }
@@ -701,7 +730,45 @@ mod tests {
             ka_protocol::Mode::Free,
             crate::hands::tasks::AgentTaskTable::new(),
             events,
+            crate::features::FeatureToggles::slot(Vec::new()),
         )
+    }
+
+    #[tokio::test]
+    async fn agent_toggle_drops_one_agent_from_the_roster() {
+        let h = hand();
+        h.features
+            .write()
+            .set(&ka_protocol::FeatureSpec::Agent("reviewer".into()), false);
+        let d = h.def();
+        assert!(!d.description.contains("reviewer"), "{}", d.description);
+        assert!(d.description.contains("scout"));
+        let schema = serde_json::to_string(&d.parameters).unwrap();
+        assert!(!schema.contains("reviewer"), "enum must drop it too");
+        // execute rejects the disabled agent by name
+        let out = h
+            .execute(
+                &serde_json::json!({"agent": "reviewer", "task": "x"}),
+                &ctx_for(),
+            )
+            .await;
+        assert!(
+            out.content.contains("disabled by a session feature toggle"),
+            "{}",
+            out.content
+        );
+        // fanout reports it inline instead of running it
+        let out = h
+            .execute(
+                &serde_json::json!({"tasks": [{"agent": "scout", "task": "x"}, {"agent": "reviewer", "task": "y"}]}),
+                &ctx_for(),
+            )
+            .await;
+        assert!(
+            out.content.contains("disabled by a session feature toggle"),
+            "{}",
+            out.content
+        );
     }
 
     fn ctx_for() -> HandContext {

@@ -958,31 +958,46 @@ impl crate::hands::Hand for McpHand {
 /// stands in for every server's tools, so a fleet of MCP servers costs
 /// one tool definition instead of dozens. Omitting `tool` lists a
 /// server's tools; with `tool` it invokes. Same exec-tier gate as the
-/// eager per-tool hands.
+/// eager per-tool hands. Per-server feature toggles (`mcp:<name>`)
+/// filter the listing and reject calls at execute time.
 pub struct McpCallHand {
     servers: Vec<McpShared>,
+    features: crate::features::FeatureSlot,
 }
 
 impl McpCallHand {
     /// One hand over every connected server.
-    pub fn new(servers: Vec<McpShared>) -> Self {
-        Self { servers }
+    pub fn new(servers: Vec<McpShared>, features: crate::features::FeatureSlot) -> Self {
+        Self { servers, features }
+    }
+
+    /// Servers visible to the model right now.
+    fn visible(&self) -> Vec<&McpShared> {
+        let features = self.features.read();
+        self.servers
+            .iter()
+            .filter(|s| features.server_enabled(s.name()))
+            .collect()
     }
 
     fn find(&self, server: &str) -> Result<&McpShared, String> {
-        self.servers
-            .iter()
-            .find(|s| s.name() == server)
-            .ok_or_else(|| {
-                format!(
-                    "mcp_call: no such server {server:?} (have: {})",
-                    self.servers
-                        .iter()
-                        .map(|s| s.name())
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                )
-            })
+        if let Some(shared) = self.servers.iter().find(|s| s.name() == server) {
+            if !self.features.read().server_enabled(server) {
+                return Err(format!(
+                    "mcp_call: server {server:?} is disabled by a session feature toggle \
+                     (`mcp:{server}`); it is unavailable until the user re-enables it"
+                ));
+            }
+            return Ok(shared);
+        }
+        Err(format!(
+            "mcp_call: no such server {server:?} (have: {})",
+            self.visible()
+                .iter()
+                .map(|s| s.name())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ))
     }
 }
 
@@ -992,7 +1007,7 @@ impl crate::hands::Hand for McpCallHand {
             "Call a tool on a configured MCP server (external execution). Omit `tool` \
              to list that server's tools first. Servers: ",
         );
-        for s in &self.servers {
+        for s in self.visible() {
             listing.push_str(&format!("{} ({} tools), ", s.name(), s.tools().len()));
         }
         crate::hands::HandDef {
@@ -1073,31 +1088,37 @@ fn truncate_chars(s: &str, cap: usize) -> String {
 
 /// The built-in `mcp` meta-hand: browse server resources and prompts
 /// without burning a model turn on discovery. Read-clearance: listing
-/// and reading never mutate server state.
+/// and reading never mutate server state. Per-server feature toggles
+/// (`mcp:<name>`) filter the listing and reject calls at execute time.
 pub struct McpMetaHand {
     servers: Vec<McpShared>,
+    features: crate::features::FeatureSlot,
 }
 
 impl McpMetaHand {
     /// One hand over every connected server.
-    pub fn new(servers: Vec<McpShared>) -> Self {
-        Self { servers }
+    pub fn new(servers: Vec<McpShared>, features: crate::features::FeatureSlot) -> Self {
+        Self { servers, features }
     }
 
     fn find(&self, server: &str) -> Result<&McpShared, String> {
-        self.servers
-            .iter()
-            .find(|s| s.name() == server)
-            .ok_or_else(|| {
-                format!(
-                    "mcp: no such server {server:?} (have: {})",
-                    self.servers
-                        .iter()
-                        .map(|s| s.name())
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                )
-            })
+        if let Some(shared) = self.servers.iter().find(|s| s.name() == server) {
+            if !self.features.read().server_enabled(server) {
+                return Err(format!(
+                    "mcp: server {server:?} is disabled by a session feature toggle \
+                     (`mcp:{server}`); it is unavailable until the user re-enables it"
+                ));
+            }
+            return Ok(shared);
+        }
+        Err(format!(
+            "mcp: no such server {server:?} (have: {})",
+            self.servers
+                .iter()
+                .map(|s| s.name())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ))
     }
 }
 

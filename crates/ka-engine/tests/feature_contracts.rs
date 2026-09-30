@@ -432,7 +432,10 @@ fn conditional_hands_contract() {
     );
 
     // MCP lazy front-hand
-    let mcp = ka_engine::mcp::McpCallHand::new(Vec::new());
+    let mcp = ka_engine::mcp::McpCallHand::new(
+        Vec::new(),
+        ka_engine::features::FeatureToggles::slot(Vec::new()),
+    );
     let d = mcp.def();
     assert_eq!(d.name, "mcp_call");
     assert_eq!(d.clearance, hands::Clearance::Exec);
@@ -465,6 +468,7 @@ fn conditional_hands_contract() {
         ka_protocol::Mode::Free,
         hands::tasks::AgentTaskTable::new(),
         evt_tx,
+        ka_engine::features::FeatureToggles::slot(Vec::new()),
     )
     .def();
     assert_eq!(d.name, "delegate");
@@ -539,6 +543,9 @@ fn config_schema_carries_every_documented_key() {
         // Phase 9 (2026-09-29): sandbox expansion, auto-review, loop rule
         "allow_write",
         "auto_review",
+        // Phase 10: runtime feature toggles
+        "features",
+        "disable",
     ] {
         assert!(
             schema.contains(&format!("\"{key}\"")),
@@ -1124,6 +1131,7 @@ async fn background_delegate_registers_and_reports() {
         ka_protocol::Mode::Free,
         table.clone(),
         note_tx,
+        voice.feature_slot(),
     )));
     let events = run_turn(&mut voice, "delegate it", None).await;
     let outs = outputs_of(&events, "delegate");

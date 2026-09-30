@@ -8,6 +8,7 @@ pub mod config;
 pub mod conventions;
 pub mod dap;
 mod engine;
+pub mod features;
 mod fshooks;
 pub mod hands;
 pub mod lsp;

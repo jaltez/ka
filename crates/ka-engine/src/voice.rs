@@ -269,6 +269,15 @@ pub struct Voice {
     /// `allowed-tools`); None = the session toolset. Set by the engine
     /// around one turn, cleared after.
     turn_tools: Option<Vec<String>>,
+    /// Session feature toggles, shared with the hands that validate
+    /// dynamically (delegate roster, lazy MCP calls). Filtering happens
+    /// in `specs()` (hide) and `admit_call` (reject strays).
+    features: crate::features::FeatureSlot,
+    /// Feature/sandbox commands that arrived mid-turn: the cheap part
+    /// (hide/deny layer) applied immediately, the side effects
+    /// (spawn/strand record/inventory) are the engine's to run once the
+    /// turn settles. Drained by the engine after each turn.
+    pending_features: parking_lot::Mutex<Vec<Command>>,
 }
 
 impl Voice {
@@ -330,6 +339,8 @@ impl Voice {
             auto_review: false,
             reviewer_model: None,
             turn_tools: None,
+            features: crate::features::FeatureToggles::slot(Vec::new()),
+            pending_features: parking_lot::Mutex::new(Vec::new()),
         }
     }
 
@@ -364,6 +375,91 @@ impl Voice {
     /// bootstrap: the delegate hand, MCP hands). Bootstrap inventory.
     pub fn hand_names(&self) -> Vec<String> {
         self.hands.iter().map(|h| h.def().name).collect()
+    }
+
+    /// Tool names the model can see right now: the registry minus
+    /// feature-toggled hands. This is what re-emitted inventory cards
+    /// report after a toggle change.
+    pub fn visible_hand_names(&self) -> Vec<String> {
+        let features = self.features.read();
+        self.hands
+            .iter()
+            .map(|h| h.def().name)
+            .filter(|n| features.hidden_reason(n).is_none())
+            .collect()
+    }
+
+    /// Replace every hand named `name` with `hands` in registry order
+    /// (appending when absent). Used to rebuild the lazy `mcp_call` /
+    /// meta hands when the connected-server set changes.
+    pub fn replace_named_hands(&mut self, name: &str, hands: Vec<std::sync::Arc<dyn Hand>>) {
+        let mut result: Vec<std::sync::Arc<dyn Hand>> = Vec::with_capacity(self.hands.len());
+        let mut replaced = false;
+        for h in self.hands.drain(..) {
+            if h.def().name == name {
+                if !replaced {
+                    replaced = true;
+                    result.extend(hands.iter().cloned());
+                }
+            } else {
+                result.push(h);
+            }
+        }
+        if !replaced && !hands.is_empty() {
+            result.extend(hands);
+        }
+        self.hands = result;
+    }
+
+    /// The shared feature-toggle slot (engine bootstrap: hands that
+    /// validate dynamically hold a clone).
+    pub fn feature_slot(&self) -> crate::features::FeatureSlot {
+        self.features.clone()
+    }
+
+    /// Install the engine-primed toggle slot (bootstrap: replaces the
+    /// fresh all-on slot before hands that share it are constructed).
+    pub fn set_feature_slot(&mut self, slot: crate::features::FeatureSlot) {
+        self.features = slot;
+    }
+
+    /// Apply one feature toggle to the live set (returns whether it
+    /// changed anything). Spawn/suspend side effects are the engine's.
+    pub fn set_feature(&mut self, spec: &ka_protocol::FeatureSpec, enabled: bool) -> bool {
+        self.features.write().set(spec, enabled)
+    }
+
+    /// Replace the whole toggle snapshot (strand restore). Live MCP
+    /// server names are preserved — they describe the world, not the
+    /// toggles.
+    pub fn restore_feature_snapshot(
+        &mut self,
+        disabled: Vec<ka_protocol::FeatureSpec>,
+        sandbox: Option<String>,
+    ) {
+        self.features.write().replace_snapshot(disabled, sandbox);
+    }
+
+    /// The current toggle snapshot: disabled specs + sandbox override.
+    pub fn features_snapshot(&self) -> (Vec<String>, Option<String>) {
+        let f = self.features.read();
+        (f.disabled_specs(), f.sandbox_override().map(str::to_string))
+    }
+
+    /// Whether hooks run at all (the `hooks` feature toggle). Engine
+    /// pre/post-turn file hooks consult this.
+    pub fn hooks_enabled(&self) -> bool {
+        self.features.read().hooks_enabled()
+    }
+
+    /// Feature/sandbox commands buffered mid-turn, for the engine to
+    /// replay through the full handler once the turn settles.
+    pub(crate) fn take_pending_features(&self) -> Vec<Command> {
+        std::mem::take(&mut *self.pending_features.lock())
+    }
+
+    fn buffer_feature_cmd(&self, cmd: Command) {
+        self.pending_features.lock().push(cmd);
     }
 
     /// Share the snapshot journal (engine-side undo + strand tracking).
@@ -436,6 +532,8 @@ impl Voice {
             auto_review: false,
             reviewer_model: None,
             turn_tools: None,
+            features: crate::features::FeatureToggles::slot(Vec::new()),
+            pending_features: parking_lot::Mutex::new(Vec::new()),
         }
     }
 
@@ -676,12 +774,16 @@ impl Voice {
     /// Run matching hooks for one event. Returns Err(reason) when a
     /// pre_tool_use hook blocked the call (exit 2, stderr as reason);
     /// Ok(steering) carries stdout steering when a hook emitted it.
+    /// The `hooks` feature toggle silences every hook class.
     async fn run_hooks(
         &self,
         event: crate::config::HookEvent,
         tool: &str,
         args: &serde_json::Value,
     ) -> Result<Option<crate::fshooks::Steering>, String> {
+        if !self.features.read().hooks_enabled() {
+            return Ok(None);
+        }
         run_hook_scripts(&self.hooks_cfg, event, tool, args, &self.hand_ctx.cwd).await
     }
 
@@ -718,6 +820,9 @@ impl Voice {
             "error" => Stop::Error,
             _ => Stop::Done,
         };
+        if !self.features.read().hooks_enabled() {
+            return;
+        }
         for event in [
             crate::config::HookEvent::Stop,
             crate::config::HookEvent::TurnEnd,
@@ -748,6 +853,9 @@ impl Voice {
         payload: serde_json::Value,
         events: &mpsc::Sender<Event>,
     ) {
+        if !self.features.read().hooks_enabled() {
+            return;
+        }
         let (failures, steer) =
             run_event_scripts(&self.hooks_cfg, event, &payload, &self.hand_ctx.cwd).await;
         for reason in failures {
@@ -1374,10 +1482,13 @@ impl Voice {
     }
 
     fn specs(&self) -> Vec<ToolSpec> {
-        // a per-turn allowlist (custom-command `allowed-tools`) filters
-        // what the model is offered for this turn
+        // two filters stack: session feature toggles hide disabled
+        // capabilities outright, and a per-turn allowlist
+        // (custom-command `allowed-tools`) narrows what remains
+        let features = self.features.read();
         self.hands
             .iter()
+            .filter(|h| features.hidden_reason(&h.def().name).is_none())
             .filter(|h| {
                 self.turn_tools
                     .as_ref()
@@ -1521,8 +1632,22 @@ impl Voice {
                 ));
             }
         }
-        // skills: progressive disclosure — names/descriptions/paths only
-        let skills = crate::conventions::discover_skills(&self.hand_ctx.cwd);
+        // skills: progressive disclosure — names/descriptions/paths only.
+        // The whole block drops when `skills` is toggled off; individual
+        // skills drop by name. (Guard scoped: the turn loop below needs
+        // `&mut self` back.)
+        let skills = {
+            let features = self.features.read();
+            let discovered = if features.skills_enabled() {
+                crate::conventions::discover_skills(&self.hand_ctx.cwd)
+            } else {
+                Vec::new()
+            };
+            discovered
+                .into_iter()
+                .filter(|sk| features.skill_enabled(&sk.name))
+                .collect::<Vec<_>>()
+        };
         if !skills.is_empty() {
             system.push_str("\nAvailable skills (read the SKILL.md path with the read tool before using one):\n");
             for sk in &skills {
@@ -1641,6 +1766,24 @@ attempt implementation — the user will review and switch to build mode.",
                             Some(Command::SetMode { mode }) => {
                                 self.mode = mode;
                                 events.send(Event::ModeChanged { mode }).await.ok();
+                            }
+                            // feature toggles mid-turn: the cheap half
+                            // (hide from the next model round-trip +
+                            // reject stragglers) applies immediately;
+                            // the side-effect half (spawn/strand/
+                            // inventory) is the engine's, once the turn
+                            // settles. Sandboxes only buffer — swapping
+                            // the policy mid-turn would race in-flight
+                            // bash calls.
+                            Some(Command::SetFeature { spec, enabled }) => {
+                                self.set_feature(&spec, enabled);
+                                self.buffer_feature_cmd(Command::SetFeature {
+                                    spec,
+                                    enabled,
+                                });
+                            }
+                            Some(cmd @ Command::SetSandbox { .. }) => {
+                                self.buffer_feature_cmd(cmd);
                             }
                             Some(_) => {}
                         }
@@ -2256,6 +2399,18 @@ attempt implementation — the user will review and switch to build mode.",
             self.surface_decided(call, &output, events).await;
             return Err(output);
         };
+        // session feature toggles: specs() already hid these; this guard
+        // rejects strays (a stale step, a hallucinated name) by naming
+        // the toggle so the model stops reaching for the tool
+        let hidden_by = self.features.read().hidden_reason(&call.tool);
+        if let Some(spec) = hidden_by {
+            let output = ToolOutput::err(format!(
+                "{} is disabled by a session feature toggle (`{spec}`); it is unavailable until the user re-enables it",
+                call.tool
+            ));
+            self.surface_decided(call, &output, events).await;
+            return Err(output);
+        }
         // per-turn allowlist (custom-command `allowed-tools`): the spec
         // filter already hides these from the model; this guard catches
         // strays (a stale step, a racing call)
@@ -2526,26 +2681,30 @@ attempt implementation — the user will review and switch to build mode.",
         }
         // convention pre-tool hook: non-zero exit vetoes the call;
         // clean-exit stdout steers the mode for subsequent calls (the
-        // veto position — after the gate — is unchanged)
-        match crate::fshooks::run(
-            crate::fshooks::HookPoint::PreTool,
-            &self.hand_ctx.cwd,
-            Some(&call.tool),
-        )
-        .await
-        {
-            Err(reason) => {
-                events
-                    .send(Event::Note {
-                        message: reason.clone(),
-                    })
-                    .await
-                    .ok();
-                let output = ToolOutput::err(format!("blocked by pre-tool hook: {reason}"));
-                self.surface_decided(call, &output, events).await;
-                return Err(output);
+        // veto position — after the gate — is unchanged). Silenced by
+        // the `hooks` feature toggle like every other hook class.
+        let hooks_on = self.features.read().hooks_enabled();
+        if hooks_on {
+            match crate::fshooks::run(
+                crate::fshooks::HookPoint::PreTool,
+                &self.hand_ctx.cwd,
+                Some(&call.tool),
+            )
+            .await
+            {
+                Err(reason) => {
+                    events
+                        .send(Event::Note {
+                            message: reason.clone(),
+                        })
+                        .await
+                        .ok();
+                    let output = ToolOutput::err(format!("blocked by pre-tool hook: {reason}"));
+                    self.surface_decided(call, &output, events).await;
+                    return Err(output);
+                }
+                Ok(steer) => self.apply_steering(steer, events).await,
             }
-            Ok(steer) => self.apply_steering(steer, events).await,
         }
         // the call survived every veto: only now does the grant attach
         if let Some(g) = pending {
@@ -2824,6 +2983,12 @@ attempt implementation — the user will review and switch to build mode.",
             };
         }
         if self.state.rules.contains(&format!("tool:{}", call.tool)) {
+            return Gate::Allow;
+        }
+        // `[permissions] allow`: the config-authored persistent
+        // allowlist, same standing as a session "always" — protected
+        // paths and deny rules outrank it (both checked above)
+        if self.allowed_tools.iter().any(|t| t == &call.tool) {
             return Gate::Allow;
         }
         match clearance {
@@ -6288,6 +6453,58 @@ mod tests {
         assert!(
             matches!(gate, Gate::Allow),
             "rule allows ordinary write: {gate:?}"
+        );
+    }
+
+    #[test]
+    fn permissions_allow_skips_the_ask_without_touching_protection() {
+        use ka_dialect::speaker::ToolCall;
+        let catalog = Catalog::parse(
+            "[dialects.\"test/m\"]\nwire = \"openai_chat\"\nbase_url = \"http://127.0.0.1:1\"\ncontext = 1000000\n",
+        )
+        .unwrap();
+        // guarded mode: writes normally ask, exec normally asks
+        let mut voice = Voice::new(catalog, std::env::temp_dir(), ka_protocol::Mode::Guarded, 5);
+        // `[permissions] allow = ["write"]` — the documented persistent
+        // allowlist ("skip the permission ask") is enforced at the gate
+        voice.set_allowed_tools(vec!["write".to_string()]);
+        let call = ToolCall {
+            id: "c1".into(),
+            tool: "write".into(),
+            arguments: serde_json::json!({"path": "src/main.rs"}),
+        };
+        assert!(
+            matches!(
+                voice.gate(crate::hands::Clearance::Write, &call),
+                Gate::Allow
+            ),
+            "allowlisted tool skips the ask in guarded mode"
+        );
+        // a non-allowlisted tool still asks
+        let call = ToolCall {
+            id: "c2".into(),
+            tool: "edit".into(),
+            arguments: serde_json::json!({"path": "src/main.rs"}),
+        };
+        assert!(
+            matches!(
+                voice.gate(crate::hands::Clearance::Write, &call),
+                Gate::Ask { .. }
+            ),
+            "non-allowlisted write still asks"
+        );
+        // protected paths outrank the allowlist (checked first)
+        let call = ToolCall {
+            id: "c3".into(),
+            tool: "write".into(),
+            arguments: serde_json::json!({"path": ".git/hooks/pre-commit"}),
+        };
+        assert!(
+            matches!(
+                voice.gate(crate::hands::Clearance::Write, &call),
+                Gate::Ask { .. }
+            ),
+            "protected path must ask even when allowlisted"
         );
     }
 

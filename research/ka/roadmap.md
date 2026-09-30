@@ -197,6 +197,29 @@ Order: 9.1 → 9.6 in sequence; 9.7 is filler and never blocks.
 
 **Exit:** approval fatigue measurably reduced on trusted repos — sandbox denials become one-shot grant asks, exec asks are pre-reviewed when opted in, hooks lint/patch/pre-approve, Claude Code switchers import in one command — and a second terminal can watch a session live, at ≤ 10 MB musl with zero new dependencies. **Met 2026-09-29: zero new workspace dependencies; `cargo xtask ci` green (fmt, clippy -D warnings incl. unwrap/expect denies, all contract suites).**
 
+## Phase 10 — Runtime Feature Toggles (ratified 2026-09-30)
+
+One spec grammar — `agents | skills | mcp | hooks | web | lsp | debug`, `mcp:<server>`, `skill:<name>`, `tool:<hand>`, `agent:<name>` — shared by four surfaces: `--disable`/`--enable` CLI flags, the strict `[features] disable` config table, the TUI's `/features` command + panel, and the strand's `Change` snapshot (restored on resume, like model/mode). Sandbox mode is a value knob (`/sandbox off|fs`, `--sandbox`, existing `[sandbox] mode`), not on/off grammar.
+
+Design invariants:
+- **Fail-closed disable**: hidden from the model-facing specs AND rejected by name at admit time (a hallucinated call cannot reach it); per-item forms hold inside the dynamic hands (delegate roster, lazy `mcp_call` server validation) so their def()/execute() stay truthful.
+- **Disable = hide, not kill**: processes (MCP servers, LSP, debug) stay up until session end — killing MCP children would fight the reconnect watchdog; enabling never-started servers reuses the extracted bootstrap spawns (`ensure_mcp_server`, LSP/debug starts) and runs them live.
+- **Mid-turn semantics**: the voice's command select applies the cheap hide/deny layer immediately (next model round-trip) and buffers the command; the engine replays spawn/strand/inventory side effects when the turn settles — "next prompts can't use them", never a mid-turn policy race.
+- **Bare mode outranks everything**: `--safe-mode` refuses every enable and every sandbox widen; no toggle can re-widen a safe-mode session.
+- **Local-trust commands**: `SetFeature`/`SetSandbox` ride the `Shell` trust invariant — serve/ACP never forward them (serve constructs a fixed `Command::Prompt` only, so the boundary is structural).
+- **Snapshot semantics on the strand**: `Record::Change` carries the full disabled set + sandbox mode (presence replaces); specs that no longer parse in old strands skip with a note.
+
+Shipped with:
+- **[M]** Protocol: `FeatureSpec` (serde as the plain string), `Command::SetFeature`/`SetSandbox`, `Event::FeaturesChanged`, `Event::Inventory.disabled` (additive; the inventory re-emits after every change), `Command::SaveSettings.features` (the panel's `s` saves the default).
+- **[M]** Config: `[features] disable` (strict; specs validated at bootstrap — unknown spec = hard error naming it); overlay + schema contracts extended; `every_documented_setting_survives_the_overlay` covers it.
+- **[M]** Bug fix folded in: `[permissions] allow` was documented ("skip the ask") but never read at the gate — now an allow source at the same standing as a session "always" (protected paths and deny rules still outrank it).
+- **[M]** TUI: `/features` panel (↑↓/⏎/`s`/esc; sections for features, sandbox, tools, MCP servers, skills, agents; a superset of ever-seen tools keeps hidden ones re-enableable), `/sandbox off|fs`, `⊘ N` status badge, transcript card only on the first inventory (re-emits are silent).
+- Tests: `feature_toggle_contract.rs` (hide/deny/restore/resume, config baseline, per-tool, skills prompt block, hooks silenced, sandbox swap, MCP spawn-on-enable with the failure named), bare-mode refusal contract, strand snapshot replay, protocol serde fixtures, `parse_specs` validation, CLI flag merge + clap validation.
+
+Known limitation (pre-existing, out of scope): `ka serve`/`acp` spawn with `Config::default()` and never load the config chain — runtime toggles still work there over the protocol, but the `[features]` baseline does not apply.
+
+**Exit:** every capability is switchable at start or mid-conversation with one grammar, strand-persisted and fail-closed, at zero new dependencies.
+
 ## Non-goals (explicit, permanent)
 No in-process plugin runtime · no vector DB / semantic indexing · no browser or computer control · no image gen / TTS / voice · no enterprise/MDM/team/cloud tier · no telemetry beyond optional local logs · no eval kernels · **no subscription OAuth in core** (`ka-passport` crate may add it later).
 

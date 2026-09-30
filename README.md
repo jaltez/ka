@@ -120,6 +120,49 @@ footer). `GET /sessions` lists every session with presence + title,
 observers have no prompt route; `POST /sessions/{id}/prompt` remains the
 only writer API.
 
+## Runtime feature toggles
+
+One grammar decides what the model can use — set at startup (flags,
+`[features]`) or flipped mid-session (`/features`, `/sandbox`). Every
+change is recorded on the strand and restored on resume, exactly like
+model and mode:
+
+```
+agents | skills | mcp | hooks | web | lsp | debug          # whole features
+mcp:<server> · skill:<name> · tool:<hand> · agent:<name>   # single items
+```
+
+- Disabling is fail-closed: the capability vanishes from the model's
+  tool list **and** a stray call is rejected naming the toggle — it
+  cannot be reached even by guessing the name.
+- Enabling restores it. An MCP server disabled at startup spawns on the
+  spot; so do the LSP and debug tiers when configured.
+- Toggles land between turns. Sent mid-turn, the hide applies to the
+  next model round-trip inside that turn and the side effects (spawn,
+  strand record, inventory) settle with it.
+- `--safe-mode` outranks every toggle — nothing it disables can be
+  re-enabled until restart.
+
+```sh
+ka --disable agents,mcp:github   # no subagents, one server off
+ka --disable tool:bash           # a session that cannot run commands
+ka --enable mcp:github           # re-enable over a [features] disable
+```
+
+```toml
+[features]
+disable = ["agents", "skill:pdf", "tool:bash"]
+```
+
+In the TUI, `/features` opens the panel (↑↓ choose · ⏎ toggle · `s`
+saves the current set as your user-layer default); `/features off
+mcp:github` toggles directly. `/sandbox off|fs` switches the bash
+sandbox live — the `fs` policy is recomputed from `[sandbox]
+allow_write`, so unpersisted session grants drop on off→fs. The status
+bar shows `⊘ N` while N specs are disabled. Precedence: flags → resumed
+strand → `[features]` → defaults. The `hooks` toggle silences config
+`[[hooks]]` and `.ka/hooks` alike; disabling a tier never weakens the
+permission tiers — it only removes capabilities.
 
 ## Sandbox & LSP
 

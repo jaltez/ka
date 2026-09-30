@@ -363,6 +363,18 @@ pub struct Fallback {
     pub models: Vec<String>,
 }
 
+/// Runtime feature toggles ([features]). The same spec grammar as the
+/// `--disable`/`--enable` CLI flags and the `/features` command.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields, default)]
+pub struct Features {
+    /// Specs to disable at startup: `agents`, `skills`, `mcp`, `hooks`,
+    /// `web`, `lsp`, `debug`, or one item as `mcp:<server>`,
+    /// `skill:<name>`, `tool:<hand>`, `agent:<name>`. Unknown specs are
+    /// a hard startup error.
+    pub disable: Vec<String>,
+}
+
 /// Engine configuration. All fields optional at the data level; resolution
 /// order is applied by [`Config::overlay`] consumers.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
@@ -431,6 +443,9 @@ pub struct Config {
     /// Post-edit verification ([verify]).
     #[serde(default)]
     pub verify: Verify,
+    /// Runtime feature toggles ([features]).
+    #[serde(default)]
+    pub features: Features,
 }
 
 impl Config {
@@ -542,6 +557,9 @@ impl Config {
         }
         if other.tui.header_glyph.is_some() {
             self.tui.header_glyph = other.tui.header_glyph;
+        }
+        if !other.features.disable.is_empty() {
+            self.features.disable = other.features.disable;
         }
     }
     /// Effective step cap (default 20).
@@ -730,8 +748,9 @@ pub fn save_user_settings(
     effort: Option<Effort>,
     mode: Option<Mode>,
     mouse: Option<&str>,
+    features: Option<&[String]>,
 ) -> Result<std::path::PathBuf, String> {
-    save_settings_to(&user_config_path(), model, effort, mode, mouse)
+    save_settings_to(&user_config_path(), model, effort, mode, mouse, features)
 }
 
 /// [`save_user_settings`] against an explicit path (tests, layers).
@@ -741,6 +760,7 @@ pub fn save_settings_to(
     effort: Option<Effort>,
     mode: Option<Mode>,
     mouse: Option<&str>,
+    features: Option<&[String]>,
 ) -> Result<std::path::PathBuf, String> {
     let mut layer = std::fs::read_to_string(path)
         .ok()
@@ -765,6 +785,9 @@ pub fn save_settings_to(
             ));
         }
         layer.tui.mouse = Some(mouse.to_string());
+    }
+    if let Some(features) = features {
+        layer.features.disable = features.to_vec();
     }
     let mut text = String::from("# ka user config — written by /settings\n\n");
     text.push_str(&toml::to_string_pretty(&layer).map_err(|e| e.to_string())?);
@@ -845,6 +868,7 @@ mod tests {
             Some(Effort::High),
             Some(Mode::Free),
             None,
+            None,
         )
         .unwrap();
         let text = std::fs::read_to_string(&path).unwrap();
@@ -866,7 +890,7 @@ mod tests {
         std::fs::write(&path, "model = \"a/x\"\n[tui]\nbell = false\n").unwrap();
         // /mouse toggled to native: the key lands under [tui], the
         // unrelated bell setting survives
-        save_settings_to(&path, None, None, None, Some("native")).unwrap();
+        save_settings_to(&path, None, None, None, Some("native"), None).unwrap();
         let layer = Config::parse_layer(&std::fs::read_to_string(&path).unwrap(), "saved").unwrap();
         assert_eq!(layer.tui.mouse.as_deref(), Some("native"));
         assert_eq!(layer.tui.bell, Some(false), "unrelated [tui] keys survive");
@@ -876,18 +900,18 @@ mod tests {
             "native parses back as uncaptured"
         );
         // toggling back rewrites the value (no [tui] duplication)
-        save_settings_to(&path, None, None, None, Some("capture")).unwrap();
+        save_settings_to(&path, None, None, None, Some("capture"), None).unwrap();
         let layer = Config::parse_layer(&std::fs::read_to_string(&path).unwrap(), "saved").unwrap();
         assert_eq!(layer.tui.mouse.as_deref(), Some("capture"));
         assert!(layer.effective_mouse_capture());
         // mouse=None is the model/mode-picker path: an existing mouse
         // choice (here "capture") must survive untouched
-        save_settings_to(&path, Some("b/y"), None, None, None).unwrap();
+        save_settings_to(&path, Some("b/y"), None, None, None, None).unwrap();
         let layer = Config::parse_layer(&std::fs::read_to_string(&path).unwrap(), "saved").unwrap();
         assert_eq!(layer.tui.mouse.as_deref(), Some("capture"));
         assert_eq!(layer.model.as_deref(), Some("b/y"));
         // non-canonical values are rejected at the writer
-        let err = save_settings_to(&path, None, None, None, Some("bogus")).unwrap_err();
+        let err = save_settings_to(&path, None, None, None, Some("bogus"), None).unwrap_err();
         assert!(err.contains("invalid [tui] mouse"), "{err}");
         assert!(
             Config::parse_layer(&std::fs::read_to_string(&path).unwrap(), "check")
@@ -1070,7 +1094,7 @@ mod tests {
         let mut cfg = Config::default();
         cfg.overlay(
             Config::parse_layer(
-                "[guards]\nspend_usd = 2.5\ncontext_pct = 80\n\n[[search]]\nprovider = \"tavily\"\napi_key_env = \"TAVILY_KEY\"\n\n[tools.web]\nallow_private_hosts = true\n\n[tools.mcp]\ndiscovery = \"lazy\"\n\n[tui]\nheader_glyph = \"*\"\nbell = false\nnotify = \"notify-send ka done\"\n\n[verify]\ntest = \"cargo test\"\n\n[[verify.lints]]\npattern = \"*.rs\"\ncommand = \"rustfmt --check {file}\"\n",
+                "[guards]\nspend_usd = 2.5\ncontext_pct = 80\n\n[[search]]\nprovider = \"tavily\"\napi_key_env = \"TAVILY_KEY\"\n\n[tools.web]\nallow_private_hosts = true\n\n[tools.mcp]\ndiscovery = \"lazy\"\n\n[tui]\nheader_glyph = \"*\"\nbell = false\nnotify = \"notify-send ka done\"\n\n[verify]\ntest = \"cargo test\"\n\n[[verify.lints]]\npattern = \"*.rs\"\ncommand = \"rustfmt --check {file}\"\n\n[features]\ndisable = [\"agents\", \"mcp:github\"]\n",
                 "project",
             )
             .unwrap(),
@@ -1098,6 +1122,11 @@ mod tests {
             "[verify] test survives"
         );
         assert_eq!(cfg.verify.lints.len(), 1, "[[verify.lints]] survive");
+        assert_eq!(
+            cfg.features.disable,
+            vec!["agents".to_string(), "mcp:github".to_string()],
+            "[features] disable survives the overlay"
+        );
     }
 
     #[test]

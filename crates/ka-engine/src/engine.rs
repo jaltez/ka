@@ -441,6 +441,22 @@ struct Ctx {
     agent_tasks: std::sync::Arc<crate::hands::tasks::AgentTaskTable>,
     /// Live DAP sessions (/tasks rows), when the [debug] tier is on.
     debug: Option<std::sync::Arc<crate::dap::DebugManager>>,
+    /// Configured MCP servers (spawn-on-enable source of truth; the
+    /// shared set excludes bare-mode stripping).
+    mcp_servers_cfg: Vec<crate::mcp::McpServerConfig>,
+    /// Supervisor feed sender (spawns on runtime MCP enable).
+    maintenance_tx: mpsc::Sender<crate::mcp::Maintenance>,
+    /// The always-constructed LSP manager + its effective config
+    /// (hands start on bootstrap or runtime enable).
+    lsp: std::sync::Arc<crate::lsp::LspManager>,
+    lsp_cfg: crate::config::Lsp,
+    /// Effective debug config (runtime enable constructs the manager).
+    debug_cfg: crate::config::Debug,
+    /// Sandbox config (policy recompute on /sandbox).
+    sandbox_cfg: crate::config::Sandbox,
+    /// MCP prompts gathered at connect time (inventory re-emits replay
+    /// this cache filtered by enabled servers).
+    mcp_prompts: Vec<String>,
 }
 
 async fn run(
@@ -486,6 +502,13 @@ async fn run(
     if let Some((wire, speaker)) = speaker {
         voice = voice.with_speaker(wire, speaker);
     }
+    // [features] disable: validated once, primed into the shared toggle
+    // slot every layer of this feature reads (specs filter, admit guard,
+    // prompt build, the dynamic hands)
+    let disabled_specs = crate::features::parse_specs(&config.features.disable)
+        .map_err(|e| -> DynError { format!("[features] disable: {e}").into() })?;
+    let features = crate::features::FeatureToggles::slot(disabled_specs);
+    voice.set_feature_slot(features.clone());
     voice.set_rules(rules);
     voice.set_verify(config.verify.clone());
     voice.set_allowed_tools(allowed_tools);
@@ -504,43 +527,42 @@ async fn run(
         roles.fast.clone(),
     );
     // safe mode: [lsp] spawns user-configured executables — same risk
-    // class as hooks/MCP, so the diagnostics tier is inert there too
+    // class as hooks/MCP, so the diagnostics tier is inert there too.
+    // The manager is always constructed (cheap, inert until started);
+    // hands start below, once the strand has restored any toggles.
     let lsp_cfg = effective_lsp_cfg(&config);
     let lsp = std::sync::Arc::new(crate::lsp::LspManager::new(&cwd, &lsp_cfg));
     voice.set_lsp(lsp.clone());
-    // navigation hands (symbols/definition/references/diagnostics) plus
-    // an eager server start, only when the diagnostics tier is live;
-    // write-through rides the same gate ([lsp] write_through)
-    if lsp_cfg.enable == Some(true) && lsp_cfg.commands.as_ref().is_some_and(|c| !c.is_empty()) {
-        lsp.start_all();
-        for hand in lsp_hands(lsp.clone(), &lsp_cfg) {
-            voice.push_hand(hand);
-        }
-    }
     // the debug probe (Phase 8.2): a single `debug` hand over DAP,
     // Exec-tier control flow, Read-tier inspection — only under
-    // [debug] enable = true
+    // [debug] enable = true (manager + hand start below, post-attach)
     let debug_cfg = effective_debug_cfg(&config);
-    let debug = (debug_cfg.enable == Some(true)).then(|| {
-        std::sync::Arc::new(crate::dap::DebugManager::new(
-            debug_cfg.adapters.clone(),
-            Some(events.clone()),
-        ))
-    });
-    if let Some(debug) = &debug {
-        voice.push_hand(std::sync::Arc::new(crate::hands::debug::DebugHand::new(
-            debug.clone(),
-        )));
-    }
     voice.set_web_allow_private(config.effective_web_allow_private());
     {
         let slot = voice.pathfinder_slot();
         slot.write().catalog = pathfinder_catalog;
     }
     let mcp_lazy = config.effective_mcp_lazy();
+    let sandbox_cfg = config.sandbox.clone();
     let mut state = EngineState::from(config);
     state.roles = roles;
+    // strand attach also restores any recorded feature-toggle snapshot
+    // (over the config baseline, like model/mode) — so the spawn
+    // decisions below honor it
     let strand = attach_strand(&events, &mut state, &mut voice, &cwd, &strand_choice).await?;
+    // strand-restored sandbox override: recompute the live policy
+    if let Some(mode) = voice.features_snapshot().1 {
+        if let Err(e) = apply_sandbox_policy(&mut voice, &sandbox_cfg, &cwd, &mode) {
+            events
+                .send(Event::Error {
+                    class: ErrorClass::Internal,
+                    retryable: false,
+                    message: format!("restoring sandbox mode {mode:?} failed: {e}"),
+                })
+                .await
+                .ok();
+        }
+    }
     let agent_tasks = crate::hands::tasks::AgentTaskTable::new();
     let (maintenance_tx, maintenance_rx) = mpsc::channel(16);
     let mut ctx = Ctx {
@@ -553,16 +575,24 @@ async fn run(
         maintenance: maintenance_rx,
         mcp_lazy,
         agent_tasks: agent_tasks.clone(),
-        debug,
+        debug: None,
+        mcp_servers_cfg: mcp_servers.clone(),
+        maintenance_tx: maintenance_tx.clone(),
+        lsp: lsp.clone(),
+        lsp_cfg: lsp_cfg.clone(),
+        debug_cfg: debug_cfg.clone(),
+        sandbox_cfg,
+        mcp_prompts: Vec::new(),
     };
     // markdown agents: .ka/agents/*.md etc. become one `delegate` hand
-    // (empty in safe mode)
+    // (empty in safe mode). The hands register even when `agents` is
+    // toggled off — disabling hides, so a re-enable is pure set
+    // membership.
     let agents = if crate::conventions::bare_mode() {
         Vec::new()
     } else {
         crate::agents::AgentDef::discover(&ctx.cwd)
     };
-    let agent_names: Vec<String> = agents.iter().map(|a| a.name.clone()).collect();
     if !agents.is_empty() {
         let slot = ctx.voice.pathfinder_slot();
         ctx.voice.push_hand(std::sync::Arc::new(
@@ -572,6 +602,7 @@ async fn run(
                 mode,
                 agent_tasks.clone(),
                 ctx.events.clone(),
+                features.clone(),
             ),
         ));
         ctx.voice
@@ -585,102 +616,59 @@ async fn run(
         ctx.voice
             .push_hand(std::sync::Arc::new(crate::hands::memory::RememberHand));
     }
+    // LSP hands: navigation (symbols/definition/references/diagnostics)
+    // plus write-through on [lsp] write_through — only when the tier is
+    // both configured and not toggled off
+    if lsp_cfg.enable == Some(true)
+        && lsp_cfg.commands.as_ref().is_some_and(|c| !c.is_empty())
+        && !features.read().is_disabled(&ka_protocol::FeatureSpec::Lsp)
+    {
+        lsp.start_all();
+        for hand in lsp_hands(lsp.clone(), &lsp_cfg) {
+            ctx.voice.push_hand(hand);
+        }
+    }
+    // debug tier: manager + hand only when configured and not toggled
+    // off (runtime enable constructs them on demand)
+    if debug_cfg.enable == Some(true)
+        && !features
+            .read()
+            .is_disabled(&ka_protocol::FeatureSpec::Debug)
+    {
+        let debug = std::sync::Arc::new(crate::dap::DebugManager::new(
+            debug_cfg.adapters.clone(),
+            Some(ctx.events.clone()),
+        ));
+        ctx.voice
+            .push_hand(std::sync::Arc::new(crate::hands::debug::DebugHand::new(
+                debug.clone(),
+            )));
+        ctx.debug = Some(debug);
+    }
 
     // MCP servers: spawn, handshake, list; each tool becomes a hand at
     // exec-tier clearance. Failures are per-server errors, never fatal.
+    // Servers disabled by toggle at startup (config or strand) are not
+    // spawned — enabling one later spawns it on the spot.
     let mut mcp_summary = Vec::with_capacity(mcp_servers.len());
     for cfg in &mcp_servers {
-        let connected = tokio::time::timeout(
-            std::time::Duration::from_secs(20),
-            crate::mcp::McpClient::spawn_connect(cfg),
-        )
-        .await;
-        match connected {
-            Ok(Ok((client, tools))) => {
-                let tool_count = tools.len();
-                let shared = crate::mcp::McpShared::new(cfg.clone(), client, tools.clone());
-                // eager mode: every tool becomes its own hand; lazy mode
-                // registers one mcp_call hand after the loop
-                if !ctx.mcp_lazy {
-                    for tool in tools {
-                        ctx.voice
-                            .push_hand(std::sync::Arc::new(crate::mcp::McpHand::new(
-                                tool,
-                                shared.clone(),
-                            )));
-                    }
-                }
-                ctx.mcp_shared.push(shared.clone());
-                tokio::spawn(crate::mcp::supervise(
-                    shared,
-                    maintenance_tx.clone(),
-                    crate::mcp::WatchdogTiming::default(),
-                ));
-                mcp_summary.push(McpSummary {
-                    name: cfg.name.clone(),
-                    ok: true,
-                    tools: tool_count,
-                });
-            }
-            Ok(Err(e)) => {
-                mcp_summary.push(McpSummary {
-                    name: cfg.name.clone(),
-                    ok: false,
-                    tools: 0,
-                });
-                ctx.events
-                    .send(Event::Error {
-                        class: ErrorClass::Protocol,
-                        retryable: false,
-                        message: format!("mcp {}: {e}", cfg.name),
-                    })
-                    .await
-                    .ok();
-            }
-            Err(_) => {
-                mcp_summary.push(McpSummary {
-                    name: cfg.name.clone(),
-                    ok: false,
-                    tools: 0,
-                });
-                ctx.events
-                    .send(Event::Error {
-                        class: ErrorClass::Protocol,
-                        retryable: false,
-                        message: format!("mcp {}: connect timed out", cfg.name),
-                    })
-                    .await
-                    .ok();
-            }
+        if !features.read().server_enabled(&cfg.name) {
+            mcp_summary.push(McpSummary {
+                name: cfg.name.clone(),
+                ok: false,
+                tools: 0,
+            });
+            continue;
         }
+        mcp_summary.push(ensure_mcp_server(&mut ctx, cfg.clone()).await);
     }
+    features.write().set_live_mcp(
+        ctx.mcp_shared
+            .iter()
+            .map(|s| s.name().to_string())
+            .collect(),
+    );
 
-    // One bootstrap inventory card replaces the old ad-hoc notes: the
-    // surface renders tools/MCP/agents/skills compactly at startup.
-    let skill_names: Vec<String> = crate::conventions::discover_skills(&ctx.cwd)
-        .into_iter()
-        .map(|s| s.name)
-        .collect();
-    // MCP prompts for the surface's /prompt popup (20s gate like tools)
-    let mut prompts: Vec<String> = Vec::new();
-    for shared in &ctx.mcp_shared {
-        let listed =
-            tokio::time::timeout(std::time::Duration::from_secs(20), shared.list_prompts()).await;
-        if let Ok(Ok(items)) = listed {
-            for p in items {
-                prompts.push(format!(
-                    "{}/{}{}",
-                    p.server,
-                    p.name,
-                    if p.arguments.is_empty() {
-                        String::new()
-                    } else {
-                        format!(" ({})", p.arguments.join(", "))
-                    }
-                ));
-            }
-        }
-    }
     // web search + fetch hands (search only when a provider is set)
     for hand in crate::hands::web::hands(search_provider, web_allow_private) {
         ctx.voice.push_hand(hand);
@@ -690,6 +678,7 @@ async fn run(
         ctx.voice
             .push_hand(std::sync::Arc::new(crate::mcp::McpCallHand::new(
                 ctx.mcp_shared.clone(),
+                features.clone(),
             )));
     }
     // browse hand over every server: resources + prompts discovery
@@ -697,18 +686,12 @@ async fn run(
         ctx.voice
             .push_hand(std::sync::Arc::new(crate::mcp::McpMetaHand::new(
                 ctx.mcp_shared.clone(),
+                features.clone(),
             )));
     }
-    ctx.events
-        .send(Event::Inventory {
-            tools: ctx.voice.hand_names(),
-            mcp: mcp_summary,
-            agents: agent_names,
-            skills: skill_names,
-            prompts,
-        })
-        .await
-        .ok();
+    // One bootstrap inventory card replaces the old ad-hoc notes: the
+    // surface renders tools/MCP/agents/skills compactly at startup.
+    emit_inventory(&ctx).await;
     // surfaces initialize the todo section immediately, before any turn
     ctx.events
         .send(Event::Todos { items: Vec::new() })
@@ -818,6 +801,380 @@ async fn handle_maintenance(update: crate::mcp::Maintenance, ctx: &mut Ctx) {
         .ok();
 }
 
+/// Recompute and install the live sandbox policy for `mode` ("off" |
+/// "fs"). The `fs` policy comes from the config allowlist — unpersisted
+/// session grants drop on off→fs (fresh-policy semantics).
+fn apply_sandbox_policy(
+    voice: &mut Voice,
+    cfg: &crate::config::Sandbox,
+    cwd: &std::path::Path,
+    mode: &str,
+) -> Result<(), String> {
+    let mut policy_cfg = cfg.to_policy_config();
+    policy_cfg.mode = Some(mode.to_string());
+    let policy = ka_sandbox::policy_from_config(&policy_cfg, cwd)
+        .map_err(|e| format!("sandbox {mode}: {e}"))?;
+    voice.set_sandbox(policy);
+    Ok(())
+}
+
+/// Spawn + handshake + hands for one configured MCP server (bootstrap
+/// and runtime enable). Failures are per-server errors, never fatal.
+async fn ensure_mcp_server(ctx: &mut Ctx, cfg: crate::mcp::McpServerConfig) -> McpSummary {
+    let connected = tokio::time::timeout(
+        std::time::Duration::from_secs(20),
+        crate::mcp::McpClient::spawn_connect(&cfg),
+    )
+    .await;
+    match connected {
+        Ok(Ok((client, tools))) => {
+            let tool_count = tools.len();
+            let shared = crate::mcp::McpShared::new(cfg.clone(), client, tools.clone());
+            // eager mode: every tool becomes its own hand; lazy mode
+            // fronts the server through the single mcp_call hand
+            if !ctx.mcp_lazy {
+                for tool in tools {
+                    ctx.voice
+                        .push_hand(std::sync::Arc::new(crate::mcp::McpHand::new(
+                            tool,
+                            shared.clone(),
+                        )));
+                }
+            }
+            // prompts for the surface's /prompt popup (20s gate like
+            // tools), cached for inventory re-emits
+            let listed =
+                tokio::time::timeout(std::time::Duration::from_secs(20), shared.list_prompts())
+                    .await;
+            if let Ok(Ok(items)) = listed {
+                for p in items {
+                    ctx.mcp_prompts.push(format!(
+                        "{}/{}{}",
+                        p.server,
+                        p.name,
+                        if p.arguments.is_empty() {
+                            String::new()
+                        } else {
+                            format!(" ({})", p.arguments.join(", "))
+                        }
+                    ));
+                }
+            }
+            ctx.mcp_shared.push(shared.clone());
+            tokio::spawn(crate::mcp::supervise(
+                shared,
+                ctx.maintenance_tx.clone(),
+                crate::mcp::WatchdogTiming::default(),
+            ));
+            rebuild_mcp_meta_hands(ctx);
+            McpSummary {
+                name: cfg.name.clone(),
+                ok: true,
+                tools: tool_count,
+            }
+        }
+        Ok(Err(e)) => {
+            ctx.events
+                .send(Event::Error {
+                    class: ErrorClass::Protocol,
+                    retryable: false,
+                    message: format!("mcp {}: {e}", cfg.name),
+                })
+                .await
+                .ok();
+            McpSummary {
+                name: cfg.name.clone(),
+                ok: false,
+                tools: 0,
+            }
+        }
+        Err(_) => {
+            ctx.events
+                .send(Event::Error {
+                    class: ErrorClass::Protocol,
+                    retryable: false,
+                    message: format!("mcp {}: connect timed out", cfg.name),
+                })
+                .await
+                .ok();
+            McpSummary {
+                name: cfg.name.clone(),
+                ok: false,
+                tools: 0,
+            }
+        }
+    }
+}
+
+/// The lazy `mcp_call` + meta hands front the whole connected set —
+/// rebuild both whenever that set grows, so a newly connected server
+/// appears in their listings.
+fn rebuild_mcp_meta_hands(ctx: &mut Ctx) {
+    let slot = ctx.voice.feature_slot();
+    if ctx.mcp_lazy && !ctx.mcp_shared.is_empty() {
+        ctx.voice.replace_named_hands(
+            "mcp_call",
+            vec![std::sync::Arc::new(crate::mcp::McpCallHand::new(
+                ctx.mcp_shared.clone(),
+                slot.clone(),
+            ))],
+        );
+    }
+    if !ctx.mcp_shared.is_empty() {
+        ctx.voice.replace_named_hands(
+            "mcp",
+            vec![std::sync::Arc::new(crate::mcp::McpMetaHand::new(
+                ctx.mcp_shared.clone(),
+                slot,
+            ))],
+        );
+    }
+}
+
+/// Emit the inventory card from live state (bootstrap and after every
+/// toggle change): visible tools, per-server MCP, agents, skills,
+/// cached prompts filtered to enabled servers, and the disabled-spec
+/// snapshot for the surface's toggle UI.
+async fn emit_inventory(ctx: &Ctx) {
+    let agents: Vec<String> = if crate::conventions::bare_mode() {
+        Vec::new()
+    } else {
+        crate::agents::AgentDef::discover(&ctx.cwd)
+            .iter()
+            .filter(|a| ctx.voice.feature_slot().read().agent_enabled(&a.name))
+            .map(|a| a.name.clone())
+            .collect()
+    };
+    let skills: Vec<String> = crate::conventions::discover_skills(&ctx.cwd)
+        .into_iter()
+        .filter(|s| ctx.voice.feature_slot().read().skill_enabled(&s.name))
+        .map(|s| s.name)
+        .collect();
+    let mcp: Vec<McpSummary> = ctx
+        .mcp_servers_cfg
+        .iter()
+        .map(
+            |cfg| match ctx.mcp_shared.iter().find(|s| s.name() == cfg.name) {
+                Some(shared) => McpSummary {
+                    name: cfg.name.clone(),
+                    ok: true,
+                    tools: shared.tools().len(),
+                },
+                None => McpSummary {
+                    name: cfg.name.clone(),
+                    ok: false,
+                    tools: 0,
+                },
+            },
+        )
+        .collect();
+    let prompts: Vec<String> = {
+        let features = ctx.voice.feature_slot();
+        let guard = features.read();
+        ctx.mcp_prompts
+            .iter()
+            .filter(|p| {
+                let server = p.split('/').next().unwrap_or_default();
+                guard.server_enabled(server)
+            })
+            .cloned()
+            .collect()
+    };
+    let (disabled, _) = ctx.voice.features_snapshot();
+    ctx.events
+        .send(Event::Inventory {
+            tools: ctx.voice.visible_hand_names(),
+            mcp,
+            agents,
+            skills,
+            prompts,
+            disabled,
+        })
+        .await
+        .ok();
+}
+
+/// Persist the toggle snapshot to the strand (last record wins on
+/// resume), announce it, and refresh the inventory card.
+async fn persist_features(ctx: &mut Ctx) {
+    let (disabled, sandbox) = ctx.voice.features_snapshot();
+    let _ = ctx.strand.append(ka_strand::Record::Change {
+        id: ka_strand::new_record_id(),
+        model: None,
+        effort: None,
+        mode: None,
+        features: Some(disabled.clone()),
+        sandbox: sandbox.clone(),
+    });
+    ctx.events
+        .send(Event::FeaturesChanged { disabled, sandbox })
+        .await
+        .ok();
+    emit_inventory(ctx).await;
+}
+
+/// Start the LSP tier on runtime enable. Disable is pure hiding — the
+/// spawned servers idle until the session ends. Returns a refusal note
+/// when there is nothing configured to enable.
+fn sync_lsp(ctx: &mut Ctx, enabled: bool) -> Option<String> {
+    if !enabled {
+        return None;
+    }
+    if lsp_cfg_ready(&ctx.lsp_cfg) {
+        if ctx.voice.hand_names().iter().any(|n| n.starts_with("lsp_")) {
+            return None; // already installed (was hidden)
+        }
+        ctx.lsp.start_all();
+        for hand in lsp_hands(ctx.lsp.clone(), &ctx.lsp_cfg) {
+            ctx.voice.push_hand(hand);
+        }
+        None
+    } else {
+        Some("lsp tier is not configured ([lsp] enable + commands) — nothing to enable".into())
+    }
+}
+
+fn lsp_cfg_ready(cfg: &crate::config::Lsp) -> bool {
+    cfg.enable == Some(true) && cfg.commands.as_ref().is_some_and(|c| !c.is_empty())
+}
+
+/// Construct the debug tier on runtime enable. Disable is pure hiding.
+fn sync_debug(ctx: &mut Ctx, enabled: bool) -> Option<String> {
+    if !enabled {
+        return None;
+    }
+    if ctx.debug.is_some() {
+        return None; // hand already installed (was hidden)
+    }
+    if ctx.debug_cfg.enable != Some(true) {
+        return Some("debug tier is not configured ([debug] enable) — nothing to enable".into());
+    }
+    let debug = std::sync::Arc::new(crate::dap::DebugManager::new(
+        ctx.debug_cfg.adapters.clone(),
+        Some(ctx.events.clone()),
+    ));
+    ctx.voice
+        .push_hand(std::sync::Arc::new(crate::hands::debug::DebugHand::new(
+            debug.clone(),
+        )));
+    ctx.debug = Some(debug);
+    None
+}
+
+/// The full `SetFeature` path: spawn side effects for the tiers that
+/// need them, update the live set, persist + announce. Disabling is
+/// always pure hiding (specs filter + admit guard + dynamic listings);
+/// enabling an MCP server that was never spawned starts it on the spot.
+async fn apply_feature_toggle(ctx: &mut Ctx, spec: &ka_protocol::FeatureSpec, enabled: bool) {
+    // bare mode pins every customization tier off — enabling is refused
+    // outright so a toggle can never widen a --safe-mode session
+    if enabled && crate::conventions::bare_mode() {
+        ctx.events
+            .send(Event::Note {
+                message: "safe mode pins features off — restart without --safe-mode to enable"
+                    .to_string(),
+            })
+            .await
+            .ok();
+        return;
+    }
+    let note = match spec {
+        ka_protocol::FeatureSpec::Mcp | ka_protocol::FeatureSpec::McpServer(_) => {
+            let name = match spec {
+                ka_protocol::FeatureSpec::McpServer(n) => Some(n.clone()),
+                _ => None,
+            };
+            if let Some(name) = name {
+                if !ctx.mcp_servers_cfg.iter().any(|c| c.name == name) {
+                    Some(format!(
+                        "no configured mcp server {name:?} — nothing to toggle"
+                    ))
+                } else {
+                    mcp_toggle(ctx, &name, enabled).await
+                }
+            } else {
+                // `mcp` fans out over every configured server
+                let names: Vec<String> =
+                    ctx.mcp_servers_cfg.iter().map(|c| c.name.clone()).collect();
+                for name in names {
+                    mcp_toggle(ctx, &name, enabled).await;
+                }
+                None
+            }
+        }
+        ka_protocol::FeatureSpec::Lsp => sync_lsp(ctx, enabled),
+        ka_protocol::FeatureSpec::Debug => sync_debug(ctx, enabled),
+        _ => None,
+    };
+    if let Some(note) = note {
+        ctx.events.send(Event::Note { message: note }).await.ok();
+    }
+    if ctx.voice.set_feature(spec, enabled) {
+        persist_features(ctx).await;
+    }
+}
+
+/// Spawn one MCP server on enable (no-op when it's already connected —
+/// it was merely hidden). Disable needs nothing here.
+async fn mcp_toggle(ctx: &mut Ctx, name: &str, enabled: bool) -> Option<String> {
+    if !enabled || ctx.mcp_shared.iter().any(|s| s.name() == name) {
+        return None;
+    }
+    let Some(cfg) = ctx.mcp_servers_cfg.iter().find(|c| c.name == name).cloned() else {
+        return Some(format!("no configured mcp server {name:?}"));
+    };
+    let summary = ensure_mcp_server(ctx, cfg).await;
+    ctx.voice.feature_slot().write().set_live_mcp(
+        ctx.mcp_shared
+            .iter()
+            .map(|s| s.name().to_string())
+            .collect(),
+    );
+    (summary.ok).then_some(None).flatten()
+}
+
+/// The full `SetSandbox` path: validate, recompute the policy, record
+/// the override, persist + announce.
+async fn apply_sandbox_mode(ctx: &mut Ctx, mode: &str) {
+    if mode != "off" && mode != "fs" {
+        ctx.events
+            .send(Event::Note {
+                message: format!("unknown sandbox mode {mode:?} (expected off|fs)"),
+            })
+            .await
+            .ok();
+        return;
+    }
+    if mode == "fs" && crate::conventions::bare_mode() {
+        ctx.events
+            .send(Event::Note {
+                message: "safe mode pins the sandbox off — restart without --safe-mode".to_string(),
+            })
+            .await
+            .ok();
+        return;
+    }
+    match apply_sandbox_policy(&mut ctx.voice, &ctx.sandbox_cfg, &ctx.cwd, mode) {
+        Ok(()) => {
+            ctx.voice
+                .feature_slot()
+                .write()
+                .set_sandbox_override(Some(mode.to_string()));
+            persist_features(ctx).await;
+        }
+        Err(e) => {
+            ctx.events
+                .send(Event::Error {
+                    class: ErrorClass::Internal,
+                    retryable: false,
+                    message: e,
+                })
+                .await
+                .ok();
+        }
+    }
+}
+
 async fn handle_command(
     cmd: Command,
     commands: &mut mpsc::Receiver<Command>,
@@ -914,10 +1271,31 @@ async fn handle_command(
                 .await;
                 settle_context(&mut ctx.voice, &mut ctx.state, &mut ctx.strand, &ctx.events).await;
             }
+            // feature toggles buffered mid-turn: replay through the full
+            // handler now that the turn (and its follow-ups) settled
+            for cmd in ctx.voice.take_pending_features() {
+                match cmd {
+                    Command::SetFeature { spec, enabled } => {
+                        apply_feature_toggle(ctx, &spec, enabled).await;
+                    }
+                    Command::SetSandbox { mode } => apply_sandbox_mode(ctx, &mode).await,
+                    _ => {}
+                }
+            }
             ctx.events.send(Event::Idle).await.ok();
         }
         Command::RefreshMcp => {
             for shared in &ctx.mcp_shared {
+                // hidden servers keep their hands registered; refreshing
+                // them would just re-install tools nobody can call
+                if !ctx
+                    .voice
+                    .feature_slot()
+                    .read()
+                    .server_enabled(shared.name())
+                {
+                    continue;
+                }
                 match shared.refresh_and_install().await {
                     Ok((tools, delta)) => {
                         if delta != 0 {
@@ -957,6 +1335,20 @@ async fn handle_command(
             ctx.events.send(Event::Idle).await.ok();
         }
         Command::CallPrompt { server, name, args } => {
+            if !ctx.voice.feature_slot().read().server_enabled(&server) {
+                ctx.events
+                    .send(Event::Error {
+                        class: ErrorClass::Unsupported,
+                        retryable: false,
+                        message: format!(
+                            "mcp: server {server:?} is disabled by a session feature toggle (`mcp:{server}`)"
+                        ),
+                    })
+                    .await
+                    .ok();
+                ctx.events.send(Event::Idle).await.ok();
+                return Ok(());
+            }
             let Some(shared) = ctx.mcp_shared.iter().find(|s| s.name() == server).cloned() else {
                 ctx.events
                     .send(Event::Error {
@@ -1009,6 +1401,8 @@ async fn handle_command(
                 model: Some(selector.clone()),
                 effort: None,
                 mode: None,
+                features: None,
+                sandbox: None,
             });
             ctx.events.send(Event::ModelChanged { selector }).await?;
             // a model change re-announces the stored level so surfaces stay truthful
@@ -1029,6 +1423,8 @@ async fn handle_command(
                 model: None,
                 effort: None,
                 mode: Some(mode),
+                features: None,
+                sandbox: None,
             });
             ctx.events.send(Event::ModeChanged { mode }).await?;
             ctx.events.send(Event::Idle).await.ok();
@@ -1042,8 +1438,18 @@ async fn handle_command(
                 model: None,
                 effort: Some(level),
                 mode: None,
+                features: None,
+                sandbox: None,
             });
             ctx.events.send(Event::EffortChanged { level }).await?;
+            ctx.events.send(Event::Idle).await.ok();
+        }
+        Command::SetFeature { spec, enabled } => {
+            apply_feature_toggle(ctx, &spec, enabled).await;
+            ctx.events.send(Event::Idle).await.ok();
+        }
+        Command::SetSandbox { mode } => {
+            apply_sandbox_mode(ctx, &mode).await;
             ctx.events.send(Event::Idle).await.ok();
         }
         Command::ContextBreakdown => {
@@ -1482,12 +1888,14 @@ async fn handle_command(
             effort,
             mode,
             mouse,
+            features,
         } => {
             match crate::config::save_user_settings(
                 model.as_deref(),
                 effort,
                 mode,
                 mouse.as_deref(),
+                features.as_deref(),
             ) {
                 Ok(path) => {
                     ctx.events
@@ -1714,6 +2122,38 @@ async fn attach_strand(
         })
         .await
         .ok();
+    // feature toggles: a recorded snapshot replaces the live set
+    // wholesale (over the config baseline, like model/mode); a strand
+    // that never recorded one keeps the current set. Specs that no
+    // longer parse (grammar drift) are skipped with a note.
+    if let Some(list) = &settings.features {
+        let parsed: Vec<ka_protocol::FeatureSpec> =
+            list.iter().filter_map(|s| s.parse().ok()).collect();
+        let skipped: Vec<String> = list
+            .iter()
+            .filter(|s| s.parse::<ka_protocol::FeatureSpec>().is_err())
+            .cloned()
+            .collect();
+        voice.restore_feature_snapshot(parsed, settings.sandbox.clone());
+        if !skipped.is_empty() {
+            events
+                .send(Event::Note {
+                    message: format!(
+                        "ignored unknown feature spec(s) from this session's history: {}",
+                        skipped.join(", ")
+                    ),
+                })
+                .await
+                .ok();
+        }
+    }
+    let (disabled, sandbox) = voice.features_snapshot();
+    if !disabled.is_empty() || sandbox.is_some() {
+        events
+            .send(Event::FeaturesChanged { disabled, sandbox })
+            .await
+            .ok();
+    }
     // one source of truth for titles: `ka_strand::title_of` over the
     // records. Surfaces learn the stored/heuristic title at bootstrap;
     // a live auto-title arrives as its own Title event later.
@@ -1995,10 +2435,14 @@ async fn dispatch_turn(
     cwd: &std::path::Path,
     model_override: Option<String>,
 ) {
-    match crate::fshooks::run(HookPoint::PreTurn, cwd, None).await {
-        Ok(steer) => apply_steering(steer, events, state, voice, strand).await,
-        Err(note) => {
-            events.send(Event::Note { message: note }).await.ok();
+    // pre/post-turn file hooks are silenced by the `hooks` feature
+    // toggle like every other hook class
+    if voice.hooks_enabled() {
+        match crate::fshooks::run(HookPoint::PreTurn, cwd, None).await {
+            Ok(steer) => apply_steering(steer, events, state, voice, strand).await,
+            Err(note) => {
+                events.send(Event::Note { message: note }).await.ok();
+            }
         }
     }
     let prompt_head = text.lines().next().unwrap_or("").to_string();
@@ -2054,10 +2498,12 @@ async fn dispatch_turn(
         cache_write: usage.cache_write,
     });
     persist_delta(voice, state, strand);
-    match crate::fshooks::run(HookPoint::PostTurn, cwd, None).await {
-        Ok(steer) => apply_steering(steer, events, state, voice, strand).await,
-        Err(note) => {
-            events.send(Event::Note { message: note }).await.ok();
+    if voice.hooks_enabled() {
+        match crate::fshooks::run(HookPoint::PostTurn, cwd, None).await {
+            Ok(steer) => apply_steering(steer, events, state, voice, strand).await,
+            Err(note) => {
+                events.send(Event::Note { message: note }).await.ok();
+            }
         }
     }
     // overflow promotion: apply the same switch path as /model
@@ -2069,6 +2515,8 @@ async fn dispatch_turn(
             model: Some(selector.clone()),
             effort: None,
             mode: None,
+            features: None,
+            sandbox: None,
         });
         events.send(Event::ModelChanged { selector }).await.ok();
     }
@@ -2210,6 +2658,8 @@ async fn apply_steering(
             model: None,
             effort: None,
             mode: Some(mode),
+            features: None,
+            sandbox: None,
         });
         events.send(Event::ModeChanged { mode }).await.ok();
     }
@@ -3656,10 +4106,12 @@ mod tests {
             agents,
             skills,
             prompts: _,
+            disabled,
         } = inventories[0]
         else {
             unreachable!("filtered above")
         };
+        assert!(disabled.is_empty(), "no toggles at bootstrap: {disabled:?}");
         assert_eq!(agents, &["reviewer".to_string()]);
         // discovery also sees the user HOME layer, so only the injected
         // names are asserted exactly
