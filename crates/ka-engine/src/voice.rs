@@ -1581,7 +1581,14 @@ impl Voice {
             .ok();
 
         // Minimal system context: identity + read-only git awareness.
-        let snap = crate::hands::git::RepoSnapshot::capture(&self.hand_ctx.cwd);
+        // The snapshot shells out to git (blocking, slow on big repos):
+        // keep it off the async runtime so turn start cannot stall
+        // event pumping.
+        let cwd = self.hand_ctx.cwd.clone();
+        let snap =
+            tokio::task::spawn_blocking(move || crate::hands::git::RepoSnapshot::capture(&cwd))
+                .await
+                .unwrap_or_else(|_| crate::hands::git::RepoSnapshot::default());
         let mut system = String::new();
         // AGENTS.md hierarchy (root→cwd)
         for agents in crate::conventions::discover_agents(&self.hand_ctx.cwd) {

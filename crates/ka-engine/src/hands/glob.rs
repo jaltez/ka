@@ -51,48 +51,63 @@ impl Hand for GlobHand {
                 return ToolOutput::err(format!("glob: cannot translate pattern {pattern:?}"));
             };
 
-            let mut hits: Vec<(std::time::SystemTime, String)> = Vec::new();
-            let walker = ignore::WalkBuilder::new(&root)
-                .hidden(true)
-                .git_ignore(true)
-                .git_global(true)
-                .build();
-            for entry in walker.flatten() {
-                let Ok(rel) = entry.path().strip_prefix(&root) else {
-                    continue;
-                };
-                let rel_str = rel.to_string_lossy().replace('\\', "/");
-                if rel_str.is_empty() {
-                    continue;
-                }
-                if matcher.is_match(&rel_str) {
-                    let mtime = entry
-                        .metadata()
-                        .ok()
-                        .and_then(|m| m.modified().ok())
-                        .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
-                    hits.push((mtime, rel_str));
-                }
-                if hits.len() >= MAX_RESULTS * 2 {
-                    break;
-                }
+            // Blocking filesystem walk: keep it off the async runtime so
+            // a repo-wide glob cannot stall event pumping (ka runs a
+            // single-threaded executor).
+            let joined = tokio::task::spawn_blocking(move || walk_matches(&root, &matcher))
+                .await
+                .map_err(|e| format!("glob: walk task failed: {e}"));
+            match joined {
+                Ok(out) if out.is_empty() => ToolOutput::ok("no matches"),
+                Ok(out) => ToolOutput::ok(out),
+                Err(msg) => ToolOutput::err(msg),
             }
-            if hits.is_empty() {
-                return ToolOutput::ok("no matches");
-            }
-            hits.sort_by_key(|h| std::cmp::Reverse(h.0));
-            hits.truncate(MAX_RESULTS);
-            let mut out = String::new();
-            for (_, rel) in &hits {
-                out.push_str(rel);
-                out.push('\n');
-            }
-            if hits.len() == MAX_RESULTS {
-                out.push_str("[...capped at 200 matches]\n");
-            }
-            ToolOutput::ok(out)
         })
     }
+}
+
+/// Blocking worker: walk the root (gitignore-aware), newest-first matches.
+fn walk_matches(root: &std::path::Path, matcher: &regex::Regex) -> String {
+    let mut hits: Vec<(std::time::SystemTime, String)> = Vec::new();
+    let walker = ignore::WalkBuilder::new(root)
+        .hidden(true)
+        .git_ignore(true)
+        .git_global(true)
+        .build();
+    for entry in walker.flatten() {
+        let Ok(rel) = entry.path().strip_prefix(root) else {
+            continue;
+        };
+        let rel_str = rel.to_string_lossy().replace('\\', "/");
+        if rel_str.is_empty() {
+            continue;
+        }
+        if matcher.is_match(&rel_str) {
+            let mtime = entry
+                .metadata()
+                .ok()
+                .and_then(|m| m.modified().ok())
+                .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+            hits.push((mtime, rel_str));
+        }
+        if hits.len() >= MAX_RESULTS * 2 {
+            break;
+        }
+    }
+    if hits.is_empty() {
+        return String::new();
+    }
+    hits.sort_by_key(|h| std::cmp::Reverse(h.0));
+    hits.truncate(MAX_RESULTS);
+    let mut out = String::new();
+    for (_, rel) in &hits {
+        out.push_str(rel);
+        out.push('\n');
+    }
+    if hits.len() == MAX_RESULTS {
+        out.push_str("[...capped at 200 matches]\n");
+    }
+    out
 }
 
 /// Translate a glob pattern to a regex for full-path matching.

@@ -477,7 +477,9 @@ mod tests {
         ));
 
         let ctx = ctx_for(&dir);
-        let out = tokio::runtime::Runtime::new()
+        let out = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
             .unwrap()
             .block_on(hand.execute(&json!({}), &ctx));
         assert!(!out.is_error, "{}", out.content);
@@ -488,7 +490,9 @@ mod tests {
 
         // exit lands in the listing (via the .done marker)
         std::fs::write(super::done_path(&spill), "0\n").unwrap();
-        let out = tokio::runtime::Runtime::new()
+        let out = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
             .unwrap()
             .block_on(hand.execute(&json!({}), &ctx));
         assert!(out.content.contains("exited 0"), "{}", out.content);

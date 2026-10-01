@@ -49,49 +49,6 @@ impl Hand for ReadHand {
                 return ToolOutput::err("read: missing required 'path'");
             };
             let path = resolve(ctx, path_str);
-            let meta = match std::fs::metadata(&path) {
-                Ok(m) => m,
-                Err(e) => return ToolOutput::err(format!("read {}: {e}", path.display())),
-            };
-            if meta.is_dir() {
-                return list_dir(&path);
-            }
-            ctx.ledger.lock().mint(&path, &meta);
-
-            // image files: sniff by magic bytes, cap size, return a
-            // placeholder plus the base64 payload for the vision wire
-            if let Some(media_type) = sniff_image_type(&path) {
-                let cap_mb = ctx.max_image_mb;
-                if cap_mb > 0 && meta.len() > cap_mb as u64 * 1024 * 1024 {
-                    return ToolOutput::err(format!(
-                        "read {}: image is {:.1} MB, over the {} MB cap \
-                         ([tools.read] max_image_mb)",
-                        path.display(),
-                        meta.len() as f64 / (1024.0 * 1024.0),
-                        cap_mb
-                    ));
-                }
-                let bytes = match std::fs::read(&path) {
-                    Ok(b) => b,
-                    Err(e) => return ToolOutput::err(format!("read {}: {e}", path.display())),
-                };
-                let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("image");
-                let kb = bytes.len().div_ceil(1024);
-                return ToolOutput {
-                    content: format!("[image {name} {kb}KB]\n"),
-                    is_error: false,
-                    spill: None,
-                    images: vec![ka_protocol::ImagePart {
-                        data: b64_encode(&bytes),
-                        media_type: media_type.to_string(),
-                    }],
-                };
-            }
-
-            let text = match std::fs::read_to_string(&path) {
-                Ok(t) => t,
-                Err(e) => return ToolOutput::err(format!("read {}: {e}", path.display())),
-            };
             let offset = args
                 .get("offset")
                 .and_then(Value::as_u64)
@@ -103,36 +60,103 @@ impl Hand for ReadHand {
                 .map(|l| (l as usize).min(MAX_LINES))
                 .unwrap_or(MAX_LINES);
 
-            let lines: Vec<&str> = text.lines().collect();
-            let total = lines.len();
-            let start = (offset - 1).min(total);
-            let end = (start + limit).min(total);
-            let mut out = String::new();
-            let mut bytes = 0usize;
-            for (i, line) in lines[start..end].iter().enumerate() {
-                let numbered = format!("{}\t{}\n", start + i + 1, line);
-                bytes += numbered.len();
-                if bytes > MAX_BYTES {
-                    out.push_str("[...byte cap reached; narrow with offset/limit]\n");
-                    break;
-                }
-                out.push_str(&numbered);
+            // File reads are blocking I/O (image payloads reach MBs): run
+            // them on the blocking pool so the single-threaded async
+            // runtime keeps pumping events during the read.
+            let ledger = ctx.ledger.clone();
+            let cap_mb = ctx.max_image_mb;
+            let joined = tokio::task::spawn_blocking(move || {
+                read_blocking(&path, offset, limit, cap_mb, &ledger)
+            })
+            .await;
+            match joined {
+                Ok(output) => output,
+                Err(e) => ToolOutput::err(format!("read: task failed: {e}")),
             }
-            if end < total {
-                out.push_str(&format!(
-                    "[...{} of {} lines shown; lines {}-{} remain]\n",
-                    end - start,
-                    total,
-                    end + 1,
-                    total
-                ));
-            }
-            if out.is_empty() {
-                out.push_str("(empty file)\n");
-            }
-            ToolOutput::ok(out)
         })
     }
+}
+
+/// Blocking worker: the whole read — metadata, listing, minting, image
+/// sniffing/base64, line windowing.
+fn read_blocking(
+    path: &std::path::Path,
+    offset: usize,
+    limit: usize,
+    cap_mb: u32,
+    ledger: &std::sync::Arc<parking_lot::Mutex<crate::hands::Ledger>>,
+) -> ToolOutput {
+    let meta = match std::fs::metadata(path) {
+        Ok(m) => m,
+        Err(e) => return ToolOutput::err(format!("read {}: {e}", path.display())),
+    };
+    if meta.is_dir() {
+        return list_dir(path);
+    }
+    ledger.lock().mint(path, &meta);
+
+    // image files: sniff by magic bytes, cap size, return a
+    // placeholder plus the base64 payload for the vision wire
+    if let Some(media_type) = sniff_image_type(path) {
+        if cap_mb > 0 && meta.len() > cap_mb as u64 * 1024 * 1024 {
+            return ToolOutput::err(format!(
+                "read {}: image is {:.1} MB, over the {} MB cap \
+                 ([tools.read] max_image_mb)",
+                path.display(),
+                meta.len() as f64 / (1024.0 * 1024.0),
+                cap_mb
+            ));
+        }
+        let bytes = match std::fs::read(path) {
+            Ok(b) => b,
+            Err(e) => return ToolOutput::err(format!("read {}: {e}", path.display())),
+        };
+        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("image");
+        let kb = bytes.len().div_ceil(1024);
+        return ToolOutput {
+            content: format!("[image {name} {kb}KB]\n"),
+            is_error: false,
+            spill: None,
+            images: vec![ka_protocol::ImagePart {
+                data: b64_encode(&bytes),
+                media_type: media_type.to_string(),
+            }],
+        };
+    }
+
+    let text = match std::fs::read_to_string(path) {
+        Ok(t) => t,
+        Err(e) => return ToolOutput::err(format!("read {}: {e}", path.display())),
+    };
+
+    let lines: Vec<&str> = text.lines().collect();
+    let total = lines.len();
+    let start = (offset - 1).min(total);
+    let end = (start + limit).min(total);
+    let mut out = String::new();
+    let mut bytes = 0usize;
+    for (i, line) in lines[start..end].iter().enumerate() {
+        let numbered = format!("{}\t{}\n", start + i + 1, line);
+        bytes += numbered.len();
+        if bytes > MAX_BYTES {
+            out.push_str("[...byte cap reached; narrow with offset/limit]\n");
+            break;
+        }
+        out.push_str(&numbered);
+    }
+    if end < total {
+        out.push_str(&format!(
+            "[...{} of {} lines shown; lines {}-{} remain]\n",
+            end - start,
+            total,
+            end + 1,
+            total
+        ));
+    }
+    if out.is_empty() {
+        out.push_str("(empty file)\n");
+    }
+    ToolOutput::ok(out)
 }
 
 fn list_dir(path: &std::path::Path) -> ToolOutput {
