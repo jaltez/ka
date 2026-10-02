@@ -324,6 +324,7 @@ async fn drive_turn(
             text: prompt,
             schema: None,
             images: Vec::new(),
+            skills: Vec::new(),
         })
         .await
         .is_err()

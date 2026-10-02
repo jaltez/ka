@@ -269,6 +269,10 @@ pub struct Voice {
     /// `allowed-tools`); None = the session toolset. Set by the engine
     /// around one turn, cleared after.
     turn_tools: Option<Vec<String>>,
+    /// Per-turn explicit skill invocation (`/skill:<name>`): the named
+    /// skills' full SKILL.md bodies ride this turn's system prompt.
+    /// Set by the engine around one turn, cleared after.
+    turn_skills: Option<Vec<String>>,
     /// Session feature toggles, shared with the hands that validate
     /// dynamically (delegate roster, lazy MCP calls). Filtering happens
     /// in `specs()` (hide) and `admit_call` (reject strays).
@@ -339,6 +343,7 @@ impl Voice {
             auto_review: false,
             reviewer_model: None,
             turn_tools: None,
+            turn_skills: None,
             features: crate::features::FeatureToggles::slot(Vec::new()),
             pending_features: parking_lot::Mutex::new(Vec::new()),
         }
@@ -532,6 +537,7 @@ impl Voice {
             auto_review: false,
             reviewer_model: None,
             turn_tools: None,
+            turn_skills: None,
             features: crate::features::FeatureToggles::slot(Vec::new()),
             pending_features: parking_lot::Mutex::new(Vec::new()),
         }
@@ -743,6 +749,14 @@ impl Voice {
     /// any stragglers at admit time.
     pub fn set_turn_tools(&mut self, tools: Option<Vec<String>>) {
         self.turn_tools = tools;
+    }
+
+    /// Scope one turn to explicitly invoked skills (`/skill:<name>`):
+    /// their SKILL.md bodies are injected into that turn's system
+    /// prompt only — the session default (progressive disclosure) is
+    /// untouched.
+    pub fn set_turn_skills(&mut self, skills: Option<Vec<String>>) {
+        self.turn_skills = skills;
     }
 
     /// Whether a per-turn tool allowlist is active (contract tests).
@@ -1515,8 +1529,8 @@ impl Voice {
         prompt: String,
         commands: &mut mpsc::Receiver<Command>,
         events: &mpsc::Sender<Event>,
-        interjections: &mut Vec<String>,
-        deferrals: &mut VecDeque<String>,
+        steers: &mut Vec<String>,
+        queue: &mut VecDeque<String>,
         guards: &mut GuardRuntime,
         schema: Option<serde_json::Value>,
         images: Vec<ka_dialect::ImagePart>,
@@ -1666,6 +1680,28 @@ impl Voice {
                 ));
             }
         }
+        // explicit invocation (/skill:<name>): the named skills' full
+        // bodies ride this turn only — the engine clears the scope
+        // when the turn settles, like `allowed-tools`. Admit-time
+        // validation ran engine-side; a name that slipped through
+        // injects nothing (the listing above stays honest).
+        if let Some(invoked) = &self.turn_skills {
+            for name in invoked {
+                if let Some(sk) = skills.iter().find(|s| &s.name == name) {
+                    match std::fs::read_to_string(&sk.path) {
+                        Ok(body) => system.push_str(&format!(
+                            "\n<skill src=\"{}\">\n{}\n</skill>\n",
+                            sk.path.display(),
+                            body
+                        )),
+                        Err(err) => system.push_str(&format!(
+                            "\n<skill src=\"{}\" error=\"{err}\" />\n",
+                            sk.path.display()
+                        )),
+                    }
+                }
+            }
+        }
         system.push_str(&format!(
             "\nYou are ka, a precise coding agent. {}. Use the provided tools to inspect and modify the repository; prefer read before edit.",
             snap.summary()
@@ -1768,8 +1804,8 @@ attempt implementation — the user will review and switch to build mode.",
                                 self.stop_hooks(events, "aborted").await;
                                 return Usage::default();
                             }
-                            Some(Command::Interject { text }) => interjections.push(text),
-                            Some(Command::Defer { text }) => deferrals.push_back(text),
+                            Some(Command::Steer { text }) => steers.push(text),
+                            Some(Command::Queue { text }) => queue.push_back(text),
                             Some(Command::SetMode { mode }) => {
                                 self.mode = mode;
                                 events.send(Event::ModeChanged { mode }).await.ok();
@@ -1982,7 +2018,7 @@ attempt implementation — the user will review and switch to build mode.",
                         })
                         .await
                         .ok();
-                    if wait_or_cancel(delay, commands, interjections, deferrals).await {
+                    if wait_or_cancel(delay, commands, steers, queue).await {
                         events
                             .send(Event::Note {
                                 message: "retry canceled".to_string(),
@@ -2168,8 +2204,8 @@ attempt implementation — the user will review and switch to build mode.",
                                 aborted = true;
                                 break;
                             }
-                            Some(Command::Interject { text }) => interjections.push(text),
-                            Some(Command::Defer { text }) => deferrals.push_back(text),
+                            Some(Command::Steer { text }) => steers.push(text),
+                            Some(Command::Queue { text }) => queue.push_back(text),
                             Some(Command::SetMode { mode }) => mode_change = Some(mode),
                             Some(_) => {}
                         },
@@ -3549,8 +3585,8 @@ async fn loop_refused(
 async fn wait_or_cancel(
     delay: Duration,
     commands: &mut mpsc::Receiver<Command>,
-    interjections: &mut Vec<String>,
-    deferrals: &mut VecDeque<String>,
+    steers: &mut Vec<String>,
+    queue: &mut VecDeque<String>,
 ) -> bool {
     let sleep = tokio::time::sleep(delay);
     tokio::pin!(sleep);
@@ -3560,8 +3596,8 @@ async fn wait_or_cancel(
             maybe = commands.recv() => match maybe {
                 None => return true,
                 Some(Command::Abort) => return true,
-                Some(Command::Interject { text }) => interjections.push(text),
-                Some(Command::Defer { text }) => deferrals.push_back(text),
+                Some(Command::Steer { text }) => steers.push(text),
+                Some(Command::Queue { text }) => queue.push_back(text),
                 Some(_) => {}
             },
             () = &mut sleep => return false,
@@ -3811,8 +3847,8 @@ mod tests {
 
         let (cmd_tx, mut cmd_rx) = mpsc::channel(16);
         let (evt_tx, mut evt_rx) = mpsc::channel(256);
-        let mut interjections = Vec::new();
-        let mut deferrals = std::collections::VecDeque::new();
+        let mut steers = Vec::new();
+        let mut queue = std::collections::VecDeque::new();
 
         let handle = tokio::spawn(async move {
             voice
@@ -3821,8 +3857,8 @@ mod tests {
                     "read the file".into(),
                     &mut cmd_rx,
                     &evt_tx,
-                    &mut interjections,
-                    &mut deferrals,
+                    &mut steers,
+                    &mut queue,
                     &mut GuardRuntime::default(),
                     None,
                     Vec::new(),
@@ -3894,8 +3930,8 @@ mod tests {
 
         let (cmd_tx, mut cmd_rx) = mpsc::channel(16);
         let (evt_tx, mut evt_rx) = mpsc::channel(256);
-        let mut interjections = Vec::new();
-        let mut deferrals = std::collections::VecDeque::new();
+        let mut steers = Vec::new();
+        let mut queue = std::collections::VecDeque::new();
 
         let handle = tokio::spawn(async move {
             voice
@@ -3904,8 +3940,8 @@ mod tests {
                     "read the file".into(),
                     &mut cmd_rx,
                     &evt_tx,
-                    &mut interjections,
-                    &mut deferrals,
+                    &mut steers,
+                    &mut queue,
                     &mut GuardRuntime::default(),
                     None,
                     Vec::new(),
@@ -3994,8 +4030,8 @@ mod tests {
 
         let (cmd_tx, mut cmd_rx) = mpsc::channel(16);
         let (evt_tx, mut evt_rx) = mpsc::channel(256);
-        let mut interjections = Vec::new();
-        let mut deferrals = std::collections::VecDeque::new();
+        let mut steers = Vec::new();
+        let mut queue = std::collections::VecDeque::new();
 
         let handle = tokio::spawn(async move {
             voice
@@ -4004,8 +4040,8 @@ mod tests {
                     "plan the work".into(),
                     &mut cmd_rx,
                     &evt_tx,
-                    &mut interjections,
-                    &mut deferrals,
+                    &mut steers,
+                    &mut queue,
                     &mut GuardRuntime::default(),
                     None,
                     Vec::new(),
@@ -4492,8 +4528,8 @@ mod tests {
 
         let (cmd_tx, mut cmd_rx) = mpsc::channel(16);
         let (evt_tx, mut evt_rx) = mpsc::channel(256);
-        let mut interjections = Vec::new();
-        let mut deferrals = std::collections::VecDeque::new();
+        let mut steers = Vec::new();
+        let mut queue = std::collections::VecDeque::new();
         let handle = tokio::spawn(async move {
             voice
                 .turn(
@@ -4501,8 +4537,8 @@ mod tests {
                     "big prompt".into(),
                     &mut cmd_rx,
                     &evt_tx,
-                    &mut interjections,
-                    &mut deferrals,
+                    &mut steers,
+                    &mut queue,
                     &mut GuardRuntime::default(),
                     None,
                     Vec::new(),
@@ -4590,8 +4626,8 @@ mod tests {
 
         let (cmd_tx, mut cmd_rx) = mpsc::channel(16);
         let (evt_tx, mut evt_rx) = mpsc::channel(256);
-        let mut interjections = Vec::new();
-        let mut deferrals = std::collections::VecDeque::new();
+        let mut steers = Vec::new();
+        let mut queue = std::collections::VecDeque::new();
         let handle = tokio::spawn(async move {
             voice
                 .turn(
@@ -4599,8 +4635,8 @@ mod tests {
                     "build it".into(),
                     &mut cmd_rx,
                     &evt_tx,
-                    &mut interjections,
-                    &mut deferrals,
+                    &mut steers,
+                    &mut queue,
                     &mut GuardRuntime::default(),
                     None,
                     Vec::new(),
@@ -4869,8 +4905,8 @@ mod tests {
     ) -> (Vec<Event>, Vec<usize>) {
         let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::channel(16);
         let (evt_tx, mut evt_rx) = tokio::sync::mpsc::channel(256);
-        let mut interjections = Vec::new();
-        let mut deferrals = std::collections::VecDeque::new();
+        let mut steers = Vec::new();
+        let mut queue = std::collections::VecDeque::new();
         let events_handle = tokio::spawn(async move {
             let mut events = Vec::new();
             while let Some(evt) = evt_rx.recv().await {
@@ -4897,8 +4933,8 @@ mod tests {
                 prompt.into(),
                 &mut cmd_rx,
                 &evt_tx,
-                &mut interjections,
-                &mut deferrals,
+                &mut steers,
+                &mut queue,
                 guards,
                 None,
                 Vec::new(),
@@ -4978,16 +5014,16 @@ mod tests {
         voice.set_effort(Some("low".into()));
         let (_evt_tx, evt_rx) = tokio::sync::mpsc::channel::<Event>(256);
         let (_cmd_tx, mut cmd_rx) = tokio::sync::mpsc::channel(16);
-        let mut interjections = Vec::new();
-        let mut deferrals = std::collections::VecDeque::new();
+        let mut steers = Vec::new();
+        let mut queue = std::collections::VecDeque::new();
         voice
             .turn(
                 "test/m@medium",
                 "prompt two".into(),
                 &mut cmd_rx,
                 &_evt_tx,
-                &mut interjections,
-                &mut deferrals,
+                &mut steers,
+                &mut queue,
                 &mut guards,
                 None,
                 Vec::new(),
@@ -5015,8 +5051,8 @@ mod tests {
 
         let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::channel(16);
         let (evt_tx, mut evt_rx) = tokio::sync::mpsc::channel(256);
-        let mut interjections = Vec::new();
-        let mut deferrals = std::collections::VecDeque::new();
+        let mut steers = Vec::new();
+        let mut queue = std::collections::VecDeque::new();
         let handle = tokio::spawn(async move {
             voice
                 .turn(
@@ -5024,8 +5060,8 @@ mod tests {
                     "prompt".into(),
                     &mut cmd_rx,
                     &evt_tx,
-                    &mut interjections,
-                    &mut deferrals,
+                    &mut steers,
+                    &mut queue,
                     &mut GuardRuntime::default(),
                     None,
                     Vec::new(),
@@ -5640,8 +5676,8 @@ mod tests {
 
         let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::channel(16);
         let (evt_tx, mut evt_rx) = tokio::sync::mpsc::channel(256);
-        let mut interjections = Vec::new();
-        let mut deferrals = std::collections::VecDeque::new();
+        let mut steers = Vec::new();
+        let mut queue = std::collections::VecDeque::new();
         let handle = tokio::spawn(async move {
             voice
                 .turn(
@@ -5649,8 +5685,8 @@ mod tests {
                     "start the sleeper".into(),
                     &mut cmd_rx,
                     &evt_tx,
-                    &mut interjections,
-                    &mut deferrals,
+                    &mut steers,
+                    &mut queue,
                     &mut GuardRuntime::default(),
                     None,
                     Vec::new(),
@@ -5760,8 +5796,8 @@ mod tests {
 
         let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::channel(16);
         let (evt_tx, mut evt_rx) = tokio::sync::mpsc::channel(256);
-        let mut interjections = Vec::new();
-        let mut deferrals = std::collections::VecDeque::new();
+        let mut steers = Vec::new();
+        let mut queue = std::collections::VecDeque::new();
         let handle = tokio::spawn(async move {
             voice
                 .turn(
@@ -5769,8 +5805,8 @@ mod tests {
                     "run long".into(),
                     &mut cmd_rx,
                     &evt_tx,
-                    &mut interjections,
-                    &mut deferrals,
+                    &mut steers,
+                    &mut queue,
                     &mut GuardRuntime::default(),
                     None,
                     Vec::new(),
@@ -5902,8 +5938,8 @@ mod tests {
         voice.set_fallbacks(fallbacks);
         let (cmd_tx, mut cmd_rx) = mpsc::channel(16);
         let (evt_tx, mut evt_rx) = mpsc::channel(256);
-        let mut interjections = Vec::new();
-        let mut deferrals = std::collections::VecDeque::new();
+        let mut steers = Vec::new();
+        let mut queue = std::collections::VecDeque::new();
         let mut guards = GuardRuntime::default();
         let start = start.to_string();
         let handle = tokio::spawn(async move {
@@ -5913,8 +5949,8 @@ mod tests {
                     "hi".into(),
                     &mut cmd_rx,
                     &evt_tx,
-                    &mut interjections,
-                    &mut deferrals,
+                    &mut steers,
+                    &mut queue,
                     &mut guards,
                     None,
                     Vec::new(),
@@ -6012,8 +6048,8 @@ mod tests {
             );
         let (_cmd_tx, mut cmd_rx) = mpsc::channel(16);
         let (evt_tx, mut evt_rx) = mpsc::channel(256);
-        let mut interjections = Vec::new();
-        let mut deferrals = std::collections::VecDeque::new();
+        let mut steers = Vec::new();
+        let mut queue = std::collections::VecDeque::new();
         let mut guards = GuardRuntime::default();
         let schema = serde_json::json!({"type": "object"});
         let handle = tokio::spawn(async move {
@@ -6023,8 +6059,8 @@ mod tests {
                     "hi".into(),
                     &mut cmd_rx,
                     &evt_tx,
-                    &mut interjections,
-                    &mut deferrals,
+                    &mut steers,
+                    &mut queue,
                     &mut guards,
                     Some(schema),
                     Vec::new(),
@@ -6110,8 +6146,8 @@ mod tests {
         );
         let (_cmd_tx, mut cmd_rx) = mpsc::channel(16);
         let (evt_tx, mut evt_rx) = mpsc::channel(256);
-        let mut interjections = Vec::new();
-        let mut deferrals = std::collections::VecDeque::new();
+        let mut steers = Vec::new();
+        let mut queue = std::collections::VecDeque::new();
         let mut guards = GuardRuntime::default();
         let handle = tokio::spawn(async move {
             voice
@@ -6120,8 +6156,8 @@ mod tests {
                     "hi".into(),
                     &mut cmd_rx,
                     &evt_tx,
-                    &mut interjections,
-                    &mut deferrals,
+                    &mut steers,
+                    &mut queue,
                     &mut guards,
                     None,
                     Vec::new(),
@@ -6167,8 +6203,8 @@ mod tests {
         voice.set_context_promote(false);
         let (_cmd_tx, mut cmd_rx) = mpsc::channel(16);
         let (evt_tx, mut evt_rx) = mpsc::channel(256);
-        let mut interjections = Vec::new();
-        let mut deferrals = std::collections::VecDeque::new();
+        let mut steers = Vec::new();
+        let mut queue = std::collections::VecDeque::new();
         let mut guards = GuardRuntime::default();
         let handle = tokio::spawn(async move {
             voice
@@ -6177,8 +6213,8 @@ mod tests {
                     "hi".into(),
                     &mut cmd_rx,
                     &evt_tx,
-                    &mut interjections,
-                    &mut deferrals,
+                    &mut steers,
+                    &mut queue,
                     &mut guards,
                     None,
                     Vec::new(),
@@ -6322,7 +6358,7 @@ mod tests {
         let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::channel(16);
         let (evt_tx, _evt_rx) = tokio::sync::mpsc::channel(256);
         let mut inter = Vec::new();
-        let mut defers = std::collections::VecDeque::new();
+        let mut queue = std::collections::VecDeque::new();
         let mut guards = GuardRuntime::default();
         voice
             .turn(
@@ -6331,7 +6367,7 @@ mod tests {
                 &mut cmd_rx,
                 &evt_tx,
                 &mut inter,
-                &mut defers,
+                &mut queue,
                 &mut guards,
                 None,
                 Vec::new(),

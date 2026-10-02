@@ -130,6 +130,7 @@ fn prompt(text: &str) -> Command {
         images: Vec::new(),
         allowed_tools: None,
         model: Some("test/m".into()),
+        skills: Vec::new(),
     }
 }
 
@@ -459,7 +460,104 @@ fn skills_toggle_drops_the_prompt_block() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// The `hooks` toggle silences config hooks: a pre_tool_use hook that
+/// `/skill:<name>` explicit invocation: the SKILL.md body rides the
+/// invoking turn's system prompt only (per-turn scope, like
+/// `allowed-tools`), and a disabled or unknown skill refuses
+/// fail-closed — a Note naming the toggle, no turn run.
+#[test]
+fn skill_invocation_injects_the_body_per_turn() {
+    let dir = tmp_dir("skill-invoke");
+    let skill = dir.join(".ka/skills/invoke-demo-skill");
+    std::fs::create_dir_all(&skill).unwrap();
+    std::fs::write(
+        skill.join("SKILL.md"),
+        "---\ndescription: a demo skill\n---\nBODY-MARKER instructions",
+    )
+    .unwrap();
+    trust::test_support::with_trust_file(|_| {
+        trust::approve(&dir);
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let rec = Rec::new();
+            let mut handle = engine(&dir, rec.clone(), ka_engine::StrandChoice::New);
+            let invoke = |text: &str, skills: Vec<&str>| Command::Prompt {
+                text: text.into(),
+                schema: None,
+                images: Vec::new(),
+                allowed_tools: None,
+                model: Some("test/m".into()),
+                skills: skills.into_iter().map(str::to_string).collect(),
+            };
+
+            // explicit invocation: the body rides this turn's system
+            // prompt, src-tagged like the scoped-rules blocks
+            settle(&mut handle, invoke("go", vec!["invoke-demo-skill"]), on_idle).await;
+            let invoked = rec.systems.lock().last().unwrap().clone();
+            assert!(
+                invoked.contains("BODY-MARKER"),
+                "skill body rides the turn: {invoked}"
+            );
+            assert!(
+                invoked.contains("<skill src="),
+                "body is src-tagged: {invoked}"
+            );
+
+            // per-turn scope: the next plain turn drops the body (the
+            // session default — the one-line listing — is untouched)
+            settle(&mut handle, prompt("plain"), on_idle).await;
+            let plain = rec.systems.lock().last().unwrap().clone();
+            assert!(
+                !plain.contains("BODY-MARKER"),
+                "scope ends with the turn: {plain}"
+            );
+            assert!(
+                plain.contains("invoke-demo-skill"),
+                "the listing still offers the skill: {plain}"
+            );
+
+            // fail closed: a disabled skill names the toggle, runs nothing
+            let before = rec.systems.lock().len();
+            settle(&mut handle, set_feature("skill:invoke-demo-skill", false), on_idle).await;
+            let events = settle(&mut handle, invoke("go", vec!["invoke-demo-skill"]), on_idle).await;
+            let note = events
+                .iter()
+                .filter_map(|e| match e {
+                    Event::Note { message } => Some(message.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join(" | ");
+            assert!(
+                note.contains("skill:invoke-demo-skill"),
+                "refusal names the toggle: {note}"
+            );
+            assert!(
+                !events.iter().any(|e| matches!(e, Event::TurnStarted { .. })),
+                "a refused invocation runs no turn: {events:?}"
+            );
+            assert_eq!(
+                rec.systems.lock().len(),
+                before,
+                "no model call for a refused invocation"
+            );
+
+            // fail closed: an unknown skill refuses the same way
+            settle(&mut handle, set_feature("skill:invoke-demo-skill", true), on_idle).await;
+            let events = settle(&mut handle, invoke("go", vec!["ghost-skill"]), on_idle).await;
+            assert!(
+                events.iter().any(|e| matches!(
+                    e,
+                    Event::Note { message } if message.contains("ghost-skill") && message.contains("not found")
+                )),
+                "unknown skill named in the refusal: {events:?}"
+            );
+        });
+    });
+    let _ = std::fs::remove_dir_all(&dir);
+}
 /// exits 2 blocks a read while hooks are on, and stops blocking once
 /// `hooks` is toggled off. (Hooks run only in a trusted project.)
 #[test]

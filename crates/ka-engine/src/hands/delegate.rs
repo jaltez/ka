@@ -501,8 +501,8 @@ async fn run_agent_once(
     let source = source.clone();
     let (usage_tx, usage_rx) = tokio::sync::oneshot::channel();
     let handle = tokio::spawn(async move {
-        let mut interjections = Vec::new();
-        let mut deferrals = std::collections::VecDeque::new();
+        let mut steers = Vec::new();
+        let mut queue = std::collections::VecDeque::new();
         let mut voice = if isolated {
             // isolated agents may write — inside the worktree only
             Voice::new(
@@ -529,8 +529,8 @@ async fn run_agent_once(
                 prompt,
                 &mut cmd_rx,
                 &evt_tx,
-                &mut interjections,
-                &mut deferrals,
+                &mut steers,
+                &mut queue,
                 &mut GuardRuntime::default(),
                 schema,
                 Vec::new(),

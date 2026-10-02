@@ -115,6 +115,130 @@ fn current_version() -> String {
         .unwrap_or_else(|| env!("CARGO_PKG_VERSION").to_string())
 }
 
+/// One network hit per 24 h — the check state file is the rate
+/// limiter (and the offline answer: a fresh cache needs no network).
+const CHECK_EVERY_SECS: u64 = 24 * 60 * 60;
+
+/// The startup check's cache (`<state>/check.json`).
+#[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
+struct CheckState {
+    /// Unix seconds of the last network check.
+    last_check: u64,
+    /// Latest release tag as of that check.
+    latest: String,
+}
+
+fn read_check_state(state_dir: &Path) -> Option<CheckState> {
+    std::fs::read_to_string(state_dir.join("check.json"))
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+}
+
+fn write_check_state(state_dir: &Path, state: &CheckState) {
+    // best effort: a failed cache write only means one extra check later
+    let _ = std::fs::create_dir_all(state_dir);
+    if let Ok(json) = serde_json::to_string(state) {
+        let _ = std::fs::write(state_dir.join("check.json"), json);
+    }
+}
+
+fn now_unix() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Whether `tag` is strictly newer than the running `current` version
+/// (hand-rolled triple compare, same as the installer; unparseable
+/// versions read as up-to-date — quiet beats a nagging badge).
+fn newer_release(tag: &str, current: &str) -> bool {
+    match (version_triple(tag), version_triple(current)) {
+        (Some(new), Some(cur)) => new > cur,
+        _ => false,
+    }
+}
+
+/// Latest `v*` (or legacy `ka-<channel>-*`) release tag. Short-capped
+/// client: a startup check must never linger on a slow network.
+async fn latest_release(api_base: &str, repo: &str, channel: &str) -> Result<String, String> {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .build()
+        .map_err(|e| format!("client: {e}"))?;
+    let url = format!("{api_base}/repos/{repo}/releases");
+    let releases: serde_json::Value = client
+        .get(&url)
+        .header("User-Agent", "ka-update")
+        .header("Accept", "application/vnd.github+json")
+        .send()
+        .await
+        .map_err(|e| format!("GET {url}: {e}"))?
+        .error_for_status()
+        .map_err(|e| format!("GET {url}: {e}"))?
+        .json()
+        .await
+        .map_err(|e| format!("releases JSON: {e}"))?;
+    let legacy_prefix = format!("ka-{channel}");
+    releases
+        .as_array()
+        .and_then(|list| {
+            list.iter().find(|r| {
+                r["tag_name"].as_str().is_some_and(|t| {
+                    // CI tags `vX.Y.Z`; the legacy `ka-<channel>-*`
+                    // shape still matches (same pick as check_and_install)
+                    (t.starts_with('v') && version_triple(t).is_some())
+                        || t.starts_with(&legacy_prefix)
+                })
+            })
+        })
+        .and_then(|r| r["tag_name"].as_str().map(str::to_string))
+        .ok_or_else(|| format!("no release tagged v* (or {legacy_prefix:?}) in {repo}"))
+}
+
+/// The TUI startup check: is a newer release out? Checks, never
+/// installs (`ka update` stays the only install path). Rate-limited to
+/// one network hit per 24 h via the state file — a fresh cache answers
+/// offline. Any failure is a quiet `None`: no badge, no nagging.
+/// Returns `(current version, latest tag)`.
+pub async fn startup_check(repo: &str, enabled: bool) -> Option<(String, String)> {
+    if !enabled {
+        return None;
+    }
+    let api_base = std::env::var("KA_UPDATE_API_BASE").unwrap_or_else(|_| DEFAULT_API.to_string());
+    startup_check_in(&state_dir(), &api_base, repo, enabled, &current_version()).await
+}
+
+/// Parameterized core (state dir + api base + version injectable for
+/// tests: `current_version` re-exes the running binary, which is the
+/// test harness there, not `ka --version`).
+async fn startup_check_in(
+    state_dir: &Path,
+    api_base: &str,
+    repo: &str,
+    enabled: bool,
+    current: &str,
+) -> Option<(String, String)> {
+    if !enabled {
+        return None;
+    }
+    if let Some(state) = read_check_state(state_dir) {
+        if now_unix().saturating_sub(state.last_check) < CHECK_EVERY_SECS {
+            return newer_release(&state.latest, current)
+                .then(|| (current.to_string(), state.latest));
+        }
+    }
+    let latest = latest_release(api_base, repo, "stable").await.ok()?;
+    write_check_state(
+        state_dir,
+        &CheckState {
+            last_check: now_unix(),
+            latest: latest.clone(),
+        },
+    );
+    newer_release(&latest, current).then(|| (current.to_string(), latest))
+}
+
 /// Fetch, verify, and (unless `check_only`) atomically install.
 pub async fn check_and_install(
     api_base: &str,
@@ -491,6 +615,128 @@ mod tests {
             .unwrap();
         assert!(status.success());
         std::fs::read(&tar_path).unwrap()
+    }
+
+    /// Serve a bare releases list (one `v9.9.9` tag), counting hits.
+    async fn releases_counter(
+        listener: tokio::net::TcpListener,
+        hits: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    ) {
+        use std::sync::atomic::Ordering;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        loop {
+            let Ok((mut sock, _)) = listener.accept().await else {
+                return;
+            };
+            let mut buf: Vec<u8> = Vec::new();
+            let mut tmp = [0u8; 8192];
+            loop {
+                match sock.read(&mut tmp).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        buf.extend_from_slice(&tmp[..n]);
+                        if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                            break;
+                        }
+                    }
+                }
+            }
+            hits.fetch_add(1, Ordering::SeqCst);
+            let releases = serde_json::json!([{"tag_name": "v-unrelated", "assets": []}, {"tag_name": "v9.9.9", "assets": []}]);
+            let body = releases.to_string().into_bytes();
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            sock.write_all(resp.as_bytes()).await.ok();
+            sock.write_all(&body).await.ok();
+        }
+    }
+
+    /// The TUI startup check: a newer release is reported once, the
+    /// state file rate-limits to one network hit per 24 h, an
+    /// up-to-date or disabled or unreachable check stays quiet.
+    #[tokio::test]
+    async fn startup_check_reports_newer_and_rate_limits() {
+        let work = std::env::temp_dir().join(format!("ka-check-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&work);
+        std::fs::create_dir_all(&work).unwrap();
+        let state = work.join("state");
+        use std::sync::atomic::Ordering;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        tokio::spawn(releases_counter(listener, hits.clone()));
+        let api = format!("http://{addr}");
+
+        // stale cache (25 h old) → one network hit, notice, fresh state
+        write_check_state(
+            &state,
+            &CheckState {
+                last_check: now_unix() - 25 * 60 * 60,
+                latest: "v0.0.1".into(),
+            },
+        );
+        let got = startup_check_in(&state, &api, "owner/ka", true, "0.2.9").await;
+        assert_eq!(
+            got.as_ref().map(|(c, l)| (c.as_str(), l.as_str())),
+            Some(("0.2.9", "v9.9.9")),
+            "newer release reported with current + latest"
+        );
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+
+        // fresh cache → answered offline, zero new requests
+        let got = startup_check_in(&state, &api, "owner/ka", true, "0.2.9").await;
+        assert!(got.is_some(), "cached verdict stands");
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            1,
+            "fresh cache answers without network"
+        );
+
+        // fresh cache, up-to-date tag → quiet None
+        write_check_state(
+            &state,
+            &CheckState {
+                last_check: now_unix(),
+                latest: "v0.2.9".into(),
+            },
+        );
+        assert!(
+            startup_check_in(&state, &api, "owner/ka", true, "0.2.9")
+                .await
+                .is_none()
+        );
+
+        // disabled → never asks
+        assert!(
+            startup_check_in(&state, &api, "owner/ka", false, "0.2.9")
+                .await
+                .is_none()
+        );
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+
+        // stale cache + dead network → quiet None, cache untouched
+        write_check_state(
+            &state,
+            &CheckState {
+                last_check: now_unix() - 25 * 60 * 60,
+                latest: "v0.0.1".into(),
+            },
+        );
+        assert!(
+            startup_check_in(&state, "http://127.0.0.1:1", "owner/ka", true, "0.2.9")
+                .await
+                .is_none()
+        );
+        assert_eq!(
+            read_check_state(&state).map(|s| s.latest),
+            Some("v0.0.1".into()),
+            "a failed check must not poison the cache"
+        );
+
+        let _ = std::fs::remove_dir_all(&work);
     }
 
     #[tokio::test]

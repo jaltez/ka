@@ -281,6 +281,11 @@ pub enum Command {
         /// `model`); None = the session model. Additive.
         #[serde(default)]
         model: Option<String>,
+        /// Per-turn skill invocation (`/skill:<name>`): the named
+        /// skills' full SKILL.md bodies are injected into this turn's
+        /// system prompt. Additive.
+        #[serde(default)]
+        skills: Vec<String>,
     },
     /// Re-run tools/list on every MCP server (watchdog-adjacent).
     RefreshMcp,
@@ -295,13 +300,17 @@ pub enum Command {
         args: std::collections::HashMap<String, String>,
     },
     /// Deliver user input mid-turn (steering), between tool batches.
-    Interject {
-        /// Interjection text.
+    /// Wire tag stays `interject` (recorded strands keep their shape).
+    #[serde(rename = "interject")]
+    Steer {
+        /// Steering text.
         text: String,
     },
-    /// Queue user input for after the current turn settles.
-    Defer {
-        /// Deferred text.
+    /// Queue user input for after the current turn settles. Wire tag
+    /// stays `defer` (recorded strands keep their shape).
+    #[serde(rename = "defer")]
+    Queue {
+        /// Queued text.
         text: String,
     },
     /// Run a user-typed shell command directly (the TUI's `!`
@@ -796,11 +805,13 @@ mod tests {
                 allowed_tools,
                 model,
                 text,
+                skills,
                 ..
             } => {
                 assert_eq!(allowed_tools, None);
                 assert_eq!(model, None);
                 assert_eq!(text, "hi");
+                assert!(skills.is_empty(), "absent skills decode empty");
             }
             other => panic!("expected prompt, got {other:?}"),
         }
@@ -814,11 +825,12 @@ mod tests {
             text: "hi".into(),
             schema: None,
             images: Vec::new(),
+            skills: Vec::new(),
         });
-        roundtrip_command(Command::Interject {
+        roundtrip_command(Command::Steer {
             text: "use tabs".into(),
         });
-        roundtrip_command(Command::Defer {
+        roundtrip_command(Command::Queue {
             text: "then run tests".into(),
         });
         roundtrip_command(Command::Abort);
@@ -846,6 +858,25 @@ mod tests {
             out: None,
             html: true,
         });
+    }
+
+    #[test]
+    fn steer_and_queue_keep_wire_tags() {
+        // the vocabulary became steer/queue, but the wire stays
+        // `interject`/`defer` — recorded strands must keep parsing
+        let steer = to_line(&Command::Steer {
+            text: "use tabs".into(),
+        })
+        .unwrap();
+        assert!(
+            steer.contains("\"type\":\"interject\""),
+            "wire tag: {steer}"
+        );
+        let queue = to_line(&Command::Queue {
+            text: "then run tests".into(),
+        })
+        .unwrap();
+        assert!(queue.contains("\"type\":\"defer\""), "wire tag: {queue}");
     }
 
     #[test]

@@ -228,6 +228,30 @@ pub const DEFAULT_BACKGROUND_AFTER_MS: u64 = 30_000;
 pub struct Update {
     /// GitHub repo (`owner/name`) releases are fetched from.
     pub repo: Option<String>,
+    /// Whether the TUI checks for a newer release on startup
+    /// (rate-limited to one network hit per 24 h; never installs —
+    /// `ka update` stays the only install path).
+    pub check: Option<UpdateCheck>,
+}
+
+/// `[update] check`: the startup availability check.
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema,
+)]
+#[serde(rename_all = "lowercase")]
+pub enum UpdateCheck {
+    /// Check on TUI startup (the default).
+    #[default]
+    Startup,
+    /// Never check.
+    Off,
+}
+
+impl Update {
+    /// The effective startup-check policy (default: on).
+    pub fn effective_check(&self) -> UpdateCheck {
+        self.check.unwrap_or_default()
+    }
 }
 
 /// One web-search provider (`[[search]]`; first entry is active).
@@ -503,6 +527,9 @@ impl Config {
         }
         if other.update.repo.is_some() {
             self.update.repo = other.update.repo;
+        }
+        if other.update.check.is_some() {
+            self.update.check = other.update.check;
         }
         if other.context.promote.is_some() {
             self.context.promote = other.context.promote;
@@ -879,6 +906,32 @@ mod tests {
         assert_eq!(layer.max_steps, Some(7), "unrelated keys preserved");
         assert_eq!(layer.tui.mouse, None, "mouse left alone when None");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn update_check_parses_strictly_and_defaults_on() {
+        // default: the startup availability check is on
+        let layer = Config::parse_layer("", "t").unwrap();
+        assert_eq!(layer.update.effective_check(), UpdateCheck::Startup);
+        assert_eq!(layer.update.check, None);
+        // off parses; the effective policy follows
+        let layer = Config::parse_layer("[update]\ncheck = \"off\"\n", "t").unwrap();
+        assert_eq!(layer.update.check, Some(UpdateCheck::Off));
+        assert_eq!(layer.update.effective_check(), UpdateCheck::Off);
+        // explicit startup + repo ride along
+        let layer =
+            Config::parse_layer("[update]\ncheck = \"startup\"\nrepo = \"a/b\"\n", "t").unwrap();
+        assert_eq!(layer.update.effective_check(), UpdateCheck::Startup);
+        assert_eq!(layer.update.repo.as_deref(), Some("a/b"));
+        // an overlay without `check` keeps the base policy
+        let mut base = Config::parse_layer("[update]\ncheck = \"off\"\n", "t").unwrap();
+        let over = Config::parse_layer("[update]\nrepo = \"x/y\"\n", "t").unwrap();
+        base.overlay(over);
+        assert_eq!(base.update.effective_check(), UpdateCheck::Off);
+        // a typo'd value is a hard error (strict TOML, like every key)
+        assert!(Config::parse_layer("[update]\ncheck = \"of\"\n", "t").is_err());
+        // unknown keys in [update] stay hard errors
+        assert!(Config::parse_layer("[update]\nchek = \"off\"\n", "t").is_err());
     }
 
     #[test]

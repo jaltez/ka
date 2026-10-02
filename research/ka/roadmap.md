@@ -35,7 +35,7 @@ Legend: **[M]** mandatory · **[O]** optional/deferrable. Names refer to the arc
 
 ## Phase 2 — Loop, Core Tools, Hard Safety
 - **[M]** Turn loop: prompt → stream → tool calls → parallel execution (ordered results) → feed back; stop/length/tools; max-steps cap; abort keeps partial work
-- **[M]** Interjection/deferral input queues (mid-turn steering)
+- **[M]** Steer/queue input (mid-turn steering; wire tags stay `interject`/`defer`)
 - **[M]** Tools: `read` (line/byte selectors, caps), `edit` (exact-match + read-before-edit + changed-since-read via ledger), `write`, `bash` (timeout, output caps + `spill://` files, process-tree kill, auto-background), `glob`, `grep` (Rust regex only, instructive error on unsupported constructs)
 - **[M]** Git read-only awareness: engine snapshots repo state (branch, dirty file list) into strand context at turn start; `glob`/`grep` respect gitignore; **no commits, no undo — VCS stays the user's**
 - **[M]** Clearance annotations on every tool (read/write/exec + read-only/idempotent)
@@ -51,7 +51,7 @@ Legend: **[M]** mandatory · **[O]** optional/deferrable. Names refer to the arc
 - **[M]** Resume + interrupted-turn synthesis (dangling turns marked aborted)
 - **[M]** ratatui TUI: streaming transcript, input editor + history, abort key, footer (tokens, cost, cache-hit %, context %), `ask` dialogs
 - **[M]** Session picker (`ka`, `ka -c`)
-- **[M]** `ka update`: fetch from GitHub releases, ed25519 signature verification before swap, opt-in channel tag (stable/edge); no auto-update, no background checks
+- **[M]** `ka update`: fetch from GitHub releases, ed25519 signature verification before swap, opt-in channel tag (stable/edge); no auto-update. Startup availability check ratified 2026-10: one rate-limited (24 h) check when the TUI opens, `⤴` badge + transcript line, `[update] check = "off"` disables; never installs
 - **[O]** Waypoints (per-terminal continue tokens)
 - **[O]** Titles via `fast` role
 - **[O]** Markdown export
@@ -129,7 +129,7 @@ Order: 8.1 → 8.2 → 8.3 → 8.4. 8.4 items are filler and never block.
 
 ### 8.3 Delegation 2.0 — contracts, steering, merge-back (shipped 2026-09)
 - **[M]** Agent frontmatter `output:` (JSON schema); child final message validated through the existing structured-output path; one instructive retry
-- **[M]** `tasks send <id> <text>` — steer running background agents via their (currently empty) interjection queues
+- **[M]** `tasks send <id> <text>` — steer running background agents via their steer queues
 - **[M]** Sibling messaging: engine-mediated roster injected into spawned context; `tasks inbox`; messages to finished agents surface as notes (no revival in v1)
 - **[M]** `tasks merge <id>` — clean-only patch apply from the surviving `ka-<name>-<uuid>` worktree branch; on conflict surface the `.patch` path and stop; parent-mode gated (accept-edits/free, else Ask)
 - **[M]** TUI `/tasks` roster w/ status/cost + transcript pager — **shipped 2026-09**: `/tasks` opens a picker modal (Enter sends `Command::TaskDetail`, the full uncapped result pages in a scrollable modal; job/dap rows listed, non-pickable)

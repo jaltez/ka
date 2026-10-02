@@ -1840,6 +1840,20 @@ fn pop_queue_head(queue: &mut Vec<String>) -> Option<String> {
     (!queue.is_empty()).then(|| queue.remove(0))
 }
 
+/// Queue one draft for after the current turn — the `+` prefix and
+/// alt+q share this path. Blank drafts never queue.
+fn queue_draft(queue: &mut Vec<String>, draft: &str, transcript: &mut Transcript) {
+    let item = draft.trim();
+    if item.is_empty() {
+        return;
+    }
+    queue.push(item.to_string());
+    transcript.push_separated(Line::Info(format!(
+        "⏳ queued · {} waiting for this turn to end",
+        queue.len()
+    )));
+}
+
 /// Braille spinner frame for an elapsed-milliseconds clock.
 fn spin_frame(elapsed_ms: u128) -> char {
     const F: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
@@ -2003,6 +2017,16 @@ fn line_down(scroll: &mut Option<usize>, total: usize, visible: usize) {
 /// Transcript rows per mouse-wheel notch.
 const WHEEL_STEP: usize = 3;
 
+/// A pending self-update, from the CLI's startup check to the TUI
+/// (`ka update` remains the only install path — this only announces).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UpdateNotice {
+    /// Running version (e.g. `0.2.9 (abc1234)`).
+    pub current: String,
+    /// Newest release tag (e.g. `v0.2.10`).
+    pub latest: String,
+}
+
 /// Footer state shown under the editor.
 #[derive(Debug, Clone, Default)]
 pub struct Meters {
@@ -2038,6 +2062,9 @@ pub struct Meters {
     pub cache_read: u64,
     /// Accumulated busy seconds across finished turns.
     pub elapsed: f64,
+    /// Newest release tag when a self-update is pending (the `⤴` badge;
+    /// None hides the segment).
+    pub update: Option<String>,
 }
 
 /// Bootstrap inventory for the sidebar (the [`Event::Inventory`] payload,
@@ -2419,6 +2446,10 @@ fn info_rows(
         format!("ctx {used}")
     };
     for row in [
+        Some(match &meters.update {
+            Some(latest) => format!("ka {} · \u{2934} {latest}", env!("CARGO_PKG_VERSION")),
+            None => format!("ka {}", env!("CARGO_PKG_VERSION")),
+        }),
         short_session(&meters.session).map(|t| format!("session #{t}")),
         (!meters.model.is_empty()).then(|| format!("model {}", meters.model)),
         (!meters.effort.is_empty()).then(|| format!("effort {}", effort_segment(&meters.effort))),
@@ -2454,6 +2485,11 @@ pub struct PendingAsk {
 /// Agent summaries injected by the CLI for `/agents` (ka-term stays
 /// ka-engine-free).
 pub static AGENTS: std::sync::OnceLock<Vec<(String, String)>> = std::sync::OnceLock::new();
+
+/// Skill names from the latest engine inventory — feeds the `/skill:`
+/// autocomplete popup. A RwLock (not OnceLock): the inventory re-emits
+/// on every feature-toggle change.
+pub static SKILLS: std::sync::RwLock<Vec<String>> = std::sync::RwLock::new(Vec::new());
 
 /// Notification settings injected by the CLI ([tui] bell / notify):
 /// the bell rings on turn completion and permission asks; the command
@@ -3434,6 +3470,7 @@ pub async fn run(
     mouse_capture: bool,
     fresh: bool,
     session_cwd: std::path::PathBuf,
+    mut updates: mpsc::Receiver<UpdateNotice>,
 ) -> std::io::Result<Exit> {
     let _ = AGENTS.set(agents.clone());
     let _ = NOTIFY.set(notify);
@@ -3478,6 +3515,7 @@ pub async fn run(
         &mut terminal,
         &mut commands,
         &mut events,
+        &mut updates,
         initial_model,
         providers,
         models,
@@ -3525,6 +3563,7 @@ async fn app(
     terminal: &mut ratatui::Terminal<ratatui::backend::CrosstermBackend<std::io::Stdout>>,
     commands: &mut mpsc::Sender<Command>,
     events: &mut mpsc::Receiver<Event>,
+    updates: &mut mpsc::Receiver<UpdateNotice>,
     initial_model: &str,
     mut providers: Vec<ProviderInfo>,
     mut models: Vec<ModelInfo>,
@@ -3570,7 +3609,7 @@ async fn app(
     let mut live_cache: Option<(String, u16, Vec<ratatui::text::Line<'static>>, Instant)> = None;
     let mut turn_ended = false;
     let mut pending: Option<PendingAsk> = None;
-    // user-deferred prompts (`+` while busy), held locally and auto-sent
+    // user-queued prompts (`+` or alt+q while busy), held locally and auto-sent
     // FIFO, one per turn settle (see the TurnFinished arm below)
     let mut queue: Vec<String> = Vec::new();
     let mut turn_produced = false;
@@ -4955,7 +4994,7 @@ async fn app(
                                     // retry = a fresh turn with the same prompt
                                     transcript.push_separated(Line::User(p.clone()));
                                     busy = true;
-                                    let _ = commands.send(Command::Prompt { text: p, schema: None, images: Vec::new(), allowed_tools: None, model: None }).await;
+                                    let _ = commands.send(Command::Prompt { text: p, schema: None, images: Vec::new(), allowed_tools: None, model: None, skills: Vec::new() }).await;
                                 } else {
                                     transcript.push_separated(Line::Info("nothing to retry yet".into()));
                                 }
@@ -5035,6 +5074,20 @@ async fn app(
                                 match staged {
                                     Ok(note) => pop_toast(&mut toast, note),
                                     Err(e) => transcript.push_separated(Line::Info(e)),
+                                }
+                                continue;
+                            }
+                            // /skill:<name> [args]: explicit invocation —
+                            // intercepted before slash dispatch so the
+                            // literal line never runs as a prompt
+                            if let Some(outcome) = skill_invocation(&text, &sidebar.inventory) {
+                                match outcome {
+                                    Ok(cmd) => {
+                                        transcript.push_separated(Line::User(text.clone()));
+                                        busy = true;
+                                        let _ = commands.send(cmd).await;
+                                    }
+                                    Err(msg) => transcript.push_separated(Line::Warn(msg)),
                                 }
                                 continue;
                             }
@@ -5278,7 +5331,7 @@ async fn app(
                                     transcript.push_separated(Line::Info("(mode set; starting)".into()));
                                     busy = true;
                                     let _ = commands
-                                        .send(Command::Prompt { text: follow, schema: None, images: Vec::new(), allowed_tools: None, model: None })
+                                        .send(Command::Prompt { text: follow, schema: None, images: Vec::new(), allowed_tools: None, model: None, skills: Vec::new() })
                                         .await;
                                 }
                                 if cmd.quit {
@@ -5290,15 +5343,8 @@ async fn app(
                             // locally; the head auto-sends when the turn
                             // settles (TurnFinished arm in the event loop)
                             if busy {
-                                if let Some(deferred) = text.strip_prefix('+') {
-                                    let item = deferred.trim().to_string();
-                                    if !item.is_empty() {
-                                        queue.push(item);
-                                        transcript.push_separated(Line::Info(format!(
-                                            "⏳ queued · {} waiting for this turn to end",
-                                            queue.len()
-                                        )));
-                                    }
+                                if let Some(queued) = text.strip_prefix('+') {
+                                    queue_draft(&mut queue, queued, &mut transcript);
                                     continue;
                                 }
                             }
@@ -5321,7 +5367,7 @@ async fn app(
                                 transcript.push_separated(Line::Info(
                                     "⚡ steering this turn".into(),
                                 ));
-                                Command::Interject { text }
+                                Command::Steer { text }
                             } else {
                                 // plain new turn: the /retry target; a
                                 // staged /image attachment rides along
@@ -5339,6 +5385,7 @@ async fn app(
                                     text,
                                     schema: None,
                                     images: pending_image.take().into_iter().collect(),
+                                    skills: Vec::new(),
                                 }
                             };
                             busy = true;
@@ -5353,7 +5400,7 @@ async fn app(
                         (KeyCode::Tab, _) => {
                             if let Some(popup) = slash_popup.as_mut() {
                                 if let Some((name, _)) = popup.items.get(popup.selected).cloned() {
-                                    input.text = format!("{name} ");
+                                    input.text = complete_slash(&name);
                                     input.cursor = input.text.chars().count();
                                     slash_popup = update_suggestions(&input.text);
                                 }
@@ -5543,11 +5590,29 @@ async fn app(
                         }
                         (KeyCode::Char('q'), KeyModifiers::CONTROL) => {
                             // recall: pop the LAST queued item back into
-                            // the draft to edit and re-defer
+                            // the draft to edit and re-queue
                             if let Some(item) = queue.pop() {
                                 input.text = item;
                                 input.cursor = input.text.chars().count();
                                 slash_popup = update_suggestions(&input.text);
+                            }
+                        }
+                        (KeyCode::Char('q'), KeyModifiers::ALT) => {
+                            // alt+q: queue the whole draft for after this
+                            // turn — the `+` prefix without the retyping
+                            // (ctrl+q pops it back)
+                            let draft = input.text.trim().to_string();
+                            if draft.is_empty() {
+                                // blank draft: nothing to queue
+                            } else if !busy {
+                                pop_toast(&mut toast, "nothing running — enter sends now");
+                            } else if draft.starts_with('/') {
+                                // queued items replay as plain prompts;
+                                // slash commands must run their dispatcher
+                                pop_toast(&mut toast, "slash commands run immediately — press enter");
+                            } else {
+                                input.take();
+                                queue_draft(&mut queue, &draft, &mut transcript);
                             }
                         }
                         // some terminals deliver ctrl+_ / ctrl+- as chars
@@ -6144,7 +6209,7 @@ async fn app(
                                     transcript.push_separated(Line::User(next.clone()));
                                     last_user = Some(next.clone());
                                     busy = true;
-                                    let _ = commands.send(Command::Prompt { text: next, schema: None, images: Vec::new(), allowed_tools: None, model: None }).await;
+                                    let _ = commands.send(Command::Prompt { text: next, schema: None, images: Vec::new(), allowed_tools: None, model: None, skills: Vec::new() }).await;
                                 }
                             }
                         }
@@ -6167,6 +6232,17 @@ async fn app(
                             scroll = None;
                         }
                     }
+                }
+            }
+            maybe_update = updates.recv() => {
+                if let Some(notice) = maybe_update {
+                    // one quiet transcript line; the status-bar badge
+                    // persists for the session
+                    meters.update = Some(notice.latest.clone());
+                    transcript.push_separated(Line::Info(format!(
+                        "update available: {} — run `ka update`",
+                        notice.latest
+                    )));
                 }
             }
             // redraws while busy (spinner/clock) or while a toast is
@@ -6702,6 +6778,10 @@ fn apply_event(
                     sidebar.known_tools.push(t.clone());
                 }
             }
+            // the /skill: autocomplete follows the live inventory
+            if let Ok(mut live) = SKILLS.write() {
+                *live = skills.clone();
+            }
             sidebar.inventory = Inventory {
                 tools: tools.clone(),
                 mcp: mcp.clone(),
@@ -7138,6 +7218,10 @@ fn builtin_slash_commands() -> Vec<(String, String)> {
             "switch the bash sandbox (off|fs)".to_string(),
         ),
         (
+            "/skill".to_string(),
+            "invoke a skill: /skill:<name> [args]".to_string(),
+        ),
+        (
             "/thinking".to_string(),
             "pick the reasoning level".to_string(),
         ),
@@ -7461,11 +7545,37 @@ pub fn complete_token(
 }
 
 /// Recompute the suggestion popup from the raw input.
+/// What Tab accepting a slash popup row types into the draft: a
+/// trailing space for argument-bearing commands, the colon for the
+/// `/skill` starter — completing `/sk` lands on `/skill:` with the
+/// inventory names already in the popup, not on `/skill ` with the
+/// family closed.
+fn complete_slash(name: &str) -> String {
+    if name == "/skill" {
+        "/skill:".to_string()
+    } else {
+        format!("{name} ")
+    }
+}
+
 pub fn update_suggestions(input: &str) -> Option<SlashPopup> {
     if !input.starts_with('/') || input.contains(' ') {
         return None;
     }
-    let items: Vec<(String, String)> = available_slash_commands()
+    let mut items = available_slash_commands();
+    // /skill:<name> — explicit invocations of the live inventory's
+    // skills (names only cross the protocol; discovery + trust stay
+    // engine-side). The shared prefix filter matches the rest.
+    if input.starts_with("/skill:") {
+        if let Ok(skills) = SKILLS.read() {
+            items.extend(
+                skills
+                    .iter()
+                    .map(|name| (format!("/skill:{name}"), "invoke skill".to_string())),
+            );
+        }
+    }
+    let items: Vec<(String, String)> = items
         .into_iter()
         .filter(|(name, _)| name.starts_with(input))
         .collect();
@@ -7731,6 +7841,74 @@ fn custom_command_in(
     None
 }
 
+/// `/skill:<name> [args]`: explicit skill invocation. The named
+/// skill's SKILL.md body is injected into this turn's system prompt
+/// engine-side (per-turn scope, like custom-command frontmatter); the
+/// args become the prompt text. Validated against the discovered
+/// inventory so a typo fails loudly instead of running a hollow turn —
+/// the engine re-checks admit-time (fail closed there too).
+///
+/// Returns None for anything that is not a `/skill:` line (the normal
+/// slash dispatch then handles it), Some(Err(msg)) for a refused
+/// invocation (msg names the toggle or the miss).
+pub fn skill_invocation(text: &str, inventory: &Inventory) -> Option<Result<Command, String>> {
+    let rest = match text.strip_prefix("/skill:") {
+        Some(rest) => rest,
+        None if text == "/skill" || text.starts_with("/skill ") => {
+            // bare `/skill` (or the space form): teach the syntax and
+            // list what's on offer — same shape as bare /agents
+            if inventory.skills.is_empty() {
+                return Some(Err(
+                    "no skills discovered (⚡ lists what ka found)".to_string()
+                ));
+            }
+            return Some(Err(format!(
+                "invoke one by name: /skill:<name> [args] — {}",
+                inventory.skills.join(", ")
+            )));
+        }
+        None => return None,
+    };
+    let (name, args) = match rest.split_once(' ') {
+        Some((name, args)) => (name.trim(), args.trim()),
+        None => (rest.trim(), ""),
+    };
+    if name.is_empty() {
+        return Some(Err("skill name expected: /skill:<name>".to_string()));
+    }
+    // inventory skills = discovered AND enabled (emit_inventory filters
+    // both); disabled names arrive in the shared spec grammar
+    if !inventory.skills.iter().any(|s| s == name) {
+        if inventory.disabled.iter().any(|d| d == "skills") {
+            return Some(Err("skills are disabled — /features on skills".to_string()));
+        }
+        if inventory
+            .disabled
+            .iter()
+            .any(|d| d == &format!("skill:{name}"))
+        {
+            return Some(Err(format!(
+                "skill {name} is disabled — /features on skill:{name}"
+            )));
+        }
+        return Some(Err(format!(
+            "no such skill: {name} (⚡ lists what ka found)"
+        )));
+    }
+    Some(Ok(Command::Prompt {
+        text: if args.is_empty() {
+            format!("Use the {name} skill.")
+        } else {
+            args.to_string()
+        },
+        schema: None,
+        images: Vec::new(),
+        allowed_tools: None,
+        model: None,
+        skills: vec![name.to_string()],
+    }))
+}
+
 pub fn slash_command(text: &str) -> Option<Slash> {
     let mut parts = text.splitn(2, ' ');
     let head = parts.next()?.trim();
@@ -7769,6 +7947,7 @@ pub fn slash_command(text: &str) -> Option<Slash> {
                     text: body,
                     schema: None,
                     images: Vec::new(),
+                    skills: Vec::new(),
                     allowed_tools: (!fm.allowed_tools.is_empty()).then_some(fm.allowed_tools),
                     model: fm.model,
                 }),
@@ -8460,6 +8639,17 @@ fn status_right(meters: &Meters) -> Vec<ratatui::text::Span<'static>> {
         // about what the model can no longer see
         push(format!("\u{2298}{}", meters.toggles), &mut segs);
     }
+    if let Some(latest) = &meters.update {
+        // a newer release is out: warm-colored so it reads at a glance
+        // (the startup check announced it once — the badge persists)
+        if !segs.is_empty() {
+            segs.push(ratatui::text::Span::styled(" · ", crate::palette::META));
+        }
+        segs.push(ratatui::text::Span::styled(
+            format!("\u{2934} {latest}"),
+            crate::palette::WARN,
+        ));
+    }
     if meters.effort_supported {
         // the engine always emits the level now; defensive: a stale
         // empty string reads as off
@@ -9107,7 +9297,11 @@ fn render(
     } else if rsearch.is_some() {
         hint_spans(&[(" ctrl+r", "next"), (" ⏎", "accept"), (" esc", "cancel")])
     } else if busy {
-        hint_spans(&[(" enter", "interject"), (" +", "defer"), (" esc", "abort")])
+        hint_spans(&[
+            (" enter", "steer"),
+            (" + · alt+q", "queue"),
+            (" esc", "abort"),
+        ])
     } else if mouse_captured {
         hint_spans(&[
             (" enter", "send"),
@@ -9176,7 +9370,10 @@ fn render(
             }
         }
         let widget = Paragraph::new(text)
-            .block(modal_frame("commands").padding(ratatui::widgets::Padding::horizontal(1)))
+            .block(
+                modal_frame("commands · tab completes, ↑↓ moves the mark")
+                    .padding(ratatui::widgets::Padding::horizontal(1)),
+            )
             .style(ratatui::style::Style::new().bg(crate::palette::BG_SURFACE))
             .wrap(Wrap { trim: false });
         frame.render_widget(widget, rect);
@@ -10413,9 +10610,9 @@ fn help_modal_rows() -> Vec<ratatui::text::Line<'static>> {
     }
     section(&mut text, "keys");
     let keys: &[(&str, &str)] = &[
-        ("enter", "send · interject mid-turn"),
+        ("enter", "send · steer mid-turn"),
         ("⇧⏎ / ctrl+j", "newline in the draft"),
-        ("+text", "defer until the turn ends"),
+        ("+text · alt+q", "queue until the turn ends"),
         ("!cmd", "run a shell command directly"),
         ("esc", "close popups & modals · unpin scroll"),
         ("esc (busy)", "abort the running turn"),
@@ -10516,6 +10713,7 @@ fn help_modal_rows() -> Vec<ratatui::text::Line<'static>> {
         &[
             ("/help", "commands and key bindings"),
             ("/agents", "list available agents"),
+            ("/skill", "invoke a skill: /skill:<name>"),
             ("/quit", "exit"),
         ],
         key_style,
@@ -12194,6 +12392,7 @@ mod tests {
             "ctrl+t / alt+o / alt+i",
             "alt+t",
             "alt+e",
+            "+text · alt+q",
             "ctrl+↑ / ctrl+↓",
             "esc esc",
         ] {
@@ -14870,6 +15069,73 @@ mod tests {
         assert_eq!(pop_queue_head(&mut queue).as_deref(), Some("first"));
         assert_eq!(pop_queue_head(&mut queue).as_deref(), Some("second"));
         assert_eq!(pop_queue_head(&mut queue), None, "empty queue: no send");
+    }
+
+    #[test]
+    fn queue_draft_pushes_and_acks_shared_by_prefix_and_alt_q() {
+        // the `+` prefix and alt+q share queue_draft: trimmed push +
+        // one ack line carrying the new depth; blanks never queue
+        let mut queue = Vec::new();
+        let mut transcript = Transcript::default();
+        queue_draft(&mut queue, "  run the tests  ", &mut transcript);
+        assert_eq!(queue, vec!["run the tests".to_string()]);
+        queue_draft(&mut queue, "then commit", &mut transcript);
+        assert_eq!(queue.len(), 2);
+        let acks: Vec<&String> = transcript
+            .lines
+            .iter()
+            .filter_map(|l| match l {
+                Line::Info(s) => Some(s),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            acks,
+            vec![
+                &"⏳ queued · 1 waiting for this turn to end".to_string(),
+                &"⏳ queued · 2 waiting for this turn to end".to_string(),
+            ]
+        );
+        queue_draft(&mut queue, "   ", &mut transcript);
+        assert_eq!(queue.len(), 2, "blank drafts never queue");
+    }
+
+    #[test]
+    fn tab_completes_skill_starter_onto_its_colon() {
+        // argument-bearing commands gain a space; the /skill starter
+        // lands on its colon so the names popup is the next frame
+        assert_eq!(complete_slash("/model"), "/model ");
+        assert_eq!(complete_slash("/skill"), "/skill:");
+        // the completed text must open the names popup immediately
+        *SKILLS.write().unwrap() = vec!["pdf".to_string()];
+        let popup = update_suggestions(&complete_slash("/skill")).expect("names appear");
+        let names: Vec<&str> = popup.items.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(names, vec!["/skill:pdf"], "{names:?}");
+        *SKILLS.write().unwrap() = Vec::new();
+    }
+
+    #[test]
+    fn status_bar_badges_a_pending_update() {
+        // the badge is the persistent half of the startup check's
+        // verdict (the transcript line is the transient half)
+        let mut meters = Meters {
+            update: Some("v0.2.10".into()),
+            ..Default::default()
+        };
+        let text: String = status_right(&meters)
+            .iter()
+            .map(|s| s.content.to_string())
+            .collect();
+        assert!(text.contains("\u{2934} v0.2.10"), "badge renders: {text}");
+        meters.update = None;
+        let text: String = status_right(&meters)
+            .iter()
+            .map(|s| s.content.to_string())
+            .collect();
+        assert!(
+            !text.contains("\u{2934}"),
+            "no badge when up to date: {text}"
+        );
     }
 
     #[test]

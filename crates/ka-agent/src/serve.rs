@@ -416,6 +416,7 @@ async fn prompt(socket: &mut tokio::net::TcpStream, session: &Session, body: &[u
             text: prompt,
             schema,
             images: Vec::new(),
+            skills: Vec::new(),
         })
         .await;
     if sent.is_err() {

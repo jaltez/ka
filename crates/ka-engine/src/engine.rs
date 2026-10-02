@@ -3,7 +3,7 @@
 //!
 //! Two turn paths: the **canned** speaker (no model configured — keeps
 //! `ka run` working keyless) and the **live voice** (real wires via
-//! ka-dialect). Both honor interjections, deferrals, and aborts through the
+//! ka-dialect). Both honor steers, queued input, and aborts through the
 //! same `select!` seam.
 
 use std::collections::VecDeque;
@@ -372,8 +372,8 @@ struct EngineState {
     model: Option<String>,
     effort: Option<ka_protocol::Effort>,
     mode: Mode,
-    deferrals: VecDeque<String>,
-    interjections: Vec<String>,
+    queue: VecDeque<String>,
+    steers: Vec<String>,
     /// Record ids of persisted history messages, aligned with
     /// voice.history[..record_ids.len()] (mod digest truncation).
     record_ids: Vec<ka_protocol::RecordId>,
@@ -404,8 +404,8 @@ impl From<Config> for EngineState {
             model: c.model,
             effort: c.effort,
             mode,
-            deferrals: VecDeque::new(),
-            interjections: Vec::new(),
+            queue: VecDeque::new(),
+            steers: Vec::new(),
             record_ids: Vec::new(),
             checkpoints: Vec::new(),
             guards: crate::voice::GuardRuntime::new(c.guards.spend_usd, c.guards.context_pct),
@@ -1187,9 +1187,47 @@ async fn handle_command(
             images,
             allowed_tools,
             model,
+            skills,
         } => {
             // a fresh user prompt earns a fresh verify-fix round
             ctx.state.verify_round_done = false;
+            // explicit skill invocation (/skill:<name>): fail closed
+            // BEFORE the turn — a missing or disabled skill must not
+            // run a hollow prompt (same admit-time stance as
+            // SetFeature: the refusal names the toggle)
+            if !skills.is_empty() {
+                let known = crate::conventions::discover_skills(&ctx.cwd);
+                for name in &skills {
+                    let refusal = {
+                        let slot = ctx.voice.feature_slot();
+                        let features = slot.read();
+                        if !known.iter().any(|s| &s.name == name) {
+                            Some(format!(
+                                "skill {name} not found — nothing ran (⚡ lists what ka found)"
+                            ))
+                        } else if !features.skill_enabled(name) {
+                            if features.skills_enabled() {
+                                Some(format!(
+                                    "skill {name} is disabled (skill:{name}) — /features on skill:{name}; nothing ran"
+                                ))
+                            } else {
+                                Some(
+                                    "skills are disabled (skills) — /features on skills; nothing ran"
+                                        .to_string(),
+                                )
+                            }
+                        } else {
+                            None
+                        }
+                    };
+                    if let Some(message) = refusal {
+                        ctx.events.send(Event::Note { message }).await.ok();
+                        ctx.events.send(Event::Idle).await.ok();
+                        return Ok(());
+                    }
+                }
+                ctx.voice.set_turn_skills(Some(skills.clone()));
+            }
             // `!` passthrough outputs ride along as leading context
             let text = if ctx.state.shell_context.is_empty() {
                 text
@@ -1249,19 +1287,20 @@ async fn handle_command(
             )
             .await;
             ctx.voice.set_turn_tools(None);
+            ctx.voice.set_turn_skills(None);
             settle_context(&mut ctx.voice, &mut ctx.state, &mut ctx.strand, &ctx.events).await;
             // auto-title once, right after the first completed turn of a
-            // fresh strand (deferral follow-on turns are later turns)
+            // fresh strand (queued follow-on turns are later turns)
             maybe_auto_title(&mut ctx.voice, &mut ctx.state, &mut ctx.strand, &ctx.events).await;
-            // Settling: drain deferrals as follow-on turns (scoped turns
-            // do not carry their restriction into deferred follow-ups).
-            while let Some(deferred) = ctx.state.deferrals.pop_front() {
+            // Settling: drain the queue as follow-on turns (scoped turns
+            // do not carry their restriction into queued follow-ups).
+            while let Some(queued) = ctx.state.queue.pop_front() {
                 dispatch_turn(
                     commands,
                     &ctx.events,
                     &mut ctx.state,
                     &mut ctx.voice,
-                    deferred,
+                    queued,
                     None,
                     Vec::new(),
                     &mut ctx.strand,
@@ -1512,8 +1551,8 @@ async fn handle_command(
             ctx.events.send(Event::DebugRoster { rows }).await.ok();
             ctx.events.send(Event::Idle).await.ok();
         }
-        Command::Interject { text } => ctx.state.interjections.push(text),
-        Command::Defer { text } => ctx.state.deferrals.push_back(text),
+        Command::Steer { text } => ctx.state.steers.push(text),
+        Command::Queue { text } => ctx.state.queue.push_back(text),
         // TRUST INVARIANT: Command::Shell is only ever sent by the local
         // TUI (see the variant docs in ka-protocol) — that is what makes
         // running it without the permission gate sound.
@@ -2465,8 +2504,8 @@ async fn dispatch_turn(
                 text,
                 commands,
                 events,
-                &mut state.interjections,
-                &mut state.deferrals,
+                &mut state.steers,
+                &mut state.queue,
                 &mut state.guards,
                 schema,
                 images,
@@ -2532,7 +2571,7 @@ async fn dispatch_turn(
             if !edited.is_empty() {
                 state.verify_round_done = true;
                 // the test can run long: keep serving the command channel
-                // so Esc/abort (and interject/defer queueing) still work —
+                // so Esc/abort (and steer/queue input) still work —
                 // an abort cancels the test and skips the fix round
                 let test_fut = tokio::time::timeout(
                     std::time::Duration::from_secs(900),
@@ -2553,8 +2592,8 @@ async fn dispatch_turn(
                                 aborted = true;
                                 break None;
                             }
-                            Some(Command::Interject { text }) => state.interjections.push(text),
-                            Some(Command::Defer { text }) => state.deferrals.push_back(text),
+                            Some(Command::Steer { text }) => state.steers.push(text),
+                            Some(Command::Queue { text }) => state.queue.push_back(text),
                             Some(_) => {}
                         },
                         out = &mut test_fut => break Some(out),
@@ -2961,8 +3000,8 @@ async fn turn_canned(
                     Some(other) => {
                         // canned path: only queue-side effects are safe here
                         match other {
-                            Command::Interject { text } => state.interjections.push(text),
-                            Command::Defer { text } => state.deferrals.push_back(text),
+                            Command::Steer { text } => state.steers.push(text),
+                            Command::Queue { text } => state.queue.push_back(text),
                             Command::Abort => {}
                             _ => {}
                         }
@@ -2990,9 +3029,9 @@ async fn turn_canned(
         return (Usage::default(), Stop::Aborted);
     }
 
-    // Settling: unhandled interjections become deferrals so they are not lost.
-    for interjection in state.interjections.drain(..) {
-        state.deferrals.push_back(interjection);
+    // Settling: unhandled steers become queued input so they are not lost.
+    for steer in state.steers.drain(..) {
+        state.queue.push_back(steer);
     }
     let est_out: u64 = chunks
         .iter()
@@ -3152,6 +3191,7 @@ mod tests {
                 text: "hi".into(),
                 schema: None,
                 images: Vec::new(),
+                skills: Vec::new(),
             })
             .await
             .unwrap();
@@ -3183,6 +3223,7 @@ mod tests {
                 text: "slow".into(),
                 schema: None,
                 images: Vec::new(),
+                skills: Vec::new(),
             })
             .await
             .unwrap();
@@ -3247,6 +3288,7 @@ mod tests {
                 text: "hello".into(),
                 schema: None,
                 images: Vec::new(),
+                skills: Vec::new(),
             })
             .await
             .unwrap();
@@ -3288,6 +3330,7 @@ mod tests {
                 text: "hello".into(),
                 schema: None,
                 images: Vec::new(),
+                skills: Vec::new(),
             })
             .await
             .unwrap();
@@ -3316,6 +3359,7 @@ mod tests {
                 text: "hello".into(),
                 schema: None,
                 images: Vec::new(),
+                skills: Vec::new(),
             })
             .await
             .unwrap();
@@ -3331,7 +3375,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn deferrals_trigger_follow_on_turns() {
+    async fn queued_input_triggers_follow_on_turns() {
         let mut handle = spawn(Config::default());
         handle
             .commands
@@ -3341,12 +3385,13 @@ mod tests {
                 text: "one".into(),
                 schema: None,
                 images: Vec::new(),
+                skills: Vec::new(),
             })
             .await
             .unwrap();
         handle
             .commands
-            .send(Command::Defer { text: "two".into() })
+            .send(Command::Queue { text: "two".into() })
             .await
             .unwrap();
         let first = drain_until_finished(&mut handle.events).await;
@@ -3396,6 +3441,7 @@ mod tests {
                 text: "hello there".into(),
                 schema: None,
                 images: Vec::new(),
+                skills: Vec::new(),
             })
             .await
             .unwrap();
@@ -3434,6 +3480,7 @@ mod tests {
                 text: "second question".into(),
                 schema: None,
                 images: Vec::new(),
+                skills: Vec::new(),
             })
             .await
             .unwrap();
@@ -3492,6 +3539,7 @@ mod tests {
                 text: "hi".into(),
                 schema: None,
                 images: Vec::new(),
+                skills: Vec::new(),
             })
             .await
             .unwrap();
@@ -3606,6 +3654,7 @@ mod tests {
                 text: "hello".into(),
                 schema: None,
                 images: Vec::new(),
+                skills: Vec::new(),
             })
             .await
             .unwrap();
@@ -3667,6 +3716,7 @@ mod tests {
                     text: prompt.into(),
                     schema: None,
                     images: Vec::new(),
+                    skills: Vec::new(),
                 })
                 .await
                 .unwrap();
@@ -3725,6 +3775,7 @@ mod tests {
                 text: "first session question".into(),
                 schema: None,
                 images: Vec::new(),
+                skills: Vec::new(),
             })
             .await
             .unwrap();
@@ -3858,6 +3909,7 @@ mod tests {
                 text: text.to_string(),
                 schema: None,
                 images: Vec::new(),
+                skills: Vec::new(),
             })
             .await
             .unwrap();
@@ -4290,6 +4342,7 @@ mod tests {
                 text: "please fix the parser in src/x.rs".into(),
                 schema: None,
                 images: Vec::new(),
+                skills: Vec::new(),
             })
             .await
             .unwrap();
@@ -4331,6 +4384,7 @@ mod tests {
                 text: "please fix the parser in src/x.rs".into(),
                 schema: None,
                 images: Vec::new(),
+                skills: Vec::new(),
             })
             .await
             .unwrap();
@@ -4369,6 +4423,7 @@ mod tests {
                 text: "please fix the parser in src/x.rs".into(),
                 schema: None,
                 images: Vec::new(),
+                skills: Vec::new(),
             })
             .await
             .unwrap();
@@ -4400,6 +4455,7 @@ mod tests {
                 text: "please fix the parser in src/x.rs".into(),
                 schema: None,
                 images: Vec::new(),
+                skills: Vec::new(),
             })
             .await
             .unwrap();
@@ -4434,6 +4490,7 @@ mod tests {
                 text: "second question".into(),
                 schema: None,
                 images: Vec::new(),
+                skills: Vec::new(),
             })
             .await
             .unwrap();

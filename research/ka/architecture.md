@@ -19,8 +19,8 @@ v0.1 · 2026-08-23 · grounded in `research/` survey; concepts reinvented and re
 | **offshoot** | moving the tip to an earlier record (branch in place) | /tree branching |
 | **split** | copying a strand's prefix into a new strand file | fork |
 | **digest** | a compaction record: summary + kept-tail boundary | compaction entries |
-| **interjection** | user input delivered mid-turn, between tool batches | steering |
-| **deferral** | user input queued for after the turn settles | follow-up |
+| **steer** | user input delivered mid-turn, between tool batches (wire tag `interject`) | steering |
+| **queue** | user input queued for after the turn settles (wire tag `defer`) | follow-up |
 | **ledger** | per-strand map of file→(mtime,hash) at last read; edits refuse stale files | read-tracking / filetracker |
 | **spill** | oversized tool output parked on disk, referenced `spill://<id>` | artifact spill |
 | **dialect** | a named per-model flag profile in `dialects.toml` shaping wire requests | compat flags |
@@ -51,8 +51,8 @@ Two queues between surface and engine, both serde enums, both NDJSON-shaped so `
 ```rust
 pub enum Command {          // surface → engine
     Prompt { text: String, attachments: Vec<Attachment> },
-    Interject { text: String },              // mid-turn steering
-    Defer { text: String },                  // queued for settle
+    Steer { text: String },                  // mid-turn steering (wire: interject)
+    Queue { text: String },                  // queued for settle (wire: defer)
     Abort,
     SetModel { selector: String },
     SetEffort { level: Effort },
@@ -76,9 +76,9 @@ pub enum Event {            // engine → surface (non_exhaustive)
 
 ## 4. Engine turn machine
 States: `Receiving → Speaking → Acting → Settling`.
-- **Speaking**: stream from the active Speaker; deltas forwarded as received; interjections checked between deltas; Esc → Abort keeps partial transcript as a record.
+- **Speaking**: stream from the active Speaker; deltas forwarded as received; steers checked between deltas; Esc → Abort keeps partial transcript as a record.
 - **Acting**: calls whose clearance is granted run in parallel (`FuturesUnordered`, results re-ordered to call order); exec-tier waits for `AlwaysAllow`/Ask when guarded; per-tool timeouts; output through the caps+spill pipe.
-- **Settling**: ledger sync, digest threshold check (maybe trigger), deferral queue drain, strand flush.
+- **Settling**: ledger sync, digest threshold check (maybe trigger), queue drain, strand flush.
 A strand is **the** state: restarting the process and replaying records to the tip reproduces everything (models, effort, mode, pending defer). No other persistence exists in core.
 
 ## 5. Dialect layer (`ka-dialect`)
@@ -146,9 +146,9 @@ Record kinds: `header` (first line: id, ts, cwd, versions, **repo snapshot: bran
 4. Later: zero-LLM elision (old results → `spill://` pointers), context promotion, speculative digest.
 
 ## 10. Surfaces
-- **TUI** (`ka-term`, ratatui): transcript pane (streaming deltas, collapsed tool rows), editor with history/interjection keys (Enter=interject while speaking, queued deferral via prefix `+`), footer meters (context %, cost, **cache-hit %**), Ask dialogs, model/effort quick-cycle keys.
+- **TUI** (`ka-term`, ratatui): transcript pane (streaming deltas, collapsed tool rows), editor with history/steer keys (Enter=steers while speaking, queue via prefix `+` or alt+q, ctrl+q recalls), footer meters (context %, cost, **cache-hit %**), Ask dialogs, model/effort quick-cycle keys.
 - **Headless** (`ka run`): stdin/prompt arg; prints the Event stream as NDJSON (Phase 6 option: Claude-Code-compatible event shapes for interop); `--schema` structured final answer (Phase 7); exit codes: 0 ok · 1 error · 2 aborted · 42 input-rejected.
-- **Updater** (`ka update`): fetches GitHub release artifact, verifies an ed25519 minisign-style signature before swapping the binary, opt-in channel tag (stable/edge); never runs in background, no auto-update. Supply chain: pinned deps, no build scripts in dependency tree where avoidable (cargo auditable).
+- **Updater** (`ka update`): fetches GitHub release artifact, verifies an ed25519 minisign-style signature before swapping the binary, opt-in channel tag (stable/edge); no auto-update — the TUI's one startup availability check (rate-limited to a hit per 24 h, `[update] check = "off"` disables, never installs) is the only background network ka does. Supply chain: pinned deps, no build scripts in dependency tree where avoidable (cargo auditable).
 
 ## 11. Config
 ```
@@ -163,7 +163,7 @@ Strict TOML: unknown keys = error with position; `ka config schema` emits JSON s
 |---|---|
 | omp hashline `[PATH#TAG]` anchored edits | ledger mtime+hash read-tracking; anchors deferred (Phase 7 candidate "clamps") |
 | omp compaction methodOrder + snapcompact | digest ladder (caps → prune → digest; elision/promotion later); bitmap trick NOT adopted (scope) |
-| omp steering/follow-up queues | interjection / deferral, `+`-prefix input |
+| omp steering/follow-up queues | steer / queue, `+`-prefix and alt+q input |
 | omp terminal breadcrumbs | waypoints |
 | omp compat-flag system (~60 flags) | dialects.toml, ~12 flags, vendor-merged |
 | omp artifact spill | `spill://` store |

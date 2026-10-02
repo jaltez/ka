@@ -940,6 +940,7 @@ async fn run_headless(
             text: prompt,
             schema,
             images,
+            skills: Vec::new(),
         })
         .await
         .map_err(|_| "engine closed before prompt".to_string())?;
@@ -1294,6 +1295,25 @@ async fn run_tui(cli: Cli) -> Result<ExitCode, String> {
         (ka_dialect::providers::vendor_rank(vendor), m.id.clone())
     });
     let fresh = matches!(choice, ka_engine::StrandChoice::New);
+    // startup update check (read before `cfg` moves into the engine):
+    // one rate-limited (24 h) availability probe against GitHub
+    // releases — never installs, `ka update` stays the only install
+    // path. Detached so a slow network never delays the first frame;
+    // failures stay silent (no badge, no nagging).
+    let update_repo = cfg
+        .update
+        .repo
+        .clone()
+        .unwrap_or_else(|| update::DEFAULT_REPO.to_string());
+    let update_enabled = cfg.update.effective_check() == ka_engine::config::UpdateCheck::Startup;
+    let (update_tx, update_rx) = tokio::sync::mpsc::channel::<ka_term::tui::UpdateNotice>(1);
+    tokio::spawn(async move {
+        if let Some((current, latest)) = update::startup_check(&update_repo, update_enabled).await {
+            let _ = update_tx
+                .send(ka_term::tui::UpdateNotice { current, latest })
+                .await;
+        }
+    });
     let handle = ka_engine::spawn_full(cfg, catalog, choice);
     let ka_engine::EngineHandle { commands, events } = handle;
     // `ka -i "<prompt>"`: one turn runs before the TUI opens — the
@@ -1307,6 +1327,7 @@ async fn run_tui(cli: Cli) -> Result<ExitCode, String> {
                 text: prompt,
                 schema: None,
                 images: Vec::new(),
+                skills: Vec::new(),
             })
             .await
             .map_err(|_| "engine closed before prompt".to_string())?;
@@ -1361,6 +1382,7 @@ async fn run_tui(cli: Cli) -> Result<ExitCode, String> {
         tui_mouse_capture,
         fresh,
         session_cwd,
+        update_rx,
     )
     .await
     .map_err(|e| format!("tui: {e}"))?;

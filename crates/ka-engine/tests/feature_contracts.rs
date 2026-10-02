@@ -87,16 +87,16 @@ async fn run_turn(voice: &mut Voice, prompt: &str, answer: Option<usize>) -> Vec
     voice.snapshot_sink().lock().set_strand("contract-test");
     let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::channel::<Command>(16);
     let (evt_tx, mut evt_rx) = tokio::sync::mpsc::channel::<Event>(256);
-    let mut interjections = Vec::new();
-    let mut deferrals = VecDeque::new();
+    let mut steers = Vec::new();
+    let mut queue = VecDeque::new();
     let mut guards = GuardRuntime::default();
     let fut = voice.turn(
         "test/m",
         prompt.to_string(),
         &mut cmd_rx,
         &evt_tx,
-        &mut interjections,
-        &mut deferrals,
+        &mut steers,
+        &mut queue,
         &mut guards,
         None,
         Vec::new(),
@@ -504,6 +504,7 @@ fn config_schema_carries_every_documented_key() {
         "models",
         "update",
         "repo",
+        "check",
         "context",
         "promote",
         "search",

@@ -98,16 +98,16 @@ impl Hand for PathfinderHand {
             let (cmd_tx, mut cmd_rx) = mpsc::channel(16);
             let (evt_tx, mut evt_rx) = mpsc::channel(256);
             let handle = tokio::spawn(async move {
-                let mut interjections = Vec::new();
-                let mut deferrals = std::collections::VecDeque::new();
+                let mut steers = Vec::new();
+                let mut queue = std::collections::VecDeque::new();
                 voice
                     .turn(
                         &model,
                         prompt,
                         &mut cmd_rx,
                         &evt_tx,
-                        &mut interjections,
-                        &mut deferrals,
+                        &mut steers,
+                        &mut queue,
                         &mut GuardRuntime::default(),
                         None,
                         Vec::new(),

@@ -43,7 +43,7 @@ struct AgentTask {
     /// aborts it for real.
     handle: Option<tokio::task::JoinHandle<()>>,
     /// Steering channel into the running nested voice: `tasks send`
-    /// injects an interjection through it. `None` for finished tasks
+    /// routes a steer through it. `None` for finished tasks
     /// and when the runner has not started yet.
     cmds: Option<mpsc::Sender<ka_protocol::Command>>,
     /// Turn cost (USD) accumulated by the runner, once known.
@@ -135,7 +135,7 @@ impl AgentTaskTable {
             .and_then(|e| e.branch.clone())
     }
 
-    /// Steer a running task (an interjection its next step honors) or,
+    /// Steer a running task (a message its next step honors) or,
     /// for a finished task, record the message as a note — no revival.
     pub fn send(&self, id: u64, text: &str) -> Result<String, String> {
         let mut t = self.inner.lock();
@@ -148,7 +148,7 @@ impl AgentTaskTable {
                 Some(cmds) => {
                     let cmds = cmds.clone();
                     drop(t);
-                    let sent = cmds.try_send(ka_protocol::Command::Interject {
+                    let sent = cmds.try_send(ka_protocol::Command::Steer {
                         text: text.to_string(),
                     });
                     match sent {
@@ -379,7 +379,7 @@ impl Hand for TasksHand {
                 background: true). {\"action\": \"list\"} shows every task; \
                 {\"action\": \"read\", \"id\": N} returns a finished task's full result \
                 (or its live status); {\"action\": \"send\", \"id\": N, \"text\": \"...\"} \
-                steers a running task (an interjection it honors next step); \
+                steers a running task (a message it honors next step); \
                 {\"action\": \"inbox\", \"id\": N} shows recorded messages; \
                 {\"action\": \"merge\", \"id\": N} applies an isolated task's surviving \
                 branch as a clean-only patch (conflict: the patch path is returned, \
@@ -577,7 +577,7 @@ mod tests {
             .await;
         assert!(out.is_error, "{}", out.content);
 
-        // with a channel: the steering lands as an Interject command
+        // with a channel: the steering lands as a Steer command
         let (tx, mut rx) = mpsc::channel(4);
         table.attach_cmds(id, tx);
         let out = hand
@@ -589,10 +589,10 @@ mod tests {
         assert!(!out.is_error, "{}", out.content);
         assert!(out.content.contains("steered"), "{}", out.content);
         match rx.recv().await {
-            Some(ka_protocol::Command::Interject { text }) => {
+            Some(ka_protocol::Command::Steer { text }) => {
                 assert_eq!(text, "focus on the parser");
             }
-            other => panic!("expected an interjection, got {other:?}"),
+            other => panic!("expected a steer, got {other:?}"),
         }
 
         // finished: the message is recorded, never replayed

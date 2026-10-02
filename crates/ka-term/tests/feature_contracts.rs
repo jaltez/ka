@@ -4,9 +4,11 @@
 //! command or interaction broke; update docs + contract together.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
+use ka_protocol::Command;
 use ka_term::tui::{
-    ModalKind, NotifySettings, Transcript, accept_memory_note, memory_modal_rows,
-    read_memory_inbox, slash_command, write_memory_inbox,
+    Inventory, ModalKind, NotifySettings, SKILLS, Transcript, accept_memory_note,
+    memory_modal_rows, read_memory_inbox, skill_invocation, slash_command, update_suggestions,
+    write_memory_inbox,
 };
 
 /// Every built-in slash command documented in the README parses. A
@@ -62,8 +64,11 @@ fn every_documented_slash_command_parses() {
     );
     // input-layer commands are intercepted before slash_command (local
     // transcript/copy/mouse state, no engine roundtrip): /find /retry
-    // /copy /clip /mouse. They are covered by the input-layer unit
-    // tests in src; if you move one into slash_command, add it above.
+    // /copy /clip /mouse, and the /skill:<name> family (validated
+    // against the inventory, dispatched as a scoped Prompt — see
+    // skill_invocation_scopes_the_turn). They are covered by the
+    // input-layer unit tests in src; if you move one into
+    // slash_command, add it above.
 }
 
 /// Argument-bearing forms parse the way the docs show.
@@ -319,4 +324,127 @@ fn custom_command_frontmatter_scopes_the_turn() {
         }
         other => panic!("expected a scoped prompt, got {other:?}"),
     }
+}
+
+/// `/skill:<name> [args]` dispatches a Prompt scoped to that skill
+/// (the engine injects the SKILL.md body into the turn's system
+/// prompt); args become the prompt text, a bare invocation gets a
+/// deterministic fallback, and unknown/disabled skills refuse with a
+/// message naming the toggle — never a hollow turn.
+#[test]
+fn skill_invocation_scopes_the_turn() {
+    let mut inv = Inventory {
+        skills: vec!["pdf".to_string(), "commit-style".to_string()],
+        ..Default::default()
+    };
+
+    // with args: the args are the prompt, the name rides `skills`
+    let cmd = skill_invocation("/skill:pdf merge a.pdf b.pdf", &inv)
+        .expect("a /skill: line")
+        .expect("pdf is offered");
+    match cmd {
+        Command::Prompt { text, skills, .. } => {
+            assert_eq!(text, "merge a.pdf b.pdf");
+            assert_eq!(skills, vec!["pdf".to_string()]);
+        }
+        other => panic!("expected a scoped prompt, got {other:?}"),
+    }
+
+    // bare: a minimal deterministic prompt, not an empty one
+    let cmd = skill_invocation("/skill:commit-style", &inv)
+        .unwrap()
+        .unwrap();
+    match cmd {
+        Command::Prompt { text, skills, .. } => {
+            assert_eq!(text, "Use the commit-style skill.");
+            assert_eq!(skills, vec!["commit-style".to_string()]);
+        }
+        other => panic!("expected a scoped prompt, got {other:?}"),
+    }
+
+    // hyphenated names parse (no space in the name, rest is args)
+    let cmd = skill_invocation("/skill:commit-style  conventional", &inv)
+        .unwrap()
+        .unwrap();
+    assert!(matches!(
+        cmd,
+        Command::Prompt { ref text, ref skills, .. }
+            if text == "conventional" && skills == &vec!["commit-style".to_string()]
+    ));
+
+    // unknown skill refuses loudly
+    let err = skill_invocation("/skill:nope do things", &inv)
+        .unwrap()
+        .unwrap_err();
+    assert!(err.contains("no such skill: nope"), "{err}");
+
+    // disabled skill names the toggle (shared spec grammar). The
+    // engine's inventory already dropped it from `skills` (emit_inventory
+    // filters); `disabled` explains why.
+    inv.skills = vec!["commit-style".to_string()];
+    inv.disabled = vec!["skill:pdf".to_string()];
+    let err = skill_invocation("/skill:pdf x", &inv).unwrap().unwrap_err();
+    assert!(err.contains("skill:pdf"), "names the toggle: {err}");
+
+    // whole tier off names the tier (no skills listed at all)
+    inv.skills = Vec::new();
+    inv.disabled = vec!["skills".to_string()];
+    let err = skill_invocation("/skill:pdf x", &inv).unwrap().unwrap_err();
+    assert!(err.contains("/features on skills"), "{err}");
+
+    // a missing name is a usage error, not a fall-through
+    let err = skill_invocation("/skill:", &inv).unwrap().unwrap_err();
+    assert!(err.contains("/skill:<name>"), "{err}");
+
+    // bare `/skill` teaches the form and lists the offer (like bare
+    // /agents); the space form is taught too, never silently invoked
+    inv.skills = vec!["pdf".to_string()];
+    inv.disabled = Vec::new();
+    let err = skill_invocation("/skill", &inv).unwrap().unwrap_err();
+    assert!(
+        err.contains("/skill:<name>") && err.contains("pdf"),
+        "teaches + lists: {err}"
+    );
+    let err = skill_invocation("/skill pdf", &inv).unwrap().unwrap_err();
+    assert!(err.contains("/skill:<name>"), "space form taught: {err}");
+    // nothing discovered: an honest empty note
+    inv.skills = Vec::new();
+    let err = skill_invocation("/skill", &inv).unwrap().unwrap_err();
+    assert!(err.contains("no skills"), "{err}");
+
+    // anything else is not a skill invocation (slash dispatch handles it)
+    assert!(skill_invocation("/model", &inv).is_none());
+    assert!(skill_invocation("plain text", &inv).is_none());
+}
+
+/// The slash popup completes the /skill family in stages: `/sk…`
+/// surfaces the `/skill` starter, the inventory's `/skill:<name>`
+/// entries wait for the colon.
+#[test]
+fn skill_popup_completes_from_inventory() {
+    *SKILLS.write().unwrap() = vec!["pdf".to_string(), "commit-style".to_string()];
+    // /sk → just the starter (the names wait for the colon)
+    // (from "/sk" on the starter is the only /s* match; "/s" alone
+    // also offers /sandbox /settings /session /spills)
+    for probe in ["/sk", "/skil", "/skill"] {
+        let popup =
+            update_suggestions(probe).unwrap_or_else(|| panic!("{probe} shows the starter"));
+        let names: Vec<&str> = popup.items.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(names, vec!["/skill"], "{probe}: {names:?}");
+    }
+    // past the colon: the inventory names, starter gone
+    let popup = update_suggestions("/skill:").expect("offers the inventory skills");
+    let names: Vec<&str> = popup.items.iter().map(|(n, _)| n.as_str()).collect();
+    assert_eq!(
+        names,
+        vec!["/skill:pdf", "/skill:commit-style"],
+        "{names:?}"
+    );
+    // prefix filter narrows as the user types the name
+    let popup = update_suggestions("/skill:com").expect("prefix narrows");
+    let names: Vec<&str> = popup.items.iter().map(|(n, _)| n.as_str()).collect();
+    assert_eq!(names, vec!["/skill:commit-style"], "{names:?}");
+    // unrelated prefixes stay quiet
+    assert!(update_suggestions("/sx").is_none());
+    *SKILLS.write().unwrap() = Vec::new();
 }

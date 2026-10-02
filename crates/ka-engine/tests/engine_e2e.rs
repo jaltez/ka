@@ -173,6 +173,7 @@ async fn prompt_canned_turn_contract() {
             text: "hello".into(),
             schema: None,
             images: Vec::new(),
+            skills: Vec::new(),
         },
         on_idle,
     )
@@ -507,6 +508,7 @@ async fn export_markdown_contract() {
             text: "record me".into(),
             schema: None,
             images: Vec::new(),
+            skills: Vec::new(),
         },
         on_idle,
     )
@@ -592,6 +594,7 @@ async fn auto_commit_off_by_default_leaves_repo_untouched() {
             text: "hello".into(),
             schema: None,
             images: Vec::new(),
+            skills: Vec::new(),
         },
         on_idle,
     )
@@ -648,6 +651,7 @@ async fn verify_failure_feeds_back_exactly_one_fix_round() {
             text: "edit the file".into(),
             schema: None,
             images: Vec::new(),
+            skills: Vec::new(),
         },
         on_idle,
     )
@@ -731,6 +735,7 @@ async fn verify_pass_is_announced_without_fix_round() {
             text: "edit the file".into(),
             schema: None,
             images: Vec::new(),
+            skills: Vec::new(),
         },
         on_idle,
     )
@@ -788,6 +793,7 @@ async fn verify_test_is_abortable() {
             text: "edit the file".into(),
             schema: None,
             images: Vec::new(),
+            skills: Vec::new(),
         })
         .await
         .expect("engine alive");
@@ -865,6 +871,7 @@ async fn lifecycle_hooks_fire_across_the_engine_loop() {
             images: vec![],
             allowed_tools: None,
             model: None,
+            skills: Vec::new(),
         },
         on_idle,
     )
@@ -931,6 +938,7 @@ async fn prompt_scoping_allowed_tools_and_model_override() {
             text: "scope this turn".into(),
             schema: None,
             images: Vec::new(),
+            skills: Vec::new(),
         },
         on_idle,
     )
@@ -992,6 +1000,7 @@ async fn prompt_scoping_allowed_tools_and_model_override() {
             text: "next turn unscoped".into(),
             schema: None,
             images: Vec::new(),
+            skills: Vec::new(),
         },
         on_idle,
     )
@@ -1052,6 +1061,7 @@ async fn prompt_model_override_rejects_invalid_selector() {
             text: "hello".into(),
             schema: None,
             images: Vec::new(),
+            skills: Vec::new(),
         },
         on_idle,
     )
