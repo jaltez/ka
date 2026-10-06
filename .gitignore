@@ -5,6 +5,9 @@ research/repos/
 
 # release signing private key (never commit)
 ka-release.key
+# release artifacts (built and signed in CI)
+ka-*.tar.gz
+ka-*.tar.gz.*
 
 # harnesses — anchored to the repo root so fixture dirs named the
 # same never silently disappear

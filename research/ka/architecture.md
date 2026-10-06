@@ -28,20 +28,21 @@ v0.1 · 2026-08-23 · grounded in `research/` survey; concepts reinvented and re
 | **Hands** | the tool registry trait ("the engine acts through them") | tool interfaces |
 | **clearance** | tool tier: `read` / `write` / `exec` | approval tiers |
 | **hardstops** | unbypassable catastrophic-command list; prompts even in free mode | droid blocklist |
-| **guarded / free** | the two permission modes | ask/yolo |
+| **guarded / accept-edits / free / plan** | the four permission modes (plan is read-only except the plans dir) | ask/yolo tiers |
 | **waypoints** | tiny per-terminal tokens so `ka -c` continues the right strand per pane | terminal breadcrumbs |
 | **pathfinder** | the read-only subagent; summary-only return | scout/explore agents |
 | **settling** | post-turn maintenance window (digest checks, ledger sync) | turn_end maintenance |
 
 ## 2. Workspace layout
 ```
-ka-agent/       engine: turn machine, queues, Hands/Clearance, digest, ledger   (no I/O deps beyond std+serde)
-ka-protocol/   Command + Event enums (shared by TUI, headless, future servers)
-ka-dialect/    Speaker trait; anthropic-messages + openai-chat wires; dialects.toml loader; selectors
+ka-engine/     engine: turn machine, queues, Hands/Clearance, digest, ledger   (no I/O deps beyond std+serde)
+ka-protocol/   Command + Event enums (shared by TUI, headless, serve/attach)
+ka-dialect/    Speaker trait; anthropic-messages/openai-chat/openai-responses wires; dialects.toml; selectors
 ka-strand/     strand store: reader, appender, tip/index, split, waypoints
-ka-term/       ratatui surface (optional feature from CLI's view)
-ka-cli/        the binary: `ka` (TUI), `ka run` (headless NDJSON)
-future crates:  ka-index (SQLite/FTS), ka-sandbox (landlock/seatbelt), ka-mcp (rmcp)
+ka-term/       ratatui surfaces: the TUI and the observe-only `ka attach` client
+ka-index/      optional FTS search (cargo feature `index`)
+ka-sandbox/    optional fs sandboxing (landlock/bwrap/firejail, fail-closed)
+ka-agent/      the published `ka` binary: TUI, `ka run` headless NDJSON, `ka serve` HTTP/SSE, `ka attach`
 ```
 Dependency direction is one-way: `cli → term/protocol/dialect/strand → engine`. The engine never imports a surface.
 
@@ -56,7 +57,7 @@ pub enum Command {          // surface → engine
     Abort,
     SetModel { selector: String },
     SetEffort { level: Effort },
-    SetMode { mode: Mode },                  // guarded | free
+    SetMode { mode: Mode },                  // guarded | accept-edits | free | plan
     AlwaysAllow { rule: RuleId },
     Resume { strand: StrandId, tip: Option<RecordId> },
     Compact { focus: Option<String> },
@@ -70,7 +71,7 @@ pub enum Event {            // engine → surface (non_exhaustive)
     Ask { id, questions },                   // surfaces render; headless prints JSON
     TurnFinished { stop: Stop, usage: Usage, cost: f64, cache_hit: f32 },
     DigestStarted/DigestFinished { kept: RecordId },
-    ModeChanged, ModelChanged, Error{class, retryable},
+    ModeChanged, ModelChanged, EffortChanged, Error{class, retryable},
 }
 ```
 

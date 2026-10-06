@@ -41,6 +41,6 @@ Dependency direction is one-way: `ka-agent → ka-term/ka-protocol/ka-dialect/ka
 ## Conventions
 
 - Vocabulary is Ka's own (strand, record, digest, ledger, Hands, Speaker, clearance, hardstops…). Glossary + lineage: `research/ka/architecture.md` §1. Design docs: `research/ka/`; `research/` is a survey, not code.
-- Tests are contracts: ~530, including documented-feature contracts — CI fails if a README-documented behavior regresses. When changing documented behavior, update README **and** the contract test together.
+- Tests are contracts: ~750, including documented-feature contracts — CI fails if a README-documented behavior regresses. When changing documented behavior, update README **and** the contract test together.
 - Wire changes need recorded SSE fixture tests (normal, malformed, partial-JSON repair paths). No keys in CI, ever.
 - Rust edition 2024, MSRV 1.85. Workspace deps only via `[workspace.dependencies]`.

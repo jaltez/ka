@@ -115,7 +115,7 @@ Editor integration → `ka acp`. Batch reporting/auditing → `ka sessions --jso
 
 ## Versioning
 
-All workspace crates carry one version (`0.2.5`), pinned through `workspace.dependencies`, and
+All workspace crates carry one version (`0.2.10`), pinned through `workspace.dependencies`, and
 publish together in lockstep — a surface and its protocol change in the same release. Pre-1.0:
 shapes may change between minor versions.
 
