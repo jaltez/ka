@@ -159,11 +159,14 @@ async fn speak_responses(
     if !req.system.is_empty() {
         body["instructions"] = json!(req.system);
     }
-    if !req.tools.is_empty() {
-        // responses tools are flat: no nested "function" object
-        let tools: Vec<Value> = req
+    {
+        let native_search = req.native_search && dialect.flags.server_search;
+        let mut tools: Vec<Value> = req
             .tools
             .iter()
+            // native search replaces the client-side hand — same name,
+            // provider executes it server-side
+            .filter(|t| !(native_search && t.name == "web_search"))
             .map(|t| {
                 json!({
                     "type": "function",
@@ -173,7 +176,12 @@ async fn speak_responses(
                 })
             })
             .collect();
-        body["tools"] = Value::Array(tools);
+        if native_search {
+            tools.push(json!({"type": "web_search"}));
+        }
+        if !tools.is_empty() {
+            body["tools"] = Value::Array(tools);
+        }
     }
     if dialect.max_output > 0 {
         body["max_output_tokens"] = json!(dialect.max_output);
@@ -252,6 +260,22 @@ async fn speak_responses(
                 }
                 "response.output_item.added" => {
                     let item = &v["item"];
+                    // provider-executed search: the harness never runs
+                    // it — surface the action the model took
+                    if item.get("type").and_then(Value::as_str) == Some("web_search_call") {
+                        if let Some(action) = item.get("action") {
+                            let q = action
+                                .pointer("/query/text")
+                                .or_else(|| action.get("query"))
+                                .and_then(Value::as_str)
+                                .unwrap_or_default();
+                            if !q.is_empty() {
+                                out.send(StreamEvent::Text(format!("\n[web_search: {q}]")))
+                                    .await
+                                    .ok();
+                            }
+                        }
+                    }
                     if item.get("type").and_then(Value::as_str) == Some("function_call") {
                         calls.push(PendingItem {
                             item_id: item

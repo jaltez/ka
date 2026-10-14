@@ -1459,15 +1459,25 @@ fn completions_script(shell: &str) -> Result<String, String> {
     }
 }
 
-/// Resolve a `--session` reference (id, id prefix, or file path).
+/// Resolve a `--session` reference (id, id prefix, file path, or a
+/// memorable session name — exact, then unique name prefix).
 fn resolve_session(cwd: &std::path::Path, id: &str) -> Result<ka_engine::StrandChoice, String> {
-    match ka_strand::resolve_id(cwd, id).map_err(|e| format!("session lookup: {e}"))? {
+    let matched =
+        match ka_strand::resolve_id(cwd, id).map_err(|e| format!("session lookup: {e}"))? {
+            ka_strand::IdMatch::None => {
+                // memorable names sit between ids and titles in the
+                // resolution order
+                ka_strand::resolve_name(cwd, id).map_err(|e| format!("session lookup: {e}"))?
+            }
+            other => other,
+        };
+    match matched {
         ka_strand::IdMatch::Unique(summary) => Ok(ka_engine::StrandChoice::Path(summary.path)),
         ka_strand::IdMatch::None => Err(format!("no session matches '{id}'")),
         ka_strand::IdMatch::Ambiguous(candidates) => {
             let ids: Vec<String> = candidates.iter().map(|c| c.id.clone()).collect();
             Err(format!(
-                "session id '{id}' is ambiguous: {}",
+                "session reference '{id}' is ambiguous: {}",
                 ids.join(", ")
             ))
         }
@@ -1486,6 +1496,7 @@ fn run_sessions(json: bool) -> Result<ExitCode, String> {
                     "id": s.id,
                     "ts": s.ts,
                     "title": s.title,
+                    "name": s.name,
                     "messages": s.messages,
                     "path": s.path.display().to_string(),
                     "cost": s.cost,
@@ -1509,12 +1520,17 @@ fn run_sessions(json: bool) -> Result<ExitCode, String> {
         first_message = "first message"
     );
     for s in strands.iter().take(30) {
+        // a set name rides beside the title: `fox · fix the pump`
+        let label = match &s.name {
+            Some(n) => format!("{n} · {}", s.title),
+            None => s.title.clone(),
+        };
         println!(
             "{:<26} {:>5} {:>10}  {}",
             s.id,
             s.messages,
             format!("${:.4}", s.cost),
-            s.title
+            label
         );
     }
     Ok(ExitCode::SUCCESS)

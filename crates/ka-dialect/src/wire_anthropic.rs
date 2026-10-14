@@ -95,10 +95,14 @@ async fn speak_anthropic(
             body["system"] = json!(req.system);
         }
     }
-    if !req.tools.is_empty() {
-        let tools: Vec<Value> = req
+    {
+        let native_search = req.native_search && dialect.flags.server_search;
+        let mut tools: Vec<Value> = req
             .tools
             .iter()
+            // native search replaces the client-side hand — same name,
+            // provider executes it server-side
+            .filter(|t| !(native_search && t.name == "web_search"))
             .map(|t| {
                 json!({
                     "name": t.name,
@@ -107,7 +111,16 @@ async fn speak_anthropic(
                 })
             })
             .collect();
-        body["tools"] = Value::Array(tools);
+        if native_search {
+            tools.push(json!({
+                "type": "web_search_20250305",
+                "name": "web_search",
+                "max_uses": 3,
+            }));
+        }
+        if !tools.is_empty() {
+            body["tools"] = Value::Array(tools);
+        }
     }
     if let Some(schema) = &req.schema {
         let mut tools: Vec<Value> = body["tools"].as_array().cloned().unwrap_or_default();
@@ -285,6 +298,17 @@ async fn speak_anthropic(
                             .to_string(),
                         args: String::new(),
                     };
+                    // web_search_tool_result arrives complete in the
+                    // start event: surface the sources as text the
+                    // model and the transcript both read — or the
+                    // failure, when the provider reports one
+                    if kind == "web_search_tool_result" {
+                        if let Some(sources) = search_sources(&v) {
+                            out.send(StreamEvent::Text(sources)).await.ok();
+                        } else if let Some(err) = search_error(&v) {
+                            out.send(StreamEvent::Text(err)).await.ok();
+                        }
+                    }
                 }
                 "content_block_delta" => {
                     let index = v.get("index").and_then(Value::as_u64).unwrap_or(0) as usize;
@@ -327,9 +351,9 @@ async fn speak_anthropic(
                 }
                 "content_block_stop" => {
                     let index = v.get("index").and_then(Value::as_u64).unwrap_or(0) as usize;
-                    if index < blocks.len() && blocks[index].kind == "tool_use" {
+                    if index < blocks.len() {
                         let b = &blocks[index];
-                        if !b.tool.is_empty() {
+                        if b.kind == "tool_use" && !b.tool.is_empty() {
                             // a structured-output request surfaces the forced
                             // tool's arguments as the reply text
                             if b.tool == "structured_output" {
@@ -344,12 +368,30 @@ async fn speak_anthropic(
                                 .ok();
                             }
                         }
+                        // provider-executed search: the harness never
+                        // runs it — surface the query the model asked
+                        if b.kind == "server_tool_use" {
+                            let query = repair_json(&b.args)
+                                .get("query")
+                                .and_then(Value::as_str)
+                                .unwrap_or_default()
+                                .to_string();
+                            if !query.is_empty() {
+                                out.send(StreamEvent::Text(format!("\n[web_search: {query}]")))
+                                    .await
+                                    .ok();
+                            }
+                        }
                     }
                 }
                 "message_delta" => {
                     if let Some(reason) = v.pointer("/delta/stop_reason").and_then(Value::as_str) {
                         stop = match reason {
                             "max_tokens" => Stop::Length,
+                            // server tools (web search) can pause the
+                            // turn server-side — surface it as a
+                            // length stop, never a silent Done
+                            "pause_turn" => Stop::Length,
                             _ => Stop::Done,
                         };
                     }
@@ -387,7 +429,7 @@ async fn speak_anthropic(
         if v.get("type").and_then(Value::as_str) == Some("message_delta") {
             if let Some(reason) = v.pointer("/delta/stop_reason").and_then(Value::as_str) {
                 stop = match reason {
-                    "max_tokens" => Stop::Length,
+                    "max_tokens" | "pause_turn" => Stop::Length,
                     _ => Stop::Done,
                 };
             }
@@ -399,6 +441,21 @@ async fn speak_anthropic(
             }
         }
     }
+    // mixed server+client tool calls: the provider defers the search
+    // (it runs only if the assistant message is resent with the
+    // server-tool block, which ka's history replay does not carry) —
+    // say so, or the query line above reads as if it ran
+    if blocks.iter().any(|b| b.kind == "server_tool_use")
+        && blocks.iter().any(|b| b.kind == "tool_use")
+    {
+        out.send(StreamEvent::Text(
+            "\n[web_search deferred by the provider alongside client tool calls — it did NOT \
+             run; re-issue the search after these tool results]"
+                .to_string(),
+        ))
+        .await
+        .ok();
+    }
     out.send(StreamEvent::Finished { stop, usage }).await.ok();
     Ok(())
 }
@@ -409,4 +466,33 @@ struct Block {
     id: String,
     tool: String,
     args: String,
+}
+
+/// Render a `web_search_tool_result` block's content array as source
+/// lines (≤5), or None when the block carries no results.
+fn search_sources(v: &Value) -> Option<String> {
+    let items = v.pointer("/content_block/content")?.as_array()?;
+    let mut out = String::from("\nSources:");
+    let mut n = 0;
+    for it in items {
+        let Some(title) = it.get("title").and_then(Value::as_str) else {
+            continue;
+        };
+        let url = it.get("url").and_then(Value::as_str).unwrap_or("");
+        out.push_str(&format!("\n- {title} — {url}"));
+        n += 1;
+        if n >= 5 {
+            break;
+        }
+    }
+    (n > 0).then_some(out)
+}
+
+/// A failed search reports an error object instead of a results
+/// array — surface it or the query line implies it ran.
+fn search_error(v: &Value) -> Option<String> {
+    let code = v
+        .pointer("/content_block/content/error_code")
+        .and_then(Value::as_str)?;
+    Some(format!("\n[web_search failed: {code}]"))
 }

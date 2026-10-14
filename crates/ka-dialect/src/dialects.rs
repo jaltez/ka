@@ -116,6 +116,14 @@ pub struct Flags {
     /// discovered local models; `false` = unknown or absent).
     #[serde(default)]
     pub tools: bool,
+    /// Provider-native server-side web search: when true, the wire
+    /// injects the provider's own search tool (Anthropic's
+    /// `web_search_20250305` server tool, OpenAI Responses'
+    /// `web_search`) and drops ka's client-side `web_search` hand for
+    /// that model — no separate `[[search]]` API key needed. Supported
+    /// on the `anthropic_messages` and `openai_responses` wires only.
+    #[serde(default)]
+    pub server_search: bool,
 }
 
 /// One model's wire profile.

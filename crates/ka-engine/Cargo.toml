@@ -41,5 +41,17 @@ required-features = ["test-util"]
 name = "project_root_contract"
 required-features = ["test-util"]
 
+# engine_e2e drives trust + mcp-cache redirection (cfg-gated the same
+# way); featureless runs skip the suite instead of failing to compile.
+[[test]]
+name = "engine_e2e"
+required-features = ["test-util"]
+
+
+# feature_toggle_contract drives the same trust redirection.
+[[test]]
+name = "feature_toggle_contract"
+required-features = ["test-util"]
+
 [lints]
 workspace = true

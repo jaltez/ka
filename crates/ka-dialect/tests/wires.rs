@@ -184,6 +184,7 @@ fn request(dialect: Dialect, system: &str) -> SpeakRequest {
         token: Some("k-test-token".to_string()),
         cache_key: None,
         schema: None,
+        native_search: false,
     }
 }
 
@@ -729,4 +730,176 @@ async fn responses_image_uses_input_image() {
         content[1]["image_url"],
         format!("data:image/png;base64,{PNG_B64}")
     );
+}
+
+// ------------------------------------------------ native server search
+
+fn tools_request(dialect: Dialect) -> SpeakRequest {
+    let mut req = request(dialect, "");
+    req.native_search = true;
+    req.tools = vec![
+        ka_dialect::speaker::ToolSpec {
+            name: "web_search".into(),
+            description: "ka-side search".into(),
+            parameters: serde_json::json!({"type": "object"}),
+        },
+        ka_dialect::speaker::ToolSpec {
+            name: "read".into(),
+            description: "read files".into(),
+            parameters: serde_json::json!({"type": "object"}),
+        },
+    ];
+    req
+}
+
+const ANTHROPIC_SERVER_SEARCH: &str = r#"
+data: {"type":"message_start","message":{"usage":{"input_tokens":20}}}
+
+data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}
+
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Searching…"}}
+
+data: {"type":"content_block_stop","index":0}
+
+data: {"type":"content_block_start","index":1,"content_block":{"type":"server_tool_use","id":"srvtool_1","name":"web_search","input":{}}}
+
+data: {"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{\"query\":"}}
+
+data: {"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"\"rust async\"}"}}
+
+data: {"type":"content_block_stop","index":1}
+
+data: {"type":"content_block_start","index":2,"content_block":{"type":"web_search_tool_result","tool_use_id":"srvtool_1","content":[{"type":"web_search_result","title":"Async in Rust","url":"https://rust-lang.org/async"},{"type":"web_search_result","title":"Tokio docs","url":"https://tokio.rs"}]}}
+
+data: {"type":"content_block_stop","index":2}
+
+data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":9}}
+
+data: {"type":"message_stop"}
+
+"#;
+
+#[tokio::test]
+async fn anthropic_native_search_swaps_the_tool_and_surfaces_sources() {
+    let (addr, captured) = serve_sse(ANTHROPIC_SERVER_SEARCH).await;
+    let dialect = dialect_for(
+        "anthropic_messages",
+        addr,
+        "[dialects.\"test/m\".flags]\nserver_search = true\n",
+    );
+    let events = collect(&AnthropicMessages::new(), tools_request(dialect)).await;
+
+    // the query the model asked + the provider's sources land as text
+    let text: String = events
+        .iter()
+        .filter_map(|e| match e {
+            StreamEvent::Text(t) => Some(t.clone()),
+            _ => None,
+        })
+        .collect();
+    assert!(text.contains("[web_search: rust async]"), "{text}");
+    assert!(
+        text.contains("Async in Rust — https://rust-lang.org/async"),
+        "{text}"
+    );
+    assert!(text.contains("Tokio docs — https://tokio.rs"), "{text}");
+    // the provider-executed search is never surfaced as a ka tool call
+    assert!(
+        !events.iter().any(|e| matches!(e, StreamEvent::Call(_))),
+        "{events:?}"
+    );
+
+    // request side: the client web_search hand is REPLACED by the
+    // server tool; other tools ride along untouched
+    let raw = captured.lock().clone().unwrap();
+    let body: serde_json::Value =
+        serde_json::from_str(raw.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+    let tools = body["tools"].as_array().unwrap();
+    assert!(
+        !tools.iter().any(
+            |t| t.get("name").and_then(|n| n.as_str()) == Some("web_search")
+                && t.get("input_schema").is_some()
+        ),
+        "client web_search hand must drop: {tools:?}"
+    );
+    let server_tool = tools
+        .iter()
+        .find(|t| t["type"] == "web_search_20250305")
+        .expect("server tool injected");
+    assert_eq!(server_tool["name"], "web_search");
+    assert!(
+        tools.iter().any(|t| t["name"] == "read"),
+        "unrelated tools ride along: {tools:?}"
+    );
+}
+
+const RESPONSES_SERVER_SEARCH: &str = r#"
+data: {"type":"response.output_item.added","item":{"type":"web_search_call","id":"ws_1","action":{"type":"search","query":{"text":"rust async"}}}}
+
+data: {"type":"response.output_text.delta","delta":"Here is what"}
+
+data: {"type":"response.output_text.delta","delta":" I found."}
+
+data: {"type":"response.completed","usage":{"input_tokens":15,"output_tokens":6}}
+
+"#;
+
+#[tokio::test]
+async fn responses_native_search_injects_tool_and_notes_the_query() {
+    let (addr, captured) = serve_sse(RESPONSES_SERVER_SEARCH).await;
+    let dialect = dialect_for(
+        "openai_responses",
+        addr,
+        "[dialects.\"test/m\".flags]\nserver_search = true\n",
+    );
+    let events = collect(&OpenaiResponses::new(), tools_request(dialect)).await;
+
+    let text: String = events
+        .iter()
+        .filter_map(|e| match e {
+            StreamEvent::Text(t) => Some(t.clone()),
+            _ => None,
+        })
+        .collect();
+    assert!(text.contains("[web_search: rust async]"), "{text}");
+    assert!(text.contains("I found."), "{text}");
+
+    let raw = captured.lock().clone().unwrap();
+    let body: serde_json::Value =
+        serde_json::from_str(raw.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+    let tools = body["tools"].as_array().unwrap();
+    assert!(
+        !tools
+            .iter()
+            .any(|t| t["type"] == "function" && t["name"] == "web_search"),
+        "client web_search hand must drop: {tools:?}"
+    );
+    assert!(
+        tools.iter().any(|t| t["type"] == "web_search"),
+        "server web_search tool injected: {tools:?}"
+    );
+    assert!(
+        tools
+            .iter()
+            .any(|t| t["type"] == "function" && t["name"] == "read"),
+        "unrelated tools ride along: {tools:?}"
+    );
+}
+
+#[tokio::test]
+async fn chat_wire_refuses_server_search_instructively() {
+    let (addr, _cap) = serve_sse(OPENAI_BASIC).await;
+    let dialect = dialect_for(
+        "openai_chat",
+        addr,
+        "[dialects.\"test/m\".flags]\nserver_search = true\n",
+    );
+    let events = collect(&OpenaiChat::new(), tools_request(dialect)).await;
+    match events.last() {
+        Some(StreamEvent::Failed { message, .. }) => assert!(
+            message.contains("server_search is not supported on the openai_chat wire"),
+            "{message}"
+        ),
+        other => panic!("expected instructive failure, got {other:?}"),
+    }
 }

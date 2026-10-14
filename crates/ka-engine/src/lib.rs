@@ -13,6 +13,7 @@ mod fshooks;
 pub mod hands;
 pub mod lsp;
 pub mod mcp;
+pub mod mcp_cache;
 pub mod trust;
 pub mod voice;
 pub mod wire;

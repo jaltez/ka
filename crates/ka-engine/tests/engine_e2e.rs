@@ -99,6 +99,7 @@ use ka_dialect::speaker::{
 /// [verify] fix-round prompt).
 struct Scripted {
     calls: parking_lot::Mutex<VecDeque<(&'static str, serde_json::Value)>>,
+    texts: parking_lot::Mutex<VecDeque<String>>,
     requests: parking_lot::Mutex<Vec<Vec<TurnMessage>>>,
     models: parking_lot::Mutex<Vec<String>>,
     efforts: parking_lot::Mutex<Vec<Option<String>>>,
@@ -109,6 +110,7 @@ impl Scripted {
     fn new(calls: Vec<(&'static str, serde_json::Value)>) -> std::sync::Arc<Self> {
         std::sync::Arc::new(Self {
             calls: parking_lot::Mutex::new(calls.into()),
+            texts: parking_lot::Mutex::new(VecDeque::new()),
             requests: parking_lot::Mutex::new(Vec::new()),
             models: parking_lot::Mutex::new(Vec::new()),
             efforts: parking_lot::Mutex::new(Vec::new()),
@@ -129,16 +131,26 @@ impl Speaker for Scripted {
             self.efforts.lock().push(req.effort.clone());
             self.tool_counts.lock().push(req.tools.len());
             let next = self.calls.lock().pop_front();
+            // an empty tool name scripts a dry round: no call, the
+            // round closes and the turn ends (auto-poke tests need to
+            // end a turn with work still pending)
             if let Some((tool, args)) = next {
-                out.send(StreamEvent::Call(ToolCall {
-                    id: "c1".into(),
-                    tool: tool.into(),
-                    arguments: args,
-                }))
-                .await
-                .ok();
+                if !tool.is_empty() {
+                    out.send(StreamEvent::Call(ToolCall {
+                        id: "c1".into(),
+                        tool: tool.into(),
+                        arguments: args,
+                    }))
+                    .await
+                    .ok();
+                }
             } else {
-                out.send(StreamEvent::Text("done".into())).await.ok();
+                let text = self
+                    .texts
+                    .lock()
+                    .pop_front()
+                    .unwrap_or_else(|| "done".into());
+                out.send(StreamEvent::Text(text)).await.ok();
             }
             out.send(StreamEvent::Finished {
                 stop: Stop::Done,
@@ -1072,5 +1084,692 @@ async fn prompt_model_override_rejects_invalid_selector() {
         ),
         "invalid override surfaces a note: {events:?}"
     );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ------------------------------------------------- [pokes] auto-poke
+
+fn todo_args(items: &[(&str, &str)]) -> serde_json::Value {
+    serde_json::json!({ "items": items
+        .iter()
+        .map(|(text, state)| serde_json::json!({"text": text, "state": state}))
+        .collect::<Vec<_>>() })
+}
+
+fn count(events: &[Event], f: fn(&Event) -> bool) -> usize {
+    events.iter().filter(|e| f(e)).count()
+}
+
+fn on_turn_started(e: &Event) -> bool {
+    matches!(e, Event::TurnStarted { .. })
+}
+
+fn on_poke_note(e: &Event) -> bool {
+    matches!(e, Event::Note { message } if message.contains("auto-poke"))
+}
+
+/// A turn that settles with pending todos earns exactly one
+/// continuation round whose prompt names the pending items; once the
+/// list is empty the loop stops (no third turn).
+#[tokio::test]
+async fn auto_poke_continues_until_todos_done() {
+    let dir = tmp_dir("poke-happy");
+    let cfg = ka_engine::Config {
+        cwd: Some(dir.to_string_lossy().into_owned()),
+        model: Some("test/m".into()),
+        ..Default::default()
+    };
+    let speaker = Scripted::new(vec![
+        ("todo", todo_args(&[("wire the pump", "pending")])),
+        ("", serde_json::Value::Null), // dry round: turn 1 ends, item pending
+        ("todo", todo_args(&[("wire the pump", "done")])), // the poke turn finishes it
+    ]);
+    let mut handle = ka_engine::spawn_with_speaker(
+        cfg,
+        test_catalog(),
+        ka_engine::StrandChoice::New,
+        ka_dialect::Wire::OpenaiChat,
+        speaker.clone(),
+    );
+    let events = settle(
+        &mut handle,
+        Command::Prompt {
+            allowed_tools: None,
+            model: None,
+            text: "wire the pump".into(),
+            schema: None,
+            images: Vec::new(),
+            skills: Vec::new(),
+        },
+        on_idle,
+    )
+    .await;
+    assert_eq!(count(&events, on_turn_started), 2, "{events:?}");
+    assert_eq!(count(&events, on_poke_note), 1, "{events:?}");
+    // the poke prompt reached the model as a user message naming the item
+    let requests = speaker.requests.lock();
+    let poked = requests.iter().any(|round| {
+        round.iter().any(|m| {
+            m.content.contains("(ka auto-poke 1/3)") && m.content.contains("wire the pump")
+        })
+    });
+    assert!(poked, "poke prompt must reach the model: {requests:?}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// An unchanged pending set is no progress: exactly one poke fires,
+/// then the loop stops instead of burning the remaining rounds.
+#[tokio::test]
+async fn auto_poke_stops_when_the_pending_set_does_not_move() {
+    let dir = tmp_dir("poke-stuck");
+    let cfg = ka_engine::Config {
+        cwd: Some(dir.to_string_lossy().into_owned()),
+        model: Some("test/m".into()),
+        ..Default::default()
+    };
+    // both turns leave the SAME two items pending
+    let items = todo_args(&[("a", "pending"), ("b", "pending")]);
+    let speaker = Scripted::new(vec![("todo", items.clone()), ("todo", items)]);
+    let mut handle = ka_engine::spawn_with_speaker(
+        cfg,
+        test_catalog(),
+        ka_engine::StrandChoice::New,
+        ka_dialect::Wire::OpenaiChat,
+        speaker,
+    );
+    let events = settle(
+        &mut handle,
+        Command::Prompt {
+            allowed_tools: None,
+            model: None,
+            text: "do a and b".into(),
+            schema: None,
+            images: Vec::new(),
+            skills: Vec::new(),
+        },
+        on_idle,
+    )
+    .await;
+    assert_eq!(count(&events, on_turn_started), 2, "{events:?}");
+    assert_eq!(count(&events, on_poke_note), 1, "{events:?}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `[pokes] max = 0` disables the loop entirely.
+#[tokio::test]
+async fn auto_poke_disabled_at_zero() {
+    let dir = tmp_dir("poke-off");
+    let cfg = ka_engine::Config {
+        cwd: Some(dir.to_string_lossy().into_owned()),
+        model: Some("test/m".into()),
+        pokes: ka_engine::config::Pokes { max: Some(0) },
+        ..Default::default()
+    };
+    let speaker = Scripted::new(vec![("todo", todo_args(&[("x", "pending")]))]);
+    let mut handle = ka_engine::spawn_with_speaker(
+        cfg,
+        test_catalog(),
+        ka_engine::StrandChoice::New,
+        ka_dialect::Wire::OpenaiChat,
+        speaker,
+    );
+    let events = settle(
+        &mut handle,
+        Command::Prompt {
+            allowed_tools: None,
+            model: None,
+            text: "x".into(),
+            schema: None,
+            images: Vec::new(),
+            skills: Vec::new(),
+        },
+        on_idle,
+    )
+    .await;
+    assert_eq!(count(&events, on_turn_started), 1, "{events:?}");
+    assert_eq!(count(&events, on_poke_note), 0, "{events:?}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A turn that ends on a non-Done stop (here: an error) never pokes —
+/// wire retries have already run; the loop must not add rounds.
+#[tokio::test]
+async fn auto_poke_never_follows_a_failed_turn() {
+    struct TodoThenErrorSpeaker {
+        round: std::sync::atomic::AtomicU32,
+    }
+    impl Speaker for TodoThenErrorSpeaker {
+        fn speak<'a>(
+            &'a self,
+            _req: SpeakRequest,
+            out: tokio::sync::mpsc::Sender<StreamEvent>,
+        ) -> SpeakFuture<'a> {
+            Box::pin(async move {
+                let n = self.round.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if n == 0 {
+                    // round 0 emits a todo call and finishes Done; the
+                    // call executes and the NEXT round finishes Error —
+                    // one turn, ending hard-failed with a pending item
+                    out.send(StreamEvent::Call(ToolCall {
+                        id: "c1".into(),
+                        tool: "todo".into(),
+                        arguments: todo_args(&[("pending work", "pending")]),
+                    }))
+                    .await
+                    .ok();
+                    out.send(StreamEvent::Finished {
+                        stop: Stop::Done,
+                        usage: ka_protocol::Usage::default(),
+                    })
+                    .await
+                    .ok();
+                } else {
+                    out.send(StreamEvent::Finished {
+                        stop: Stop::Error,
+                        usage: ka_protocol::Usage::default(),
+                    })
+                    .await
+                    .ok();
+                }
+            })
+        }
+    }
+    let dir = tmp_dir("poke-error");
+    // the turn assigns a pending todo mid-flight and its next model
+    // round fails hard (a stream Finished{Error}, not a retryable wire
+    // failure) — the error stop alone must bar the poke
+    let cfg = ka_engine::Config {
+        cwd: Some(dir.to_string_lossy().into_owned()),
+        model: Some("test/m".into()),
+        ..Default::default()
+    };
+    let mut handle = ka_engine::spawn_with_speaker(
+        cfg,
+        test_catalog(),
+        ka_engine::StrandChoice::New,
+        ka_dialect::Wire::OpenaiChat,
+        std::sync::Arc::new(TodoThenErrorSpeaker {
+            round: std::sync::atomic::AtomicU32::new(0),
+        }),
+    );
+    let events = settle(
+        &mut handle,
+        Command::Prompt {
+            allowed_tools: None,
+            model: None,
+            text: "anything".into(),
+            schema: None,
+            images: Vec::new(),
+            skills: Vec::new(),
+        },
+        on_idle,
+    )
+    .await;
+    assert_eq!(count(&events, on_turn_started), 1, "{events:?}");
+    assert_eq!(count(&events, on_poke_note), 0, "{events:?}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The bound itself: a model that keeps assigning NEW pending items
+/// (progress every round) still earns exactly `max` poke rounds.
+#[tokio::test]
+async fn auto_poke_stops_at_max_rounds() {
+    let dir = tmp_dir("poke-max");
+    let cfg = ka_engine::Config {
+        cwd: Some(dir.to_string_lossy().into_owned()),
+        model: Some("test/m".into()),
+        ..Default::default()
+    };
+    // each turn: assign a fresh pending item, then run dry — the turn
+    // ends with work pending and the list keeps MOVING, so only the
+    // bound can stop the loop
+    let script = vec![
+        ("todo", todo_args(&[("task-1", "pending")])),
+        ("", serde_json::Value::Null),
+        ("todo", todo_args(&[("task-2", "pending")])),
+        ("", serde_json::Value::Null),
+        ("todo", todo_args(&[("task-3", "pending")])),
+        ("", serde_json::Value::Null),
+        ("todo", todo_args(&[("task-4", "pending")])),
+        ("", serde_json::Value::Null),
+    ];
+    let speaker = Scripted::new(script);
+    let mut handle = ka_engine::spawn_with_speaker(
+        cfg,
+        test_catalog(),
+        ka_engine::StrandChoice::New,
+        ka_dialect::Wire::OpenaiChat,
+        speaker,
+    );
+    let events = settle(
+        &mut handle,
+        Command::Prompt {
+            allowed_tools: None,
+            model: None,
+            text: "work".into(),
+            schema: None,
+            images: Vec::new(),
+            skills: Vec::new(),
+        },
+        on_idle,
+    )
+    .await;
+    // 1 user turn + exactly 3 pokes (the default max)
+    assert_eq!(count(&events, on_turn_started), 4, "{events:?}");
+    assert_eq!(count(&events, on_poke_note), 3, "{events:?}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Plan mode never pokes — research is not execution.
+#[tokio::test]
+async fn auto_poke_never_fires_in_plan_mode() {
+    let dir = tmp_dir("poke-plan");
+    let cfg = ka_engine::Config {
+        cwd: Some(dir.to_string_lossy().into_owned()),
+        model: Some("test/m".into()),
+        mode: Some(ka_protocol::Mode::Plan),
+        ..Default::default()
+    };
+    let speaker = Scripted::new(vec![
+        ("todo", todo_args(&[("research-thing", "pending")])),
+        ("", serde_json::Value::Null),
+    ]);
+    let mut handle = ka_engine::spawn_with_speaker(
+        cfg,
+        test_catalog(),
+        ka_engine::StrandChoice::New,
+        ka_dialect::Wire::OpenaiChat,
+        speaker,
+    );
+    let events = settle(
+        &mut handle,
+        Command::Prompt {
+            allowed_tools: None,
+            model: None,
+            text: "research it".into(),
+            schema: None,
+            images: Vec::new(),
+            skills: Vec::new(),
+        },
+        on_idle,
+    )
+    .await;
+    assert_eq!(count(&events, on_turn_started), 1, "{events:?}");
+    assert_eq!(count(&events, on_poke_note), 0, "{events:?}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ------------------------------------------- /name + /transfer
+
+/// `/name fox` appends a Name record and `ka --session fox` resolves:
+/// `resolve_name` finds the strand by its alias; invalid names refuse
+/// with a usage note and write nothing.
+#[tokio::test]
+async fn set_name_persists_and_resolves() {
+    let dir = tmp_dir("set-name");
+    let cfg = ka_engine::Config {
+        cwd: Some(dir.to_string_lossy().into_owned()),
+        ..Default::default()
+    };
+    let speaker = Scripted::new(vec![]);
+    let mut handle = ka_engine::spawn_with_speaker(
+        cfg,
+        test_catalog(),
+        ka_engine::StrandChoice::New,
+        ka_dialect::Wire::OpenaiChat,
+        speaker,
+    );
+    let _ = settle(
+        &mut handle,
+        Command::Prompt {
+            allowed_tools: None,
+            model: None,
+            text: "hello world".into(),
+            schema: None,
+            images: Vec::new(),
+            skills: Vec::new(),
+        },
+        on_idle,
+    )
+    .await;
+    let events = settle(
+        &mut handle,
+        Command::SetName { name: "fox".into() },
+        on_idle,
+    )
+    .await;
+    assert!(
+        events.iter().any(
+            |e| matches!(e, Event::Note { message } if message.contains("session name set: fox"))
+        ),
+        "name ack surfaces: {events:?}"
+    );
+    match ka_strand::resolve_name(&dir, "fox").unwrap() {
+        ka_strand::IdMatch::Unique(s) => assert_eq!(s.name.as_deref(), Some("fox")),
+        other => panic!("name must resolve after SetName: {other:?}"),
+    }
+    // invalid name: usage note, nothing written
+    let events = settle(
+        &mut handle,
+        Command::SetName {
+            name: "two words".into(),
+        },
+        on_idle,
+    )
+    .await;
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, Event::Note { message } if message.contains("usage: /name"))),
+        "invalid name refuses with usage: {events:?}"
+    );
+    assert_eq!(
+        ka_strand::list(&dir).unwrap().len(),
+        1,
+        "no extra strand; the invalid name wrote nothing"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `/transfer` digests the live context and attaches a FRESH child
+/// strand carrying only the digest: new session id, parent link, a
+/// Digest record, and a "(transfer)" title.
+#[tokio::test]
+async fn transfer_digests_into_a_fresh_child_strand() {
+    let dir = tmp_dir("transfer");
+    let cfg = ka_engine::Config {
+        cwd: Some(dir.to_string_lossy().into_owned()),
+        model: Some("test/m".into()),
+        ..Default::default()
+    };
+    let speaker = Scripted::new(vec![]);
+    let mut handle = ka_engine::spawn_with_speaker(
+        cfg,
+        test_catalog(),
+        ka_engine::StrandChoice::New,
+        ka_dialect::Wire::OpenaiChat,
+        speaker,
+    );
+    let first = settle(
+        &mut handle,
+        Command::Prompt {
+            allowed_tools: None,
+            model: None,
+            text: "wire the pump".into(),
+            schema: None,
+            images: Vec::new(),
+            skills: Vec::new(),
+        },
+        on_idle,
+    )
+    .await;
+    let old_id = first
+        .iter()
+        .find_map(|e| match e {
+            Event::SessionInfo { id } => Some(id.clone()),
+            _ => None,
+        })
+        .expect("SessionInfo after spawn");
+    let events = settle(
+        &mut handle,
+        Command::TransferStrand { focus: None },
+        on_idle,
+    )
+    .await;
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            Event::Note { message } if message.contains("transferred to fresh session")
+        )),
+        "transfer ack surfaces: {events:?}"
+    );
+    let new_id = events
+        .iter()
+        .find_map(|e| match e {
+            Event::SessionInfo { id } => Some(id.clone()),
+            _ => None,
+        })
+        .expect("SessionInfo after transfer");
+    assert_ne!(old_id, new_id, "transfer switches the live strand");
+    // the child strand: parent link + digest-only carry + transfer title
+    let listed = ka_strand::list(&dir).unwrap();
+    let child = listed
+        .iter()
+        .find(|s| s.id == new_id)
+        .expect("child strand listed");
+    assert_eq!(child.parent.as_deref(), Some(old_id.as_str()));
+    assert!(child.title.contains("(transfer)"), "{}", child.title);
+    assert_eq!(child.messages, 0, "no message records ride over");
+    // the digest IS the carried memory — exactly one Digest record
+    let digest_records = ka_strand::StrandFile::open(&child.path)
+        .unwrap()
+        .records()
+        .iter()
+        .filter(|r| matches!(r, ka_strand::Record::Digest { .. }))
+        .count();
+    assert_eq!(digest_records, 1, "digest must ride into the child strand");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ------------------------------------------------- MCP tool cache
+
+/// A cache hit registers the server's tools immediately — even when
+/// the server cannot spawn at all — so startup never blocks and the
+/// tool list stays stable; the (failing) verification is background
+/// and silent, the watchdog owns retries.
+#[tokio::test]
+async fn mcp_cache_registers_tools_without_waiting_on_the_server() {
+    let _guard = ka_engine::mcp_cache::test_support::cache_guard();
+    let dir = tmp_dir("mcp-cache");
+    let server = ka_engine::mcp::McpServerConfig {
+        name: "demo".into(),
+        command: Some("/nonexistent-ka-mcp-server".into()),
+        args: Vec::new(),
+        env: std::collections::HashMap::new(),
+        url: None,
+        headers: Vec::new(),
+    };
+    ka_engine::mcp_cache::store_tools(
+        &server,
+        &[ka_engine::mcp::McpTool {
+            name: "demo.fetch".into(),
+            raw_name: "fetch".into(),
+            description: "fetch things".into(),
+            schema: serde_json::json!({"type": "object"}),
+        }],
+    );
+    let cfg = ka_engine::Config {
+        cwd: Some(dir.to_string_lossy().into_owned()),
+        mcp: vec![server],
+        ..Default::default()
+    };
+    let mut handle = ka_engine::spawn_with_speaker(
+        cfg,
+        test_catalog(),
+        ka_engine::StrandChoice::New,
+        ka_dialect::Wire::OpenaiChat,
+        Scripted::new(vec![]),
+    );
+    let events = settle(
+        &mut handle,
+        Command::Prompt {
+            allowed_tools: None,
+            model: None,
+            text: "hello".into(),
+            schema: None,
+            images: Vec::new(),
+            skills: Vec::new(),
+        },
+        on_idle,
+    )
+    .await;
+    // the inventory reports the server ok with its cached tool…
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            Event::Inventory { mcp, tools, .. }
+                if mcp.iter().any(|s| s.name == "demo" && s.ok && s.tools == 1)
+                    && tools.iter().any(|t| t == "demo.fetch")
+        )),
+        "cached tools must register without the server: {events:?}"
+    );
+    // …and the provenance is visible
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, Event::Note { message } if message.contains("from cache"))),
+        "cache note surfaces: {events:?}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Without a cache entry the same dead server reports `ok: false` —
+/// the cache is the only thing standing between slow and stuck.
+#[tokio::test]
+async fn mcp_cache_miss_reports_the_dead_server() {
+    let _guard = ka_engine::mcp_cache::test_support::cache_guard();
+    let dir = tmp_dir("mcp-cache-miss");
+    let cfg = ka_engine::Config {
+        cwd: Some(dir.to_string_lossy().into_owned()),
+        mcp: vec![ka_engine::mcp::McpServerConfig {
+            name: "demo".into(),
+            command: Some("/nonexistent-ka-mcp-server".into()),
+            args: Vec::new(),
+            env: std::collections::HashMap::new(),
+            url: None,
+            headers: Vec::new(),
+        }],
+        ..Default::default()
+    };
+    let mut handle = ka_engine::spawn_with_speaker(
+        cfg,
+        test_catalog(),
+        ka_engine::StrandChoice::New,
+        ka_dialect::Wire::OpenaiChat,
+        Scripted::new(vec![]),
+    );
+    let events = settle(
+        &mut handle,
+        Command::Prompt {
+            allowed_tools: None,
+            model: None,
+            text: "hello".into(),
+            schema: None,
+            images: Vec::new(),
+            skills: Vec::new(),
+        },
+        on_idle,
+    )
+    .await;
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            Event::Inventory { mcp, .. } if mcp.iter().any(|s| s.name == "demo" && !s.ok)
+        )),
+        "no cache, dead server: ok must be false: {events:?}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// --------------------------------------------- hill-climbability
+
+/// A plan-mode turn earns a fast-role hill-climbability rating; below
+/// the gate the harness pushes for a verifiable objective.
+#[tokio::test]
+async fn plan_goal_below_hill_climb_gate_gets_pushback() {
+    let dir = tmp_dir("hill-low");
+    let cfg = ka_engine::Config {
+        cwd: Some(dir.to_string_lossy().into_owned()),
+        model: Some("test/m".into()),
+        mode: Some(ka_protocol::Mode::Plan),
+        roles: ka_engine::config::Roles {
+            default: None,
+            fast: Some("test/m".into()),
+        },
+        ..Default::default()
+    };
+    // rounds: the plan reply, the auto-title call, then the rating
+    let speaker = Scripted::new(vec![]);
+    speaker.texts.lock().extend([
+        "a numbered plan".into(),
+        "nice app plan".into(),
+        "40".into(),
+    ]);
+    let mut handle = ka_engine::spawn_with_speaker(
+        cfg,
+        test_catalog(),
+        ka_engine::StrandChoice::New,
+        ka_dialect::Wire::OpenaiChat,
+        speaker.clone(),
+    );
+    let events = settle(
+        &mut handle,
+        Command::Prompt {
+            allowed_tools: None,
+            model: None,
+            text: "make the app feel nicer".into(),
+            schema: None,
+            images: Vec::new(),
+            skills: Vec::new(),
+        },
+        on_idle,
+    )
+    .await;
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            Event::Note { message }
+                if message.contains("hill-climbability 40/100")
+                    && message.contains("verifiable objective")
+        )),
+        "low score must push back: {events:?}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Non-plan modes never rate (no extra model call), and a high score
+/// is informational only.
+#[tokio::test]
+async fn hill_climb_rates_only_plan_mode() {
+    let dir = tmp_dir("hill-mode");
+    let cfg = ka_engine::Config {
+        cwd: Some(dir.to_string_lossy().into_owned()),
+        model: Some("test/m".into()),
+        roles: ka_engine::config::Roles {
+            default: None,
+            fast: Some("test/m".into()),
+        },
+        ..Default::default()
+    };
+    let speaker = Scripted::new(vec![]);
+    let mut handle = ka_engine::spawn_with_speaker(
+        cfg,
+        test_catalog(),
+        ka_engine::StrandChoice::New,
+        ka_dialect::Wire::OpenaiChat,
+        speaker.clone(),
+    );
+    let events = settle(
+        &mut handle,
+        Command::Prompt {
+            allowed_tools: None,
+            model: None,
+            text: "make the app feel nicer".into(),
+            schema: None,
+            images: Vec::new(),
+            skills: Vec::new(),
+        },
+        on_idle,
+    )
+    .await;
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, Event::Note { message } if message.contains("hill-climbability"))),
+        "free mode must not rate: {events:?}"
+    );
+    // two speaker rounds: the turn itself + the auto-title (fast role);
+    // the rating never runs outside plan mode
+    assert_eq!(speaker.requests.lock().len(), 2);
     let _ = std::fs::remove_dir_all(&dir);
 }

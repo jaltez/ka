@@ -394,6 +394,13 @@ struct EngineState {
     verify_test: Option<String>,
     /// One automatic verify-fix round per user prompt (loop guard).
     verify_round_done: bool,
+    /// `[pokes] max`: auto-poke rounds allowed per user prompt.
+    poke_max: u32,
+    /// Auto-poke rounds spent on the current user prompt.
+    pokes_used: u32,
+    /// Pending-todo set observed at the last poke check: an unchanged
+    /// set means no progress — poking stops instead of burning rounds.
+    poke_pending: Option<Vec<String>>,
     /// `!` passthrough outputs waiting to ride the next user prompt.
     shell_context: Vec<String>,
 }
@@ -412,7 +419,10 @@ impl From<Config> for EngineState {
             roles: EngineRoles::default(),
             needs_title: false,
             auto_commit: c.git.auto_commit.unwrap_or(false),
+            poke_max: c.pokes.max.unwrap_or(3),
             verify_test: c.verify.test.clone(),
+            pokes_used: 0,
+            poke_pending: None,
             verify_round_done: false,
             shell_context: Vec::new(),
         }
@@ -749,6 +759,68 @@ async fn run(
 /// Apply one MCP supervisor update: swap the server's hands for the
 /// fresh tool set and tell the surface.
 async fn handle_maintenance(update: crate::mcp::Maintenance, ctx: &mut Ctx) {
+    if let crate::mcp::Maintenance::McpVerified {
+        server,
+        tools,
+        changed,
+    } = update
+    {
+        // cache verification: swap hands only on a real change (a
+        // matching list keeps the registered hands — and the provider
+        // prompt cache — untouched); the cache refreshes either way
+        if changed {
+            if let Some(shared) = ctx.mcp_shared.iter().find(|s| s.name() == server).cloned() {
+                if !ctx.mcp_lazy {
+                    let hands: Vec<std::sync::Arc<dyn crate::hands::Hand>> = tools
+                        .iter()
+                        .map(|t| {
+                            std::sync::Arc::new(crate::mcp::McpHand::new(t.clone(), shared.clone()))
+                                as _
+                        })
+                        .collect();
+                    ctx.voice.replace_server_hands(&server, hands);
+                }
+                ctx.events
+                    .send(Event::Note {
+                        message: format!(
+                            "mcp {server}: tool list changed since the cached copy — refreshed \
+                             ({} tools)",
+                            tools.len()
+                        ),
+                    })
+                    .await
+                    .ok();
+                emit_inventory(ctx).await;
+            }
+        }
+        // the verified server is live: backfill the prompts list the
+        // cache fast path skipped (the /prompt popup and inventory
+        // otherwise lose them on every cache-hit startup)
+        if let Some(shared) = ctx.mcp_shared.iter().find(|s| s.name() == server).cloned() {
+            let listed =
+                tokio::time::timeout(std::time::Duration::from_secs(20), shared.list_prompts())
+                    .await;
+            if let Ok(Ok(items)) = listed {
+                for p in items {
+                    ctx.mcp_prompts.push(format!(
+                        "{}/{}{}",
+                        p.server,
+                        p.name,
+                        if p.arguments.is_empty() {
+                            String::new()
+                        } else {
+                            format!(" ({})", p.arguments.join(", "))
+                        }
+                    ));
+                }
+                emit_inventory(ctx).await;
+            }
+        }
+        if let Some(cfg) = ctx.mcp_servers_cfg.iter().find(|c| c.name == server) {
+            crate::mcp_cache::store_tools(cfg, &tools);
+        }
+        return;
+    }
     let (server, tools, note) = match update {
         crate::mcp::Maintenance::McpReconnected {
             server,
@@ -759,6 +831,8 @@ async fn handle_maintenance(update: crate::mcp::Maintenance, ctx: &mut Ctx) {
             tools,
             format!("mcp {{server}} reconnected (+{gained} tools)"),
         ),
+        // handled by the if-let above; listed for exhaustiveness
+        crate::mcp::Maintenance::McpVerified { .. } => return,
         crate::mcp::Maintenance::McpRefreshed {
             server,
             tools,
@@ -793,6 +867,11 @@ async fn handle_maintenance(update: crate::mcp::Maintenance, ctx: &mut Ctx) {
         // lazy mode: the single mcp_call hand reads the refreshed tool
         // list through McpShared — nothing to swap
     }
+    // every observed tool set refreshes the on-disk cache, or the next
+    // startup registers a stale list and re-triggers the swap churn
+    if let Some(cfg) = ctx.mcp_servers_cfg.iter().find(|c| c.name == server) {
+        crate::mcp_cache::store_tools(cfg, &tools);
+    }
     ctx.events
         .send(Event::Note {
             message: note.replace("{server}", &server),
@@ -821,6 +900,46 @@ fn apply_sandbox_policy(
 /// Spawn + handshake + hands for one configured MCP server (bootstrap
 /// and runtime enable). Failures are per-server errors, never fatal.
 async fn ensure_mcp_server(ctx: &mut Ctx, cfg: crate::mcp::McpServerConfig) -> McpSummary {
+    // cache hit: register the remembered hands immediately — startup
+    // never blocks on the handshake, the tool list stays stable across
+    // runs (provider prompt-cache stability) — and verify in the
+    // background; the watchdog spawned alongside owns retries
+    if let Some(cached) = crate::mcp_cache::load_tools(&cfg) {
+        let count = cached.len();
+        let shared = crate::mcp::McpShared::placeholder(cfg.clone(), cached);
+        if !ctx.mcp_lazy {
+            for tool in shared.tools() {
+                ctx.voice
+                    .push_hand(std::sync::Arc::new(crate::mcp::McpHand::new(
+                        tool,
+                        shared.clone(),
+                    )));
+            }
+        }
+        ctx.mcp_shared.push(shared.clone());
+        // verify_initial owns the first connect, then chains into the
+        // supervise watchdog — never two spawn_connects in flight
+        tokio::spawn(crate::mcp::verify_initial(
+            shared,
+            ctx.maintenance_tx.clone(),
+            crate::mcp::WatchdogTiming::default(),
+        ));
+        rebuild_mcp_meta_hands(ctx);
+        ctx.events
+            .send(Event::Note {
+                message: format!(
+                    "mcp {}: {count} tool(s) from cache — verifying in background",
+                    cfg.name
+                ),
+            })
+            .await
+            .ok();
+        return McpSummary {
+            name: cfg.name.clone(),
+            ok: true,
+            tools: count,
+        };
+    }
     let connected = tokio::time::timeout(
         std::time::Duration::from_secs(20),
         crate::mcp::McpClient::spawn_connect(&cfg),
@@ -829,6 +948,9 @@ async fn ensure_mcp_server(ctx: &mut Ctx, cfg: crate::mcp::McpServerConfig) -> M
     match connected {
         Ok(Ok((client, tools))) => {
             let tool_count = tools.len();
+            // remember the advertised list: the next startup registers
+            // from cache and never waits on this handshake
+            crate::mcp_cache::store_tools(&cfg, &tools);
             let shared = crate::mcp::McpShared::new(cfg.clone(), client, tools.clone());
             // eager mode: every tool becomes its own hand; lazy mode
             // fronts the server through the single mcp_call hand
@@ -1292,15 +1414,94 @@ async fn handle_command(
             // auto-title once, right after the first completed turn of a
             // fresh strand (queued follow-on turns are later turns)
             maybe_auto_title(&mut ctx.voice, &mut ctx.state, &mut ctx.strand, &ctx.events).await;
+            // plan-mode goals earn a hill-climbability rating (fast
+            // role): no metric to climb → the harness pushes back
+            maybe_rate_hill_climb(&mut ctx.voice, &ctx.state, &ctx.events).await;
             // Settling: drain the queue as follow-on turns (scoped turns
-            // do not carry their restriction into queued follow-ups).
-            while let Some(queued) = ctx.state.queue.pop_front() {
+            // do not carry their restriction into queued follow-ups),
+            // then auto-poke while the model's own todo list still has
+            // pending items ([pokes] max, default 3). Most agent
+            // failures are early exits, not wrong answers: the harness
+            // continues the work itself, bounded. Pokes stop on a
+            // non-Done stop (aborts and errors — wire-level retries
+            // have already run for transient failures), in plan mode
+            // (research, not execution), and when the pending set
+            // stops moving (no progress = stop, don't burn rounds).
+            // A poke is a normal turn: its prompt rides the strand as
+            // a user message, visible on every surface.
+            ctx.state.pokes_used = 0;
+            ctx.state.poke_pending = None;
+            loop {
+                while let Some(queued) = ctx.state.queue.pop_front() {
+                    dispatch_turn(
+                        commands,
+                        &ctx.events,
+                        &mut ctx.state,
+                        &mut ctx.voice,
+                        queued,
+                        None,
+                        Vec::new(),
+                        &mut ctx.strand,
+                        &ctx.cwd,
+                        None,
+                    )
+                    .await;
+                    settle_context(&mut ctx.voice, &mut ctx.state, &mut ctx.strand, &ctx.events)
+                        .await;
+                    // fresh user input resets the progress baseline
+                    ctx.state.poke_pending = None;
+                }
+                if ctx.state.pokes_used >= ctx.state.poke_max
+                    || ctx.voice.mode() == Mode::Plan
+                    || ctx.voice.last_stop() != Stop::Done
+                {
+                    break;
+                }
+                let pending: Vec<String> = ctx
+                    .voice
+                    .todo_slot()
+                    .lock()
+                    .iter()
+                    .filter(|i| i.state == ka_protocol::TodoState::Pending)
+                    .map(|i| i.text.clone())
+                    .collect();
+                if pending.is_empty() || ctx.state.poke_pending.as_ref() == Some(&pending) {
+                    break;
+                }
+                ctx.state.pokes_used += 1;
+                ctx.state.poke_pending = Some(pending.clone());
+                let list = pending
+                    .iter()
+                    .map(|t| format!("- {t}"))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                let poke = format!(
+                    "(ka auto-poke {}/{}) Your todo list still has {} pending item(s):\n{list}\n\
+                     Continue the work: finish the remaining items, re-verify anything you \
+                     marked done without evidence (a confidence jump is a claim, not a \
+                     measurement), keep the todo list current, and stop with a short summary \
+                     when everything is done.",
+                    ctx.state.pokes_used,
+                    ctx.state.poke_max,
+                    pending.len()
+                );
+                ctx.events
+                    .send(Event::Note {
+                        message: format!(
+                            "auto-poke {}/{}: {} todo item(s) still pending — continuing",
+                            ctx.state.pokes_used,
+                            ctx.state.poke_max,
+                            pending.len()
+                        ),
+                    })
+                    .await
+                    .ok();
                 dispatch_turn(
                     commands,
                     &ctx.events,
                     &mut ctx.state,
                     &mut ctx.voice,
-                    queued,
+                    poke,
                     None,
                     Vec::new(),
                     &mut ctx.strand,
@@ -1614,11 +1815,100 @@ async fn handle_command(
             .await;
             ctx.events.send(Event::Idle).await.ok();
         }
+        Command::TransferStrand { focus } => {
+            // /transfer = digest + fresh child strand: the summary
+            // becomes the new session's entire carried memory
+            let digested = run_digest(
+                &mut ctx.voice,
+                &mut ctx.state,
+                &mut ctx.strand,
+                &ctx.events,
+                focus,
+            )
+            .await;
+            if matches!(digested, DigestResult::NoModel) {
+                ctx.events.send(Event::Idle).await.ok();
+                return Ok(());
+            }
+            let Some(summary) = ctx.voice.digest_text().map(str::to_string) else {
+                ctx.events
+                    .send(Event::Error {
+                        class: ErrorClass::Protocol,
+                        retryable: false,
+                        message: "transfer needs a digest summary".to_string(),
+                    })
+                    .await
+                    .ok();
+                ctx.events.send(Event::Idle).await.ok();
+                return Ok(());
+            };
+            match transfer_strand(&ctx.cwd, &ctx.strand, &summary) {
+                Ok(path) => {
+                    match attach_strand(
+                        &ctx.events,
+                        &mut ctx.state,
+                        &mut ctx.voice,
+                        &ctx.cwd,
+                        &StrandChoice::Path(path),
+                    )
+                    .await
+                    {
+                        Ok(fresh) => {
+                            let id = strand_id(&fresh);
+                            ctx.strand = fresh;
+                            // the transfer strand already carries its
+                            // "(transfer)" Title — keep it; a second
+                            // auto-title would leave resume and the
+                            // running surface with divergent labels
+                            ctx.state.needs_title = false;
+                            ctx.events
+                                .send(Event::Note {
+                                    message: format!(
+                                        "transferred to fresh session {id} — context compacted \
+                                         into a digest; resume with ka --session {id}"
+                                    ),
+                                })
+                                .await
+                                .ok();
+                        }
+                        Err(e) => {
+                            ctx.events
+                                .send(Event::Error {
+                                    class: ErrorClass::Protocol,
+                                    retryable: false,
+                                    message: format!("transfer created but attach failed: {e}"),
+                                })
+                                .await
+                                .ok();
+                        }
+                    }
+                }
+                Err(e) => {
+                    ctx.events
+                        .send(Event::Error {
+                            class: ErrorClass::Unsupported,
+                            retryable: false,
+                            message: format!("transfer failed: {e}"),
+                        })
+                        .await
+                        .ok();
+                }
+            }
+            ctx.events.send(Event::Idle).await.ok();
+        }
         Command::SwitchStrand { id } => {
             let choice = if id.trim() == "new" {
                 StrandChoice::New
             } else {
-                match ka_strand::resolve_id(&ctx.cwd, &id) {
+                let matched = match ka_strand::resolve_id(&ctx.cwd, &id) {
+                    Ok(ka_strand::IdMatch::None) => {
+                        // memorable names sit between ids and failure,
+                        // same as `ka --session`
+                        ka_strand::resolve_name(&ctx.cwd, &id)
+                    }
+                    other => other,
+                };
+                match matched {
                     Ok(ka_strand::IdMatch::Unique(summary)) => StrandChoice::Path(summary.path),
                     Ok(ka_strand::IdMatch::Ambiguous(candidates)) => {
                         let ids: Vec<String> = candidates.iter().map(|c| c.id.clone()).collect();
@@ -1733,6 +2023,34 @@ async fn handle_command(
                         .await
                         .ok();
                 }
+            }
+            ctx.events.send(Event::Idle).await.ok();
+        }
+        Command::SetName { name } => {
+            let clean = name.trim();
+            let valid = !clean.is_empty()
+                && clean.chars().count() <= 64
+                && clean.chars().all(|c| !c.is_whitespace() && !c.is_control());
+            if !valid {
+                ctx.events
+                    .send(Event::Note {
+                        message: "usage: /name <word> — 1–64 chars, no spaces".to_string(),
+                    })
+                    .await
+                    .ok();
+            } else {
+                let _ = ctx.strand.append(ka_strand::Record::Name {
+                    id: ka_strand::new_record_id(),
+                    name: clean.to_string(),
+                });
+                ctx.events
+                    .send(Event::Note {
+                        message: format!(
+                            "session name set: {clean} — resume with ka --session {clean}"
+                        ),
+                    })
+                    .await
+                    .ok();
             }
             ctx.events.send(Event::Idle).await.ok();
         }
@@ -2225,6 +2543,66 @@ const TITLE_TIMEOUT: Duration = Duration::from_secs(10);
 const TITLE_SYSTEM: &str = "You write terse conversation titles.";
 /// Chars of each side fed to the title prompt.
 const TITLE_SIDE_CAP: usize = 2_000;
+
+/// Below this, a goal is not hill-climbable enough to iterate on.
+const HILL_GATE: u32 = 70;
+const HILL_SYSTEM: &str = "You rate coding goals for hill-climbability: whether the work has a measurable, \
+     iterable objective to optimize against (a test to pass, a benchmark to move, a \
+     number to climb). Reply with only the integer score 0-100.";
+
+/// Rate the plan-mode goal's hill-climbability with the fast role and
+/// push back when there is nothing to climb: agents are at their best
+/// iterating against a metric, and most goals never state one (jcode's
+/// hill-climbability study — mean 91/100, ~18% of goals below the
+/// gate). One cheap rating per plan turn; fast role unconfigured or a
+/// failed/timed-out call stays silent, and non-Done turns never rate.
+async fn maybe_rate_hill_climb(
+    voice: &mut Voice,
+    state: &EngineState,
+    events: &mpsc::Sender<Event>,
+) {
+    if voice.mode() != ka_protocol::Mode::Plan || voice.last_stop() != Stop::Done {
+        return;
+    }
+    let Some(fast) = state.roles.fast.clone() else {
+        return;
+    };
+    let Some(goal) = voice
+        .history
+        .iter()
+        .rev()
+        .find(|m| m.role == ka_dialect::speaker::TurnRole::User)
+        .map(|m| m.content.chars().take(400).collect::<String>())
+    else {
+        return;
+    };
+    let prompt = format!("<goal>\n{goal}\n</goal>");
+    let Some(raw) = voice
+        .role_complete(&fast, HILL_SYSTEM, &prompt, TITLE_TIMEOUT)
+        .await
+    else {
+        return;
+    };
+    // first digit run in the reply is the score
+    let score = raw
+        .trim()
+        .chars()
+        .skip_while(|c| !c.is_ascii_digit())
+        .take_while(|c| c.is_ascii_digit())
+        .collect::<String>()
+        .parse::<u32>()
+        .unwrap_or(100);
+    let message = if score < HILL_GATE {
+        format!(
+            "hill-climbability {score}/100 — this goal has no metric to iterate against. \
+             Reframe it into a verifiable objective (a test to pass, a benchmark to move, a \
+             number to climb) and wire [verify] to measure it."
+        )
+    } else {
+        format!("hill-climbability {score}/100")
+    };
+    events.send(Event::Note { message }).await.ok();
+}
 
 /// After the first completed turn of a fresh strand, ask the fast role
 /// (when configured) for a 3-6 word title, persist it as a
@@ -2767,6 +3145,46 @@ fn fork_strand(
     fork.path()
         .map(std::path::Path::to_path_buf)
         .ok_or_else(|| "fork was never materialized".to_string())
+}
+
+/// Create the `/transfer` handoff strand: a fresh child file whose
+/// only content record is the digest — the summary is the new
+/// session's entire carried memory. Mirrors [`fork_strand`] minus the
+/// record copy.
+fn transfer_strand(
+    cwd: &std::path::Path,
+    current: &ka_strand::StrandFile,
+    summary: &str,
+) -> Result<std::path::PathBuf, String> {
+    let records = current.records();
+    let mut fresh =
+        ka_strand::StrandFile::create(cwd, repo_snapshot(cwd)).map_err(|e| e.to_string())?;
+    let parent_id = records.iter().find_map(|r| match r {
+        ka_strand::Record::Header { id, .. } => Some(id.0.clone()),
+        _ => None,
+    });
+    if let Some(parent_id) = &parent_id {
+        fresh.set_parent(parent_id);
+    }
+    fresh
+        .append(ka_strand::Record::Digest {
+            id: ka_strand::new_record_id(),
+            summary: summary.to_string(),
+            // no kept history rides over — the digest is everything
+            kept_from: ka_strand::new_record_id(),
+        })
+        .map_err(|e| e.to_string())?;
+    let title = format!("{} (transfer)", ka_strand::title_of(records));
+    fresh
+        .append(ka_strand::Record::Title {
+            id: ka_strand::new_record_id(),
+            title,
+        })
+        .map_err(|e| e.to_string())?;
+    fresh
+        .path()
+        .map(std::path::Path::to_path_buf)
+        .ok_or_else(|| "transfer strand was never materialized".to_string())
 }
 
 /// Pose a question and wait for the surface's answer. `None` = the

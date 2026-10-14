@@ -106,6 +106,13 @@ impl FeatureToggles {
         !self.is_disabled(&FeatureSpec::Skills)
     }
 
+    /// Whether the web tools (client or provider-native search) are
+    /// offered at all — the fail-closed gate the wires honor for
+    /// server-side search injection.
+    pub fn web_enabled(&self) -> bool {
+        !self.is_disabled(&FeatureSpec::Web)
+    }
+
     /// Whether one named skill is offered.
     pub fn skill_enabled(&self, name: &str) -> bool {
         self.skills_enabled() && !self.is_disabled(&FeatureSpec::Skill(name.into()))

@@ -43,6 +43,9 @@ const TAIL_CHARS: usize = 400;
 /// Cap on steering note length (chars). Also caps hook-controlled key
 /// lists surfaced in transcript notes elsewhere in the engine.
 pub(crate) const NOTE_CHARS: usize = 200;
+/// Cap on post-tool feedback length (chars) — tool-result-sized, not
+/// note-sized: a linter's findings must fit.
+const FEEDBACK_CHARS: usize = 2000;
 
 /// Minimal hook-stdout steering: a JSON object may switch the
 /// permission mode, surface a short note, patch the upcoming tool
@@ -50,10 +53,14 @@ pub(crate) const NOTE_CHARS: usize = 200;
 /// pre-approve the call (`decision: "allow"` — matched
 /// case-insensitively). A pre-approve may only skip a permission ASK:
 /// hardstops, protected paths, and deny-class gate verdicts (deny
-/// rules, plan-mode writes outside .ka/plans/) still apply. Anything
-/// else — invalid JSON, unknown keys, non-objects — is ignored
-/// silently; hook output never fails a turn. This is deliberately the
-/// whole action language (no rule mutation, no directory adds).
+/// rules, plan-mode writes outside .ka/plans/) still apply. A
+/// `post_tool_use` hook may additionally return `feedback`: the string
+/// is appended to that call's tool result for the model to read
+/// (formatters, linters, policy echoes) — pre_tool_use feedback has no
+/// result to ride and is ignored. Anything else — invalid JSON,
+/// unknown keys, non-objects — is ignored silently; hook output never
+/// fails a turn. This is deliberately the whole action language (no
+/// rule mutation, no directory adds).
 #[derive(Debug, Clone, Default, PartialEq)]
 pub(crate) struct Steering {
     pub mode: Option<ka_protocol::Mode>,
@@ -65,6 +72,9 @@ pub(crate) struct Steering {
     /// the call — the permission ask is skipped; hardstops, protected
     /// paths, and deny-class verdicts still refuse.
     pub allow: bool,
+    /// Post-tool feedback (post_tool_use only): appended to the tool
+    /// result the model reads, capped at [`FEEDBACK_CHARS`] chars.
+    pub feedback: Option<String>,
 }
 
 /// Parse steering off a successful hook's trimmed stdout.
@@ -101,11 +111,17 @@ pub(crate) fn parse_steering(stdout: &str) -> Steering {
         .get("decision")
         .and_then(|d| d.as_str())
         .is_some_and(|d| d.eq_ignore_ascii_case("allow"));
+    let feedback = v
+        .get("feedback")
+        .and_then(|f| f.as_str())
+        .map(|s| s.chars().take(FEEDBACK_CHARS).collect::<String>())
+        .filter(|s| !s.is_empty());
     Steering {
         mode,
         note,
         updated_input,
         allow,
+        feedback,
     }
 }
 
@@ -292,6 +308,20 @@ mod tests {
         let long = "x".repeat(500);
         let s = parse_steering(&format!(r#"{{"note":"{long}"}}"#));
         assert_eq!(s.note.as_deref().map(str::len), Some(200));
+    }
+
+    #[test]
+    fn steering_parses_feedback_capped() {
+        let s = parse_steering(r#"{"feedback":"rustfmt: 3 diffs"}"#);
+        assert_eq!(s.feedback.as_deref(), Some("rustfmt: 3 diffs"));
+        // non-strings and empties are ignored
+        assert!(parse_steering(r#"{"feedback":7}"#).feedback.is_none());
+        assert!(parse_steering(r#"{"feedback":""}"#).feedback.is_none());
+        assert!(parse_steering(r#"{"feedback":null}"#).feedback.is_none());
+        // capped at FEEDBACK_CHARS chars
+        let long = "y".repeat(FEEDBACK_CHARS + 50);
+        let s = parse_steering(&format!(r#"{{"feedback":"{long}"}}"#));
+        assert_eq!(s.feedback.as_deref().map(str::len), Some(FEEDBACK_CHARS));
     }
 
     #[test]

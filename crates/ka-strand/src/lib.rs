@@ -154,6 +154,15 @@ pub enum Record {
         /// The display title.
         title: String,
     },
+    /// A stored session name (memorable alias): set by the user, last
+    /// one wins, resolvable by `ka --session <name>` (exact, then
+    /// unique prefix) before title matching.
+    Name {
+        /// Record identifier.
+        id: RecordId,
+        /// The session's memorable name.
+        name: String,
+    },
     /// Per-turn token/cost accounting, appended by the engine at each
     /// TurnFinished. `list()` sums these into the summary fields.
     Usage {
@@ -183,6 +192,7 @@ impl Record {
             | Record::Boundary { id, .. }
             | Record::Rewind { id, .. }
             | Record::Title { id, .. }
+            | Record::Name { id, .. }
             | Record::Usage { id, .. }
             | Record::Custom { id, .. } => Some(id),
         }
@@ -611,6 +621,9 @@ pub struct StrandSummary {
     pub cost: f64,
     /// Parent strand id when this strand is a fork.
     pub parent: Option<String>,
+    /// Memorable name (last `Name` record wins); `ka --session <name>`
+    /// resolves on it before title matching.
+    pub name: Option<String>,
     /// Summed tokens (input + output + cache reads/writes) across the
     /// strand's Usage records; 0 for strands without usage accounting.
     pub tokens: u64,
@@ -677,6 +690,7 @@ fn summarize(path: &Path) -> Option<StrandSummary> {
     let file = File::open(path).ok()?;
     let lines = BufReader::new(file).lines();
     let mut title = String::new();
+    let mut name: Option<String> = None;
     let mut messages = 0usize;
     let mut cost = 0.0f64;
     let mut tokens = 0u64;
@@ -706,6 +720,12 @@ fn summarize(path: &Path) -> Option<StrandSummary> {
             if let Ok(Record::Title { title: t, .. }) = serde_json::from_str(&line) {
                 title = t;
             }
+        } else if line.starts_with("{\"record\":\"name\"") {
+            // memorable name: last one wins, purely an alias (content
+            // stays the title's job)
+            if let Ok(Record::Name { name: n, .. }) = serde_json::from_str(&line) {
+                name = Some(n);
+            }
         } else if line.starts_with("{\"record\":\"usage\"") {
             if let Ok(probe) = serde_json::from_str::<UsageProbe>(&line) {
                 cost += probe.cost;
@@ -723,8 +743,9 @@ fn summarize(path: &Path) -> Option<StrandSummary> {
         title,
         messages,
         cost,
-        tokens,
         parent,
+        name,
+        tokens,
     })
 }
 
@@ -789,6 +810,7 @@ pub fn resolve_id(cwd: &Path, needle: &str) -> std::io::Result<IdMatch> {
             messages: 0,
             cost: 0.0,
             tokens: 0,
+            name: None,
             parent: None,
         }));
     }
@@ -814,6 +836,34 @@ fn strands_filter(cwd: &Path, needle: &str) -> std::io::Result<Vec<StrandSummary
         })
         .filter_map(|(path, _)| summarize(&path))
         .collect())
+}
+
+/// Resolve a session reference by its memorable name: exact match
+/// first (newest strand wins on collisions), then a unique name
+/// prefix. Callers try this after [`resolve_id`] and before any
+/// title-substring matching.
+pub fn resolve_name(cwd: &Path, needle: &str) -> std::io::Result<IdMatch> {
+    let needle = needle.trim();
+    if needle.is_empty() {
+        return Ok(IdMatch::None);
+    }
+    let named: Vec<StrandSummary> = list(cwd)?
+        .into_iter()
+        .filter(|s| s.name.as_deref().is_some_and(|n| !n.is_empty()))
+        .collect();
+    // exact: newest wins (list is newest-first)
+    if let Some(exact) = named.iter().find(|s| s.name.as_deref() == Some(needle)) {
+        return Ok(IdMatch::Unique(exact.clone()));
+    }
+    let mut prefix: Vec<StrandSummary> = named
+        .into_iter()
+        .filter(|s| s.name.as_deref().is_some_and(|n| n.starts_with(needle)))
+        .collect();
+    match prefix.len() {
+        0 => Ok(IdMatch::None),
+        1 => Ok(IdMatch::Unique(prefix.swap_remove(0))),
+        _ => Ok(IdMatch::Ambiguous(prefix)),
+    }
 }
 
 impl IdMatch {
@@ -1393,6 +1443,92 @@ mod tests {
         // empty
         assert!(matches!(resolve_id(&cwd, "  ").unwrap(), IdMatch::None));
         drop(strands);
+        let _ = std::fs::remove_dir_all(&data);
+    }
+
+    #[test]
+    fn name_records_surface_in_summaries_and_resolve() {
+        let data = temp_data("names");
+        let cwd = PathBuf::from("/tmp/proj-names");
+        let mut a = StrandFile::create(&cwd, None).unwrap();
+        a.append(Record::Message {
+            id: new_record_id(),
+            role: Role::User,
+            content: "fix the pump".into(),
+            calls: Vec::new(),
+            results: Vec::new(),
+            thinking: None,
+        })
+        .unwrap();
+        a.append(Record::Name {
+            id: new_record_id(),
+            name: "pump".into(),
+        })
+        .unwrap();
+        // a rename later in the file wins
+        a.append(Record::Name {
+            id: new_record_id(),
+            name: "fox".into(),
+        })
+        .unwrap();
+        let mut b = StrandFile::create(&cwd, None).unwrap();
+        b.append(Record::Name {
+            id: new_record_id(),
+            name: "ferret".into(),
+        })
+        .unwrap();
+        drop((a, b));
+        // summaries carry the LAST name; the title stays content
+        let listed = list(&cwd).unwrap();
+        let fox = listed
+            .iter()
+            .find(|s| s.name.as_deref() == Some("fox"))
+            .expect("last name wins");
+        assert_eq!(fox.title, "fix the pump", "name is an alias, not a title");
+        // exact resolution
+        match resolve_name(&cwd, "fox").unwrap() {
+            IdMatch::Unique(s) => assert_eq!(s.id, fox.id),
+            other => panic!("exact name must resolve: {other:?}"),
+        }
+        // unique prefix resolution
+        match resolve_name(&cwd, "fer").unwrap() {
+            IdMatch::Unique(s) => assert_eq!(s.name.as_deref(), Some("ferret")),
+            other => panic!("name prefix must resolve: {other:?}"),
+        }
+        // shared prefix of "fox"/"ferret" is ambiguous
+        assert!(matches!(
+            resolve_name(&cwd, "f").unwrap(),
+            IdMatch::Ambiguous(_)
+        ));
+        // unknown and empty
+        assert!(matches!(
+            resolve_name(&cwd, "badger").unwrap(),
+            IdMatch::None
+        ));
+        assert!(matches!(resolve_name(&cwd, "  ").unwrap(), IdMatch::None));
+        let _ = std::fs::remove_dir_all(&data);
+    }
+
+    #[test]
+    fn duplicate_exact_names_resolve_newest() {
+        let data = temp_data("names-dup");
+        let cwd = PathBuf::from("/tmp/proj-names-dup");
+        for _ in 0..2 {
+            let mut s = StrandFile::create(&cwd, None).unwrap();
+            s.append(Record::Name {
+                id: new_record_id(),
+                name: "twin".into(),
+            })
+            .unwrap();
+        }
+        // list() is newest-first, so exact matches resolve the newest
+        let listed = list(&cwd).unwrap();
+        assert_eq!(listed.len(), 2);
+        let newest = listed.first().unwrap();
+        match resolve_name(&cwd, "twin").unwrap() {
+            IdMatch::Unique(s) => assert_eq!(s.id, newest.id),
+            other => panic!("exact duplicate name must resolve newest: {other:?}"),
+        }
         let _ = std::fs::remove_dir_all(&data);
     }
 

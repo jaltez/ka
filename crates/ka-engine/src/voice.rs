@@ -774,6 +774,23 @@ impl Voice {
         self.last_stop
     }
 
+    /// The shared todo slot (engine reads pending items for auto-poke).
+    pub(crate) fn todo_slot(&self) -> &crate::hands::todo::TodoSlot {
+        &self.todo
+    }
+
+    /// The active digest summary, if any (engine reads it for
+    /// `/transfer`'s handoff strand).
+    pub(crate) fn digest_text(&self) -> Option<&str> {
+        self.digest.as_deref()
+    }
+
+    /// The live permission mode (engine guards read this — a mid-turn
+    /// /mode steer updates the voice, not EngineState's mirror).
+    pub fn mode(&self) -> ka_protocol::Mode {
+        self.mode
+    }
+
     /// Set the bash auto-background threshold in ms (engine bootstrap;
     /// 0 = never background).
     pub fn set_bash_background_ms(&mut self, ms: u64) {
@@ -1139,6 +1156,7 @@ impl Voice {
             token,
             cache_key: None,
             schema: None,
+            native_search: false,
         };
         let (tx, mut rx) = mpsc::channel::<StreamEvent>(256);
         {
@@ -1222,6 +1240,7 @@ impl Voice {
             token,
             cache_key: None,
             schema: None,
+            native_search: false,
         };
         let speaker = self.speaker(wire);
         let (tx, mut rx) = mpsc::channel::<StreamEvent>(256);
@@ -1702,27 +1721,11 @@ impl Voice {
                 }
             }
         }
-        system.push_str(&format!(
-            "\nYou are ka, a precise coding agent. {}. Use the provided tools to inspect and modify the repository; prefer read before edit.",
-            snap.summary()
+        system.push_str(&core_instructions(
+            &snap.summary(),
+            self.mode,
+            &self.hand_ctx.cwd,
         ));
-        system.push_str(
-            "\nMaintain your plan with the todo tool: on multi-step tasks keep the todo list \
-current — one item per step, mark items done as you finish them (each call replaces the \
-whole list).",
-        );
-        if self.mode == ka_protocol::Mode::Plan {
-            // absolute, root-anchored: a session launched from a
-            // subdirectory must draft into the one project plans dir the
-            // /approve flow and the TUI watcher watch
-            let plan = crate::project_root(&self.hand_ctx.cwd).join(".ka/plans/plan.md");
-            system.push_str(&format!(
-                "\n\nPLAN MODE: research the task with read/glob/grep/pathfinder, then write a \
-concrete numbered plan to {} (the only writable path). Do not \
-attempt implementation — the user will review and switch to build mode.",
-                plan.display()
-            ));
-        }
         if let Some(d) = &self.digest {
             system.push_str(&format!(
                 "\n\nEarlier-conversation summary (this is your memory of prior turns — treat it as accurate ground truth):\n{d}"
@@ -1749,6 +1752,10 @@ attempt implementation — the user will review and switch to build mode.",
         let mut overflow_retried = false;
         let mut retry_attempt: usize = 0;
 
+        // native server-search injection needs the dialect flag AND the
+        // web feature word — the wire cannot see the toggle itself
+        let native_search = dialect.flags.server_search && self.features.read().web_enabled();
+
         'outer: loop {
             let req = SpeakRequest {
                 effort: parsed.effort.clone().or_else(|| self.effort.clone()),
@@ -1760,6 +1767,7 @@ attempt implementation — the user will review and switch to build mode.",
                 token: token.clone(),
                 cache_key: None,
                 schema: schema.clone(),
+                native_search,
             };
             let speaker = self.speaker(dialect.wire);
             let (tx, mut rx) = mpsc::channel::<StreamEvent>(256);
@@ -2166,10 +2174,24 @@ attempt implementation — the user will review and switch to build mode.",
                             enrich_with_lint(&mut output, &call, &ctx, &verify).await;
                         }
                         // the todo hand owns normalization; surfaces get the
-                        // fresh list as a whole-replacement event
+                        // fresh list as a whole-replacement event, and any
+                        // confidence-spike advisory rides out as a note so
+                        // the user sees the re-check request too
                         if call.tool == "todo" && !output.is_error {
                             let items = todo.lock().clone();
                             events.send(Event::Todos { items }).await.ok();
+                            for line in output
+                                .content
+                                .lines()
+                                .filter(|l| l.contains(crate::hands::todo::SPIKE_MARK))
+                            {
+                                events
+                                    .send(Event::Note {
+                                        message: format!("todo: {line}"),
+                                    })
+                                    .await
+                                    .ok();
+                            }
                         }
                         events
                             .send(Event::CallOutput {
@@ -2509,6 +2531,7 @@ attempt implementation — the user will review and switch to build mode.",
                             note: s.note,
                             updated_input: None,
                             allow: false,
+                            feedback: None,
                         }),
                         events,
                     )
@@ -3143,6 +3166,38 @@ use /build to switch to implementation",
     }
 }
 
+/// The static core of the system prompt: identity + repo posture, the
+/// todo discipline, and (in plan mode) the plan-mode contract. This is
+/// the only prompt text ka itself authors — project instructions,
+/// memory, scoped rules, skills, and the digest summary are session
+/// data layered around it, outside the budget. Contract-capped by
+/// `system_prompt_core_stays_within_budget` so it cannot creep.
+fn core_instructions(snap_summary: &str, mode: ka_protocol::Mode, cwd: &std::path::Path) -> String {
+    let mut s = String::new();
+    s.push_str(&format!(
+        "\nYou are ka, a precise coding agent. {}. Use the provided tools to inspect and modify the repository; prefer read before edit.",
+        snap_summary
+    ));
+    s.push_str(
+        "\nMaintain your plan with the todo tool: on multi-step tasks keep the todo list \
+current — one item per step, mark items done as you finish them (each call replaces the \
+whole list).",
+    );
+    if mode == ka_protocol::Mode::Plan {
+        // absolute, root-anchored: a session launched from a
+        // subdirectory must draft into the one project plans dir the
+        // /approve flow and the TUI watcher watch
+        let plan = crate::project_root(cwd).join(".ka/plans/plan.md");
+        s.push_str(&format!(
+            "\n\nPLAN MODE: research the task with read/glob/grep/pathfinder, then write a \
+concrete numbered plan to {} (the only writable path). Do not \
+attempt implementation — the user will review and switch to build mode.",
+            plan.display()
+        ));
+    }
+    s
+}
+
 /// Execution phase for one approved call: post_tool_use hooks, the call
 /// itself (bash streams live previews), and one-way secret redaction.
 /// Runs concurrently for every approved call of a step; each call emits
@@ -3184,7 +3239,9 @@ async fn execute_approved(
     };
     let mut steering = None;
     // post_tool_use hooks: exit 2 flags the result as an error; clean
-    // stdout may steer
+    // stdout may steer and may carry `feedback` — appended to the
+    // result the model reads (formatters, linters, policy echoes),
+    // capped, never an error
     match run_hook_scripts(
         hooks,
         crate::config::HookEvent::PostToolUse,
@@ -3200,7 +3257,16 @@ async fn execute_approved(
                 .content
                 .push_str(&format!("\n[post-tool hook: {reason}]"));
         }
-        Ok(steer) => steering = steer,
+        Ok(steer) => {
+            if let Some(steer) = steer {
+                if let Some(feedback) = &steer.feedback {
+                    output
+                        .content
+                        .push_str(&format!("\n[hook feedback]\n{feedback}"));
+                }
+                steering = Some(steer);
+            }
+        }
     }
     // one-way secret redaction before anything reaches the model
     output.content = crate::hands::secrets::redact(&output.content);
@@ -3474,6 +3540,7 @@ async fn run_event_scripts(
                         note: s.note,
                         updated_input: None,
                         allow: false,
+                        feedback: None,
                     });
                 }
             }
@@ -3722,6 +3789,30 @@ mod tests {
     use ka_protocol::{Command, Event, Stop, Usage};
 
     use super::{Gate, GuardRuntime, Voice, call_detail, cost_of, glob_match};
+
+    #[test]
+    fn system_prompt_core_stays_within_budget() {
+        // The harness-authored core is budget-capped (chars ≈ 4×
+        // tokens): 2 KiB ≈ 500 tokens, the line jcode (671) and pi
+        // (336) hold. Session data (AGENTS.md, skills, memory, digest)
+        // rides outside this budget; growth here is harness creep.
+        const BUDGET: usize = 2048;
+        let modes = [
+            ka_protocol::Mode::Guarded,
+            ka_protocol::Mode::AcceptEdits,
+            ka_protocol::Mode::Free,
+            ka_protocol::Mode::Plan,
+        ];
+        for mode in modes {
+            let core =
+                super::core_instructions("(git: main, clean)", mode, std::path::Path::new("/tmp"));
+            let n = core.chars().count();
+            assert!(
+                n <= BUDGET,
+                "static system-prompt core for {mode:?} is {n} chars (budget {BUDGET}) — trim it"
+            );
+        }
+    }
 
     #[test]
     fn unpriced_dialects_never_report_cost() {

@@ -1046,6 +1046,43 @@ async fn hook_stdout_steers_mode() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A `post_tool_use` hook's `{"feedback": ...}` rides the tool result
+/// the model reads — informational, never an error, capped — the
+/// generalized [verify]-lint channel for any tool and any script.
+#[tokio::test]
+async fn hook_feedback_rides_the_tool_result() {
+    let dir = tmp_dir("hook-feedback");
+    let mut voice = Voice::new(test_catalog(), dir.clone(), ka_protocol::Mode::Free, 5)
+        .with_speaker(
+            ka_dialect::Wire::OpenaiChat,
+            Scripted::calls(vec![("bash", serde_json::json!({"command": "echo hi"}))]),
+        );
+    voice.set_hooks(vec![ka_engine::config::Hook {
+        event: ka_engine::config::HookEvent::PostToolUse,
+        tool: Some("bash".into()),
+        command: r#"printf '{"feedback":"shellcheck: 2 findings (SC2086)"}'"#.into(),
+    }]);
+    let events = run_turn(&mut voice, "run it", None).await;
+    // the model-facing result carries the feedback block…
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            Event::CallOutput { excerpt, is_error: false, .. }
+                if excerpt.contains("[hook feedback]")
+                    && excerpt.contains("shellcheck: 2 findings")
+        )),
+        "feedback must ride the result, not an error: {events:?}"
+    );
+    // …and the call itself still finished clean
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, Event::CallFinished { tool, ok: true, .. } if tool == "bash")),
+        "the poked call stays a success: {events:?}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 // ---------------------------------------------------------------- verify
 
 /// [verify] lints ride successful edit results as informational

@@ -42,7 +42,7 @@ impl TodoHand {
 /// back to pending, texts truncate at [`MAX_TEXT`] chars, and the list
 /// caps at [`MAX_ITEMS`] items. An empty array clears the list. Malformed
 /// payloads (missing `items`, non-array `items`, item without string
-/// `text`) error so the model can self-correct.
+/// `text`, out-of-range `confidence`) error so the model can self-correct.
 pub fn normalize(args: &Value) -> Result<Vec<ka_protocol::TodoItem>, String> {
     let Some(items) = args.get("items") else {
         return Err("todo requires an `items` array".to_string());
@@ -60,9 +60,63 @@ pub fn normalize(args: &Value) -> Result<Vec<ka_protocol::TodoItem>, String> {
             Some("done") => ka_protocol::TodoState::Done,
             _ => ka_protocol::TodoState::Pending,
         };
-        out.push(ka_protocol::TodoItem { text, state });
+        let confidence = match item.get("confidence") {
+            None | Some(Value::Null) => None,
+            Some(v) => {
+                let c = v
+                    .as_u64()
+                    .filter(|c| *c <= 100)
+                    .ok_or_else(|| format!("items[{i}] `confidence` must be an integer 0–100"))?;
+                Some(c as u8)
+            }
+        };
+        out.push(ka_protocol::TodoItem {
+            text,
+            state,
+            confidence,
+        });
     }
     Ok(out)
+}
+
+/// A low rating at assignment — below this, a later high rating is a
+/// spike worth checking (jcode's confidence-stepping thresholds).
+const SPIKE_LOW: u8 = 40;
+/// A high rating at completion.
+const SPIKE_HIGH: u8 = 90;
+
+/// Marker prefix the voice relays as a transcript note. Shared const so
+/// the hand's advisory line and the voice's detection cannot drift.
+pub const SPIKE_MARK: &str = "⚠ confidence spike";
+
+/// Confidence-spike detection between two consecutive lists: an item
+/// flipped pending→done whose assignment confidence was low (≤
+/// [`SPIKE_LOW`]) but whose completion confidence is high (≥
+/// [`SPIKE_HIGH`]). The jump is a claim, not a measurement — the harness
+/// asks for verification instead of accepting it. Unrated sides never
+/// spike (only real low-assignment signal counts). One advisory line
+/// per spike, item text capped like the item itself.
+pub fn confidence_spikes(
+    prev: &[ka_protocol::TodoItem],
+    next: &[ka_protocol::TodoItem],
+) -> Vec<String> {
+    next.iter()
+        .filter(|n| n.state == ka_protocol::TodoState::Done)
+        .filter_map(|n| {
+            let p = prev
+                .iter()
+                .find(|p| p.text == n.text && p.state == ka_protocol::TodoState::Pending)?;
+            let (Some(lo), Some(hi)) = (p.confidence, n.confidence) else {
+                return None;
+            };
+            (lo <= SPIKE_LOW && hi >= SPIKE_HIGH).then(|| {
+                format!(
+                    "{SPIKE_MARK} \"{}\" ({lo}→{hi}): verify this item before relying on it",
+                    n.text.chars().take(MAX_TEXT).collect::<String>()
+                )
+            })
+        })
+        .collect()
 }
 
 impl Hand for TodoHand {
@@ -70,8 +124,10 @@ impl Hand for TodoHand {
         HandDef {
             name: "todo".into(),
             description: "Maintain your live todo list for the session sidebar. Each call \
-replaces the WHOLE list: send every item with its state (`pending` or `done`), in display \
-order; an empty list clears it. Keep it current on multi-step tasks."
+replaces the WHOLE list: send every item with its state (`pending` or `done`) and your \
+confidence 0–100 — rate an item when you assign it, and re-rate it when you mark it done \
+(let verification raise it step by step, don't just declare 100). An empty list clears \
+it. Keep it current on multi-step tasks."
                 .into(),
             parameters: json!({
                 "type": "object",
@@ -83,7 +139,8 @@ order; an empty list clears it. Keep it current on multi-step tasks."
                             "type": "object",
                             "properties": {
                                 "text": { "type": "string", "maxLength": MAX_TEXT },
-                                "state": { "type": "string", "enum": ["pending", "done"] }
+                                "state": { "type": "string", "enum": ["pending", "done"] },
+                                "confidence": { "type": "integer", "minimum": 0, "maximum": 100 }
                             },
                             "required": ["text", "state"]
                         }
@@ -113,10 +170,18 @@ order; an empty list clears it. Keep it current on multi-step tasks."
                         .iter()
                         .filter(|i| i.state == ka_protocol::TodoState::Done)
                         .count();
-                    *self.slot.lock() = items;
+                    let spikes = {
+                        let mut slot = self.slot.lock();
+                        let spikes = confidence_spikes(&slot, &items);
+                        *slot = items;
+                        spikes
+                    };
                     let mut note = format!("todo list updated: {kept} items ({done} done)");
                     if sent > kept {
                         note.push_str(&format!("; capped at {MAX_ITEMS} items"));
+                    }
+                    for spike in &spikes {
+                        note.push_str(&format!("\n{spike}"));
                     }
                     ToolOutput::ok(note)
                 }
@@ -147,13 +212,95 @@ mod tests {
             vec![
                 ka_protocol::TodoItem {
                     text: "first".into(),
-                    state: ka_protocol::TodoState::Pending
+                    state: ka_protocol::TodoState::Pending,
+                    confidence: None
                 },
                 ka_protocol::TodoItem {
                     text: "second".into(),
-                    state: ka_protocol::TodoState::Done
+                    state: ka_protocol::TodoState::Done,
+                    confidence: None
                 },
             ]
+        );
+    }
+
+    #[test]
+    fn normalize_parses_confidence_and_rejects_out_of_range() {
+        let items = normalize(&json!({
+            "items": [
+                {"text": "a", "state": "pending", "confidence": 35},
+                {"text": "b", "state": "done", "confidence": 100},
+                {"text": "c", "state": "pending", "confidence": null},
+            ]
+        }))
+        .unwrap();
+        assert_eq!(items[0].confidence, Some(35));
+        assert_eq!(items[1].confidence, Some(100));
+        assert_eq!(items[2].confidence, None);
+        assert!(
+            normalize(&json!({"items": [{"text": "x", "confidence": 101}]})).is_err(),
+            "above 100 errors"
+        );
+        assert!(
+            normalize(&json!({"items": [{"text": "x", "confidence": -1}]})).is_err(),
+            "negative errors"
+        );
+        assert!(
+            normalize(&json!({"items": [{"text": "x", "confidence": "high"}]})).is_err(),
+            "non-integer errors"
+        );
+    }
+
+    #[test]
+    fn confidence_spikes_flag_low_to_high_completion_jumps() {
+        let item =
+            |text: &str, state: ka_protocol::TodoState, c: Option<u8>| ka_protocol::TodoItem {
+                text: text.into(),
+                state,
+                confidence: c,
+            };
+        let prev = vec![
+            item("spiky", ka_protocol::TodoState::Pending, Some(35)),
+            item("honest", ka_protocol::TodoState::Pending, Some(85)),
+            item("unrated", ka_protocol::TodoState::Pending, None),
+            item("still-pending", ka_protocol::TodoState::Pending, Some(10)),
+        ];
+        let next = vec![
+            item("spiky", ka_protocol::TodoState::Done, Some(100)),
+            item("honest", ka_protocol::TodoState::Done, Some(95)),
+            item("unrated", ka_protocol::TodoState::Done, Some(100)),
+            item("still-pending", ka_protocol::TodoState::Pending, Some(10)),
+        ];
+        let spikes = confidence_spikes(&prev, &next);
+        assert_eq!(spikes.len(), 1, "{spikes:?}");
+        assert!(spikes[0].contains(SPIKE_MARK), "{}", spikes[0]);
+        assert!(spikes[0].contains("\"spiky\" (35→100)"), "{}", spikes[0]);
+        // mid-range completion on a low assignment is not a spike
+        let prev2 = vec![item("m", ka_protocol::TodoState::Pending, Some(20))];
+        let next2 = vec![item("m", ka_protocol::TodoState::Done, Some(80))];
+        assert!(confidence_spikes(&prev2, &next2).is_empty());
+    }
+
+    #[test]
+    fn execute_appends_spike_advisory_to_the_result() {
+        let hand = TodoHand::new(slot());
+        let ctx = test_ctx();
+        let assign = tokio_test_block(hand.execute(
+            &json!({"items": [{"text": "wire it", "state": "pending", "confidence": 30}]}),
+            &ctx,
+        ));
+        assert!(!assign.is_error);
+        assert!(!assign.content.contains(SPIKE_MARK));
+        let done = tokio_test_block(hand.execute(
+            &json!({"items": [{"text": "wire it", "state": "done", "confidence": 100}]}),
+            &ctx,
+        ));
+        assert!(!done.is_error, "{}", done.content);
+        assert!(done.content.contains(SPIKE_MARK), "{}", done.content);
+        assert!(
+            done.content.contains("verify this item"),
+            "{}",
+            done.content
         );
     }
 

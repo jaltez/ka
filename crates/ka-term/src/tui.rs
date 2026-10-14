@@ -1841,10 +1841,16 @@ fn pop_queue_head(queue: &mut Vec<String>) -> Option<String> {
 }
 
 /// Queue one draft for after the current turn — the `+` prefix and
-/// alt+q share this path. Blank drafts never queue.
+/// alt+q share this path. Blank drafts never queue; slash drafts that
+/// cannot run from a queue refuse with a visible reason (see
+/// [`queue_refusal`]) instead of silently replaying as a prompt.
 fn queue_draft(queue: &mut Vec<String>, draft: &str, transcript: &mut Transcript) {
     let item = draft.trim();
     if item.is_empty() {
+        return;
+    }
+    if let Some(reason) = queue_refusal(item) {
+        transcript.push_separated(Line::Warn(reason));
         return;
     }
     queue.push(item.to_string());
@@ -1852,6 +1858,42 @@ fn queue_draft(queue: &mut Vec<String>, draft: &str, transcript: &mut Transcript
         "⏳ queued · {} waiting for this turn to end",
         queue.len()
     )));
+}
+
+/// May this draft ride the queue? Plain text always queues. Slash
+/// commands queue only when they carry an engine event and need no
+/// interactive surface (`/mode free`, `/model x`, `/compact`, custom
+/// commands): picker-openers (`/model` bare), `/quit`, follow-up
+/// carriers, and unknown names refuse with a reason — the drain
+/// replays them through the slash dispatcher, never as a prompt.
+fn queue_refusal(draft: &str) -> Option<String> {
+    let item = draft.trim();
+    if !item.starts_with('/') {
+        return None;
+    }
+    // /skill: lines never reach the slash dispatcher (skill_invocation
+    // intercepts them live) — refuse with an accurate reason instead
+    // of "unknown command"
+    if item.starts_with("/skill:") || item == "/skill" {
+        return Some("skills run immediately — press enter".to_string());
+    }
+    let head = item.split(' ').next().unwrap_or_default();
+    match slash_command(item) {
+        None => Some(format!("{head}: unknown command — nothing queued")),
+        Some(cmd) => {
+            if cmd.quit {
+                Some(format!("{head} runs immediately — press enter"))
+            } else if cmd.modal.is_some() {
+                Some(format!("{head} opens a picker — run it after the turn"))
+            } else if cmd.followup.is_some() {
+                Some(format!("{head} sends a follow-up prompt — run it directly"))
+            } else if cmd.event.is_none() {
+                Some(format!("{head} only prints a note — nothing to run"))
+            } else {
+                None
+            }
+        }
+    }
 }
 
 /// Braille spinner frame for an elapsed-milliseconds clock.
@@ -5600,16 +5642,16 @@ async fn app(
                         (KeyCode::Char('q'), KeyModifiers::ALT) => {
                             // alt+q: queue the whole draft for after this
                             // turn — the `+` prefix without the retyping
-                            // (ctrl+q pops it back)
+                            // (ctrl+q pops it back). Slash drafts queue
+                            // when they can run unattended; queue_refusal
+                            // explains the ones that can't
                             let draft = input.text.trim().to_string();
                             if draft.is_empty() {
                                 // blank draft: nothing to queue
                             } else if !busy {
                                 pop_toast(&mut toast, "nothing running — enter sends now");
-                            } else if draft.starts_with('/') {
-                                // queued items replay as plain prompts;
-                                // slash commands must run their dispatcher
-                                pop_toast(&mut toast, "slash commands run immediately — press enter");
+                            } else if let Some(reason) = queue_refusal(&draft) {
+                                pop_toast(&mut toast, &reason);
                             } else {
                                 input.take();
                                 queue_draft(&mut queue, &draft, &mut transcript);
@@ -6200,16 +6242,70 @@ async fn app(
                         }
                         if matches!(evt, Event::TurnFinished { .. }) {
                             turn_ended = true;
-                            // one queued item per settle: the head becomes
-                            // the next turn. Non-turn Idles (SetMode, …) are
-                            // separate events and never reach this arm; an
-                            // unanswered ask holds the queue until answered.
+                            // one queued item per settle — and the queue
+                            // drains in order: slash items run through
+                            // the dispatcher (non-turn commands apply
+                            // instantly and draining continues; a queued
+                            // `/mode plan` arms the plan watcher like the
+                            // submit arm), the first plain-text item
+                            // becomes the next turn. Non-turn Idles
+                            // (SetMode, …) are separate events and never
+                            // reach this arm; an unanswered ask holds the
+                            // queue until answered.
                             if pending.is_none() {
-                                if let Some(next) = pop_queue_head(&mut queue) {
-                                    transcript.push_separated(Line::User(next.clone()));
-                                    last_user = Some(next.clone());
-                                    busy = true;
-                                    let _ = commands.send(Command::Prompt { text: next, schema: None, images: Vec::new(), allowed_tools: None, model: None, skills: Vec::new() }).await;
+                                while let Some(next) = pop_queue_head(&mut queue) {
+                                    if let Some(cmd) = slash_command(&next) {
+                                        transcript.push_separated(Line::User(next));
+                                        if let Some(note) = cmd.note {
+                                            transcript.push_separated(
+                                                if note.starts_with("usage:") {
+                                                    Line::Warn(note)
+                                                } else {
+                                                    Line::Info(note)
+                                                },
+                                            );
+                                        }
+                                        if let Some(event) = cmd.event {
+                                            let starts_turn =
+                                                matches!(event, Command::Prompt { .. });
+                                            if let Command::Prompt { text, .. } = &event {
+                                                last_user = Some(text.clone());
+                                            }
+                                            if matches!(
+                                                event,
+                                                Command::SetMode {
+                                                    mode: ka_protocol::Mode::Plan
+                                                }
+                                            ) {
+                                                plan_started =
+                                                    Some(std::time::SystemTime::now());
+                                            }
+                                            if starts_turn {
+                                                busy = true;
+                                            }
+                                            let _ = commands.send(event).await;
+                                            if starts_turn {
+                                                break;
+                                            }
+                                        }
+                                        // note-only or instant command: keep
+                                        // draining — nothing is running
+                                    } else if next.starts_with('/') {
+                                        // enqueue-time validation accepted this as a
+                                        // command, but it no longer parses (custom
+                                        // command deleted, trust revoked, bare mode) —
+                                        // never replay it as a literal prompt
+                                        transcript.push_separated(Line::Warn(format!(
+                                            "{next}: no longer a command — skipped"
+                                        )));
+                                        continue;
+                                    } else {
+                                        transcript.push_separated(Line::User(next.clone()));
+                                        last_user = Some(next.clone());
+                                        busy = true;
+                                        let _ = commands.send(Command::Prompt { text: next, schema: None, images: Vec::new(), allowed_tools: None, model: None, skills: Vec::new() }).await;
+                                        break;
+                                    }
                                 }
                             }
                         }
@@ -7256,6 +7352,14 @@ fn builtin_slash_commands() -> Vec<(String, String)> {
         ),
         ("/compact".to_string(), "digest the context now".to_string()),
         (
+            "/name".to_string(),
+            "name this session (ka --session <name>)".to_string(),
+        ),
+        (
+            "/transfer".to_string(),
+            "digest into a fresh handoff session".to_string(),
+        ),
+        (
             "/session".to_string(),
             "pick a session to resume".to_string(),
         ),
@@ -7931,6 +8035,8 @@ pub fn slash_command(text: &str) -> Option<Slash> {
             | "/export"
             | "/spills"
             | "/fork"
+            | "/name"
+            | "/transfer"
             | "/checkpoint"
             | "/restore"
             | "/mcp"
@@ -8083,6 +8189,41 @@ blocker > major > minor > nit, each as `file:line — issue — concrete fix`, \
             Some(Slash {
                 note: None,
                 event: Some(Command::Compact { focus }),
+                quit: false,
+                followup: None,
+                modal: None,
+            })
+        }
+        "/name" => {
+            // a memorable alias for THIS session: `ka --session fox`
+            // resolves on it (exact, then unique prefix)
+            let clean = rest.map(str::trim).filter(|r| !r.is_empty());
+            Some(match clean {
+                Some(name) => Slash {
+                    event: Some(Command::SetName {
+                        name: name.to_string(),
+                    }),
+                    note: None,
+                    quit: false,
+                    followup: None,
+                    modal: None,
+                },
+                None => Slash {
+                    note: Some("usage: /name <word> — 1–64 chars, no spaces".to_string()),
+                    event: None,
+                    quit: false,
+                    followup: None,
+                    modal: None,
+                },
+            })
+        }
+        "/transfer" => {
+            // digest now, then continue in a fresh handoff session that
+            // carries only the summary
+            let focus = rest.map(str::to_string);
+            Some(Slash {
+                event: Some(Command::TransferStrand { focus }),
+                note: None,
                 quit: false,
                 followup: None,
                 modal: None,
@@ -11015,6 +11156,35 @@ mod tests {
     }
 
     #[test]
+    fn queue_refusal_classifies_queuable_drafts() {
+        // plain text always queues
+        assert_eq!(queue_refusal("keep going"), None);
+        assert_eq!(queue_refusal("see /mode in a sentence"), None);
+        // argumented commands carry events: they queue
+        assert_eq!(queue_refusal("/mode free"), None);
+        assert_eq!(queue_refusal("/thinking high"), None);
+        // picker-openers, quit, and unknown commands refuse with a reason
+        let bare = queue_refusal("/model").unwrap_or_default();
+        assert!(bare.contains("picker"), "{bare}");
+        let quit = queue_refusal("/quit").unwrap_or_default();
+        assert!(quit.contains("immediately"), "{quit}");
+        let unknown = queue_refusal("/definitely-not-a-command").unwrap_or_default();
+        assert!(unknown.contains("unknown"), "{unknown}");
+    }
+
+    #[test]
+    fn queue_draft_refuses_and_never_enqueues_disallowed_slash() {
+        let mut queue = Vec::new();
+        let mut transcript = Transcript::default();
+        queue_draft(&mut queue, "/quit", &mut transcript);
+        assert!(queue.is_empty(), "refused drafts must not enqueue");
+        queue_draft(&mut queue, "/mode free", &mut transcript);
+        assert_eq!(queue, vec!["/mode free".to_string()]);
+        queue_draft(&mut queue, "then summarize", &mut transcript);
+        assert_eq!(queue.len(), 2);
+    }
+
+    #[test]
     fn safe_mode_blocks_custom_command_execution() {
         // isolated here: ka-term's test binary is its own process, so
         // flipping the bare-mode atomic cannot disturb ka-engine's tests
@@ -12234,6 +12404,7 @@ mod tests {
                     cost: 0.0,
                     tokens: 0,
                     parent: None,
+                    name: None,
                 },
                 ka_strand::StrandSummary {
                     path: std::path::PathBuf::from("/tmp/b.jsonl"),
@@ -12244,6 +12415,7 @@ mod tests {
                     cost: 0.0,
                     tokens: 0,
                     parent: None,
+                    name: None,
                 },
             ],
             selected: 0,
@@ -12267,6 +12439,7 @@ mod tests {
                 cost: 0.0,
                 tokens: 0,
                 parent: None,
+                name: None,
             }],
             selected: 1,
             filter: "parser".to_string(),
@@ -12469,6 +12642,7 @@ mod tests {
                 messages: 12,
                 cost: 0.5,
                 parent: None,
+                name: None,
                 tokens: 1234,
             },
             ka_strand::StrandSummary {
@@ -12479,6 +12653,7 @@ mod tests {
                 messages: 4,
                 cost: 0.003,
                 parent: None,
+                name: None,
                 tokens: 0,
             },
         ];
@@ -13986,6 +14161,7 @@ mod tests {
             cost: 0.0,
             tokens: 0,
             parent: None,
+            name: None,
         };
         let picker = SessionPicker {
             sessions: vec![s],
@@ -14388,6 +14564,7 @@ mod tests {
                 cost: 1.234,
                 tokens: 12_345,
                 parent: None,
+                name: None,
             }],
             selected: 0,
             filter: String::new(),
@@ -14410,6 +14587,7 @@ mod tests {
                 cost: 0.004,
                 tokens: 0,
                 parent: None,
+                name: None,
             }],
             selected: 0,
             filter: String::new(),
@@ -15315,14 +15493,17 @@ mod tests {
                 ka_protocol::TodoItem {
                     text: "survey".into(),
                     state: ka_protocol::TodoState::Done,
+                    confidence: None,
                 },
                 ka_protocol::TodoItem {
                     text: "implement".into(),
                     state: ka_protocol::TodoState::Pending,
+                    confidence: None,
                 },
                 ka_protocol::TodoItem {
                     text: "ship".into(),
                     state: ka_protocol::TodoState::Pending,
+                    confidence: None,
                 },
             ],
             ..Default::default()
@@ -15438,6 +15619,7 @@ mod tests {
             todos: vec![ka_protocol::TodoItem {
                 text: "\u{4e16}\u{754c}\u{4e16}\u{754c}\u{4e16}\u{754c}".into(),
                 state: ka_protocol::TodoState::Pending,
+                confidence: None,
             }],
             ..Default::default()
         };
@@ -15523,6 +15705,7 @@ mod tests {
                 items: vec![ka_protocol::TodoItem {
                     text: "dig".into(),
                     state: ka_protocol::TodoState::Done,
+                    confidence: None,
                 }],
             },
             &mut lines,
@@ -17767,6 +17950,7 @@ mod tests {
                 messages: 3,
                 cost: 0.0,
                 parent: None,
+                name: None,
                 tokens: 0,
             },
             ka_strand::StrandSummary {
@@ -17777,6 +17961,7 @@ mod tests {
                 messages: 9,
                 cost: 0.0,
                 parent: None,
+                name: None,
                 tokens: 0,
             },
             ka_strand::StrandSummary {
@@ -17787,6 +17972,7 @@ mod tests {
                 messages: 1,
                 cost: 0.0,
                 parent: Some("root".into()),
+                name: None,
                 tokens: 0,
             },
             ka_strand::StrandSummary {
@@ -17797,6 +17983,7 @@ mod tests {
                 messages: 2,
                 cost: 0.0,
                 parent: Some("kid".into()),
+                name: None,
                 tokens: 0,
             },
         ];

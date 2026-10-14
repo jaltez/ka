@@ -63,7 +63,7 @@ impl McpServerConfig {
 }
 
 /// One tool advertised by a server.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct McpTool {
     /// Prefixed tool name (`server.tool`).
     pub name: String,
@@ -588,6 +588,15 @@ pub enum Maintenance {
         tools: Vec<McpTool>,
         delta: i64,
     },
+    /// The background verification of a cache-started server finished:
+    /// `changed` says whether the live list differs from the cached
+    /// one the hands were registered from. The engine swaps hands only
+    /// on change and refreshes the cache either way.
+    McpVerified {
+        server: String,
+        tools: Vec<McpTool>,
+        changed: bool,
+    },
 }
 
 /// Watchdog timing (tests shrink everything).
@@ -639,6 +648,18 @@ impl McpShared {
     /// The current tool list (empty while disconnected).
     pub fn tools(&self) -> Vec<McpTool> {
         self.tools.lock().clone()
+    }
+
+    /// A not-yet-connected shell over a CACHED tool list: hands can be
+    /// registered against it immediately (startup never blocks on the
+    /// handshake), calls answer "disconnected" until a client lands in
+    /// the cell, and [`verify_initial`] fills it.
+    pub fn placeholder(cfg: McpServerConfig, tools: Vec<McpTool>) -> Self {
+        Self {
+            cfg,
+            cell: Arc::new(Mutex::new(None)),
+            tools: Arc::new(parking_lot::Mutex::new(tools)),
+        }
     }
 
     /// Whether the current client answers a liveness probe.
@@ -788,6 +809,34 @@ pub async fn supervise(
             }
         }
     }
+}
+
+/// Immediate background handshake for a cache-started server, then —
+/// success or failure — the watchdog takes over: chaining (rather
+/// than spawning both) serializes the initial connect against
+/// supervise's reconnects, so exactly one spawn_connect is ever in
+/// flight and a slow-but-healthy server can't race a second process
+/// or a bogus give-up.
+pub async fn verify_initial(
+    shared: McpShared,
+    maintenance: mpsc::Sender<Maintenance>,
+    timing: WatchdogTiming,
+) {
+    let cached = shared.tools();
+    let cfg = shared.cfg.clone();
+    if let Ok((client, tools)) = McpClient::spawn_connect(&cfg).await {
+        let changed = tools != cached;
+        shared.install(client, tools.clone()).await;
+        maintenance
+            .send(Maintenance::McpVerified {
+                server: shared.name().to_string(),
+                tools,
+                changed,
+            })
+            .await
+            .ok();
+    }
+    supervise(shared, maintenance, timing).await;
 }
 
 /// Parse a tools/list result into prefixed [`McpTool`]s.

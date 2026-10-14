@@ -382,6 +382,21 @@ pub enum Command {
         /// Optional focus instructions for the summary.
         focus: Option<String>,
     },
+    /// Name the current session with a memorable alias, appended to the
+    /// strand as a `Name` record. `ka --session <name>` resolves on it
+    /// (exact, then unique prefix) before title matching.
+    SetName {
+        /// The alias (1–64 chars, no whitespace).
+        name: String,
+    },
+    /// Transfer: digest the live context, then attach a FRESH child
+    /// strand that carries only the digest — a clean handoff session
+    /// with the summary as its memory. The old strand is untouched on
+    /// disk (parent link set).
+    TransferStrand {
+        /// Optional focus instructions for the summary.
+        focus: Option<String>,
+    },
     /// Rewind the conversation to before the Nth-last user message.
     Rewind {
         /// How many user turns back (1 = erase the last exchange).
@@ -512,6 +527,12 @@ pub struct TodoItem {
     pub text: String,
     /// Whether it is finished.
     pub state: TodoState,
+    /// Optional self-rated confidence, 0–100. Rated when the item is
+    /// assigned and re-rated when it is marked done; a low→high spike
+    /// at completion is treated as a claim, not a measurement (the
+    /// harness asks for verification). Absent = unrated.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confidence: Option<u8>,
 }
 
 /// Completion state of a [`TodoItem`].
@@ -842,6 +863,11 @@ mod tests {
         roundtrip_command(Command::Compact {
             focus: Some("keep API notes".into()),
         });
+        roundtrip_command(Command::SetName { name: "fox".into() });
+        roundtrip_command(Command::TransferStrand { focus: None });
+        roundtrip_command(Command::TransferStrand {
+            focus: Some("keep the API notes".into()),
+        });
         roundtrip_command(Command::Answer {
             question: AskId("q1".into()),
             choice: 0,
@@ -1069,10 +1095,12 @@ mod tests {
                 TodoItem {
                     text: "scaffold the parser".into(),
                     state: TodoState::Done,
+                    confidence: Some(90),
                 },
                 TodoItem {
                     text: "wire the sidebar".into(),
                     state: TodoState::Pending,
+                    confidence: None,
                 },
             ],
         });
@@ -1120,20 +1148,34 @@ mod tests {
             items: vec![TodoItem {
                 text: "ship it".into(),
                 state: TodoState::Done,
+                confidence: Some(100),
             }],
         })
         .unwrap();
         assert!(line.contains("\"type\":\"todos\""), "got: {line}");
         assert!(line.contains("\"state\":\"done\""), "got: {line}");
+        assert!(line.contains("\"confidence\":100"), "got: {line}");
         let back: Event = from_line(&line).unwrap();
         match back {
             Event::Todos { items } => {
                 assert_eq!(items.len(), 1);
                 assert_eq!(items[0].text, "ship it");
                 assert_eq!(items[0].state, TodoState::Done);
+                assert_eq!(items[0].confidence, Some(100));
             }
-            other => panic!("expected todos, got {other:?}"),
+            other => panic!("expected todos, got: {other:?}"),
         }
+        // unrated items must not carry the key: pre-confidence
+        // senders/receivers stay wire-compatible
+        let plain = to_line(&Event::Todos {
+            items: vec![TodoItem {
+                text: "old".into(),
+                state: TodoState::Pending,
+                confidence: None,
+            }],
+        })
+        .unwrap();
+        assert!(!plain.contains("confidence"), "got: {plain}");
     }
 
     #[test]
@@ -1149,11 +1191,13 @@ mod tests {
                 vec![
                     TodoItem {
                         text: "a".into(),
-                        state: TodoState::Pending
+                        state: TodoState::Pending,
+                        confidence: None
                     },
                     TodoItem {
                         text: "b".into(),
-                        state: TodoState::Done
+                        state: TodoState::Done,
+                        confidence: None
                     },
                 ]
             ),

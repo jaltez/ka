@@ -76,7 +76,19 @@ async fn speak_openai(
             .map(|(_, m)| m.to_string())
             .unwrap_or(req.model_id.clone())
     });
-
+    if dialect.flags.server_search && req.native_search {
+        // Chat Completions has no server-side search tool — the native
+        // path exists on anthropic_messages and openai_responses only
+        return Err(WireError {
+            class: ka_protocol::ErrorClass::Unsupported,
+            retryable: false,
+            message: format!(
+                "model {}: server_search is not supported on the openai_chat wire — remove the \
+                 flag (ka's [[search]] providers cover this wire)",
+                req.model_id
+            ),
+        });
+    }
     let mut body = json!({
         "model": wire_model,
         "stream": true,

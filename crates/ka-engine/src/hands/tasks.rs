@@ -279,7 +279,11 @@ fn elapsed(started: std::time::Instant) -> String {
 /// clean-only patch apply (`git apply --check` before `git apply`). On
 /// conflict nothing is applied — the patch is written into `.ka/` and
 /// the error names it. The result stays uncommitted for review.
-fn merge_branch(cwd: &std::path::Path, id: u64, branch: &str) -> Result<String, String> {
+fn merge_branch(
+    cwd: &std::path::Path,
+    id: u64,
+    branch: &str,
+) -> Result<(String, Vec<String>), String> {
     let git = |args: &[&str]| -> Result<std::process::Output, String> {
         std::process::Command::new("git")
             .args(args)
@@ -302,8 +306,20 @@ fn merge_branch(cwd: &std::path::Path, id: u64, branch: &str) -> Result<String, 
     }
     let patch = diff.stdout;
     if patch.is_empty() {
-        return Ok(format!("branch {branch} is empty — nothing to merge"));
+        return Ok((
+            format!("branch {branch} is empty — nothing to merge"),
+            Vec::new(),
+        ));
     }
+    // changed paths ride along for the caller's read-ledger conflict
+    // check (repo-relative, one per line)
+    let changed = String::from_utf8_lossy(
+        &git(&["diff", "--name-only", &format!("{base}..{branch}")])?.stdout,
+    )
+    .lines()
+    .map(str::to_string)
+    .filter(|l| !l.is_empty())
+    .collect::<Vec<_>>();
     let feed = |check: bool| -> Result<std::process::Output, String> {
         let mut args = vec!["apply", "--whitespace=nowarn"];
         if check {
@@ -354,8 +370,11 @@ fn merge_branch(cwd: &std::path::Path, id: u64, branch: &str) -> Result<String, 
             String::from_utf8_lossy(&apply.stderr)
         ));
     }
-    Ok(format!(
-        "merged {branch} into the working tree (uncommitted — review the diff, then commit)"
+    Ok((
+        format!(
+            "merged {branch} into the working tree (uncommitted — review the diff, then commit)"
+        ),
+        changed,
     ))
 }
 
@@ -469,7 +488,46 @@ impl Hand for TasksHand {
                     };
                     match self.table.branch(id) {
                         Some(branch) => match merge_branch(&ctx.cwd, id, &branch) {
-                            Ok(msg) => ToolOutput::ok(format!("tasks: {msg}")),
+                            Ok((msg, changed)) => {
+                                // cross-agent conflict note (the swarm
+                                // file-conflict pattern): a file this
+                                // voice READ just changed under it —
+                                // warn in the result the model reads,
+                                // before the ledger refuses a stale edit
+                                let conflicts: Vec<String> = {
+                                    let ledger = ctx.ledger.lock();
+                                    // `git diff --name-only` emits worktree-ROOT-relative
+                                    // paths — not cwd-relative when the session launched
+                                    // from a subdirectory — so probe the root-joined form
+                                    // alongside the cwd-joined one. Files the branch
+                                    // DELETED no longer exist post-apply: "re-read" is
+                                    // impossible guidance, skip them.
+                                    let root = crate::project_root(&ctx.cwd);
+                                    changed
+                                        .iter()
+                                        .filter(|rel| {
+                                            let exists = ctx.cwd.join(rel).exists()
+                                                || root.join(rel).exists();
+                                            exists
+                                                && (ledger.is_tracked(&root.join(rel))
+                                                    || ledger.is_tracked(&ctx.cwd.join(rel)))
+                                        })
+                                        .cloned()
+                                        .collect()
+                                };
+                                let mut out = format!("tasks: {msg}");
+                                if !conflicts.is_empty() {
+                                    out.push_str(
+                                        "\n⚠ read-file conflict: these files were read \
+                                         earlier this session and just changed — re-read \
+                                         them before editing:",
+                                    );
+                                    for f in &conflicts {
+                                        out.push_str(&format!("\n- {f}"));
+                                    }
+                                }
+                                ToolOutput::ok(out)
+                            }
                             Err(e) => ToolOutput::err(format!("tasks merge: {e}")),
                         },
                         None => ToolOutput::err(format!(
@@ -676,6 +734,11 @@ mod tests {
         table.set_branch(id, "ka-worker".to_string());
         let mut ctx = ctx_for();
         ctx.cwd = repo.clone();
+        // the main voice read f.txt before the worker's merge lands
+        ctx.ledger.lock().mint(
+            &repo.join("f.txt"),
+            &std::fs::metadata(repo.join("f.txt")).unwrap(),
+        );
         let hand = TasksHand::new(table.clone());
 
         // no-branch tasks refuse
@@ -693,6 +756,18 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(repo.join("f.txt")).unwrap(),
             "worker edit\n"
+        );
+        // the merged file was read (ledger-tracked) BEFORE the merge:
+        // the result carries the read-file conflict advisory
+        assert!(
+            out.content.contains("read-file conflict"),
+            "conflict advisory must ride the merge result: {}",
+            out.content
+        );
+        assert!(
+            out.content.contains("- f.txt"),
+            "the changed+read file is named: {}",
+            out.content
         );
 
         // now the patch no longer applies: conflict → patch path

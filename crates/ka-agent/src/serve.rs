@@ -428,11 +428,19 @@ async fn prompt(socket: &mut tokio::net::TcpStream, session: &Session, body: &[u
     respond(socket, 200, r#"{"ok":true}"#).await;
 }
 
-/// Resolve a strand reference (id or prefix) against the server's cwd,
-/// exactly like `ka --session`. `Err` = 400 material.
+/// Resolve a strand reference (id, prefix, or memorable name) against
+/// the server's cwd, exactly like `ka --session`. `Err` = 400
+/// material.
 fn resolve_strand(id: &str) -> Result<StrandChoice, String> {
     let cwd = std::env::current_dir().unwrap_or_default();
-    match ka_strand::resolve_id(&cwd, id).map_err(|e| format!("session lookup: {e}"))? {
+    let matched =
+        match ka_strand::resolve_id(&cwd, id).map_err(|e| format!("session lookup: {e}"))? {
+            ka_strand::IdMatch::None => {
+                ka_strand::resolve_name(&cwd, id).map_err(|e| format!("session lookup: {e}"))?
+            }
+            other => other,
+        };
+    match matched {
         ka_strand::IdMatch::Unique(summary) => Ok(StrandChoice::Path(summary.path)),
         ka_strand::IdMatch::None => Err(format!("no session matches '{id}'")),
         ka_strand::IdMatch::Ambiguous(candidates) => {

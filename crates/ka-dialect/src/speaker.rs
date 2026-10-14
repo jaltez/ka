@@ -176,6 +176,11 @@ pub struct SpeakRequest {
     pub cache_key: Option<String>,
     /// Structured-output schema the reply must satisfy (None = free-form).
     pub schema: Option<serde_json::Value>,
+    /// The voice's go-ahead for provider-native server-side search:
+    /// true only when the dialect flag is set AND the `web` feature
+    /// word is enabled (the wire injects the provider's server tool
+    /// only then — the feature toggle stays fail-closed).
+    pub native_search: bool,
 }
 
 /// Normalized streaming events emitted by any wire.

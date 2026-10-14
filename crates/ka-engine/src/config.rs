@@ -367,6 +367,20 @@ pub struct LintRule {
     pub command: String,
 }
 
+/// Auto-poke persistence ([pokes]). Most agent failures are early
+/// exits, not wrong answers: when a turn settles while the model's own
+/// todo list still has pending items, the harness continues the work
+/// itself with a bounded auto-continuation round. Pokes stop on
+/// non-Done stops (aborts, errors — wire retries have already run),
+/// in plan mode, and when the pending set stops moving.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields, default)]
+pub struct Pokes {
+    /// Maximum auto-poke rounds per user prompt (0 disables; unset
+    /// layers keep the lower layer, default 3).
+    pub max: Option<u32>,
+}
+
 /// Context-window policy ([context]).
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields, default)]
@@ -449,6 +463,9 @@ pub struct Config {
     /// Sandbox policy ([sandbox]).
     #[serde(default)]
     pub sandbox: Sandbox,
+    /// Auto-poke persistence ([pokes]; default max 3, 0 disables).
+    #[serde(default)]
+    pub pokes: Pokes,
     /// Language-server diagnostics ([lsp]).
     #[serde(default)]
     pub lsp: Lsp,
@@ -570,6 +587,9 @@ impl Config {
         if other.verify.test.is_some() {
             self.verify.test = other.verify.test;
         }
+        if other.pokes.max.is_some() {
+            self.pokes.max = other.pokes.max;
+        }
         if !other.verify.lints.is_empty() {
             self.verify.lints = other.verify.lints;
         }
@@ -656,6 +676,12 @@ impl Config {
     /// The effective permission mode (free unless set in a layer).
     pub fn effective_mode(&self) -> Mode {
         self.mode.unwrap_or(Mode::Free)
+    }
+
+    /// Effective auto-poke rounds per user prompt (default 3; 0
+    /// disables — the documented opt-out must survive layering).
+    pub fn effective_pokes_max(&self) -> u32 {
+        self.pokes.max.unwrap_or(3)
     }
 
     /// JSON schema for editor integration (`ka config schema`).
@@ -1259,5 +1285,40 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("command"), "got: {err}");
+    }
+
+    #[test]
+    fn pokes_default_parse_overlay_schema() {
+        // default: 3 rounds per user prompt
+        assert_eq!(Config::default().effective_pokes_max(), 3);
+        let c = Config::parse_layer("[pokes]\nmax = 0\n", "user").unwrap();
+        assert_eq!(c.pokes.max, Some(0));
+        // a bare [pokes] header parses (serde default on the table)
+        assert_eq!(
+            Config::parse_layer("[pokes]\n", "user").unwrap().pokes.max,
+            None
+        );
+        // layering: an upper layer that sets max wins; an unset layer
+        // keeps the lower value (the disable must survive layering)
+        let mut base = c;
+        base.overlay(Config::default());
+        assert_eq!(
+            base.effective_pokes_max(),
+            0,
+            "explicit 0 survives an unset layer"
+        );
+        base.overlay(Config::parse_layer("[pokes]\nmax = 1\n", "proj").unwrap());
+        assert_eq!(base.effective_pokes_max(), 1, "upper layer wins");
+        // unknown keys hard-error
+        let err = Config::parse_layer("[pokes]\nmaximum = 1\n", "user")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("unknown field") && err.contains("maximum"),
+            "{err}"
+        );
+        // strict [pokes] lands in the JSON schema
+        let schema = Config::schema_json().unwrap();
+        assert!(schema.contains("pokes"), "got: {schema}");
     }
 }

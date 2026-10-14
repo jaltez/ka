@@ -165,10 +165,19 @@ where
                     .map(std::path::PathBuf::from)
                     .or_else(|| std::env::current_dir().ok())
                     .unwrap_or_default();
-                let resumed = match ka_strand::resolve_id(&cwd, session) {
+                let matched = match ka_strand::resolve_id(&cwd, session) {
                     Ok(ka_strand::IdMatch::Unique(summary)) => Some(summary),
+                    Ok(ka_strand::IdMatch::None) => {
+                        // memorable session names resolve like
+                        // `ka --session` (exact, then unique prefix)
+                        match ka_strand::resolve_name(&cwd, session) {
+                            Ok(ka_strand::IdMatch::Unique(summary)) => Some(summary),
+                            _ => None,
+                        }
+                    }
                     _ => None,
                 };
+                let resumed = matched;
                 match resumed {
                     Some(summary) => {
                         let cfg = Config {
