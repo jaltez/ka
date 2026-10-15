@@ -172,7 +172,7 @@ fn memory_inbox_roundtrip_and_accept() {
     // staged notes round-trip
     let staged = vec![
         "- [1700000000] prefer parking_lot locks".to_string(),
-        "- [1700000001] never commit ka-release.key".to_string(),
+        "- [1700000001] never commit ka-harness-release.key".to_string(),
     ];
     write_memory_inbox(&dir, &staged);
     assert_eq!(read_memory_inbox(&dir), staged, "staged notes round-trip");

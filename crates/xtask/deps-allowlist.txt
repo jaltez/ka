@@ -1,7 +1,7 @@
 # Allowed crate names in the ka binary's default-feature dependency graph
 # (cargo tree -p ka-harness --edges normal, linux CI target). Any name NOT
 # here fails `cargo xtask deps` in CI — additions are deliberate, reviewed
-# acts under the footprint contract. Boundary: research/ka/agent-boundary.md.
+# acts under the footprint contract. Boundary: research/ka-harness/agent-boundary.md.
 # Sorted; one name per line; '#' comments.
 aho-corasick
 allocator-api2

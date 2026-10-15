@@ -38,11 +38,11 @@ Dependency direction is one-way: `ka-harness → ka-term/ka-protocol/ka-dialect/
 - **Data over code**: model quirks go in `crates/ka-dialect/dialects.toml` / `models-dev.toml`, permission rules and tool catalogs are data — never branches in the engine.
 - Strict TOML everywhere: unknown config keys are hard errors with line numbers. Keep it that way.
 - Fail toward boring: exact-match edits, append-only logs, fail-closed sandboxes.
-- Ka and the future **Ka Agent** are separate products: resident-agent concerns (messaging channels, web UI, schedulers, long-term memory, plugin runtimes) never enter this workspace's engine crates or the `ka` binary's dependency graph — CI gates the graph (`cargo xtask deps`). Decision record: `research/ka/agent-boundary.md`.
+- Ka and the future **Ka Agent** are separate products: resident-agent concerns (messaging channels, web UI, schedulers, long-term memory, plugin runtimes) never enter this workspace's engine crates or the `ka` binary's dependency graph — CI gates the graph (`cargo xtask deps`). Decision record: `research/ka-harness/agent-boundary.md`.
 
 ## Conventions
 
-- Vocabulary is Ka's own (strand, record, digest, ledger, Hands, Speaker, clearance, hardstops…). Glossary + lineage: `research/ka/architecture.md` §1. Design docs: `research/ka/`; `research/` is a survey, not code.
+- Vocabulary is Ka's own (strand, record, digest, ledger, Hands, Speaker, clearance, hardstops…). Glossary + lineage: `research/ka-harness/architecture.md` §1. Design docs: `research/ka-harness/`; `research/` is a survey, not code.
 - Tests are contracts: ~750, including documented-feature contracts — CI fails if a README-documented behavior regresses. When changing documented behavior, update README **and** the contract test together.
 - Wire changes need recorded SSE fixture tests (normal, malformed, partial-JSON repair paths). No keys in CI, ever.
 - Rust edition 2024, MSRV 1.85. Workspace deps only via `[workspace.dependencies]`.

@@ -17,7 +17,7 @@ use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 
 /// Placeholder repo (config `[update] repo` overrides; anything else
 /// fails with the configured name in the error — no guessing).
-pub const DEFAULT_REPO: &str = "jaltez/ka";
+pub const DEFAULT_REPO: &str = "jaltez/ka-harness";
 const DEFAULT_API: &str = "https://api.github.com";
 
 /// The update result summary, ready to print.
@@ -961,7 +961,7 @@ mod tests {
     #[test]
     fn default_repo_is_the_real_repository() {
         // regression: shipped 0.2.x pointed at kampka/ka and 404'd
-        assert_eq!(DEFAULT_REPO, "jaltez/ka");
+        assert_eq!(DEFAULT_REPO, "jaltez/ka-harness");
     }
 
     #[test]

@@ -56,9 +56,9 @@ fn print_help() {
             (hint: KA_DATA_DIR=/tmp/ka-dev cargo xtask dev -- models)
   ci        fmt --check + clippy -D warnings + tests (what CI runs)
   models-sync  regenerate crates/ka-dialect/models-dev.toml from models.dev
-  keygen    generate ka-release.key/.pub (ed25519, refused if keys exist;
+  keygen    generate ka-harness-release.key/.pub (ed25519, refused if keys exist;
             --force overwrites)
-  sign <file>  sign with ka-release.key (or $KA_SIGNING_KEY base64) -> <file>.sig
+  sign <file>  sign with ka-harness-release.key (or $KA_SIGNING_KEY base64) -> <file>.sig
   release   build musl release, tar.gz it, sign, print artifact paths
   size [--bin <path>]
             release binary size vs the 10 MB contract (default
@@ -317,7 +317,7 @@ fn size(rest: &[String]) -> i32 {
 /// `xtask deps`: the `ka` binary's dependency-graph allowlist — the guard
 /// that keeps resident-agent concerns (messaging channels, web
 /// frameworks, schedulers, plugin runtimes; see
-/// research/ka/agent-boundary.md) out of the shipped binary, and makes
+/// research/ka-harness/agent-boundary.md) out of the shipped binary, and makes
 /// any new dependency a deliberate, reviewed act. Compares
 /// `cargo tree -p ka-harness` (default features, normal edges) against
 /// `crates/xtask/deps-allowlist.txt` (crate names, one per line).
@@ -459,12 +459,12 @@ fn os_random_32() -> Option<[u8; 32]> {
 
 fn key_paths() -> (PathBuf, PathBuf) {
     (
-        repo_root().join("ka-release.key"),
-        repo_root().join("ka-release.pub"),
+        repo_root().join("ka-harness-release.key"),
+        repo_root().join("ka-harness-release.pub"),
     )
 }
 
-/// `xtask keygen [--force]`: write ka-release.key/.pub (base64), print pub.
+/// `xtask keygen [--force]`: write ka-harness-release.key/.pub (base64), print pub.
 fn keygen(rest: &[String]) -> i32 {
     let force = rest.iter().any(|a| a == "--force");
     let (key_path, pub_path) = key_paths();
@@ -498,7 +498,7 @@ fn keygen(rest: &[String]) -> i32 {
     0
 }
 
-/// The signing key: $KA_SIGNING_KEY (base64) or ka-release.key at the root.
+/// The signing key: $KA_SIGNING_KEY (base64) or ka-harness-release.key at the root.
 fn load_signing_key() -> Option<ed25519_dalek::SigningKey> {
     let text = match env::var("KA_SIGNING_KEY") {
         Ok(k) if !k.trim().is_empty() => k,

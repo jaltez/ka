@@ -4,7 +4,7 @@ research/repos/
 .test/
 
 # release signing private key (never commit)
-ka-release.key
+ka-harness-release.key
 # release artifacts (built and signed in CI)
 ka-*.tar.gz
 ka-*.tar.gz.*

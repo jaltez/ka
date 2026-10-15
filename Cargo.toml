@@ -3,7 +3,7 @@ resolver = "3"
 members = ["crates/*"]
 # Future Ka Agent product crates may join `members` (workspace/CI-visible)
 # but never this list: root cargo build/test stay the ka-binary universe.
-# Boundary contract: research/ka/agent-boundary.md §2.
+# Boundary contract: research/ka-harness/agent-boundary.md §2.
 default-members = [
     "crates/ka-protocol",
     "crates/ka-strand",
@@ -21,7 +21,7 @@ version = "0.3.0"
 edition = "2024"
 license = "MIT"
 rust-version = "1.85"
-repository = "https://github.com/jaltez/ka"
+repository = "https://github.com/jaltez/ka-harness"
 
 [workspace.dependencies]
 ka-protocol = { path = "crates/ka-protocol", version = "0.3.0" }
