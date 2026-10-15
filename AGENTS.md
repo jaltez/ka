@@ -6,10 +6,11 @@ ka: a model-agnostic, low-footprint coding agent in Rust. Single binary, ≤ 10 
 
 ```sh
 cargo xtask ci        # the CI gate: fmt --check + clippy -D warnings + tests — run before pushing
-cargo build -p ka-agent          # debug build
+cargo build -p ka-harness         # debug build
 cargo test --workspace --all-features
 cargo xtask dev -- models        # rebuild + run dev binary with args
 cargo xtask size                 # binary size vs the 10 MB contract
+cargo xtask deps                 # binary dep-graph allowlist gate (agent-product concerns stay out)
 cargo xtask link                 # build release + symlink `kad` → target/release/ka
 ```
 
@@ -24,11 +25,11 @@ Stable owns the name `ka`; dev is always `kad`. Isolate dev runs with `KA_DATA_D
 | `ka-dialect` | model catalog + wires (anthropic-messages, openai-chat, openai-responses) + local discovery |
 | `ka-strand` | append-only JSONL session store, waypoints |
 | `ka-term` | ratatui TUI |
-| `ka-agent` | the published `ka` binary |
+| `ka-harness` | the published `ka` binary (crate renamed from `ka-agent`; the name is reserved for the future Ka Agent product) |
 | `ka-index` / `ka-sandbox` | optional: FTS search (`index` feature), fs sandboxing |
 | `xtask` | repo automation |
 
-Dependency direction is one-way: `ka-agent → ka-term/ka-protocol/ka-dialect/ka-strand → ka-engine`. The engine never imports a surface, never does I/O beyond std+serde.
+Dependency direction is one-way: `ka-harness → ka-term/ka-protocol/ka-dialect/ka-strand → ka-engine`. The engine never imports a surface, never does I/O beyond std+serde.
 
 ## Hard rules
 
@@ -37,6 +38,7 @@ Dependency direction is one-way: `ka-agent → ka-term/ka-protocol/ka-dialect/ka
 - **Data over code**: model quirks go in `crates/ka-dialect/dialects.toml` / `models-dev.toml`, permission rules and tool catalogs are data — never branches in the engine.
 - Strict TOML everywhere: unknown config keys are hard errors with line numbers. Keep it that way.
 - Fail toward boring: exact-match edits, append-only logs, fail-closed sandboxes.
+- Ka and the future **Ka Agent** are separate products: resident-agent concerns (messaging channels, web UI, schedulers, long-term memory, plugin runtimes) never enter this workspace's engine crates or the `ka` binary's dependency graph — CI gates the graph (`cargo xtask deps`). Decision record: `research/ka/agent-boundary.md`.
 
 ## Conventions
 

@@ -774,7 +774,7 @@ async fn dispatch(cli: Cli) -> Result<ExitCode, String> {
 fn run_sandbox_exec(policy: &str, argv: &[String]) -> Result<ExitCode, String> {
     use std::os::unix::process::CommandExt;
 
-    // parse the policy JSON by hand (serde_json::Value): ka-agent does
+    // parse the policy JSON by hand (serde_json::Value): ka-harness does
     // not depend on serde derive directly, and this shape is tiny
     let parsed: serde_json::Value =
         serde_json::from_str(policy).map_err(|e| format!("sandbox policy: {e}"))?;

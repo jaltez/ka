@@ -42,9 +42,13 @@ ka-strand/     strand store: reader, appender, tip/index, split, waypoints
 ka-term/       ratatui surfaces: the TUI and the observe-only `ka attach` client
 ka-index/      optional FTS search (cargo feature `index`)
 ka-sandbox/    optional fs sandboxing (landlock/bwrap/firejail, fail-closed)
-ka-agent/      the published `ka` binary: TUI, `ka run` headless NDJSON, `ka serve` HTTP/SSE, `ka attach`
+ka-harness/     the published `ka` binary: TUI, `ka run` headless NDJSON, `ka serve` HTTP/SSE, `ka attach`
 ```
 Dependency direction is one-way: `cli → term/protocol/dialect/strand → engine`. The engine never imports a surface.
+A separate future product — **Ka Agent** (persistent, channel-facing) —
+builds on these surfaces from the outside (`ka serve`, `ka run`, ACP, or
+the binary as a subprocess) and never enters the graph above; boundaries
+and enforcement live in `agent-boundary.md`.
 
 ## 3. The protocol (`ka-protocol`)
 Two queues between surface and engine, both serde enums, both NDJSON-shaped so `ka run` literally serializes the Event side:

@@ -9,9 +9,9 @@ A model-agnostic, very-low-footprint coding agent in Rust.
 ## Quickstart
 
 ```sh
-cargo install ka-agent               # from crates.io — installs the `ka` binary
-# from a clone:  cargo install --path crates/ka-agent
-# dev:           cargo build --release -p ka-agent && alias ka=target/release/ka
+cargo install ka-harness               # from crates.io — installs the `ka` binary (≤ 0.2.11 shipped as `ka-agent`)
+# from a clone:  cargo install --path crates/ka-harness
+# dev:           cargo build --release -p ka-harness && alias ka=target/release/ka
 
 cd your-project
 ka --model ollama/qwen3.5:9b          # TUI: fresh chat
@@ -311,11 +311,15 @@ cargo xtask unlink    # remove the kad symlink
 
 Stable owns the name `ka`; dev is always `kad`. Isolate dev sessions with `KA_DATA_DIR=/tmp/ka-dev kad …` (shares config/rules/hooks, separates strands).
 
+## Ka and the future Ka Agent
+
+`ka` (this repo) is the engine and the terminal experience — one ≤10 MB binary, no daemons. **Ka Agent** is a planned, separate product: an optional persistent agent (long-term memory, messaging channels such as Telegram, web UI, plugins, automations) that will build on ka's stable surfaces — `ka serve`, `ka run --print ndjson`, `ka acp`, the strand format, the crate APIs — or run the `ka` binary as a subprocess. Never inside it, never as its dependency; CI gates the binary's dependency graph so it stays that way. The naming stays Egyptian: ka is the vital essence; **Ba** (the mobile personality) and **Akh** (the effective spirit) are reserved as the product's inner layer names. Decision record: [`research/ka/agent-boundary.md`](research/ka/agent-boundary.md).
+
 ## Crates
 
-`ka-protocol` (Command/Event wire contract) · `ka-engine` (engine: turn machine, tools + MCP hands, gate, digests, strands) · `ka-dialect` (catalog + 3 wires + discovery) · `ka-strand` (append-only JSONL sessions) · `ka-term` (ratatui TUI) · `ka-agent` (the binary, published to crates.io).
+`ka-protocol` (Command/Event wire contract) · `ka-engine` (engine: turn machine, tools + MCP hands, gate, digests, strands) · `ka-dialect` (catalog + 3 wires + discovery) · `ka-strand` (append-only JSONL sessions) · `ka-term` (ratatui TUI) · `ka-harness` (the binary, published to crates.io).
 
 ## Footprint contract
-Single binary ≤ 10 MB (currently **6.25 MB** musl, gated in CI on the stripped musl artifact) · cold start ≤ 50 ms · idle RSS ≤ 15 MB · no steady-state network (one rate-limited update check at startup; `[update] check = "off"` disables it). 779 tests (feature contracts included — CI fails if a documented behavior regresses), `clippy -D warnings` clean, musl CI build. Full-text session search ships behind the opt-in `index` cargo feature (`cargo install ka-agent --features index`).
+Single binary ≤ 10 MB (currently **6.25 MB** musl, gated in CI on the stripped musl artifact) · cold start ≤ 50 ms · idle RSS ≤ 15 MB · no steady-state network (one rate-limited update check at startup; `[update] check = "off"` disables it). 779 tests (feature contracts included — CI fails if a README-documented behavior regresses), `clippy -D warnings` clean, musl CI build. Full-text session search ships behind the opt-in `index` cargo feature (`cargo install ka-harness --features index`).
 
 **System-prompt budget**: the harness-authored core of the system prompt (identity + todo discipline + the plan-mode block) is contract-capped at **2 KiB ≈ 500 tokens** (`system_prompt_core_stays_within_budget`); project instructions, skills, memory, and digest summaries are session data layered outside it. The core cannot grow without the test failing.

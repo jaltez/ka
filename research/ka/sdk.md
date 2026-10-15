@@ -9,8 +9,11 @@ rather than in the TUI.
 `crates/*`, one version pinned in the root `Cargo.toml`. Dependencies point one way,
 nothing depends upward: `ka-protocol` and `ka-sandbox` have no ka deps; `ka-dialect` and
 `ka-strand` sit on `ka-protocol`; `ka-index` on `ka-strand`; `ka-engine` on
-protocol+dialect+strand+sandbox; `ka-term` and the `ka` binary (`ka-agent`) on
+protocol+dialect+strand+sandbox; `ka-term` and the `ka` binary (`ka-harness`) on
 `ka-engine` and the rest.
+A future separate product — Ka Agent (persistent, channel-facing) — builds
+on these surfaces from the outside; boundaries and enforcement:
+`agent-boundary.md`.
 
 | Crate | Public surface (lib.rs) |
 |---|---|
@@ -20,7 +23,7 @@ protocol+dialect+strand+sandbox; `ka-term` and the `ka` binary (`ka-agent`) on
 | `ka-strand` | Session store — one session = one append-only JSONL file: `StrandFile`/`StrandWriter`, `Record` (serde tag `"record"`), `list`/`latest`/`resolve_id` (id-prefix addressing)/`read`, `render_markdown`, `data_dir`/`strand_dir`. |
 | `ka-term` | Terminal primitives: raw-mode `Terminal` guard, `Key` decode, `markdown`/`palette`/`tui` render modules. Only needed to build a TUI. |
 | `ka-sandbox` | `[sandbox] mode = "fs"` filesystem policy: `SandboxConfig`, `policy_from_config`, `wrap_command`. Enforcement order bubblewrap → firejail → in-kernel landlock (via the hidden `ka ka-sandbox-exec` trampoline); no tool available fails closed. |
-| `ka-index` | SQLite FTS5 (bundled) full-text search over strands: `open_db`, `default_db_path`, `rebuild`, `search`. Optional — behind `ka-agent`'s `index` feature. |
+| `ka-index` | SQLite FTS5 (bundled) full-text search over strands: `open_db`, `default_db_path`, `rebuild`, `search`. Optional — behind `ka-harness`'s `index` feature. |
 
 ## 2. Headless: `ka run`
 
@@ -151,7 +154,7 @@ auth = "passport"       # NEW optional key: token comes from a
                         # registered TokenSource, never an env var
 ```
 
-Rules fixed at ratification: core never links the passport crate (ka-agent
+Rules fixed at ratification: core never links the passport crate (ka-harness
 opt-in via cargo feature), `auth = "passport"` rows without a registered
 source fail with an instructive error at engine bootstrap, tokens live in
 the OS keyring under service `ka-passport` (same class as keys today), and

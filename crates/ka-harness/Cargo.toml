@@ -1,5 +1,5 @@
 [package]
-name = "ka-agent"
+name = "ka-harness"
 description = "ka: a model-agnostic, very-low-footprint coding agent (TUI + headless NDJSON)"
 version.workspace = true
 edition.workspace = true

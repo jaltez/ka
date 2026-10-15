@@ -1,6 +1,7 @@
 //! Repo automation for ka, following the cargo-xtask convention.
 //! Usage: `cargo xtask <task>` — see `help` for the task list.
 
+use std::collections::BTreeSet;
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -20,6 +21,7 @@ fn main() {
         "dev" => dev(&rest),
         "ci" => ci(),
         "size" => size(&rest),
+        "deps" => deps(),
         "models-sync" => models_sync(),
         "keygen" => keygen(&rest),
         "sign" => sign(&rest),
@@ -61,6 +63,8 @@ fn print_help() {
   size [--bin <path>]
             release binary size vs the 10 MB contract (default
             target/release/ka; --bin gates any artifact, e.g. musl)
+  deps      ka binary dependency-graph allowlist gate — fails on any new
+            crate name (list: crates/xtask/deps-allowlist.txt)
   bench [--update] [--bin <path>]
             p50 `ka --version` latency + peak RSS vs baselines.json
             (±30% tolerance; --update rewrites the baseline)
@@ -100,11 +104,11 @@ fn run(cmd: &mut Command) -> i32 {
     }
 }
 
-/// `cargo install --path crates/ka-agent --locked` — the stable channel.
+/// `cargo install --path crates/ka-harness --locked` — the stable channel.
 fn install() -> i32 {
     let mut cmd = Command::new("cargo");
     cmd.current_dir(repo_root())
-        .args(["install", "--path", "crates/ka-agent", "--locked"]);
+        .args(["install", "--path", "crates/ka-harness", "--locked"]);
     let code = run(&mut cmd);
     if code == 0 {
         println!("\nstable `ka` installed to {}", cargo_bin_dir().display());
@@ -113,7 +117,7 @@ fn install() -> i32 {
 }
 
 /// Publish the workspace crates to crates.io in dependency order
-/// (leaf first, the `ka-agent` binary last). Crates already live at
+/// (leaf first, the `ka-harness` binary last). Crates already live at
 /// the current version are skipped, so a run interrupted by a
 /// crates.io rate limit resumes with the same command.
 /// `--dry-run` packages and verifies every crate without uploading.
@@ -126,7 +130,7 @@ fn publish(args: &[String]) -> i32 {
         "ka-engine",
         "ka-index",
         "ka-term",
-        "ka-agent",
+        "ka-harness",
     ];
     let dry = args.iter().any(|a| a == "--dry-run");
     for name in ORDER {
@@ -181,7 +185,7 @@ fn published_version(name: &str) -> Option<String> {
 /// Build release and symlink `kad` → repo's target/release/ka (dev channel).
 fn link() -> i32 {
     let build = run(Command::new("cargo")
-        .args(["build", "--release", "-p", "ka-agent"])
+        .args(["build", "--release", "-p", "ka-harness"])
         .current_dir(repo_root()));
     if build != 0 {
         return build;
@@ -229,7 +233,7 @@ fn unlink() -> i32 {
 /// Rebuild and execute the dev binary with passthrough args.
 fn dev(rest: &[String]) -> i32 {
     let build = run(Command::new("cargo")
-        .args(["build", "--release", "-p", "ka-agent"])
+        .args(["build", "--release", "-p", "ka-harness"])
         .current_dir(repo_root()));
     if build != 0 {
         return build;
@@ -262,6 +266,10 @@ fn ci() -> i32 {
     if clippy != 0 {
         return clippy;
     }
+    let graph_gate = deps();
+    if graph_gate != 0 {
+        return graph_gate;
+    }
     run(Command::new("cargo")
         .args(["test", "--workspace", "--all-features"])
         .current_dir(repo_root()))
@@ -286,7 +294,7 @@ fn size(rest: &[String]) -> i32 {
             return 2;
         }
         let build = run(Command::new("cargo")
-            .args(["build", "--release", "-p", "ka-agent"])
+            .args(["build", "--release", "-p", "ka-harness"])
             .current_dir(repo_root()));
         if build != 0 {
             return build;
@@ -304,6 +312,78 @@ fn size(rest: &[String]) -> i32 {
         mb, SIZE_BUDGET_MB
     );
     if mb <= SIZE_BUDGET_MB { 0 } else { 1 }
+}
+
+/// `xtask deps`: the `ka` binary's dependency-graph allowlist — the guard
+/// that keeps resident-agent concerns (messaging channels, web
+/// frameworks, schedulers, plugin runtimes; see
+/// research/ka/agent-boundary.md) out of the shipped binary, and makes
+/// any new dependency a deliberate, reviewed act. Compares
+/// `cargo tree -p ka-harness` (default features, normal edges) against
+/// `crates/xtask/deps-allowlist.txt` (crate names, one per line).
+/// Unknown names in the graph fail; names gone from the graph are
+/// reported as stale (platform-specific entries, prune when real).
+fn deps() -> i32 {
+    let allowlist = repo_root().join("crates/xtask/deps-allowlist.txt");
+    let Ok(text) = fs::read_to_string(&allowlist) else {
+        eprintln!("xtask: {} missing", allowlist.display());
+        return 2;
+    };
+    let allowed: BTreeSet<&str> = text
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .collect();
+    let Ok(output) = Command::new("cargo")
+        .args([
+            "tree",
+            "-p",
+            "ka-harness",
+            "--edges",
+            "normal",
+            "--prefix",
+            "none",
+            "--format",
+            "{p}",
+        ])
+        .current_dir(repo_root())
+        .output()
+    else {
+        eprintln!("xtask: cargo tree failed to start");
+        return 2;
+    };
+    if !output.status.success() {
+        eprintln!("xtask: cargo tree failed");
+        return 2;
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let graph: BTreeSet<&str> = stdout
+        .lines()
+        .filter_map(|l| l.split_whitespace().next())
+        .map(|spec| spec.split_once(' ').map_or(spec, |(name, _)| name))
+        .collect();
+    let added: Vec<&str> = graph.difference(&allowed).copied().collect();
+    let stale: Vec<&str> = allowed.difference(&graph).copied().collect();
+    if !stale.is_empty() {
+        println!(
+            "stale allowlist entries (not in today's graph — platform-specific or pruned): {}",
+            stale.join(", ")
+        );
+    }
+    if added.is_empty() {
+        println!(
+            "deps OK — {} crate names allowed, graph matches",
+            allowed.len()
+        );
+        0
+    } else {
+        eprintln!(
+            "new crates in the ka binary graph: {}\n  not in {} — review against the footprint contract, then add deliberately",
+            added.join(", "),
+            allowlist.display()
+        );
+        1
+    }
 }
 
 /// Base64 (standard alphabet) encoder — keeps xtask dependency-light.
@@ -457,7 +537,7 @@ fn sign(rest: &[String]) -> i32 {
 fn release() -> i32 {
     let target = "x86_64-unknown-linux-musl";
     let code = run(Command::new(cargo_bin_dir().join("cargo"))
-        .args(["build", "-p", "ka-agent", "--release", "--target", target])
+        .args(["build", "-p", "ka-harness", "--release", "--target", target])
         .current_dir(repo_root()));
     if code != 0 {
         return code;
@@ -536,7 +616,7 @@ fn bench(rest: &[String]) -> i32 {
     let bin_path = repo_root().join(&bin);
     if !bin_path.exists() {
         eprintln!(
-            "xtask: {} missing — build it first (cargo build --release -p ka-agent or --bin <path>)",
+            "xtask: {} missing — build it first (cargo build --release -p ka-harness or --bin <path>)",
             bin_path.display()
         );
         return 2;

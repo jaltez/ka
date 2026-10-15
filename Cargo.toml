@@ -1,22 +1,36 @@
 [workspace]
 resolver = "3"
 members = ["crates/*"]
+# Future Ka Agent product crates may join `members` (workspace/CI-visible)
+# but never this list: root cargo build/test stay the ka-binary universe.
+# Boundary contract: research/ka/agent-boundary.md §2.
+default-members = [
+    "crates/ka-protocol",
+    "crates/ka-strand",
+    "crates/ka-dialect",
+    "crates/ka-sandbox",
+    "crates/ka-engine",
+    "crates/ka-term",
+    "crates/ka-index",
+    "crates/ka-harness",
+    "crates/xtask",
+]
 
 [workspace.package]
-version = "0.2.11"
+version = "0.3.0"
 edition = "2024"
 license = "MIT"
 rust-version = "1.85"
 repository = "https://github.com/jaltez/ka"
 
 [workspace.dependencies]
-ka-protocol = { path = "crates/ka-protocol", version = "0.2.11" }
-ka-strand = { path = "crates/ka-strand", version = "0.2.11" }
-ka-dialect = { path = "crates/ka-dialect", version = "0.2.11" }
-ka-engine = { path = "crates/ka-engine", version = "0.2.11" }
-ka-term = { path = "crates/ka-term", version = "0.2.11" }
-ka-index = { path = "crates/ka-index", version = "0.2.11" }
-ka-sandbox = { path = "crates/ka-sandbox", version = "0.2.11" }
+ka-protocol = { path = "crates/ka-protocol", version = "0.3.0" }
+ka-strand = { path = "crates/ka-strand", version = "0.3.0" }
+ka-dialect = { path = "crates/ka-dialect", version = "0.3.0" }
+ka-engine = { path = "crates/ka-engine", version = "0.3.0" }
+ka-term = { path = "crates/ka-term", version = "0.3.0" }
+ka-index = { path = "crates/ka-index", version = "0.3.0" }
+ka-sandbox = { path = "crates/ka-sandbox", version = "0.3.0" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "0.9"
